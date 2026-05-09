@@ -1357,6 +1357,49 @@ def _load_agents_md(cwd_path: Path) -> str:
     return ""
 
 
+def _load_home_agents_md() -> str:
+    """Load durable AGENTS.md from HERMES_HOME.
+
+    When running a named profile under ``~/.hermes/profiles/<name>``, also load the
+    shared root ``~/.hermes/AGENTS.md`` first so cross-profile governance rules do
+    not disappear just because the gateway's cwd is the hermes-agent checkout.
+    """
+    try:
+        home = get_hermes_home().resolve()
+    except Exception as e:
+        logger.debug("Could not resolve HERMES_HOME for AGENTS.md loading: %s", e)
+        return ""
+
+    candidates = []
+    if home.parent.name == "profiles":
+        candidates.append(("Shared Hermes AGENTS.md", home.parent.parent / "AGENTS.md"))
+    candidates.append(("HERMES_HOME AGENTS.md", home / "AGENTS.md"))
+
+    sections = []
+    seen_paths = set()
+    for label, candidate in candidates:
+        try:
+            resolved = candidate.resolve()
+        except Exception:
+            resolved = candidate
+        key = str(resolved)
+        if key in seen_paths or not candidate.exists():
+            continue
+        seen_paths.add(key)
+        try:
+            content = candidate.read_text(encoding="utf-8").strip()
+            if not content:
+                continue
+            content = _scan_context_content(content, candidate.name)
+            sections.append(f"## {label}\n\n{content}")
+        except Exception as e:
+            logger.debug("Could not read %s: %s", candidate, e)
+
+    if not sections:
+        return ""
+    return _truncate_content("\n\n".join(sections), "HERMES_HOME AGENTS.md")
+
+
 def _load_claude_md(cwd_path: Path) -> str:
     """CLAUDE.md / claude.md — cwd only."""
     for name in ["CLAUDE.md", "claude.md"]:
@@ -1412,6 +1455,8 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
       3. CLAUDE.md / claude.md   (cwd only)
       4. .cursorrules / .cursor/rules/*.mdc  (cwd only)
 
+    AGENTS.md from HERMES_HOME is also loaded independently so profile/runtime
+    governance rules survive even when cwd points at the hermes-agent checkout.
     SOUL.md from HERMES_HOME is independent and always included when present.
     Each context source is capped at 20,000 chars.
 
@@ -1433,6 +1478,10 @@ def build_context_files_prompt(cwd: Optional[str] = None, skip_soul: bool = Fals
     )
     if project_context:
         sections.append(project_context)
+
+    home_agents_context = _load_home_agents_md()
+    if home_agents_context:
+        sections.append(home_agents_context)
 
     # SOUL.md from HERMES_HOME only — skip when already loaded as identity
     if not skip_soul:

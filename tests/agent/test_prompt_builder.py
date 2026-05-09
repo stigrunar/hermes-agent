@@ -512,6 +512,25 @@ class TestBuildContextFilesPrompt:
         result = build_context_files_prompt(cwd=str(tmp_path))
         assert "type hints" in result
 
+    def test_loads_agents_md_from_hermes_home(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
+        hermes_home = tmp_path / "hermes_home"
+        hermes_home.mkdir()
+        (hermes_home / "AGENTS.md").write_text("Hermes home runtime rules.", encoding="utf-8")
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Hermes home runtime rules." in result
+
+    def test_named_profile_loads_shared_and_profile_home_agents(self, tmp_path, monkeypatch):
+        shared_home = tmp_path / ".hermes"
+        profile_home = shared_home / "profiles" / "dollyops"
+        profile_home.mkdir(parents=True)
+        (shared_home / "AGENTS.md").write_text("Shared runtime governance.", encoding="utf-8")
+        (profile_home / "AGENTS.md").write_text("Profile-local ops rules.", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(profile_home))
+        result = build_context_files_prompt(cwd=str(tmp_path))
+        assert "Shared runtime governance." in result
+        assert "Profile-local ops rules." in result
+
     def test_loads_soul_md_from_hermes_home_only(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_home"))
         hermes_home = tmp_path / "hermes_home"
