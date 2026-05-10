@@ -267,6 +267,42 @@ class TestBuildFromSessions:
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
 
+    def test_telegram_configured_group_topic_label_overrides_generic_session_topic(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "topic_20": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003828321118",
+                    "chat_name": "Dolly Main Projects",
+                    "thread_id": "20",
+                },
+                "chat_type": "group",
+            },
+        })
+        (tmp_path / "config.yaml").write_text(
+            "platforms:\n"
+            "  telegram:\n"
+            "    extra:\n"
+            "      group_topics:\n"
+            "      - chat_id: -1003828321118\n"
+            "        topics:\n"
+            "        - name: \"▸ HWNextApp – /finance\"\n"
+            "          thread_id: 20\n",
+            encoding="utf-8",
+        )
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("telegram")
+
+        assert entries == [
+            {
+                "id": "-1003828321118:20",
+                "name": "Dolly Main Projects / ▸ HWNextApp – /finance",
+                "type": "group",
+                "thread_id": "20",
+            }
+        ]
+
 
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):
