@@ -1338,6 +1338,39 @@ def test_board_surfaces_done_parent_follow_up_not_underway_warning(client):
     assert diag["data"]["child_ids"] == [child]
 
 
+def test_board_surfaces_running_specialist_missing_acceptance_warning(client):
+    now = int(time.time())
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="running-specialist", assignee="reviewer")
+        kb.claim_task(conn, tid)
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (now - 3600, tid),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'claimed'",
+            (now - 3600, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE task_id = ? AND ended_at IS NULL",
+            (now - 3600, tid),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    tasks = [t for col in data["columns"] for t in col["tasks"]]
+    task_dict = next(t for t in tasks if t["title"] == "running-specialist")
+    assert task_dict.get("warnings") is not None
+    assert "running_specialist_missing_acceptance" in task_dict["warnings"]["kinds"]
+    diag = next(d for d in task_dict["diagnostics"] if d["kind"] == "running_specialist_missing_acceptance")
+    assert diag["data"]["assignee"] == "reviewer"
+
+
 def test_board_warnings_cleared_after_clean_completion(client):
     """A completed or edited event after a hallucination event clears
     the warning badge — we don't mark tasks permanently."""

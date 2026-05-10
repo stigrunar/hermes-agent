@@ -245,6 +245,12 @@ def _compute_task_diagnostics(
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
     child_rows_by_parent: dict[str, list[dict]] = {tid: [] for tid in row_ids}
+    task_comments_by_id: dict[str, list[str]] = {tid: [] for tid in row_ids}
+    for comment_row in conn.execute(
+        f"SELECT task_id, body FROM task_comments WHERE task_id IN ({placeholders}) ORDER BY id",
+        tuple(row_ids),
+    ).fetchall():
+        task_comments_by_id.setdefault(comment_row["task_id"], []).append(comment_row["body"])
     child_ids: set[str] = set()
     for link_row in conn.execute(
         f"SELECT parent_id, child_id FROM task_links WHERE parent_id IN ({placeholders})",
@@ -295,7 +301,10 @@ def _compute_task_diagnostics(
             r,
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
-            context={"children": child_rows_by_parent.get(tid, [])},
+            context={
+                "comments": task_comments_by_id.get(tid, []),
+                "children": child_rows_by_parent.get(tid, []),
+            },
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]

@@ -75,6 +75,13 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
 
 
 def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
+    task_comments = [
+        row["body"]
+        for row in conn.execute(
+            "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id",
+            (task_id,),
+        ).fetchall()
+    ]
     child_ids = [
         row["child_id"]
         for row in conn.execute(
@@ -83,14 +90,14 @@ def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
         ).fetchall()
     ]
     if not child_ids:
-        return {"children": []}
+        return {"comments": task_comments, "children": []}
 
     children: list[dict[str, Any]] = []
     for child_id in child_ids:
         child = kb.get_task(conn, child_id)
         if child is None:
             continue
-        comments = [
+        child_comments = [
             row["body"]
             for row in conn.execute(
                 "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id",
@@ -107,10 +114,10 @@ def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
             "started_at": child.started_at,
             "completed_at": child.completed_at,
             "current_run_id": child.current_run_id,
-            "comments": comments,
+            "comments": child_comments,
             "runs": kb.list_runs(conn, child_id),
         })
-    return {"children": children}
+    return {"comments": task_comments, "children": children}
 
 
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:

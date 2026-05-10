@@ -243,6 +243,70 @@ def test_stuck_in_blocked_silent_when_not_blocked():
     assert kd.compute_task_diagnostics(task, events, [], now=9999999) == []
 
 
+def test_running_specialist_missing_acceptance_fires_after_grace_window():
+    now = int(time.time())
+    task = _task(
+        status="running",
+        assignee="reviewer",
+        started_at=now - 3600,
+        current_run_id=7,
+    )
+    events = [_event("claimed", ts=now - 3600, run_id=7)]
+    diags = kd.compute_task_diagnostics(task, events, [_run(outcome="running", run_id=7)], now=now, context={"comments": []})
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "running_specialist_missing_acceptance"
+    assert d.severity == "warning"
+    assert d.run_id == 7
+    assert d.data["assignee"] == "reviewer"
+    assert "accepted_by" in d.data["missing_acceptance_fields"]
+    assert any(a.kind == "cli_hint" and a.suggested for a in d.actions)
+
+
+def test_running_specialist_missing_acceptance_silent_with_acceptance_comment():
+    now = int(time.time())
+    acceptance = (
+        "accepted_by: dollycode\naccepted_at: 2026-05-10T02:00:00Z\n"
+        "lane: governance\nscope_understood: yes\nfirst_action: inspect repo\n"
+        "expected_artifact: diagnostics patch\nrisk_level: low\nwill_not_do: redesign"
+    )
+    task = _task(status="running", assignee="reviewer", started_at=now - 3600, current_run_id=8)
+    events = [_event("claimed", ts=now - 3600, run_id=8)]
+    assert kd.compute_task_diagnostics(
+        task,
+        events,
+        [_run(outcome="running", run_id=8)],
+        now=now,
+        context={"comments": [acceptance]},
+    ) == []
+
+
+def test_running_specialist_missing_acceptance_silent_for_default_assignee():
+    now = int(time.time())
+    task = _task(status="running", assignee="default", started_at=now - 3600, current_run_id=9)
+    events = [_event("claimed", ts=now - 3600, run_id=9)]
+    assert kd.compute_task_diagnostics(
+        task,
+        events,
+        [_run(outcome="running", run_id=9)],
+        now=now,
+        context={"comments": []},
+    ) == []
+
+
+def test_running_specialist_missing_acceptance_respects_grace_window():
+    now = int(time.time())
+    task = _task(status="running", assignee="reviewer", started_at=now - 60, current_run_id=10)
+    events = [_event("claimed", ts=now - 60, run_id=10)]
+    assert kd.compute_task_diagnostics(
+        task,
+        events,
+        [_run(outcome="running", run_id=10)],
+        now=now,
+        context={"comments": []},
+    ) == []
+
+
 def test_done_parent_follow_up_not_underway_fires_after_handoff_window():
     now = int(time.time())
     task = _task(status="done", completed_at=now - 3600 * 12)

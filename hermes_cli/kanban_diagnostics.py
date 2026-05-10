@@ -250,6 +250,13 @@ def _context_children(context: Optional[dict]) -> list[dict]:
     return children if isinstance(children, list) else []
 
 
+def _context_comments(context: Optional[dict]) -> list[str]:
+    if not context:
+        return []
+    comments = context.get("comments")
+    return comments if isinstance(comments, list) else []
+
+
 def _latest_completed_like_ts(task: Any, events: list[Any]) -> int:
     completed_at = _task_field(task, "completed_at", None)
     if completed_at:
@@ -277,12 +284,30 @@ def _child_has_acceptance_evidence(child: dict) -> bool:
     return False
 
 
+def _task_has_acceptance_evidence(task: Any, context: Optional[dict]) -> bool:
+    if _text_has_acceptance_markers(_task_field(task, "body", None)):
+        return True
+    for comment in _context_comments(context):
+        if _text_has_acceptance_markers(comment):
+            return True
+    return False
+
+
 def _child_has_run_evidence(child: dict) -> bool:
     if _task_field(child, "current_run_id", None):
         return True
     if _task_field(child, "started_at", None):
         return True
     return bool(child.get("runs") or [])
+
+
+def _latest_running_like_ts(task: Any, events: list[Any]) -> int:
+    started_at = _task_field(task, "started_at", None)
+    latest = int(started_at or 0)
+    for ev in events:
+        if _event_kind(ev) in {"claimed", "spawned"}:
+            latest = max(latest, _event_ts(ev))
+    return latest
 
 
 def _rule_hallucinated_cards(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
@@ -624,6 +649,67 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg, context=None) -> list[D
     )]
 
 
+def _rule_running_specialist_missing_acceptance(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
+    """Running specialist task has claim/run evidence but no acceptance yet."""
+    if _task_field(task, "status") != "running":
+        return []
+    assignee = _task_field(task, "assignee")
+    if not assignee or assignee == "default":
+        return []
+    if _task_has_acceptance_evidence(task, context):
+        return []
+
+    grace_minutes = float(cfg.get("specialist_acceptance_grace_minutes", 15))
+    grace_seconds = int(grace_minutes * 60)
+    running_since = _latest_running_like_ts(task, events)
+    if running_since <= 0 or now - running_since < grace_seconds:
+        return []
+
+    task_id = _task_field(task, "id")
+    current_run_id = _task_field(task, "current_run_id", None)
+    actions: list[DiagnosticAction] = []
+    if task_id:
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Inspect task thread: hermes kanban show {task_id}",
+            payload={"command": f"hermes kanban show {task_id}"},
+            suggested=True,
+        ))
+    actions.append(DiagnosticAction(
+        kind="comment",
+        label="Record specialist acceptance fields or a blocker on the task",
+        suggested=False,
+    ))
+    actions.extend(_generic_recovery_actions(task, running=True))
+
+    return [Diagnostic(
+        kind="running_specialist_missing_acceptance",
+        severity="warning",
+        title=f"Running specialist task missing acceptance ({assignee})",
+        detail=(
+            f"This task has been claimed/spawned in `running` for at least "
+            f"{int(grace_minutes)}m, but there are still no acceptance markers "
+            f"(`accepted_by`, `accepted_at`, `lane`, `scope_understood`, "
+            f"`first_action`, `expected_artifact`, `risk_level`, `will_not_do`). "
+            f"By policy that means the task is claimed/spawned, not yet truly "
+            f"underway / `i arbeid`, until the specialist records acceptance or "
+            f"a blocker."
+        ),
+        actions=actions,
+        first_seen_at=running_since,
+        last_seen_at=now,
+        count=1,
+        run_id=int(current_run_id) if current_run_id else None,
+        data={
+            "assignee": assignee,
+            "running_since": running_since,
+            "grace_minutes": grace_minutes,
+            "current_run_id": current_run_id,
+            "missing_acceptance_fields": list(_ACCEPTANCE_FIELDS),
+        },
+    )]
+
+
 def _rule_done_parent_follow_up_not_underway(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """Done parent has follow-up materialized, but it still looks parked."""
     if _task_field(task, "status") != "done":
@@ -715,6 +801,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
+    _rule_running_specialist_missing_acceptance,
     _rule_done_parent_follow_up_not_underway,
 ]
 
@@ -727,6 +814,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",
+    "running_specialist_missing_acceptance",
     "done_parent_follow_up_not_underway",
 )
 
@@ -737,6 +825,7 @@ DEFAULT_CONFIG = {
     "spawn_failure_threshold": 3,
     "crash_threshold": 2,
     "blocked_stale_hours": 24,
+    "specialist_acceptance_grace_minutes": 15,
     "follow_up_handoff_hours": 6,
 }
 
