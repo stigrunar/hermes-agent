@@ -8128,7 +8128,17 @@ class GatewayRunner:
         # Parse --provider and --global flags
         model_input, explicit_provider, persist_global = parse_model_flags(raw_args)
 
-        # Read current model/provider from config
+        # Read current model/provider from config.
+        #
+        # Most of the CLI treats both of these shapes as valid:
+        #   model: gpt-5.5
+        #   provider: openai-codex
+        # and:
+        #   model:
+        #     default: gpt-5.5
+        #     provider: openai-codex
+        # The gateway /model picker used to read raw YAML and only handle the
+        # dict form, so scalar configs displayed as "unknown" on OpenRouter.
         current_model = ""
         current_provider = "openrouter"
         current_base_url = ""
@@ -8141,9 +8151,16 @@ class GatewayRunner:
             if cfg:
                 model_cfg = cfg.get("model", {})
                 if isinstance(model_cfg, dict):
-                    current_model = model_cfg.get("default", "")
-                    current_provider = model_cfg.get("provider", current_provider)
-                    current_base_url = model_cfg.get("base_url", "")
+                    current_model = model_cfg.get("default", "") or model_cfg.get("model", "")
+                    current_provider = model_cfg.get("provider", cfg.get("provider", current_provider))
+                    current_base_url = model_cfg.get("base_url", cfg.get("base_url", ""))
+                elif model_cfg:
+                    current_model = str(model_cfg)
+                    current_provider = cfg.get("provider", current_provider)
+                    current_base_url = cfg.get("base_url", "")
+                else:
+                    current_provider = cfg.get("provider", current_provider)
+                    current_base_url = cfg.get("base_url", "")
                 user_provs = cfg.get("providers")
                 try:
                     from hermes_cli.config import get_compatible_custom_providers
