@@ -381,6 +381,31 @@ def test_done_parent_follow_up_not_underway_silent_with_acceptance_markers():
     assert kd.compute_task_diagnostics(task, [], [], now=now, context=context) == []
 
 
+def test_done_parent_follow_up_not_underway_silent_when_child_waits_on_other_parent():
+    now = int(time.time())
+    task = _task(status="done", completed_at=now - 3600 * 12)
+    context = {
+        "children": [
+            {
+                "id": "t_child_waiting",
+                "status": "todo",
+                "assignee": "dollycode",
+                "created_at": now - 3600 * 10,
+                "started_at": None,
+                "current_run_id": None,
+                "body": None,
+                "parents": [
+                    {"id": "t_done_parent", "status": "done"},
+                    {"id": "t_blocked_parent", "status": "blocked"},
+                ],
+                "comments": [],
+                "runs": [],
+            }
+        ]
+    }
+    assert kd.compute_task_diagnostics(task, [], [], now=now, context=context) == []
+
+
 def test_done_parent_follow_up_not_underway_respects_grace_window():
     now = int(time.time())
     task = _task(status="done", completed_at=now - 3600)

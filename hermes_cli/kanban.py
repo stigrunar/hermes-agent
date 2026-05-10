@@ -104,6 +104,19 @@ def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
                 (child_id,),
             ).fetchall()
         ]
+        child_parents = [
+            {"id": row["id"], "status": row["status"]}
+            for row in conn.execute(
+                """
+                SELECT t.id AS id, t.status AS status
+                FROM tasks t
+                JOIN task_links l ON l.parent_id = t.id
+                WHERE l.child_id = ?
+                ORDER BY t.id
+                """,
+                (child_id,),
+            ).fetchall()
+        ]
         children.append({
             "id": child.id,
             "title": child.title,
@@ -114,6 +127,7 @@ def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
             "started_at": child.started_at,
             "completed_at": child.completed_at,
             "current_run_id": child.current_run_id,
+            "parents": child_parents,
             "comments": child_comments,
             "runs": kb.list_runs(conn, child_id),
         })

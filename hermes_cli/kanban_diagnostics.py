@@ -301,6 +301,19 @@ def _child_has_run_evidence(child: dict) -> bool:
     return bool(child.get("runs") or [])
 
 
+def _child_waits_on_unfinished_parent(child: dict) -> bool:
+    parents = child.get("parents") or []
+    if not isinstance(parents, list):
+        return False
+    for parent in parents:
+        if not isinstance(parent, dict):
+            continue
+        status = str(parent.get("status") or "").strip().lower()
+        if status and status != "done":
+            return True
+    return False
+
+
 def _latest_running_like_ts(task: Any, events: list[Any]) -> int:
     started_at = _task_field(task, "started_at", None)
     latest = int(started_at or 0)
@@ -728,6 +741,8 @@ def _rule_done_parent_follow_up_not_underway(task, events, runs, now, cfg, conte
     for child in children:
         child_status = _task_field(child, "status", "")
         if child_status not in {"triage", "todo", "ready"}:
+            continue
+        if child_status == "todo" and _child_waits_on_unfinished_parent(child):
             continue
         evidence_ts = max(parent_done_ts, int(_task_field(child, "created_at", 0) or 0))
         if evidence_ts <= 0 or now - evidence_ts < grace_seconds:
