@@ -53,6 +53,78 @@ def _session_entry_name(origin: Dict[str, Any]) -> str:
     return f"{base_name} / {topic_label}"
 
 
+def _configured_topic_labels(platform_name: str) -> Dict[str, str]:
+    """Return configured thread labels keyed as ``<chat_id>:<thread_id>``.
+
+    Telegram forum topics often arrive in stored session metadata without a
+    human topic title, so session-derived channel-directory entries degrade to
+    generic labels such as ``Dolly Main Projects / topic 20``. When operators
+    have explicitly bound project topics in ``config.yaml`` (``group_topics``),
+    those labels should be treated as canonical routing/display labels for the
+    cached directory.
+    """
+    if platform_name != "telegram":
+        return {}
+
+    try:
+        import yaml
+    except Exception:
+        return {}
+
+    config_path = get_hermes_home() / "config.yaml"
+    if not config_path.exists():
+        return {}
+
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+    except Exception as e:
+        logger.debug("Channel directory: failed to read configured topic labels: %s", e)
+        return {}
+
+    labels: Dict[str, str] = {}
+    telegram_config = config.get("telegram") if isinstance(config, dict) else None
+    group_topics = (telegram_config or {}).get("group_topics", []) if isinstance(telegram_config, dict) else []
+
+    if not group_topics and isinstance(config, dict):
+        platform_telegram = ((config.get("platforms") or {}).get("telegram") or {})
+        if isinstance(platform_telegram, dict):
+            platform_extra = platform_telegram.get("extra") or {}
+            if isinstance(platform_extra, dict):
+                group_topics = platform_extra.get("group_topics", [])
+
+    if not isinstance(group_topics, list):
+        return labels
+
+    for chat_entry in group_topics:
+        if not isinstance(chat_entry, dict):
+            continue
+        chat_id = chat_entry.get("chat_id")
+        if chat_id is None:
+            continue
+        for topic in chat_entry.get("topics", []) or []:
+            if not isinstance(topic, dict):
+                continue
+            thread_id = topic.get("thread_id")
+            name = topic.get("name")
+            if thread_id is None or not name:
+                continue
+            labels[f"{chat_id}:{thread_id}"] = str(name)
+    return labels
+
+
+def _session_entry_name_with_config(origin: Dict[str, Any], configured_topic_labels: Dict[str, str]) -> str:
+    base_name = origin.get("chat_name") or origin.get("user_name") or str(origin.get("chat_id"))
+    thread_id = origin.get("thread_id")
+    if not thread_id:
+        return base_name
+
+    configured_label = configured_topic_labels.get(f"{origin.get('chat_id')}:{thread_id}")
+    if configured_label:
+        return f"{base_name} / {configured_label}"
+    return _session_entry_name(origin)
+
+
 # ---------------------------------------------------------------------------
 # Build / refresh
 # ---------------------------------------------------------------------------
@@ -220,6 +292,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             data = json.load(f)
 
         seen_ids = set()
+        configured_topic_labels = _configured_topic_labels(platform_name)
         for _key, session in data.items():
             origin = session.get("origin") or {}
             if origin.get("platform") != platform_name:
@@ -230,7 +303,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             seen_ids.add(entry_id)
             entries.append({
                 "id": entry_id,
-                "name": _session_entry_name(origin),
+                "name": _session_entry_name_with_config(origin, configured_topic_labels),
                 "type": session.get("chat_type", "dm"),
                 "thread_id": origin.get("thread_id"),
             })
