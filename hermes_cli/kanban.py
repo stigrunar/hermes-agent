@@ -74,6 +74,45 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
     }
 
 
+def _diagnostic_context_for_task(conn, task_id: str) -> dict[str, Any]:
+    child_ids = [
+        row["child_id"]
+        for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+            (task_id,),
+        ).fetchall()
+    ]
+    if not child_ids:
+        return {"children": []}
+
+    children: list[dict[str, Any]] = []
+    for child_id in child_ids:
+        child = kb.get_task(conn, child_id)
+        if child is None:
+            continue
+        comments = [
+            row["body"]
+            for row in conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ? ORDER BY id",
+                (child_id,),
+            ).fetchall()
+        ]
+        children.append({
+            "id": child.id,
+            "title": child.title,
+            "body": child.body,
+            "assignee": child.assignee,
+            "status": child.status,
+            "created_at": child.created_at,
+            "started_at": child.started_at,
+            "completed_at": child.completed_at,
+            "current_run_id": child.current_run_id,
+            "comments": comments,
+            "runs": kb.list_runs(conn, child_id),
+        })
+    return {"children": children}
+
+
 def _parse_workspace_flag(value: str) -> tuple[str, Optional[str]]:
     """Parse ``--workspace`` into ``(kind, path|None)``.
 
@@ -1204,7 +1243,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    diag_context = _diagnostic_context_for_task(conn, task.id)
+    diags = kd.compute_task_diagnostics(task, events, runs, context=diag_context)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1345,6 +1385,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     task,
                     kb.list_events(conn, args.task),
                     kb.list_runs(conn, args.task),
+                    context=_diagnostic_context_for_task(conn, args.task),
                 )
             }
         else:
@@ -1372,7 +1413,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 diags_by_task = {}
                 for r in rows:
                     tid = r["id"]
-                    dl = kd.compute_task_diagnostics(r, ev_by.get(tid, []), run_by.get(tid, []))
+                    dl = kd.compute_task_diagnostics(
+                        r,
+                        ev_by.get(tid, []),
+                        run_by.get(tid, []),
+                        context=_diagnostic_context_for_task(conn, tid),
+                    )
                     if dl:
                         diags_by_task[tid] = dl
 

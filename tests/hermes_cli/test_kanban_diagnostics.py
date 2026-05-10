@@ -243,6 +243,101 @@ def test_stuck_in_blocked_silent_when_not_blocked():
     assert kd.compute_task_diagnostics(task, events, [], now=9999999) == []
 
 
+def test_done_parent_follow_up_not_underway_fires_after_handoff_window():
+    now = int(time.time())
+    task = _task(status="done", completed_at=now - 3600 * 12)
+    context = {
+        "children": [
+            {
+                "id": "t_child01",
+                "status": "ready",
+                "assignee": "reviewer",
+                "created_at": now - 3600 * 10,
+                "started_at": None,
+                "current_run_id": None,
+                "body": None,
+                "comments": [],
+                "runs": [],
+            }
+        ]
+    }
+    diags = kd.compute_task_diagnostics(task, [], [], now=now, context=context)
+    assert len(diags) == 1
+    d = diags[0]
+    assert d.kind == "done_parent_follow_up_not_underway"
+    assert d.severity == "warning"
+    assert d.data["child_ids"] == ["t_child01"]
+    assert any(a.kind == "cli_hint" and a.suggested for a in d.actions)
+
+
+def test_done_parent_follow_up_not_underway_silent_with_run_evidence():
+    now = int(time.time())
+    task = _task(status="done", completed_at=now - 3600 * 12)
+    context = {
+        "children": [
+            {
+                "id": "t_child02",
+                "status": "ready",
+                "assignee": "reviewer",
+                "created_at": now - 3600 * 10,
+                "started_at": now - 3600,
+                "current_run_id": 7,
+                "body": None,
+                "comments": [],
+                "runs": [{"id": 7, "outcome": "running"}],
+            }
+        ]
+    }
+    assert kd.compute_task_diagnostics(task, [], [], now=now, context=context) == []
+
+
+def test_done_parent_follow_up_not_underway_silent_with_acceptance_markers():
+    now = int(time.time())
+    task = _task(status="done", completed_at=now - 3600 * 12)
+    acceptance = (
+        "accepted_by: dollycode\naccepted_at: 2026-05-10T02:00:00Z\n"
+        "lane: governance\nscope_understood: yes\nfirst_action: inspect repo\n"
+        "expected_artifact: diagnostics patch\nrisk_level: low\nwill_not_do: redesign"
+    )
+    context = {
+        "children": [
+            {
+                "id": "t_child03",
+                "status": "todo",
+                "assignee": "reviewer",
+                "created_at": now - 3600 * 10,
+                "started_at": None,
+                "current_run_id": None,
+                "body": None,
+                "comments": [acceptance],
+                "runs": [],
+            }
+        ]
+    }
+    assert kd.compute_task_diagnostics(task, [], [], now=now, context=context) == []
+
+
+def test_done_parent_follow_up_not_underway_respects_grace_window():
+    now = int(time.time())
+    task = _task(status="done", completed_at=now - 3600)
+    context = {
+        "children": [
+            {
+                "id": "t_child04",
+                "status": "ready",
+                "assignee": "reviewer",
+                "created_at": now - 1800,
+                "started_at": None,
+                "current_run_id": None,
+                "body": None,
+                "comments": [],
+                "runs": [],
+            }
+        ]
+    }
+    assert kd.compute_task_diagnostics(task, [], [], now=now, context=context) == []
+
+
 def test_repeated_crashes_surfaces_actual_error_in_title():
     """The title should lead with the actual error text so operators
     see WHAT broke (e.g. rate-limit, auth, OOM) without opening logs.
@@ -367,7 +462,7 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
 
 
 def test_broken_rule_is_isolated(monkeypatch):
-    def _bad_rule(task, events, runs, now, cfg):
+    def _bad_rule(task, events, runs, now, cfg, context=None):
         raise RuntimeError("synthetic rule bug")
 
     # Insert a broken rule at the front of the registry; subsequent

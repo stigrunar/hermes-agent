@@ -576,6 +576,8 @@ hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events 
         [--kinds completed,blocked,…] [--interval SECS]
 hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal for long ops
 hermes kanban runs <id> [--json]                       # attempt history (one row per run)
+hermes kanban diagnostics [--task <id>] [--severity S] [--json]
+                                                        # active warnings/distress signals
 hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
 hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
         [--failure-limit N] [--json]
@@ -596,6 +598,8 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+The diagnostics surface is the cheapest prevention canary when follow-up already exists in Kanban but still is not visibly underway. `hermes kanban show <id>` now prints active diagnostics inline, and `hermes kanban diagnostics` lists them board-wide. One built-in warning to watch for is `done_parent_follow_up_not_underway`: a parent task is already `done`, but a linked child has sat in `triage` / `todo` / `ready` beyond the default 6 h handoff window with neither specialist-acceptance markers (`accepted_by:`, `accepted_at:`, `lane:`, `scope_understood:`, `first_action:`, `expected_artifact:`, `risk_level:`, `will_not_do:`) nor any run evidence. That catches the common "follow-up materialized in Kanban, but the human surface can still over-read it as chat-only continuation" failure mode.
 
 ## `/kanban` slash command {#kanban-slash-command}
 

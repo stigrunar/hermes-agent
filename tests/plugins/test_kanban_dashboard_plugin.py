@@ -1304,6 +1304,40 @@ def test_board_surfaces_warnings_field_for_hallucinated_completions(client):
     assert "t_deadbeefcafe" in parent_dict["diagnostics"][0]["data"]["phantom_ids"]
 
 
+def test_board_surfaces_done_parent_follow_up_not_underway_warning(client):
+    now = int(time.time())
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="done-parent", assignee="alice")
+        child = kb.create_task(conn, title="ready-child", assignee="reviewer", parents=[parent])
+        assert kb.complete_task(conn, parent, summary="slice complete") is True
+        conn.execute(
+            "UPDATE tasks SET completed_at = ? WHERE id = ?",
+            (now - 3600 * 12, parent),
+        )
+        conn.execute(
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            (now - 3600 * 10, child),
+        )
+        conn.execute(
+            "UPDATE task_events SET created_at = ? WHERE task_id = ? AND kind = 'completed'",
+            (now - 3600 * 12, parent),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    r = client.get("/api/plugins/kanban/board")
+    assert r.status_code == 200
+    data = r.json()
+    tasks = [t for col in data["columns"] for t in col["tasks"]]
+    parent_dict = next(t for t in tasks if t["title"] == "done-parent")
+    assert parent_dict.get("warnings") is not None
+    assert "done_parent_follow_up_not_underway" in parent_dict["warnings"]["kinds"]
+    diag = next(d for d in parent_dict["diagnostics"] if d["kind"] == "done_parent_follow_up_not_underway")
+    assert diag["data"]["child_ids"] == [child]
+
+
 def test_board_warnings_cleared_after_clean_completion(client):
     """A completed or edited event after a hallucination event clears
     the warning badge — we don't mark tasks permanently."""

@@ -228,10 +228,64 @@ def _generic_recovery_actions(task: Any, *, running: bool) -> list[DiagnosticAct
 # kanban_db.Event / kanban_db.Run (or plain dicts matching the same
 # shape — for test convenience).
 
-RuleFn = Callable[[Any, list[Any], list[Any], int, dict], list[Diagnostic]]
+RuleFn = Callable[[Any, list[Any], list[Any], int, dict, Optional[dict]], list[Diagnostic]]
 
 
-def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
+_ACCEPTANCE_FIELDS = (
+    "accepted_by",
+    "accepted_at",
+    "lane",
+    "scope_understood",
+    "first_action",
+    "expected_artifact",
+    "risk_level",
+    "will_not_do",
+)
+
+
+def _context_children(context: Optional[dict]) -> list[dict]:
+    if not context:
+        return []
+    children = context.get("children")
+    return children if isinstance(children, list) else []
+
+
+def _latest_completed_like_ts(task: Any, events: list[Any]) -> int:
+    completed_at = _task_field(task, "completed_at", None)
+    if completed_at:
+        return int(completed_at)
+    latest = 0
+    for ev in events:
+        if _event_kind(ev) == "completed":
+            latest = max(latest, _event_ts(ev))
+    return latest
+
+
+def _text_has_acceptance_markers(text: Any) -> bool:
+    if not isinstance(text, str) or not text.strip():
+        return False
+    lower = text.lower()
+    return all(f"{field}:" in lower for field in _ACCEPTANCE_FIELDS)
+
+
+def _child_has_acceptance_evidence(child: dict) -> bool:
+    if _text_has_acceptance_markers(child.get("body")):
+        return True
+    for comment in child.get("comments") or []:
+        if _text_has_acceptance_markers(comment):
+            return True
+    return False
+
+
+def _child_has_run_evidence(child: dict) -> bool:
+    if _task_field(child, "current_run_id", None):
+        return True
+    if _task_field(child, "started_at", None):
+        return True
+    return bool(child.get("runs") or [])
+
+
+def _rule_hallucinated_cards(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """Blocked-hallucination gate fires: a worker called kanban_complete
     with created_cards that didn't exist or weren't created by the
     completing profile. Task stayed in its prior state; the operator
@@ -278,7 +332,7 @@ def _rule_hallucinated_cards(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
+def _rule_prose_phantom_refs(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """Advisory prose-scan: the completion summary mentions ``t_<hex>``
     ids that don't resolve. Non-blocking; surfaced as a warning only.
 
@@ -312,7 +366,7 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
+def _rule_repeated_failures(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """Task's unified ``consecutive_failures`` counter is climbing —
     something about this task+profile combo is broken and each retry
     fails the same way. Triggers regardless of the specific failure
@@ -432,7 +486,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
+def _rule_repeated_crashes(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """The worker spawns fine but keeps crashing mid-run. Check the last
     N runs' outcomes; N consecutive ``crashed`` without a successful
     ``completed`` means something about the task + profile combo is
@@ -519,7 +573,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
-def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
+def _rule_stuck_in_blocked(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
     """Task has been in ``blocked`` status for too long without a comment.
 
     Threshold: cfg["blocked_stale_hours"] (default 24).
@@ -570,6 +624,89 @@ def _rule_stuck_in_blocked(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _rule_done_parent_follow_up_not_underway(task, events, runs, now, cfg, context=None) -> list[Diagnostic]:
+    """Done parent has follow-up materialized, but it still looks parked."""
+    if _task_field(task, "status") != "done":
+        return []
+    children = _context_children(context)
+    if not children:
+        return []
+
+    grace_hours = float(cfg.get("follow_up_handoff_hours", 6))
+    grace_seconds = int(grace_hours * 3600)
+    parent_done_ts = _latest_completed_like_ts(task, events)
+    if parent_done_ts <= 0:
+        return []
+
+    flagged: list[dict] = []
+    for child in children:
+        child_status = _task_field(child, "status", "")
+        if child_status not in {"triage", "todo", "ready"}:
+            continue
+        evidence_ts = max(parent_done_ts, int(_task_field(child, "created_at", 0) or 0))
+        if evidence_ts <= 0 or now - evidence_ts < grace_seconds:
+            continue
+        has_acceptance = _child_has_acceptance_evidence(child)
+        has_runs = _child_has_run_evidence(child)
+        if has_acceptance or has_runs:
+            continue
+        flagged.append({
+            "id": _task_field(child, "id"),
+            "status": child_status,
+            "assignee": _task_field(child, "assignee"),
+            "age_hours": round((now - evidence_ts) / 3600.0, 1),
+        })
+
+    if not flagged:
+        return []
+
+    child_ids = [c["id"] for c in flagged if c.get("id")]
+    actions: list[DiagnosticAction] = []
+    if child_ids:
+        actions.append(DiagnosticAction(
+            kind="cli_hint",
+            label=f"Inspect linked follow-up: hermes kanban show {child_ids[0]}",
+            payload={"command": f"hermes kanban show {child_ids[0]}"},
+            suggested=True,
+        ))
+    actions.append(DiagnosticAction(
+        kind="comment",
+        label="Record specialist acceptance or blocker on the child task",
+        suggested=False,
+    ))
+
+    count = len(flagged)
+    noun = "child" if count == 1 else "children"
+    detail_preview = ", ".join(
+        f"{row['id']} ({row['status']}, assignee={row.get('assignee') or '-'})"
+        for row in flagged[:5]
+        if row.get("id")
+    )
+    detail_suffix = "" if count <= 5 else f" and {count - 5} more"
+    return [Diagnostic(
+        kind="done_parent_follow_up_not_underway",
+        severity="warning",
+        title=f"Scoped-done parent has {count} linked {noun} not underway",
+        detail=(
+            f"This task is already done, but linked follow-up remains parked in "
+            f"triage/todo/ready beyond the {int(grace_hours)}h handoff window with "
+            f"no explicit acceptance markers and no run evidence. This catches the "
+            f"common case where follow-up exists in Kanban but still looks like "
+            f"chat-only continuation. Affected {noun}: {detail_preview}{detail_suffix}."
+        ),
+        actions=actions,
+        first_seen_at=parent_done_ts,
+        last_seen_at=now,
+        count=count,
+        data={
+            "child_ids": child_ids,
+            "children": flagged,
+            "grace_hours": grace_hours,
+            "parent_completed_at": parent_done_ts,
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -578,6 +715,7 @@ _RULES: list[RuleFn] = [
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
+    _rule_done_parent_follow_up_not_underway,
 ]
 
 
@@ -589,6 +727,7 @@ DIAGNOSTIC_KINDS = (
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",
+    "done_parent_follow_up_not_underway",
 )
 
 
@@ -598,6 +737,7 @@ DEFAULT_CONFIG = {
     "spawn_failure_threshold": 3,
     "crash_threshold": 2,
     "blocked_stale_hours": 24,
+    "follow_up_handoff_hours": 6,
 }
 
 
@@ -608,6 +748,7 @@ def compute_task_diagnostics(
     *,
     now: Optional[int] = None,
     config: Optional[dict] = None,
+    context: Optional[dict] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
@@ -620,7 +761,7 @@ def compute_task_diagnostics(
     out: list[Diagnostic] = []
     for rule in _RULES:
         try:
-            out.extend(rule(task, events, runs, now_ts, cfg))
+            out.extend(rule(task, events, runs, now_ts, cfg, context))
         except Exception:
             # A broken rule must never crash the dashboard. Rule bugs
             # get caught in tests; in production we'd rather drop the

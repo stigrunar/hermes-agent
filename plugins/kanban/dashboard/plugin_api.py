@@ -213,9 +213,6 @@ def _compute_task_diagnostics(
     """
     from hermes_cli import kanban_diagnostics as kd
 
-    # Build the candidate task list. We need each task's row + its
-    # events + its runs. Doing N separate queries works but scales
-    # poorly; do three aggregate queries instead.
     if task_ids is not None:
         if not task_ids:
             return {}
@@ -232,10 +229,6 @@ def _compute_task_diagnostics(
     if not rows:
         return {}
 
-    # Index events + runs by task id. For very large boards this will
-    # slurp a lot — acceptable on the dashboard's typical working set
-    # (hundreds of tasks), but we can add pagination / filtering later
-    # if profiling shows it's a hotspot.
     row_ids = [r["id"] for r in rows]
     placeholders = ",".join(["?"] * len(row_ids))
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
@@ -251,6 +244,50 @@ def _compute_task_diagnostics(
     ).fetchall():
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
+    child_rows_by_parent: dict[str, list[dict]] = {tid: [] for tid in row_ids}
+    child_ids: set[str] = set()
+    for link_row in conn.execute(
+        f"SELECT parent_id, child_id FROM task_links WHERE parent_id IN ({placeholders})",
+        tuple(row_ids),
+    ).fetchall():
+        child_id = link_row["child_id"]
+        child = kanban_db.get_task(conn, child_id)
+        if child is None:
+            continue
+        child_ids.add(child_id)
+        child_rows_by_parent.setdefault(link_row["parent_id"], []).append({
+            "id": child.id,
+            "title": child.title,
+            "assignee": child.assignee,
+            "status": child.status,
+            "created_at": child.created_at,
+            "started_at": child.started_at,
+            "completed_at": child.completed_at,
+            "current_run_id": child.current_run_id,
+            "body": child.body,
+        })
+
+    child_runs_by_task: dict[str, list] = {tid: [] for tid in child_ids}
+    child_comments_by_task: dict[str, list[str]] = {tid: [] for tid in child_ids}
+    if child_ids:
+        child_placeholders = ",".join(["?"] * len(child_ids))
+        child_id_tuple = tuple(child_ids)
+        for run_row in conn.execute(
+            f"SELECT * FROM task_runs WHERE task_id IN ({child_placeholders}) ORDER BY id",
+            child_id_tuple,
+        ).fetchall():
+            child_runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
+        for comment_row in conn.execute(
+            f"SELECT task_id, body FROM task_comments WHERE task_id IN ({child_placeholders}) ORDER BY id",
+            child_id_tuple,
+        ).fetchall():
+            child_comments_by_task.setdefault(comment_row["task_id"], []).append(comment_row["body"])
+        for parent_id, children in child_rows_by_parent.items():
+            for child in children:
+                cid = child["id"]
+                child["runs"] = child_runs_by_task.get(cid, [])
+                child["comments"] = child_comments_by_task.get(cid, [])
+
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
@@ -258,6 +295,7 @@ def _compute_task_diagnostics(
             r,
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
+            context={"children": child_rows_by_parent.get(tid, [])},
         )
         if diags:
             out[tid] = [d.to_dict() for d in diags]
