@@ -14,8 +14,11 @@ import time
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
-from fastapi.testclient import TestClient
+
+fastapi = pytest.importorskip("fastapi", reason="Kanban dashboard plugin tests require the optional web extra")
+testclient = pytest.importorskip("fastapi.testclient", reason="Kanban dashboard plugin tests require the optional web extra")
+FastAPI = fastapi.FastAPI
+TestClient = testclient.TestClient
 
 from hermes_cli import kanban_db as kb
 
