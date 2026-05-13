@@ -7,6 +7,7 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 
 def _make_adapter(
     require_mention=None,
+    require_mention_chats=None,
     free_response_chats=None,
     mention_patterns=None,
     ignored_threads=None,
@@ -18,6 +19,8 @@ def _make_adapter(
     extra = {}
     if require_mention is not None:
         extra["require_mention"] = require_mention
+    if require_mention_chats is not None:
+        extra["require_mention_chats"] = require_mention_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if mention_patterns is not None:
@@ -148,6 +151,16 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_specific_chats_can_require_direct_trigger_without_global_gate():
+    adapter = _make_adapter(require_mention_chats=["-200"])
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", chat_id=-200, entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
 
 
 def test_ignored_threads_drop_group_messages_before_other_gates():
