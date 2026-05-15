@@ -358,7 +358,7 @@ def test_concurrent_claims_only_one_wins(kanban_home):
 # Complete / block / unblock / archive / assign
 # ---------------------------------------------------------------------------
 
-def test_complete_records_result(kanban_home):
+def test_complete_sets_status_and_result(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x")
         assert kb.complete_task(conn, t, result="done and dusted")
@@ -366,6 +366,20 @@ def test_complete_records_result(kanban_home):
     assert task.status == "done"
     assert task.result == "done and dusted"
     assert task.completed_at is not None
+
+
+def test_complete_uses_summary_as_visible_result_when_result_omitted(kanban_home):
+    handoff = "shipped three files and ran smoke tests"
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="x")
+        assert kb.complete_task(conn, t, summary=handoff)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+    assert task.status == "done"
+    assert task.result == handoff
+    completed = next(ev for ev in reversed(events) if ev.kind == "completed")
+    assert completed.payload["summary"] == handoff
+    assert completed.payload["result_len"] == len(handoff)
 
 
 def test_block_then_unblock(kanban_home):
@@ -618,6 +632,32 @@ def test_dispatch_skips_nonspawnable_into_separate_bucket(kanban_home, monkeypat
     assert t in res.skipped_nonspawnable
     assert t not in res.skipped_unassigned
     assert not res.spawned
+
+
+def test_dispatch_blocks_unknown_required_skills_before_claim_or_spawn(kanban_home, all_assignees_spawnable):
+    spawned = []
+
+    def fake_spawn(task, workspace):
+        spawned.append(task.id)
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="needs missing skill",
+            assignee="alice",
+            skills=["missing-skill"],
+        )
+        res = kb.dispatch_once(conn, spawn_fn=fake_spawn)
+        task = kb.get_task(conn, t)
+        events = kb.list_events(conn, t)
+    assert res.validation_blocked == [t]
+    assert spawned == []
+    assert task.status == "blocked"
+    assert task.claim_lock is None
+    assert any(ev.kind == "blocked" for ev in events)
+    validation = next(ev for ev in events if ev.kind == "dispatch_validation_failed")
+    assert validation.payload["missing_skills"] == ["missing-skill"]
+    assert validation.payload["required_skills"] == ["kanban-worker", "missing-skill"]
 
 
 def test_has_spawnable_ready_false_when_only_terminal_lanes(kanban_home, monkeypatch):

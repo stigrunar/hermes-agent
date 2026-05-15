@@ -2387,6 +2387,13 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    visible_result = result
+    if (visible_result is None or not str(visible_result).strip()) and summary is not None and str(summary).strip():
+        # Keep completion evidence visible on the task row when workers only
+        # provide a structured/handoff summary. Otherwise the user-visible
+        # closeout lives only in task_runs/event payloads while `tasks.result`
+        # stays blank.
+        visible_result = summary
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -2429,7 +2436,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (visible_result, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -2445,35 +2452,35 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (visible_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
         run_id = _end_run(
             conn, task_id,
             outcome="completed", status="done",
-            summary=summary if summary is not None else result,
+            summary=summary if summary is not None else visible_result,
             metadata=metadata,
         )
         # If complete_task was called on a never-claimed task (ready or
         # blocked → done with no run in flight), synthesize a
         # zero-duration run so the handoff fields are persisted in
         # attempt history instead of silently lost.
-        if run_id is None and (summary or metadata or result):
+        if run_id is None and (summary or metadata or visible_result):
             run_id = _synthesize_ended_run(
                 conn, task_id,
                 outcome="completed",
-                summary=summary if summary is not None else result,
+                summary=summary if summary is not None else visible_result,
                 metadata=metadata,
             )
         # Carry the handoff summary in the event payload so gateway
         # notifiers and dashboard WS consumers can render it without a
         # second SQL round-trip. First line only, 400 char cap — the
         # full summary stays on the run row.
-        ev_summary = (summary if summary is not None else result) or ""
+        ev_summary = (summary if summary is not None else visible_result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         completed_payload: dict = {
-            "result_len": len(result) if result else 0,
+            "result_len": len(visible_result) if visible_result else 0,
             "summary": ev_summary or None,
         }
         if verified_cards:
@@ -2487,7 +2494,7 @@ def complete_task(
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
     # time we emit the warning.
-    scan_text = " ".join(filter(None, [summary, result]))
+    scan_text = " ".join(filter(None, [summary, visible_result]))
     if scan_text:
         phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
         # Drop any phantom refs that were already flagged as verified
@@ -2901,6 +2908,10 @@ class DispatchResult:
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
+    validation_blocked: list[str] = field(default_factory=list)
+    """Ready task ids blocked by pre-spawn validation (for example missing
+    required dispatch skills). These must never go through the misleading
+    claimed/spawned path first."""
     skipped_unassigned: list[str] = field(default_factory=list)
     """Ready task ids skipped because they have no assignee at all.
     Operator-actionable — usually a misfiled task waiting for routing."""
@@ -3663,6 +3674,56 @@ def has_spawnable_ready(conn: sqlite3.Connection) -> bool:
     return False
 
 
+def _required_dispatch_skills(task: Task) -> list[str]:
+    """Return the exact skill set the dispatcher will force-load for ``task``."""
+    required = ["kanban-worker"]
+    for raw in task.skills or []:
+        name = str(raw or "").strip()
+        if not name or name in required:
+            continue
+        required.append(name)
+    return required
+
+
+def _missing_dispatch_skills(task: Task) -> list[str]:
+    """Return required dispatcher skill names that cannot currently resolve."""
+    required = _required_dispatch_skills(task)
+    if not required:
+        return []
+    try:
+        # Reuse the CLI skill-resolution path, but avoid bumping skill-usage
+        # counters during preflight. We only need a yes/no existence check here.
+        from agent.skill_commands import _load_skill_payload
+    except Exception:
+        return []
+    missing: list[str] = []
+    for name in required:
+        try:
+            loaded = _load_skill_payload(name, task_id=task.id)
+        except Exception:
+            loaded = None
+        if loaded is None:
+            missing.append(name)
+    return missing
+
+
+def _dispatch_validation_failure(task: Task) -> Optional[dict[str, Any]]:
+    """Return a structured pre-spawn validation failure, or ``None``."""
+    missing_skills = _missing_dispatch_skills(task)
+    if not missing_skills:
+        return None
+    noun = "skill" if len(missing_skills) == 1 else "skills"
+    reason = (
+        "dispatcher preflight rejected task before claim/spawn: unknown required "
+        f"{noun}: {', '.join(missing_skills)}"
+    )
+    return {
+        "reason": reason,
+        "missing_skills": missing_skills,
+        "required_skills": _required_dispatch_skills(task),
+    }
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -3796,6 +3857,21 @@ def dispatch_once(
             # multi-lane setups where the ready queue is steadily full
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
+            continue
+        task = get_task(conn, row["id"])
+        if task is None:
+            continue
+        validation_failure = _dispatch_validation_failure(task)
+        if validation_failure is not None:
+            if dry_run:
+                result.validation_blocked.append(task.id)
+                continue
+            blocked = block_task(conn, task.id, reason=validation_failure["reason"])
+            if blocked:
+                _append_event(
+                    conn, task.id, "dispatch_validation_failed", validation_failure
+                )
+                result.validation_blocked.append(task.id)
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
