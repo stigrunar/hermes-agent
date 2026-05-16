@@ -3774,6 +3774,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_mention_only_chats(self) -> set[str]:
+        """Return group chat IDs that accept only an explicit @bot mention.
+
+        Unlike ``require_mention``/``require_mention_chats``, this stricter
+        per-chat gate does *not* treat replies to the bot or regex wake words
+        as a trigger.  It is for multi-bot rooms where bot-to-bot replies can
+        otherwise create loops.
+        """
+        raw = self.config.extra.get("mention_only_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_MENTION_ONLY_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -3985,6 +4000,9 @@ class TelegramAdapter(BasePlatformAdapter):
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
             return guest_mention
+
+        if chat_id_str in self._telegram_mention_only_chats():
+            return self._message_mentions_bot(message)
 
         if guest_mention:
             return True

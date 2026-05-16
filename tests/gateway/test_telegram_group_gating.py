@@ -8,6 +8,7 @@ from gateway.config import Platform, PlatformConfig, load_gateway_config
 def _make_adapter(
     require_mention=None,
     require_mention_chats=None,
+    mention_only_chats=None,
     free_response_chats=None,
     mention_patterns=None,
     ignored_threads=None,
@@ -23,6 +24,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if require_mention_chats is not None:
         extra["require_mention_chats"] = require_mention_chats
+    if mention_only_chats is not None:
+        extra["mention_only_chats"] = mention_only_chats
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
     if mention_patterns is not None:
@@ -163,6 +166,22 @@ def test_specific_chats_can_require_direct_trigger_without_global_gate():
     adapter = _make_adapter(require_mention_chats=["-200"])
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", chat_id=-200, entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_mention_only_chats_do_not_accept_replies_or_wake_words():
+    adapter = _make_adapter(
+        mention_only_chats=["-200"],
+        mention_patterns=[r"^\\s*dolly\\b"],
+        free_response_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("reply", chat_id=-200, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("dolly status", chat_id=-200)) is False
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
     assert adapter._should_process_message(
         _group_message("hi @hermes_bot", chat_id=-200, entities=[_mention_entity("hi @hermes_bot")])
