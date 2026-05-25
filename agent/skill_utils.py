@@ -281,21 +281,27 @@ def get_external_skills_dirs() -> List[Path]:
 
     raw_dirs = skills_cfg.get("external_dirs")
     if not raw_dirs:
-        result: List[Path] = []
-        if cache_key is not None:
-            _EXTERNAL_DIRS_CACHE[cache_key] = list(result)
-        return result
+        raw_dirs = []
     if isinstance(raw_dirs, str):
         raw_dirs = [raw_dirs]
     if not isinstance(raw_dirs, list):
         return []
 
-    from hermes_constants import get_hermes_home
+    from hermes_constants import get_default_hermes_root, get_hermes_home
 
     hermes_home = get_hermes_home()
     local_skills = get_skills_dir().resolve()
+    shared_root_skills = (get_default_hermes_root() / "skills").resolve()
     seen: Set[Path] = set()
     result = []
+
+    # In profile mode, shared skills still live under ~/.hermes/skills even when
+    # HERMES_HOME points at ~/.hermes/profiles/<name>. Expose that shared library
+    # automatically so every profile sees globally installed skills without having
+    # to duplicate skills.external_dirs in every profile config.
+    if shared_root_skills != local_skills and shared_root_skills.is_dir():
+        seen.add(shared_root_skills)
+        result.append(shared_root_skills)
 
     for entry in raw_dirs:
         entry = str(entry).strip()

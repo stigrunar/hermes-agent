@@ -1009,28 +1009,76 @@ def skill_view(
                     _record(None, found_md)
 
         if len(candidates) > 1:
-            paths = [str(smd) for _, smd in candidates]
-            logging.getLogger(__name__).warning(
-                "Skill name collision for '%s': %d candidates — %s",
-                name, len(candidates), "; ".join(paths),
-            )
-            return json.dumps(
-                {
-                    "success": False,
-                    "error": (
-                        f"Ambiguous skill name '{name}': {len(candidates)} skills "
-                        "match across your local skills dir and external_dirs. "
-                        "Refusing to guess — load one explicitly by its categorized path."
-                    ),
-                    "matches": paths,
-                    "hint": (
-                        "Pass the full relative path instead of the bare name "
-                        "(e.g., 'category/skill-name'), or rename one of the "
-                        "colliding skills so each name is unique."
-                    ),
-                },
-                ensure_ascii=False,
-            )
+            explicit_rel = None
+            if "/" in name:
+                explicit_rel = str(Path(name))
+            elif local_category_name:
+                explicit_rel = str(Path(local_category_name))
+
+            if explicit_rel:
+                mirrored = True
+                for candidate_skill_dir, _ in candidates:
+                    if candidate_skill_dir is None:
+                        mirrored = False
+                        break
+                    matched_rel = None
+                    for search_dir in all_dirs:
+                        try:
+                            matched_rel = str(candidate_skill_dir.resolve().relative_to(search_dir.resolve()))
+                            break
+                        except Exception:
+                            continue
+                    if matched_rel != explicit_rel:
+                        mirrored = False
+                        break
+                if mirrored:
+                    skill_dir, skill_md = candidates[0]
+                else:
+                    paths = [str(smd) for _, smd in candidates]
+                    logging.getLogger(__name__).warning(
+                        "Skill name collision for '%s': %d candidates — %s",
+                        name, len(candidates), "; ".join(paths),
+                    )
+                    return json.dumps(
+                        {
+                            "success": False,
+                            "error": (
+                                f"Ambiguous skill name '{name}': {len(candidates)} skills "
+                                "match across your local skills dir and external_dirs. "
+                                "Refusing to guess — load one explicitly by its categorized path."
+                            ),
+                            "matches": paths,
+                            "hint": (
+                                "Pass the full relative path instead of the bare name "
+                                "(e.g., 'category/skill-name'), or rename one of the "
+                                "colliding skills so each name is unique."
+                            ),
+                        },
+                        ensure_ascii=False,
+                    )
+            else:
+                paths = [str(smd) for _, smd in candidates]
+                logging.getLogger(__name__).warning(
+                    "Skill name collision for '%s': %d candidates — %s",
+                    name, len(candidates), "; ".join(paths),
+                )
+                return json.dumps(
+                    {
+                        "success": False,
+                        "error": (
+                            f"Ambiguous skill name '{name}': {len(candidates)} skills "
+                            "match across your local skills dir and external_dirs. "
+                            "Refusing to guess — load one explicitly by its categorized path."
+                        ),
+                        "matches": paths,
+                        "hint": (
+                            "Pass the full relative path instead of the bare name "
+                            "(e.g., 'category/skill-name'), or rename one of the "
+                            "colliding skills so each name is unique."
+                        ),
+                    },
+                    ensure_ascii=False,
+                )
 
         if candidates:
             skill_dir, skill_md = candidates[0]
