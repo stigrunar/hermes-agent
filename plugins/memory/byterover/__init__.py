@@ -20,6 +20,8 @@ from __future__ import annotations
 import json
 import logging
 import os
+import pwd
+import re
 import shutil
 import subprocess
 import threading
@@ -48,25 +50,79 @@ _brv_path_lock = threading.Lock()
 _cached_brv_path: Optional[str] = None
 
 
+def _is_executable(path: Path) -> bool:
+    """Return True when *path* points to an executable file."""
+    return path.is_file() and os.access(path, os.X_OK)
+
+
+def _real_user_home() -> Path:
+    """Return the OS account home even when HOME is profile/wrapper-scoped."""
+    try:
+        return Path(pwd.getpwuid(os.getuid()).pw_dir)
+    except Exception:
+        return Path.home()
+
+
+def _candidate_brv_paths() -> List[Path]:
+    """Preferred brv locations, ordered before generic PATH lookup.
+
+    Gateway/profile processes may run with a minimal PATH where an old system
+    install (for example /usr/bin/brv) wins over the user-local npm install.
+    Prefer explicit/configured and profile-local shims first so long-running
+    Hermes processes do not silently select stale CLIs.
+    """
+    from hermes_constants import get_hermes_home
+
+    candidates: List[Path] = []
+    for env_name in ("BRV_CLI_PATH", "BYTEROVER_CLI_PATH"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            candidates.append(Path(value).expanduser())
+
+    hermes_home = get_hermes_home()
+    candidates.extend([
+        hermes_home / "home" / ".local" / "bin" / "brv",
+        hermes_home / ".local" / "bin" / "brv",
+    ])
+
+    homes = [Path.home(), _real_user_home()]
+    for home in homes:
+        candidates.extend([
+            home / ".npm-global" / "bin" / "brv",
+            home / ".local" / "bin" / "brv",
+            home / ".brv-cli" / "bin" / "brv",
+        ])
+
+    candidates.append(Path("/usr/local/bin/brv"))
+
+    seen = set()
+    unique: List[Path] = []
+    for candidate in candidates:
+        key = str(candidate)
+        if key not in seen:
+            unique.append(candidate)
+            seen.add(key)
+    return unique
+
+
 def _resolve_brv_path() -> Optional[str]:
-    """Find the brv binary on PATH or well-known install locations."""
+    """Find the brv binary, preferring configured/current installs over PATH."""
     global _cached_brv_path
     with _brv_path_lock:
         if _cached_brv_path is not None:
-            return _cached_brv_path if _cached_brv_path != "" else None
+            cached = Path(_cached_brv_path) if _cached_brv_path else None
+            if cached and _is_executable(cached):
+                return str(cached)
+            _cached_brv_path = None
 
-    found = shutil.which("brv")
+    found: Optional[str] = None
+    for candidate in _candidate_brv_paths():
+        if _is_executable(candidate):
+            found = str(candidate)
+            break
+
     if not found:
-        home = Path.home()
-        candidates = [
-            home / ".brv-cli" / "bin" / "brv",
-            Path("/usr/local/bin/brv"),
-            home / ".npm-global" / "bin" / "brv",
-        ]
-        for c in candidates:
-            if c.exists():
-                found = str(c)
-                break
+        found = shutil.which("brv")
 
     with _brv_path_lock:
         if _cached_brv_path is not None:
@@ -99,8 +155,8 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT,
         stderr = result.stderr.strip()
 
         if result.returncode == 0:
-            return {"success": True, "output": stdout}
-        return {"success": False, "error": stderr or stdout or f"brv exited {result.returncode}"}
+            return {"success": True, "output": stdout, "stderr": stderr}
+        return {"success": False, "error": stderr or stdout or f"brv exited {result.returncode}", "output": stdout, "stderr": stderr}
 
     except subprocess.TimeoutExpired:
         return {"success": False, "error": f"brv timed out after {timeout}s"}
@@ -117,6 +173,49 @@ def _get_brv_cwd() -> Path:
     """Profile-scoped working directory for the brv context tree."""
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "byterover"
+
+
+def _extract_curate_log_id(output: str) -> Optional[str]:
+    """Extract a ByteRover curate log id from command output when present."""
+    match = re.search(r"\bcur-\d+\b", output or "")
+    return match.group(0) if match else None
+
+
+def _curate_detail_has_write(detail: str) -> bool:
+    """Return True when a completed curate detail shows at least one operation."""
+    if "Status:" not in detail or "completed" not in detail.lower():
+        return False
+    if "Operations:" not in detail:
+        return False
+    operations = detail.split("Operations:", 1)[1]
+    operations = operations.split("Summary:", 1)[0]
+    return "✓" in operations or "[UPSERT]" in operations or "created" in operations.lower() or "updated" in operations.lower()
+
+
+def _verify_curate_write(curate_output: str, *, cwd: str) -> dict:
+    """Verify that a brv curate command produced a durable completed write."""
+    log_id = _extract_curate_log_id(curate_output)
+    if not log_id:
+        return {
+            "verified": False,
+            "log_id": None,
+            "detail": "brv curate output did not include a log id; durable write not verified",
+        }
+
+    detail = _run_brv(["curate", "view", log_id], timeout=30, cwd=cwd)
+    if not detail.get("success"):
+        return {
+            "verified": False,
+            "log_id": log_id,
+            "detail": detail.get("error", "curate verification failed"),
+        }
+
+    detail_output = detail.get("output", "")
+    return {
+        "verified": _curate_detail_has_write(detail_output),
+        "log_id": log_id,
+        "detail": detail_output[:4000],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -365,7 +464,23 @@ class ByteRoverMemoryProvider(MemoryProvider):
         if not result["success"]:
             return tool_error(result.get("error", "Curate failed"))
 
-        return json.dumps({"result": "Memory curated successfully."})
+        verification = _verify_curate_write(result.get("output", ""), cwd=self._cwd)
+        if not verification.get("verified"):
+            return json.dumps({
+                "result": "ByteRover curate command completed, but durable write was not verified.",
+                "verified": False,
+                "log_id": verification.get("log_id"),
+                "verification_detail": verification.get("detail", ""),
+                "curate_output": result.get("output", "")[:4000],
+                "curate_stderr": result.get("stderr", "")[:2000],
+            })
+
+        return json.dumps({
+            "result": "Memory curated and verified.",
+            "verified": True,
+            "log_id": verification.get("log_id"),
+            "verification_detail": verification.get("detail", ""),
+        })
 
     def _tool_status(self) -> str:
         result = _run_brv(["status"], timeout=15, cwd=self._cwd)
