@@ -4274,6 +4274,21 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_mention_only_chats(self) -> set[str]:
+        """Return chats that only accept explicit direct bot addresses.
+
+        This is stricter than ``require_mention`` for multi-bot rooms: replies
+        to the bot, free-response bypasses, and regex wake words must not wake
+        the adapter. Only an explicit @mention/text_mention or /cmd@botname is
+        accepted.
+        """
+        raw = self.config.extra.get("mention_only_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_MENTION_ONLY_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -4738,6 +4753,9 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
+
+        if chat_id_str in self._telegram_mention_only_chats():
+            return self._message_mentions_bot(message)
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.

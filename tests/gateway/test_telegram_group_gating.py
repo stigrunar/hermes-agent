@@ -11,6 +11,7 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    mention_only_chats=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +31,8 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if mention_only_chats is not None:
+        extra["mention_only_chats"] = mention_only_chats
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -541,6 +544,31 @@ def test_free_response_chats_bypass_mention_requirement():
 
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is True
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_mention_only_chats_accept_only_explicit_direct_bot_address():
+    adapter = _make_adapter(
+        require_mention=False,
+        free_response_chats=["-200"],
+        mention_only_chats=["-200"],
+        mention_patterns=[r"^\s*chompy\b"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("reply", chat_id=-200, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("chompy status", chat_id=-200)) is False
+
+    mention_text = "hi @hermes_bot"
+    assert adapter._should_process_message(
+        _group_message(mention_text, chat_id=-200, entities=[_mention_entity(mention_text)])
+    ) is True
+
+    command_text = "/help@hermes_bot"
+    assert adapter._should_process_message(
+        _group_message(command_text, chat_id=-200, entities=[_bot_command_entity(command_text, command_text)])
+    ) is True
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is True
 
 
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
