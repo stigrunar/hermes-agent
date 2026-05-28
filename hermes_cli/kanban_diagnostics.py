@@ -689,14 +689,15 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
-            break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
-            continue
+            # This rule is specifically about a *trailing* crash streak.
+            # Any more-recent non-crash outcome means the worker got past
+            # the crash point (or the task moved to a different failure
+            # class such as blocked/timed_out/spawn_failed). Do not keep
+            # surfacing older crashes once a later run has produced a
+            # real terminal/non-crash outcome; otherwise resolved review
+            # gates keep showing stale repeated_crashes diagnostics.
+            break
     if consecutive < threshold:
         return []
     task_id = _task_field(task, "id")
