@@ -91,6 +91,17 @@ from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
 
+try:  # Unix, including WSL/Linux/macOS
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows fallback exercised via msvcrt if present
+    fcntl = None  # type: ignore[assignment]
+    try:
+        import msvcrt  # type: ignore
+    except ImportError:  # pragma: no cover
+        msvcrt = None  # type: ignore[assignment]
+else:
+    msvcrt = None  # type: ignore[assignment]
+
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -1132,6 +1143,44 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     raise KanbanDbCorruptError(resolved, backup, reason)
 
 
+@contextlib.contextmanager
+def _kanban_init_file_lock(path: Path):
+    """Serialize first-open WAL/schema setup across Hermes processes.
+
+    SQLite serializes normal writes itself, but each Hermes process used to run
+    ``PRAGMA journal_mode=WAL`` plus schema/migration setup on its first
+    ``connect()``. In a gateway with cross-profile workers that means root,
+    worker, cleanup, and watchdog processes can all try page-1-affecting setup
+    work at the same time. A small advisory lock keeps that initialization path
+    single-file, while leaving ordinary task transactions to SQLite.
+    """
+    lock_path = path.with_suffix(path.suffix + ".init.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    if fcntl is None and msvcrt is None:
+        yield
+        return
+    with open(lock_path, "a+", encoding="utf-8") as lock_fd:
+        locked = False
+        try:
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            else:
+                lock_fd.seek(0)
+                msvcrt.locking(lock_fd.fileno(), msvcrt.LK_LOCK, 1)  # type: ignore[union-attr]
+            locked = True
+            yield
+        finally:
+            if locked:
+                try:
+                    if fcntl is not None:
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                    else:
+                        lock_fd.seek(0)
+                        msvcrt.locking(lock_fd.fileno(), msvcrt.LK_UNLCK, 1)  # type: ignore[union-attr]
+                except (OSError, IOError):
+                    pass
+
+
 def connect(
     db_path: Optional[Path] = None,
     *,
@@ -1139,8 +1188,9 @@ def connect(
 ) -> sqlite3.Connection:
     """Open (and initialize if needed) the kanban DB.
 
-    WAL mode is enabled on every connection; it's a no-op after the first
-    time but keeps the code robust if the DB file is ever re-created.
+    WAL mode and schema/migration setup run once per process and are guarded
+    by a small cross-process file lock. Normal task writes still use SQLite's
+    own locks and :func:`write_txn`.
 
     The first connection to a given path auto-runs :func:`init_db` so
     fresh installs and test harnesses that construct `connect()`
@@ -1160,39 +1210,40 @@ def connect(
     else:
         path = kanban_db_path(board=board)
     path.parent.mkdir(parents=True, exist_ok=True)
-    # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
-    # and other invalid-header cases without opening a sqlite connection.
-    _validate_sqlite_header(path)
-    # Full integrity probe — catches corruption past the header (malformed
-    # pages, broken internal metadata). Cached per-path after first success
-    # via _INITIALIZED_PATHS so it only runs once per process per path.
-    _guard_existing_db_is_healthy(path)
     resolved = str(path.resolve())
+
+    # Cheap byte-level check on every open — catches page-0 damage even after
+    # this process has already initialized the path.
+    _validate_sqlite_header(path)
+
+    if resolved not in _INITIALIZED_PATHS:
+        with _kanban_init_file_lock(path):
+            # Re-check after waiting for another process: the DB may have been
+            # repaired or damaged while we were queued on the init lock.
+            _validate_sqlite_header(path)
+            _guard_existing_db_is_healthy(path)
+            conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
+            try:
+                conn.row_factory = sqlite3.Row
+                with _INIT_LOCK:
+                    from hermes_state import apply_wal_with_fallback
+                    apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
+                    conn.execute("PRAGMA synchronous=NORMAL")
+                    conn.execute("PRAGMA foreign_keys=ON")
+                    if resolved not in _INITIALIZED_PATHS:
+                        conn.executescript(SCHEMA_SQL)
+                        _migrate_add_optional_columns(conn)
+                        _INITIALIZED_PATHS.add(resolved)
+            except Exception:
+                conn.close()
+                raise
+            return conn
+
     conn = sqlite3.connect(str(path), isolation_level=None, timeout=30)
     try:
         conn.row_factory = sqlite3.Row
-        with _INIT_LOCK:
-            # WAL activation can take an exclusive lock while SQLite creates the
-            # sidecar files for a fresh database. Keep it in the same process-local
-            # critical section as schema initialization so concurrent gateway
-            # startup threads do not race before _INITIALIZED_PATHS is populated.
-            # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-            # falls back to DELETE with one WARNING so kanban stays usable there.
-            # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
-            from hermes_state import apply_wal_with_fallback
-            apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
-            conn.execute("PRAGMA synchronous=NORMAL")
-            conn.execute("PRAGMA foreign_keys=ON")
-            needs_init = resolved not in _INITIALIZED_PATHS
-            if needs_init:
-                # Idempotent: runs CREATE TABLE IF NOT EXISTS + the additive
-                # migrations. Cached so subsequent connect() calls in the same
-                # process are cheap. The lock prevents same-process dispatcher
-                # threads from racing through the additive ALTER TABLE pass with
-                # stale PRAGMA snapshots during gateway startup.
-                conn.executescript(SCHEMA_SQL)
-                _migrate_add_optional_columns(conn)
-                _INITIALIZED_PATHS.add(resolved)
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA foreign_keys=ON")
     except Exception:
         conn.close()
         raise
@@ -1478,7 +1529,10 @@ def write_txn(conn: sqlite3.Connection):
     try:
         yield conn
     except Exception:
-        conn.execute("ROLLBACK")
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error as rollback_exc:
+            _log.warning("kanban rollback failed after transaction error: %s", rollback_exc)
         raise
     else:
         conn.execute("COMMIT")
@@ -2868,7 +2922,7 @@ def complete_task(
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
-    """Transition ``running|ready -> done`` and record ``result``.
+    """Transition ``running|ready -> done`` and record visible closeout.
 
     Accepts a task that is merely ``ready`` too, so a manual CLI
     completion (``hermes kanban complete <id>``) works without requiring
@@ -2877,7 +2931,10 @@ def complete_task(
     ``summary`` and ``metadata`` are stored on the closing run (if any)
     and surfaced to downstream children via :func:`build_worker_context`.
     When ``summary`` is omitted we fall back to ``result`` so single-run
-    callers do not have to pass both. ``metadata`` is a free-form dict
+    callers do not have to pass both. When ``result`` is omitted we mirror
+    ``summary`` into ``tasks.result`` so completion remains visible on the
+    task row instead of being hidden only in run/event payloads.
+    ``metadata`` is a free-form dict
     (e.g. ``{"changed_files": [...], "tests_run": [...]}``) — workers
     are encouraged to use it for structured handoff facts.
 
@@ -2897,6 +2954,7 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    visible_result = result if result is not None and str(result).strip() else summary
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -2939,7 +2997,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (visible_result, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -2955,7 +3013,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (visible_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -2983,7 +3041,7 @@ def complete_task(
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         completed_payload: dict = {
-            "result_len": len(result) if result else 0,
+            "result_len": len(visible_result) if visible_result else 0,
             "summary": ev_summary or None,
         }
         if verified_cards:

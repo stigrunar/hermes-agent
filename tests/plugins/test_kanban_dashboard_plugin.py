@@ -1270,6 +1270,9 @@ def test_event_dict_includes_run_id(client):
         kb.claim_task(conn, tid)
         run_id = kb.latest_run(conn, tid).id
         kb.complete_task(conn, tid, summary="wss")
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.result == "wss"
     finally:
         conn.close()
 
