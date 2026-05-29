@@ -10,9 +10,13 @@ Requires: ``brv`` CLI installed (npm install -g byterover-cli or
 curl -fsSL https://byterover.dev/install.sh | sh).
 
 Config via environment variables (profile-scoped via each profile's .env):
-  BRV_API_KEY   — ByteRover API key (for cloud features, optional for local)
+  BRV_API_KEY       — ByteRover API key (for cloud features, optional for local)
+  BRV_BIN           — explicit brv CLI path (optional; preferred when multiple versions exist)
+  BRV_PROJECT_ROOT  — project root to run brv from (optional; defaults to $HERMES_HOME/byterover)
 
-Working directory: $HERMES_HOME/byterover/ (profile-scoped context tree)
+Working directory: $BRV_PROJECT_ROOT when set, otherwise $HERMES_HOME/byterover/
+(profile-scoped context tree). Set BRV_PROJECT_ROOT when a host has a canonical
+shared ByteRover project that should back memory/tools across profiles.
 """
 
 from __future__ import annotations
@@ -49,24 +53,36 @@ _cached_brv_path: Optional[str] = None
 
 
 def _resolve_brv_path() -> Optional[str]:
-    """Find the brv binary on PATH or well-known install locations."""
+    """Find the brv binary, preferring explicit/newer user installs over PATH.
+
+    Some hosts have an older system ``/usr/bin/brv`` earlier on PATH while the
+    supported CLI lives under ``~/.npm-global/bin`` or an explicit ``BRV_BIN``.
+    Prefer the explicit/user path first so memory tools, MCP, and manual CLI
+    checks do not silently use different ByteRover versions.
+    """
     global _cached_brv_path
     with _brv_path_lock:
         if _cached_brv_path is not None:
             return _cached_brv_path if _cached_brv_path != "" else None
 
-    found = shutil.which("brv")
+    found = None
+    env_brv = os.getenv("BRV_BIN", "").strip()
+    home = Path.home()
+    candidates = []
+    if env_brv:
+        candidates.append(Path(env_brv).expanduser())
+    candidates.extend([
+        home / ".npm-global" / "bin" / "brv",
+        Path("/home/openclaw/.npm-global/bin/brv"),
+        home / ".brv-cli" / "bin" / "brv",
+        Path("/usr/local/bin/brv"),
+    ])
+    for c in candidates:
+        if c.exists() and os.access(c, os.X_OK):
+            found = str(c)
+            break
     if not found:
-        home = Path.home()
-        candidates = [
-            home / ".brv-cli" / "bin" / "brv",
-            Path("/usr/local/bin/brv"),
-            home / ".npm-global" / "bin" / "brv",
-        ]
-        for c in candidates:
-            if c.exists():
-                found = str(c)
-                break
+        found = shutil.which("brv")
 
     with _brv_path_lock:
         if _cached_brv_path is not None:
@@ -114,7 +130,15 @@ def _run_brv(args: List[str], timeout: int = _QUERY_TIMEOUT,
 
 
 def _get_brv_cwd() -> Path:
-    """Profile-scoped working directory for the brv context tree."""
+    """Working directory for the brv context tree.
+
+    ``BRV_PROJECT_ROOT`` lets deployments bind the memory provider to the same
+    canonical project used by MCP/manual BRV checks. Without it we keep the
+    historical profile-scoped default for portability.
+    """
+    project_root = os.getenv("BRV_PROJECT_ROOT", "").strip()
+    if project_root:
+        return Path(project_root).expanduser()
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "byterover"
 
