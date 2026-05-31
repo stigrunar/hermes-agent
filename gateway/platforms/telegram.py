@@ -3793,6 +3793,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         raw = self.config.extra.get("mention_only_chats")
         if raw is None:
+            raw = self.config.extra.get("explicit_mention_only_chats")
+        if raw is None:
             raw = os.getenv("TELEGRAM_MENTION_ONLY_CHATS", "")
         if isinstance(raw, list):
             return {str(part).strip() for part in raw if str(part).strip()}
