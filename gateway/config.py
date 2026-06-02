@@ -862,6 +862,12 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["group_allowed_chats"] = platform_cfg["group_allowed_chats"]
                 if plat == Platform.TELEGRAM and "allowed_topics" in platform_cfg:
                     bridged["allowed_topics"] = platform_cfg["allowed_topics"]
+                if plat == Platform.TELEGRAM and "explicit_mention_only_chats" in platform_cfg:
+                    bridged["explicit_mention_only_chats"] = platform_cfg["explicit_mention_only_chats"]
+                if plat == Platform.TELEGRAM and "mention_only_chats" in platform_cfg:
+                    bridged["mention_only_chats"] = platform_cfg["mention_only_chats"]
+                if plat == Platform.TELEGRAM and "bot_handoff_chats" in platform_cfg:
+                    bridged["bot_handoff_chats"] = platform_cfg["bot_handoff_chats"]
                 if "free_response_channels" in platform_cfg:
                     bridged["free_response_channels"] = platform_cfg["free_response_channels"]
                 if "mention_patterns" in platform_cfg:
@@ -1053,7 +1059,26 @@ def load_gateway_config() -> GatewayConfig:
                     if isinstance(group_allowed_chats, list):
                         group_allowed_chats = ",".join(str(v) for v in group_allowed_chats)
                     os.environ["TELEGRAM_GROUP_ALLOWED_CHATS"] = str(group_allowed_chats)
-                for _telegram_extra_key in ("guest_mode", "disable_link_previews", "observe_unmentioned_group_messages"):
+                explicit_mention_only_chats = telegram_cfg.get("explicit_mention_only_chats")
+                if explicit_mention_only_chats is None:
+                    explicit_mention_only_chats = telegram_cfg.get("mention_only_chats")
+                if explicit_mention_only_chats is not None and not os.getenv("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS"):
+                    if isinstance(explicit_mention_only_chats, list):
+                        explicit_mention_only_chats = ",".join(str(v) for v in explicit_mention_only_chats)
+                    os.environ["TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS"] = str(explicit_mention_only_chats)
+                bot_handoff_chats = telegram_cfg.get("bot_handoff_chats")
+                if bot_handoff_chats is not None and not os.getenv("TELEGRAM_BOT_HANDOFF_CHATS"):
+                    if isinstance(bot_handoff_chats, list):
+                        bot_handoff_chats = ",".join(str(v) for v in bot_handoff_chats)
+                    os.environ["TELEGRAM_BOT_HANDOFF_CHATS"] = str(bot_handoff_chats)
+                for _telegram_extra_key in (
+                    "guest_mode",
+                    "disable_link_previews",
+                    "observe_unmentioned_group_messages",
+                    "explicit_mention_only_chats",
+                    "mention_only_chats",
+                    "bot_handoff_chats",
+                ):
                     if _telegram_extra_key in telegram_cfg:
                         plat_data = platforms_data.setdefault(Platform.TELEGRAM.value, {})
                         if not isinstance(plat_data, dict):

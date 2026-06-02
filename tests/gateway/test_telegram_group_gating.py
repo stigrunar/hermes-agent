@@ -21,6 +21,9 @@ def _make_adapter(
     group_allowed_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
+    explicit_mention_only_chats=None,
+    mention_only_chats=None,
+    bot_handoff_chats=None,
     bot_username="hermes_bot",
 ):
     from gateway.platforms.telegram import TelegramAdapter
@@ -62,6 +65,12 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if explicit_mention_only_chats is not None:
+        extra["explicit_mention_only_chats"] = explicit_mention_only_chats
+    if mention_only_chats is not None:
+        extra["mention_only_chats"] = mention_only_chats
+    if bot_handoff_chats is not None:
+        extra["bot_handoff_chats"] = bot_handoff_chats
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -96,6 +105,7 @@ def _group_message(
     entities=None,
     caption=None,
     caption_entities=None,
+    from_user_is_bot=False,
 ):
     reply_to_message = None
     if reply_to_bot:
@@ -109,7 +119,12 @@ def _group_message(
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
         chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
-        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
+        from_user=SimpleNamespace(
+            id=from_user_id,
+            full_name=from_user_name,
+            first_name=from_user_name.split()[0],
+            is_bot=from_user_is_bot,
+        ),
         reply_to_message=reply_to_message,
         date=None,
     )
@@ -543,6 +558,65 @@ def test_free_response_chats_bypass_mention_requirement():
     assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
 
 
+def test_explicit_mention_only_chat_rejects_reply_wake_word_and_free_response_bypass():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-200"],
+        mention_patterns=[r"^\s*chompy\b"],
+        explicit_mention_only_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("reply", chat_id=-200, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("chompy status", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(
+            "hi @hermes_bot",
+            chat_id=-200,
+            entities=[_mention_entity("hi @hermes_bot")],
+        )
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(
+            "/status@hermes_bot",
+            chat_id=-200,
+            entities=[_bot_command_entity("/status@hermes_bot", "/status@hermes_bot")],
+        ),
+        is_command=True,
+    ) is True
+    assert adapter._should_process_message(_group_message("hello everyone", chat_id=-201)) is False
+
+
+def test_legacy_mention_only_chats_alias_enforces_explicit_mention_gate():
+    adapter = _make_adapter(
+        require_mention=True,
+        mention_patterns=[r"^\s*chompy\b"],
+        mention_only_chats=["-200"],
+    )
+
+    assert adapter._should_process_message(_group_message("chompy status", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message("hi @hermes_bot", chat_id=-200, entities=[_mention_entity("hi @hermes_bot")])
+    ) is True
+
+
+def test_explicit_mention_only_chat_rejects_bot_origin_messages_unless_handoff_allowed():
+    text = "@hermes_bot run bounded handoff"
+    entities = [_mention_entity(text)]
+    default_policy = _make_adapter(explicit_mention_only_chats=["-200"])
+    handoff_policy = _make_adapter(explicit_mention_only_chats=["-200"], bot_handoff_chats=["-200"])
+
+    assert default_policy._should_process_message(
+        _group_message(text, chat_id=-200, entities=entities, from_user_is_bot=True)
+    ) is False
+    assert handoff_policy._should_process_message(
+        _group_message(text, chat_id=-200, entities=entities, from_user_is_bot=True)
+    ) is True
+    assert handoff_policy._should_process_message(
+        _group_message("reply", chat_id=-200, reply_to_bot=True, from_user_is_bot=True)
+    ) is False
+
+
 def test_guest_mode_allows_only_direct_mentions_outside_allowed_chats():
     adapter = _make_adapter(
         require_mention=True,
@@ -649,6 +723,10 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
+        "  explicit_mention_only_chats:\n"
+        "    - \"-200\"\n"
+        "  bot_handoff_chats:\n"
+        "    - \"-201\"\n"
         "  allowed_chats:\n"
         "    - \"-100\"\n"
         "  group_allowed_chats:\n"
@@ -665,6 +743,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_GUEST_MODE", raising=False)
     monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_BOT_HANDOFF_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_TOPICS", raising=False)
@@ -678,6 +758,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] == "true"
     assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS"] == "-200"
+    assert __import__("os").environ["TELEGRAM_BOT_HANDOFF_CHATS"] == "-201"
     assert __import__("os").environ["TELEGRAM_ALLOWED_CHATS"] == "-100"
     assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
     assert __import__("os").environ["TELEGRAM_ALLOWED_TOPICS"] == "8"
@@ -687,6 +769,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
+    assert tg_cfg.extra.get("explicit_mention_only_chats") == ["-200"]
+    assert tg_cfg.extra.get("bot_handoff_chats") == ["-201"]
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True
     assert tg_cfg.extra.get("observe_unmentioned_group_messages") is True
 
@@ -717,6 +801,32 @@ def test_config_bridges_telegram_user_allowlists(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_ALLOWED_USERS"] == "111,222"
     assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_USERS"] == "333"
     assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
+
+
+def test_nested_platforms_extra_preserves_explicit_mention_only_config(monkeypatch, tmp_path):
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "platforms:\n"
+        "  telegram:\n"
+        "    extra:\n"
+        "      explicit_mention_only_chats:\n"
+        "        - \"-1003599094281\"\n"
+        "      mention_only_chats:\n"
+        "        - \"-1003599094281\"\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS", raising=False)
+
+    config = load_gateway_config()
+
+    assert config is not None
+    tg_cfg = config.platforms.get(Platform.TELEGRAM)
+    assert tg_cfg is not None
+    assert tg_cfg.extra.get("explicit_mention_only_chats") == ["-1003599094281"]
+    assert tg_cfg.extra.get("mention_only_chats") == ["-1003599094281"]
 
 
 def test_config_env_overrides_telegram_user_allowlists(monkeypatch, tmp_path):
