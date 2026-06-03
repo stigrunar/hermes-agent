@@ -143,6 +143,20 @@ describe('sidebarControlSurfaceFor', () => {
     ])
   })
 
+  it('marks agents as display-only so they do not select an empty Recent Sessions scope', () => {
+    const sessions = [baseSession({ id: 'topic-session' }), baseSession({ id: 'other-session' })]
+
+    const agentItem = sidebarControlSurfaceFor({
+      agents: [agent({})],
+      conversations: [],
+      projects: [],
+      sessions
+    }).find(section => section.id === 'agents')?.items[0]
+
+    expect(agentItem?.selectable).toBe(false)
+    expect(agentItem?.scope.kind).toBe('agent')
+  })
+
   it('scopes sessions from a project topic click when matching sessions are loaded', () => {
     const sessions = [baseSession({ id: 'topic-session' }), baseSession({ id: 'other-session' })]
 

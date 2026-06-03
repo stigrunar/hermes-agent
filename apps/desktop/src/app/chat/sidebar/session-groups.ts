@@ -13,6 +13,7 @@ export interface SidebarControlSurfaceItem {
   id: string
   label: string
   meta?: string
+  selectable?: boolean
   scope: SidebarEntityScope
 }
 
@@ -136,6 +137,7 @@ export function sidebarControlSurfaceFor({
         id: agent.id,
         label: agent.name,
         meta: agent.gateway?.state ?? agent.provider ?? undefined,
+        selectable: false,
         scope: { id: agent.id, kind: 'agent', label: agent.name, sessionIds: [] }
       }))
     },

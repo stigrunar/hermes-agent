@@ -695,15 +695,23 @@ function SidebarControlSurfaceSection({ activeScopeId, onSelect, section }: Side
         <SidebarGroupContent className="grid gap-px pb-1">
           {section.items.map(item => {
             const active = activeScopeId === item.scope.id
+            const selectable = item.selectable !== false
 
             return (
               <button
+                aria-disabled={!selectable}
                 className={cn(
                   'group flex min-h-6 cursor-pointer items-center gap-1.5 rounded-md bg-transparent px-2 text-left text-[0.8125rem] text-(--ui-text-secondary) transition-colors duration-100 ease-out hover:bg-(--ui-row-hover-background) hover:text-foreground hover:transition-none',
-                  active && 'bg-(--ui-row-active-background) text-foreground'
+                  active && 'bg-(--ui-row-active-background) text-foreground',
+                  !selectable &&
+                    'cursor-default hover:bg-transparent hover:text-(--ui-text-secondary) hover:transition-colors'
                 )}
                 key={item.id}
-                onClick={() => onSelect(item.scope)}
+                onClick={() => {
+                  if (selectable) {
+                    onSelect(item.scope)
+                  }
+                }}
                 title={item.label}
                 type="button"
               >
