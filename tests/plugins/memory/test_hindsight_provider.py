@@ -20,6 +20,8 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _HERMES_AUXILIARY_DAEMON_API_KEY,
+    _ensure_hermes_auxiliary_proxy,
     _load_config,
     _build_embedded_profile_env,
     _normalize_retain_tags,
@@ -224,6 +226,52 @@ class TestConfig:
         """An empty list shouldn't disable the filter (would be wider than default)."""
         p = provider_with_config(recall_types=[])
         assert p._recall_types == ["observation"]
+
+    def test_hermes_auxiliary_env_uses_local_proxy_not_real_key(self):
+        config = {
+            "mode": "local_embedded",
+            "llm_provider": "hermes_auxiliary/openai-codex",
+            "llm_model": "gpt-5.4-mini",
+            "llm_api_key": "must-not-leak",
+            "_hermes_auxiliary_base_url": "http://127.0.0.1:12345/v1",
+        }
+
+        env = _build_embedded_profile_env(config)
+
+        assert env["HINDSIGHT_API_LLM_PROVIDER"] == "openai"
+        assert env["HINDSIGHT_API_LLM_API_KEY"] == _HERMES_AUXILIARY_DAEMON_API_KEY
+        assert env["HINDSIGHT_API_LLM_BASE_URL"] == "http://127.0.0.1:12345/v1"
+        assert "must-not-leak" not in json.dumps(env)
+
+    def test_hermes_auxiliary_proxy_forwards_chat_completions_through_aux_router(self, monkeypatch):
+        calls = []
+
+        def fake_call_llm(**kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=SimpleNamespace(content="proxy-ok"))]
+            )
+
+        monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call_llm)
+        base_url = _ensure_hermes_auxiliary_proxy({
+            "llm_provider": "hermes_auxiliary/openai-codex",
+            "llm_model": "gpt-5.4-mini",
+            "timeout": 7,
+        })
+
+        import urllib.request
+        req = urllib.request.Request(
+            base_url + "/chat/completions",
+            data=json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer local-dummy"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:  # noqa: S310 - local loopback server
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        assert payload["choices"][0]["message"]["content"] == "proxy-ok"
+        assert calls[0]["provider"] == "openai-codex"
+        assert calls[0]["model"] == "gpt-5.4-mini"
 
     def test_custom_config_values(self, provider_with_config):
         p = provider_with_config(
@@ -813,7 +861,7 @@ class TestSyncTurn:
     def test_resume_creates_new_document(self, tmp_path, monkeypatch):
         """Resuming a session (re-initializing) gets a new document_id
         so previously stored content is not overwritten."""
-        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://127.0.0.1:9", "bank_id": "b"}
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config))
@@ -843,7 +891,7 @@ class TestSyncTurn:
 
     def test_sync_turn_parent_session_tag(self, tmp_path, monkeypatch):
         """When initialized with parent_session_id, parent tag is added."""
-        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://x", "bank_id": "b"}
+        config = {"mode": "cloud", "apiKey": "k", "api_url": "http://127.0.0.1:9", "bank_id": "b"}
         config_path = tmp_path / "hindsight" / "config.json"
         config_path.parent.mkdir(parents=True, exist_ok=True)
         config_path.write_text(json.dumps(config))
