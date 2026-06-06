@@ -2,7 +2,11 @@ name: hindsight
 version: 1.0.0
 description: "Hindsight — long-term memory with knowledge graph, entity resolution, and multi-strategy retrieval."
 pip_dependencies:
-  - "hindsight-client>=0.4.22"
+  # OAuth bridge verified with hindsight-client 0.6.1. Keep an upper bound so
+  # future client API changes do not silently break the embedded/local proxy
+  # contract during `hermes update`; widen after running
+  # `scripts/hindsight_oauth_canary.py --live` on the new version.
+  - "hindsight-client>=0.6.1,<0.7"
 requires_env: []
 hooks:
   - on_session_end
