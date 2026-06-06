@@ -36,6 +36,8 @@ import logging
 import os
 import queue
 import threading
+import time
+import uuid
 
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -69,7 +71,122 @@ _PROVIDER_DEFAULT_MODELS = {
     "ollama": "gemma3:12b",
     "lmstudio": "local-model",
     "openai_compatible": "your-model-name",
+    "hermes_auxiliary/openai-codex": "gpt-5.4-mini",
 }
+
+_HERMES_AUXILIARY_PROVIDER_PREFIX = "hermes_auxiliary"
+_HERMES_AUXILIARY_DAEMON_API_KEY = "hermes-oauth-proxy"
+
+_proxy_lock = threading.Lock()
+_proxy_servers: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def _is_hermes_auxiliary_provider(provider: str | None) -> bool:
+    value = str(provider or "").strip().lower()
+    return value == _HERMES_AUXILIARY_PROVIDER_PREFIX or value.startswith(
+        f"{_HERMES_AUXILIARY_PROVIDER_PREFIX}/"
+    )
+
+
+def _resolve_hermes_auxiliary_provider(config: dict[str, Any]) -> str:
+    """Return the Hermes provider used behind the local Hindsight LLM proxy."""
+    configured = str(config.get("llm_aux_provider") or "").strip()
+    if configured:
+        return configured
+    llm_provider = str(config.get("llm_provider") or "").strip()
+    if "/" in llm_provider:
+        _, suffix = llm_provider.split("/", 1)
+        if suffix.strip():
+            return suffix.strip()
+    return "openai-codex"
+
+
+def _ensure_hermes_auxiliary_proxy(config: dict[str, Any]) -> str:
+    """Start a localhost OpenAI-compatible proxy backed by Hermes auxiliary routing.
+
+    Hindsight's embedded daemon only knows how to call provider SDKs with an
+    API-key-shaped credential. For OAuth-backed Hermes providers (notably
+    openai-codex), keep the OAuth token inside Hermes by exposing only a
+    loopback /v1/chat/completions endpoint to the daemon. The daemon receives a
+    dummy local key and never sees the real OAuth access token.
+    """
+    aux_provider = _resolve_hermes_auxiliary_provider(config)
+    model = str(config.get("llm_model") or _PROVIDER_DEFAULT_MODELS["hermes_auxiliary/openai-codex"]).strip()
+    cache_key = (aux_provider, model)
+    with _proxy_lock:
+        existing = _proxy_servers.get(cache_key)
+        if existing and existing.get("thread") and existing["thread"].is_alive():
+            return str(existing["base_url"])
+
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _HermesAuxiliaryProxyHandler(BaseHTTPRequestHandler):
+            server_version = "HermesHindsightAuxProxy/1.0"
+
+            def log_message(self, format, *args):  # pragma: no cover - keep daemon logs quiet
+                logger.debug("Hindsight Hermes auxiliary proxy: " + format, *args)
+
+            def _json_response(self, status: int, payload: dict[str, Any]) -> None:
+                body = json.dumps(payload).encode("utf-8")
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_POST(self):  # noqa: N802 - BaseHTTPRequestHandler API
+                if self.path.rstrip("/") not in {"/v1/chat/completions", "/chat/completions"}:
+                    self._json_response(404, {"error": {"message": "not found"}})
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or "0")
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                    messages = payload.get("messages") or []
+                    if not isinstance(messages, list):
+                        raise ValueError("messages must be a list")
+                    from agent.auxiliary_client import call_llm
+
+                    response = call_llm(
+                        task="hindsight",
+                        provider=aux_provider,
+                        model=model,
+                        messages=messages,
+                        temperature=payload.get("temperature"),
+                        max_tokens=payload.get("max_tokens") or payload.get("max_completion_tokens"),
+                        timeout=float(config.get("llm_timeout") or config.get("timeout") or _DEFAULT_TIMEOUT),
+                    )
+                    content = response.choices[0].message.content or ""
+                    self._json_response(200, {
+                        "id": f"chatcmpl-hermes-hindsight-{uuid.uuid4().hex}",
+                        "object": "chat.completion",
+                        "created": int(time.time()),
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "message": {"role": "assistant", "content": content},
+                            "finish_reason": "stop",
+                        }],
+                    })
+                except Exception as exc:
+                    logger.warning("Hindsight Hermes auxiliary proxy request failed: %s", exc)
+                    self._json_response(500, {"error": {"message": str(exc)}})
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _HermesAuxiliaryProxyHandler)
+        thread = threading.Thread(
+            target=server.serve_forever,
+            daemon=True,
+            name=f"hindsight-hermes-aux-proxy-{aux_provider}",
+        )
+        thread.start()
+        base_url = f"http://127.0.0.1:{server.server_address[1]}/v1"
+        _proxy_servers[cache_key] = {"server": server, "thread": thread, "base_url": base_url}
+        logger.info(
+            "Hindsight Hermes auxiliary proxy started on %s (provider=%s, model=%s)",
+            base_url,
+            aux_provider,
+            model,
+        )
+        return base_url
 
 
 def _parse_int_setting(value: Any, default: int) -> int:
@@ -415,6 +532,11 @@ def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | No
     current_model = config.get("llm_model", "")
     current_base_url = config.get("llm_base_url") or os.environ.get("HINDSIGHT_API_LLM_BASE_URL", "")
 
+    if _is_hermes_auxiliary_provider(current_provider):
+        current_provider = "openai"
+        current_key = _HERMES_AUXILIARY_DAEMON_API_KEY
+        current_base_url = config.get("_hermes_auxiliary_base_url") or current_base_url
+
     # The embedded daemon expects OpenAI wire format for these providers.
     daemon_provider = "openai" if current_provider in {"openai_compatible", "openrouter"} else current_provider
 
@@ -740,7 +862,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
             provider_config["llm_provider"] = llm_provider
 
-            if llm_provider == "openai_compatible":
+            if _is_hermes_auxiliary_provider(llm_provider):
+                provider_config["llm_aux_provider"] = _resolve_hermes_auxiliary_provider(provider_config)
+                provider_config.pop("llm_base_url", None)
+            elif llm_provider == "openai_compatible":
                 existing_base_url = provider_config.get("llm_base_url", "")
                 prompt = "  LLM endpoint URL (e.g. http://192.168.1.10:8080/v1)"
                 if existing_base_url:
@@ -757,20 +882,23 @@ class HindsightMemoryProvider(MemoryProvider):
             val = input(f"  LLM model [{current_model}]: ").strip()
             provider_config["llm_model"] = val or current_model
 
-            sys.stdout.write("  LLM API key: ")
-            sys.stdout.flush()
-            llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
-            if llm_key:
-                env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
+            if _is_hermes_auxiliary_provider(llm_provider):
+                env_writes.pop("HINDSIGHT_LLM_API_KEY", None)
             else:
-                env_path = Path(hermes_home) / ".env"
-                existing_llm_key = ""
-                if env_path.exists():
-                    for line in env_path.read_text().splitlines():
-                        if line.startswith("HINDSIGHT_LLM_API_KEY="):
-                            existing_llm_key = line.split("=", 1)[1]
-                            break
-                env_writes["HINDSIGHT_LLM_API_KEY"] = existing_llm_key
+                sys.stdout.write("  LLM API key: ")
+                sys.stdout.flush()
+                llm_key = masked_secret_prompt("") if sys.stdin.isatty() else sys.stdin.readline().strip()
+                if llm_key:
+                    env_writes["HINDSIGHT_LLM_API_KEY"] = llm_key
+                else:
+                    env_path = Path(hermes_home) / ".env"
+                    existing_llm_key = ""
+                    if env_path.exists():
+                        for line in env_path.read_text().splitlines():
+                            if line.startswith("HINDSIGHT_LLM_API_KEY="):
+                                existing_llm_key = line.split("=", 1)[1]
+                                break
+                    env_writes["HINDSIGHT_LLM_API_KEY"] = existing_llm_key
 
         # Step 4: Save everything
         provider_config.setdefault("bank_id", "hermes")
@@ -848,7 +976,8 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "api_url", "description": "Hindsight API URL", "default": _DEFAULT_LOCAL_URL, "when": {"mode": "local_external"}},
             {"key": "api_key", "description": "API key (optional)", "secret": True, "env_var": "HINDSIGHT_API_KEY", "when": {"mode": "local_external"}},
             # Local embedded mode
-            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "ollama", "lmstudio", "openai_compatible"], "when": {"mode": "local_embedded"}},
+            {"key": "llm_provider", "description": "LLM provider", "default": "openai", "choices": ["openai", "anthropic", "gemini", "groq", "openrouter", "minimax", "ollama", "lmstudio", "openai_compatible", "hermes_auxiliary/openai-codex"], "when": {"mode": "local_embedded"}},
+            {"key": "llm_aux_provider", "description": "Hermes auxiliary provider behind the local OAuth-safe proxy", "default": "openai-codex", "when": {"mode": "local_embedded", "llm_provider": "hermes_auxiliary/openai-codex"}},
             {"key": "llm_base_url", "description": "Endpoint URL (e.g. http://192.168.1.10:8080/v1)", "default": "", "when": {"mode": "local_embedded", "llm_provider": "openai_compatible"}},
             {"key": "llm_api_key", "description": "LLM API key (optional for openai_compatible)", "secret": True, "env_var": "HINDSIGHT_LLM_API_KEY", "when": {"mode": "local_embedded"}},
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
@@ -897,16 +1026,23 @@ class HindsightMemoryProvider(MemoryProvider):
                     raise ImportError(str(_e))
                 from hindsight import HindsightEmbedded
                 HindsightEmbedded.__del__ = lambda self: None
-                llm_provider = self._config.get("llm_provider", "")
-                if llm_provider in {"openai_compatible", "openrouter"}:
+                config = self._config or {}
+                llm_provider = config.get("llm_provider", "")
+                llm_api_key = config.get("llmApiKey") or config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", "")
+                if _is_hermes_auxiliary_provider(llm_provider):
+                    self._llm_base_url = _ensure_hermes_auxiliary_proxy(config)
+                    config["_hermes_auxiliary_base_url"] = self._llm_base_url
+                    llm_provider = "openai"
+                    llm_api_key = _HERMES_AUXILIARY_DAEMON_API_KEY
+                elif llm_provider in {"openai_compatible", "openrouter"}:
                     llm_provider = "openai"
                 logger.debug("Creating HindsightEmbedded client (profile=%s, provider=%s)",
-                             self._config.get("profile", "hermes"), llm_provider)
+                             config.get("profile", "hermes"), llm_provider)
                 kwargs = dict(
-                    profile=self._config.get("profile", "hermes"),
+                    profile=config.get("profile", "hermes"),
                     llm_provider=llm_provider,
-                    llm_api_key=self._config.get("llmApiKey") or self._config.get("llm_api_key") or os.environ.get("HINDSIGHT_LLM_API_KEY", ""),
-                    llm_model=self._config.get("llm_model", ""),
+                    llm_api_key=llm_api_key,
+                    llm_model=config.get("llm_model", ""),
                 )
                 if self._llm_base_url:
                     kwargs["llm_base_url"] = self._llm_base_url
