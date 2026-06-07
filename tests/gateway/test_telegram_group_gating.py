@@ -11,6 +11,8 @@ from gateway.session import SessionSource
 def _make_adapter(
     require_mention=None,
     free_response_chats=None,
+    explicit_mention_only_chats=None,
+    mention_only_chats=None,
     mention_patterns=None,
     exclusive_bot_mentions=None,
     ignored_threads=None,
@@ -30,6 +32,10 @@ def _make_adapter(
         extra["require_mention"] = require_mention
     if free_response_chats is not None:
         extra["free_response_chats"] = free_response_chats
+    if explicit_mention_only_chats is not None:
+        extra["explicit_mention_only_chats"] = explicit_mention_only_chats
+    if mention_only_chats is not None:
+        extra["mention_only_chats"] = mention_only_chats
     if mention_patterns is not None:
         extra["mention_patterns"] = mention_patterns
     if exclusive_bot_mentions is not None:
@@ -96,6 +102,7 @@ def _group_message(
     entities=None,
     caption=None,
     caption_entities=None,
+    from_user_is_bot=False,
 ):
     reply_to_message = None
     if reply_to_bot:
@@ -109,7 +116,12 @@ def _group_message(
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
         chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
-        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
+        from_user=SimpleNamespace(
+            id=from_user_id,
+            full_name=from_user_name,
+            first_name=from_user_name.split()[0],
+            is_bot=from_user_is_bot,
+        ),
         reply_to_message=reply_to_message,
         date=None,
     )
@@ -536,6 +548,53 @@ def test_exclusive_bot_mentions_can_be_disabled_for_legacy_groups():
     ) is True
 
 
+def test_explicit_mention_only_chats_accept_only_fresh_direct_addresses():
+    adapter = _make_adapter(
+        require_mention=False,
+        free_response_chats=["-200"],
+        explicit_mention_only_chats=["-200"],
+        mention_patterns=[r"^\\s*Dolly\\b"],
+        bot_username="DollyClawBot",
+    )
+
+    mention_text = "hi @DollyClawBot"
+    cmd_text = "/status@DollyClawBot"
+
+    assert adapter._should_process_message(_group_message("plain status", chat_id=-200)) is False
+    assert adapter._should_process_message(_group_message("reply only", chat_id=-200, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("Dolly status", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(mention_text, chat_id=-200, entities=[_mention_entity(mention_text, "@DollyClawBot")])
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(cmd_text, chat_id=-200, entities=[_bot_command_entity(cmd_text, cmd_text)]),
+        is_command=True,
+    ) is True
+    assert adapter._should_process_message(
+        _group_message(mention_text, chat_id=-200, entities=[_mention_entity(mention_text, "@DollyClawBot")], from_user_is_bot=True)
+    ) is False
+    assert adapter._should_process_message(
+        _group_message("hi @OtherClawBot", chat_id=-200, entities=[_mention_entity("hi @OtherClawBot", "@OtherClawBot")])
+    ) is False
+
+    # Other chats keep their existing free-response behavior.
+    assert adapter._should_process_message(_group_message("plain status", chat_id=-201)) is True
+
+
+def test_mention_only_chats_alias_keeps_legacy_strict_gate():
+    adapter = _make_adapter(
+        require_mention=False,
+        mention_only_chats=["-200"],
+        bot_username="DollyClawBot",
+    )
+
+    mention_text = "hi @DollyClawBot"
+    assert adapter._should_process_message(_group_message("plain status", chat_id=-200)) is False
+    assert adapter._should_process_message(
+        _group_message(mention_text, chat_id=-200, entities=[_mention_entity(mention_text, "@DollyClawBot")])
+    ) is True
+
+
 def test_free_response_chats_bypass_mention_requirement():
     adapter = _make_adapter(require_mention=True, free_response_chats=["-200"])
 
@@ -649,6 +708,10 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
         "    - \"^\\\\s*chompy\\\\b\"\n"
         "  free_response_chats:\n"
         "    - \"-123\"\n"
+        "  explicit_mention_only_chats:\n"
+        "    - \"-200\"\n"
+        "  mention_only_chats:\n"
+        "    - \"-201\"\n"
         "  allowed_chats:\n"
         "    - \"-100\"\n"
         "  group_allowed_chats:\n"
@@ -665,6 +728,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     monkeypatch.delenv("TELEGRAM_GUEST_MODE", raising=False)
     monkeypatch.delenv("TELEGRAM_OBSERVE_UNMENTIONED_GROUP_MESSAGES", raising=False)
     monkeypatch.delenv("TELEGRAM_FREE_RESPONSE_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS", raising=False)
+    monkeypatch.delenv("TELEGRAM_MENTION_ONLY_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_GROUP_ALLOWED_CHATS", raising=False)
     monkeypatch.delenv("TELEGRAM_ALLOWED_TOPICS", raising=False)
@@ -678,6 +743,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert __import__("os").environ["TELEGRAM_EXCLUSIVE_BOT_MENTIONS"] == "true"
     assert json.loads(__import__("os").environ["TELEGRAM_MENTION_PATTERNS"]) == [r"^\s*chompy\b"]
     assert __import__("os").environ["TELEGRAM_FREE_RESPONSE_CHATS"] == "-123"
+    assert __import__("os").environ["TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS"] == "-200"
+    assert __import__("os").environ["TELEGRAM_MENTION_ONLY_CHATS"] == "-201"
     assert __import__("os").environ["TELEGRAM_ALLOWED_CHATS"] == "-100"
     assert __import__("os").environ["TELEGRAM_GROUP_ALLOWED_CHATS"] == "-100"
     assert __import__("os").environ["TELEGRAM_ALLOWED_TOPICS"] == "8"
@@ -685,6 +752,8 @@ def test_config_bridges_telegram_group_settings(monkeypatch, tmp_path):
     assert tg_cfg is not None
     assert tg_cfg.extra.get("guest_mode") is True
     assert tg_cfg.extra.get("allowed_chats") == ["-100"]
+    assert tg_cfg.extra.get("explicit_mention_only_chats") == ["-200"]
+    assert tg_cfg.extra.get("mention_only_chats") == ["-201"]
     assert tg_cfg.extra.get("group_allowed_chats") == ["-100"]
     assert tg_cfg.extra.get("allowed_topics") == [8]
     assert tg_cfg.extra.get("exclusive_bot_mentions") is True

@@ -4551,13 +4551,40 @@ class TelegramAdapter(BasePlatformAdapter):
             return bool(configured)
         return os.getenv("TELEGRAM_EXCLUSIVE_BOT_MENTIONS", "true").lower() in {"true", "1", "yes", "on"}
 
+    @staticmethod
+    def _telegram_string_set(raw) -> set[str]:
+        """Normalize comma-separated or list-style Telegram config values."""
+        if raw is None:
+            return set()
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_free_response_chats(self) -> set[str]:
         raw = self.config.extra.get("free_response_chats")
         if raw is None:
             raw = os.getenv("TELEGRAM_FREE_RESPONSE_CHATS", "")
-        if isinstance(raw, list):
-            return {str(part).strip() for part in raw if str(part).strip()}
-        return {part.strip() for part in str(raw).split(",") if part.strip()}
+        return self._telegram_string_set(raw)
+
+    def _telegram_explicit_mention_only_chats(self) -> set[str]:
+        """Chats where only a fresh explicit address to this bot can dispatch.
+
+        This is stricter than ``require_mention`` for multi-bot rooms: replies,
+        regex wake words, free-response bypasses, and bot-origin messages are
+        rejected unless a future explicit handoff policy says otherwise.
+        ``mention_only_chats`` is kept as the compatibility alias used by older
+        local config; ``explicit_mention_only_chats`` is the clearer durable key.
+        """
+        chats = set()
+        for key, env_name in (
+            ("explicit_mention_only_chats", "TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS"),
+            ("mention_only_chats", "TELEGRAM_MENTION_ONLY_CHATS"),
+        ):
+            raw = self.config.extra.get(key)
+            if raw is None:
+                raw = os.getenv(env_name, "")
+            chats.update(self._telegram_string_set(raw))
+        return chats
 
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
@@ -5073,11 +5100,17 @@ class TelegramAdapter(BasePlatformAdapter):
         DMs remain unrestricted. Group/supergroup messages are accepted when:
         - the chat passes the ``allowed_chats`` whitelist (when set), or
           ``guest_mode`` is enabled and the bot is explicitly mentioned
+        - the chat is not configured as ``explicit_mention_only_chats`` /
+          ``mention_only_chats``
         - the chat is explicitly allowlisted in ``free_response_chats``
         - ``require_mention`` is disabled
         - the message replies to the bot
         - the bot is @mentioned
         - the text/caption matches a configured regex wake-word pattern
+
+        In explicit-mention-only chats, only a fresh direct address to this bot
+        is accepted; reply chains, wake words, free-response bypasses, and
+        bot-origin messages are rejected to prevent multi-bot loops.
 
         When ``allowed_chats`` is non-empty, it remains a hard gate except for
         the narrow ``guest_mode`` bypass: group/supergroup messages that
@@ -5127,9 +5160,16 @@ class TelegramAdapter(BasePlatformAdapter):
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
         # exact message as an explicit direct mention. DMs are excluded above.
+        strict_mention_only = chat_id_str in self._telegram_explicit_mention_only_chats()
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
-            return guest_mention
+            return False if strict_mention_only else guest_mention
+
+        if strict_mention_only:
+            from_user = getattr(message, "from_user", None)
+            if bool(getattr(from_user, "is_bot", False)):
+                return False
+            return self._message_mentions_bot(message)
 
         if guest_mention:
             return True
