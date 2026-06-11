@@ -32,6 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any, Callable, Iterable, Optional
 import json
+import re
 import time
 
 
@@ -167,6 +168,19 @@ def _event_kind(ev) -> str:
 def _event_ts(ev) -> int:
     t = _task_field(ev, "created_at", 0)
     return int(t or 0)
+
+
+def _comment_body(comment: Any) -> str:
+    """Read a comment body regardless of representation."""
+    return str(_task_field(comment, "body", "") or "")
+
+
+def _has_label(text: str, *labels: str) -> bool:
+    """Return True when any YAML/Markdown-ish ``label:`` is present."""
+    for label in labels:
+        if re.search(rf"(?im)^\s*{re.escape(label)}\s*:", text):
+            return True
+    return False
 
 
 def _active_hallucination_events(
@@ -974,6 +988,120 @@ def _rule_stranded_in_ready(task, events, runs, now, cfg) -> list[Diagnostic]:
     )]
 
 
+def _looks_like_detached_review_gate(task: Any) -> bool:
+    """Narrow detector for detached review/QA gates.
+
+    Keep this deliberately conservative. The autonomy-frame diagnostic is a
+    process guard for a specific high-autonomy handoff class, not a broad
+    task-spec linter for every Kanban card.
+    """
+    title = str(_task_field(task, "title", "") or "")
+    body = str(_task_field(task, "body", "") or "")
+    haystack = f"{title}\n{body}".lower()
+    return "detached review" in haystack or "detached gate" in haystack
+
+
+def _rule_detached_review_autonomy_frame(
+    task: Any,
+    comments: list[Any],
+    now: int,
+) -> list[Diagnostic]:
+    """Report active detached review gates missing Stig's autonomy frame.
+
+    Read-only by design: this warns operators before they treat
+    ``claimed``/``spawned`` as real review progress, but it does not block,
+    reassign, or mutate existing tasks. A complete frame can live in the body
+    or in an early source-thread seed/acceptance comment.
+    """
+    status = str(_task_field(task, "status", "") or "")
+    if status not in {"ready", "running", "review"}:
+        return []
+    if not _looks_like_detached_review_gate(task):
+        return []
+
+    task_id = str(_task_field(task, "id", "") or "")
+    title = str(_task_field(task, "title", "") or "")
+    body = str(_task_field(task, "body", "") or "")
+    text = "\n\n".join([title, body, *(_comment_body(c) for c in comments)])
+
+    missing: list[str] = []
+    if not _has_label(text, "goal"):
+        missing.append("goal")
+    if not _has_label(text, "skills", "skills/runbooks", "runbooks"):
+        missing.append("skills_or_runbooks")
+    if not _has_label(text, "tools_required"):
+        missing.append("tools_required")
+
+    if not _has_label(text, "context"):
+        missing.append("context")
+    if not _has_label(text, "source_task", "source task"):
+        missing.append("context.source_task")
+    if not _has_label(text, "repo_or_surface", "repo/workspace", "repo", "workspace"):
+        missing.append("context.repo_or_surface")
+    if not _has_label(text, "source_artifacts", "source artifacts"):
+        missing.append("context.source_artifacts")
+    if not _has_label(text, "constraints"):
+        missing.append("context.constraints")
+    if not _has_label(text, "non_goals", "non-goals"):
+        missing.append("context.non_goals")
+
+    if not missing:
+        return []
+
+    severity = "error" if status == "running" else "warning"
+    actions = [
+        DiagnosticAction(
+            kind="comment",
+            label="Add autonomy-frame comment before review continues",
+            payload={
+                "template": (
+                    "Autonomy frame:\n"
+                    "goal: <one concrete review/proof outcome>\n"
+                    "skills: [<skills/runbooks>]\n"
+                    "tools_required: [<file|terminal|browser|github|kanban|...>]\n"
+                    "context:\n"
+                    "  source_task: <task id>\n"
+                    "  repo_or_surface: <repo/worktree/url/topic/page>\n"
+                    "  source_artifacts: [<commit/diff/test receipt/docs>]\n"
+                    "  constraints: [<no-write/no-deploy/no-secrets/etc>]\n"
+                    "  non_goals: [<what the reviewer must not do>]"
+                )
+            },
+            suggested=True,
+        ),
+        DiagnosticAction(
+            kind="cli_hint",
+            label="Open detached review gate template",
+            payload={
+                "path": "/home/openclaw/knowledge/runbooks/kanban-detached-review-gate-template.md"
+            },
+        ),
+    ]
+
+    return [Diagnostic(
+        kind="detached_review_autonomy_frame_incomplete",
+        severity=severity,
+        title="Detached review gate lacks the autonomy frame",
+        detail=(
+            "This active detached review/QA handoff is missing parts of "
+            "Stig's autonomy frame. Treat claimed/spawned state as process "
+            "evidence only, not high-autonomy review progress, until the "
+            "gate has goal, skills/runbooks, tools_required, and source "
+            "context with artifacts, constraints, and non-goals."
+        ),
+        actions=actions,
+        first_seen_at=now,
+        last_seen_at=now,
+        count=1,
+        data={
+            "status": status,
+            "task_id": task_id,
+            "missing": missing,
+            "scope": "detached_review_gate",
+        },
+    )]
+
+
 # Registry — order matters: rules higher on the list render first when
 # severity ties. Add new rules here.
 _RULES: list[RuleFn] = [
@@ -999,6 +1127,7 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
+    "detached_review_autonomy_frame_incomplete",
 )
 
 
@@ -1069,6 +1198,7 @@ def compute_task_diagnostics(
     *,
     now: Optional[int] = None,
     config: Optional[dict] = None,
+    comments: Optional[list] = None,
 ) -> list[Diagnostic]:
     """Run every rule against a single task's state and return a
     severity-sorted list of active diagnostics.
@@ -1097,6 +1227,12 @@ def compute_task_diagnostics(
             # get caught in tests; in production we'd rather drop the
             # diagnostic than 500 a whole /board request.
             continue
+    try:
+        out.extend(_rule_detached_review_autonomy_frame(
+            task, comments or [], now_ts,
+        ))
+    except Exception:
+        pass
     severity_idx = {s: i for i, s in enumerate(SEVERITY_ORDER)}
     out.sort(
         key=lambda d: (

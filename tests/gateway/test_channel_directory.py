@@ -14,6 +14,7 @@ from gateway.channel_directory import (
     load_directory,
     _build_from_sessions,
     _build_slack,
+    _configured_topic_labels,
 )
 
 
@@ -264,6 +265,44 @@ class TestBuildFromSessions:
         assert "Coaching Chat" in names
         assert "Coaching Chat / topic 17585" in names
         assert "Coaching Chat / topic 17587" in names
+
+    def test_configured_telegram_topic_label_overrides_generic_session_label(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "topic_87": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003828321118",
+                    "chat_name": "Dolly Main Projects",
+                    "thread_id": "87",
+                    "chat_topic": None,
+                },
+                "chat_type": "group",
+            },
+        })
+        (tmp_path / "config.yaml").write_text("""
+platforms:
+  telegram:
+    extra:
+      group_topics:
+      - chat_id: -1003828321118
+        topics:
+        - name: 87 – HWAPI Server
+          thread_id: 87
+""")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            labels = _configured_topic_labels("telegram")
+            entries = _build_from_sessions("telegram")
+
+        assert labels["-1003828321118:87"] == "87 – HWAPI Server"
+        assert entries == [
+            {
+                "id": "-1003828321118:87",
+                "name": "Dolly Main Projects / 87 – HWAPI Server",
+                "type": "group",
+                "thread_id": "87",
+            }
+        ]
 
 
 class TestFormatDirectoryForDisplay:

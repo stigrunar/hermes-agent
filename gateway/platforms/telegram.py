@@ -4717,6 +4717,30 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_explicit_mention_only_chats(self) -> set[str]:
+        """Chats that require a fresh explicit @bot or /cmd@bot address.
+
+        This is stricter than the legacy ``require_mention``/``mention_only``
+        behavior because it rejects reply-to-bot and regex wake-word fallbacks.
+        It is intended for shared multi-bot rooms where implicit context can
+        create loops or wake the wrong bot.
+        """
+        raw = self.config.extra.get("explicit_mention_only_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
+    def _telegram_bot_handoff_chats(self) -> set[str]:
+        """Chats where bot-origin direct mentions are allowed as handoffs."""
+        raw = self.config.extra.get("bot_handoff_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_BOT_HANDOFF_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -4836,6 +4860,11 @@ class TelegramAdapter(BasePlatformAdapter):
             return False
         chat_type = str(getattr(chat, "type", "")).split(".")[-1].lower()
         return chat_type in {"group", "supergroup"}
+
+    @staticmethod
+    def _message_from_bot(message: Message) -> bool:
+        from_user = getattr(message, "from_user", None)
+        return bool(from_user and getattr(from_user, "is_bot", False))
 
     def _is_reply_to_bot(self, message: Message) -> bool:
         if not self._bot or not getattr(message, "reply_to_message", None):
@@ -5282,12 +5311,19 @@ class TelegramAdapter(BasePlatformAdapter):
         # is not called redundantly in the normal flow below.
         guest_mention = self._is_guest_mention(message)
 
+        explicit_mention_only = chat_id_str in self._telegram_explicit_mention_only_chats()
+
         # allowed_chats check (whitelist). When set, group messages from chats
         # outside the whitelist are ignored unless guest_mode permits this
         # exact message as an explicit direct mention. DMs are excluded above.
         allowed = self._telegram_allowed_chats()
         if allowed and chat_id_str not in allowed:
-            return guest_mention
+            return False if explicit_mention_only else guest_mention
+
+        if explicit_mention_only:
+            if self._message_from_bot(message) and chat_id_str not in self._telegram_bot_handoff_chats():
+                return False
+            return self._message_mentions_bot(message)
 
         if guest_mention:
             return True

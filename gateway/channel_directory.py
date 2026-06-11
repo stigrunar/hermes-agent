@@ -11,7 +11,7 @@ import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
-from hermes_cli.config import get_hermes_home
+from hermes_cli.config import get_hermes_home, load_config
 from utils import atomic_json_write
 
 logger = logging.getLogger(__name__)
@@ -43,13 +43,59 @@ def _session_entry_id(origin: Dict[str, Any]) -> Optional[str]:
     return str(chat_id)
 
 
-def _session_entry_name(origin: Dict[str, Any]) -> str:
+def _configured_topic_labels(platform_name: str) -> Dict[str, str]:
+    """Return configured Telegram topic labels keyed by ``<chat_id>:<thread_id>``.
+
+    Telegram forum topics cannot be enumerated by the bot, so session origins
+    may only know the numeric thread id.  ``platforms.telegram.extra.group_topics``
+    is the durable human-name source used to keep the channel directory from
+    degrading back to labels like ``topic 87`` on refresh.
+    """
+    if platform_name != "telegram":
+        return {}
+
+    try:
+        config = load_config()
+    except Exception as e:
+        logger.debug("Channel directory: failed to load topic labels: %s", e)
+        return {}
+
+    groups = (
+        (((config.get("platforms") or {}).get("telegram") or {}).get("extra") or {}).get("group_topics")
+        or (config.get("telegram") or {}).get("group_topics")
+        or []
+    )
+    labels: Dict[str, str] = {}
+    if not isinstance(groups, list):
+        return labels
+
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        chat_id = group.get("chat_id")
+        topics = group.get("topics") or []
+        if chat_id is None or not isinstance(topics, list):
+            continue
+        for topic in topics:
+            if not isinstance(topic, dict):
+                continue
+            thread_id = topic.get("thread_id")
+            name = topic.get("name")
+            if thread_id is None or not name:
+                continue
+            labels[f"{chat_id}:{thread_id}"] = str(name)
+    return labels
+
+
+def _session_entry_name(origin: Dict[str, Any], topic_labels: Optional[Dict[str, str]] = None) -> str:
     base_name = origin.get("chat_name") or origin.get("user_name") or str(origin.get("chat_id"))
     thread_id = origin.get("thread_id")
     if not thread_id:
         return base_name
 
-    topic_label = origin.get("chat_topic") or f"topic {thread_id}"
+    entry_id = _session_entry_id(origin)
+    configured_label = (topic_labels or {}).get(entry_id or "")
+    topic_label = origin.get("chat_topic") or configured_label or f"topic {thread_id}"
     return f"{base_name} / {topic_label}"
 
 
@@ -220,6 +266,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             data = json.load(f)
 
         seen_ids = set()
+        topic_labels = _configured_topic_labels(platform_name)
         for _key, session in data.items():
             origin = session.get("origin") or {}
             if origin.get("platform") != platform_name:
@@ -230,7 +277,7 @@ def _build_from_sessions(platform_name: str) -> List[Dict[str, str]]:
             seen_ids.add(entry_id)
             entries.append({
                 "id": entry_id,
-                "name": _session_entry_name(origin),
+                "name": _session_entry_name(origin, topic_labels),
                 "type": session.get("chat_type", "dm"),
                 "thread_id": origin.get("thread_id"),
             })

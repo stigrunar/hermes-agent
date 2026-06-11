@@ -19,6 +19,8 @@ def _make_adapter(
     group_allow_from=None,
     allowed_chats=None,
     group_allowed_chats=None,
+    explicit_mention_only_chats=None,
+    bot_handoff_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
     bot_username="hermes_bot",
@@ -58,6 +60,10 @@ def _make_adapter(
         extra["group_allowed_chats"] = group_allowed_chats
     else:
         extra["group_allowed_chats"] = []
+    if explicit_mention_only_chats is not None:
+        extra["explicit_mention_only_chats"] = explicit_mention_only_chats
+    if bot_handoff_chats is not None:
+        extra["bot_handoff_chats"] = bot_handoff_chats
     if guest_mode is not None:
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
@@ -96,6 +102,7 @@ def _group_message(
     entities=None,
     caption=None,
     caption_entities=None,
+    from_user_is_bot=False,
 ):
     reply_to_message = None
     if reply_to_bot:
@@ -109,7 +116,7 @@ def _group_message(
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
         chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
-        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
+        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0], is_bot=from_user_is_bot),
         reply_to_message=reply_to_message,
         date=None,
     )
@@ -468,6 +475,62 @@ def test_group_messages_can_require_direct_trigger_via_config():
     # And commands still pass unconditionally when require_mention is disabled
     adapter_no_mention = _make_adapter(require_mention=False)
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
+
+
+def test_explicit_mention_only_chat_rejects_reply_and_wake_word_fallbacks():
+    adapter = _make_adapter(
+        require_mention=False,
+        mention_patterns=[r"^\s*Dolly\b"],
+        free_response_chats=["-300"],
+        explicit_mention_only_chats=["-300"],
+        bot_username="DollyClawBot",
+    )
+
+    assert adapter._should_process_message(_group_message("plain status", chat_id=-300)) is False
+    assert adapter._should_process_message(_group_message("reply only", chat_id=-300, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("Dolly status", chat_id=-300)) is False
+
+    mention_text = "hi @DollyClawBot"
+    assert adapter._should_process_message(
+        _group_message(mention_text, chat_id=-300, entities=[_mention_entity(mention_text, "@DollyClawBot")])
+    ) is True
+
+    cmd_text = "/status@DollyClawBot"
+    assert adapter._should_process_message(
+        _group_message(cmd_text, chat_id=-300, entities=[_bot_command_entity(cmd_text, cmd_text)]),
+        is_command=True,
+    ) is True
+
+
+def test_explicit_mention_only_chat_rejects_bot_origin_without_handoff_policy():
+    mention_text = "hi @DollyClawBot"
+    adapter = _make_adapter(
+        explicit_mention_only_chats=["-300"],
+        bot_username="DollyClawBot",
+    )
+
+    assert adapter._should_process_message(
+        _group_message(
+            mention_text,
+            chat_id=-300,
+            entities=[_mention_entity(mention_text, "@DollyClawBot")],
+            from_user_is_bot=True,
+        )
+    ) is False
+
+    handoff_adapter = _make_adapter(
+        explicit_mention_only_chats=["-300"],
+        bot_handoff_chats=["-300"],
+        bot_username="DollyClawBot",
+    )
+    assert handoff_adapter._should_process_message(
+        _group_message(
+            mention_text,
+            chat_id=-300,
+            entities=[_mention_entity(mention_text, "@DollyClawBot")],
+            from_user_is_bot=True,
+        )
+    ) is True
 
 
 def test_explicit_multi_bot_mentions_route_only_to_named_bots():

@@ -1542,7 +1542,7 @@ def _cmd_show(args: argparse.Namespace) -> int:
     # of show output so CLI users see them before scrolling through
     # comments / runs.
     from hermes_cli import kanban_diagnostics as kd
-    diags = kd.compute_task_diagnostics(task, events, runs)
+    diags = kd.compute_task_diagnostics(task, events, runs, comments=comments)
     if diags:
         sev_marker = {"warning": "⚠", "error": "!!", "critical": "!!!"}
         print(f"\n  Diagnostics ({len(diags)}):")
@@ -1687,6 +1687,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     kb.list_events(conn, args.task),
                     kb.list_runs(conn, args.task),
                     config=diag_config,
+                    comments=kb.list_comments(conn, args.task),
                 )
             }
         else:
@@ -1711,6 +1712,12 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                     tuple(ids),
                 ):
                     run_by.setdefault(row["task_id"], []).append(row)
+                comment_by = {i: [] for i in ids}
+                for row in conn.execute(
+                    f"SELECT * FROM task_comments WHERE task_id IN ({placeholders}) ORDER BY id",
+                    tuple(ids),
+                ):
+                    comment_by.setdefault(row["task_id"], []).append(row)
                 diags_by_task = {}
                 for r in rows:
                     tid = r["id"]
@@ -1719,6 +1726,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                         ev_by.get(tid, []),
                         run_by.get(tid, []),
                         config=diag_config,
+                        comments=comment_by.get(tid, []),
                     )
                     if dl:
                         diags_by_task[tid] = dl

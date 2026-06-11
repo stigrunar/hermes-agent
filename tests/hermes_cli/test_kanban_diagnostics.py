@@ -748,3 +748,68 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+def test_detached_review_autonomy_frame_fires_for_active_gate_missing_frame():
+    task = _task(
+        id="t_review1",
+        title="Detached review: payment flow on abc123",
+        status="running",
+        body="""
+Detached review gate for source task `t_source`.
+
+Review target:
+- repo/workspace: `/repo`
+
+acceptance receipt:
+accepted_by: dollyqa
+accepted_at: 2026-06-08T12:00:00+02:00
+lane: qa
+scope_understood: review commit abc123 only.
+first_action: inspect the diff.
+expected_artifact: verdict comment.
+risk_level: low
+will_not_do: no source mutation.
+""",
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=100, comments=[])
+    hits = [d for d in diags if d.kind == "detached_review_autonomy_frame_incomplete"]
+    assert len(hits) == 1
+    assert hits[0].severity == "error"
+    assert "goal" in hits[0].data["missing"]
+    assert "tools_required" in hits[0].data["missing"]
+    assert "context.source_artifacts" in hits[0].data["missing"]
+
+
+def test_detached_review_autonomy_frame_accepts_seed_comment():
+    task = _task(
+        id="t_review2",
+        title="Detached review: payment flow on abc123",
+        status="ready",
+        body="Detached review gate for source task `t_source`.",
+    )
+    comments = [{"body": """
+Autonomy frame:
+goal: review commit abc123 and return approved or changes_requested
+skills: [github-code-review, kanban-worker]
+tools_required: [file, terminal, github, kanban]
+context:
+  source_task: t_source
+  repo_or_surface: /repo
+  source_artifacts: [commit abc123, pytest receipt]
+  constraints: [no source mutation, no deploy]
+  non_goals: [live product acceptance]
+"""}]
+    diags = kd.compute_task_diagnostics(task, [], [], now=100, comments=comments)
+    assert [d for d in diags if d.kind == "detached_review_autonomy_frame_incomplete"] == []
+
+
+def test_detached_review_autonomy_frame_ignores_done_gate():
+    task = _task(
+        id="t_review3",
+        title="Detached review: payment flow on abc123",
+        status="done",
+        body="Detached review gate without a formal autonomy frame.",
+    )
+    diags = kd.compute_task_diagnostics(task, [], [], now=100, comments=[])
+    assert [d for d in diags if d.kind == "detached_review_autonomy_frame_incomplete"] == []
