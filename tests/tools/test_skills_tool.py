@@ -1225,6 +1225,37 @@ class TestSkillViewCollisionDetection:
         assert result["success"] is True
         assert "LOCAL VERSION" in result["content"]
 
+    def test_explicit_categorized_path_prefers_local_when_shared_root_mirrors_same_path(
+        self, tmp_path
+    ):
+        """Profile-local mirrored skills should not make explicit categorized
+        paths ambiguous once shared root skills are auto-exposed."""
+        local_dir = tmp_path / "local"
+        external_dir = tmp_path / "external"
+        local_dir.mkdir()
+        external_dir.mkdir()
+
+        _make_skill(
+            local_dir,
+            "hermes-agent",
+            category="autonomous-ai-agents",
+            body="LOCAL HERMES AGENT",
+        )
+        _make_skill(
+            external_dir,
+            "hermes-agent",
+            category="autonomous-ai-agents",
+            body="EXTERNAL HERMES AGENT",
+        )
+
+        p1, p2 = self._patch_dirs(local_dir, [external_dir])
+        with p1, p2:
+            raw = skill_view("autonomous-ai-agents/hermes-agent")
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert "LOCAL HERMES AGENT" in result["content"]
+
     def test_external_skill_resolves_when_no_collision(self, tmp_path):
         """External-only skills still resolve normally when there's no
         local skill of the same name."""
