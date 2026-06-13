@@ -52,6 +52,31 @@ def kanban_home(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
+# Assignee validation
+# ---------------------------------------------------------------------------
+
+def test_create_task_rejects_execution_mode_as_assignee(kanban_home):
+    conn = kb.connect()
+    try:
+        with pytest.raises(ValueError, match="execution mode"):
+            kb.create_task(conn, title="implement with codex", assignee="codex")
+        with pytest.raises(ValueError, match="execution_mode=acp"):
+            kb.create_task(conn, title="implement with acp", assignee="acp")
+    finally:
+        conn.close()
+
+
+def test_assign_task_rejects_execution_mode_as_assignee(kanban_home):
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="real owner", assignee="dollycode")
+        with pytest.raises(ValueError, match="execution mode"):
+            kb.assign_task(conn, tid, "codex")
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------------------
 # Idempotency key
 # ---------------------------------------------------------------------------
 

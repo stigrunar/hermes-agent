@@ -2040,6 +2040,9 @@ def _claimer_id() -> str:
 # Task creation / mutation
 # ---------------------------------------------------------------------------
 
+NON_PROFILE_EXECUTION_ASSIGNEES = {"codex", "acp"}
+
+
 def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     """Lowercase-assignee normalization for Kanban rows (dashboard/CLI parity)."""
     if assignee is None:
@@ -2047,6 +2050,22 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     from hermes_cli.profiles import normalize_profile_name
 
     return normalize_profile_name(assignee)
+
+
+def _validate_runnable_assignee(assignee: Optional[str]) -> None:
+    """Reject execution-mode labels stored as Kanban assignees.
+
+    Kanban assignees are runnable Hermes profile owners. Harness choices such as
+    Codex/ACP belong in task metadata/prompt text (for example
+    ``execution_mode=codex``) under a real profile such as ``dollycode``.
+    """
+    name = (assignee or "").strip().casefold()
+    if name in NON_PROFILE_EXECUTION_ASSIGNEES:
+        raise ValueError(
+            f"{name!r} is an execution mode, not a runnable Hermes profile assignee. "
+            "Assign the card to a real owner profile such as 'dollycode' and "
+            f"record execution_mode={name} / acp_command metadata in the task body."
+        )
 
 
 def create_task(
@@ -2098,6 +2117,7 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    _validate_runnable_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2380,6 +2400,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
     Reassign after the current run completes if needed.
     """
     profile = _canonical_assignee(profile)
+    _validate_runnable_assignee(profile)
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, assignee FROM tasks WHERE id = ?", (task_id,)

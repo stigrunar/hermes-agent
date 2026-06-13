@@ -1325,29 +1325,33 @@ def _cmd_create(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title=args.title,
-            body=args.body,
-            assignee=args.assignee,
-            created_by=args.created_by or _profile_author(),
-            workspace_kind=ws_kind,
-            workspace_path=ws_path,
-            branch_name=branch_name,
-            tenant=args.tenant,
-            priority=args.priority,
-            parents=tuple(args.parent or ()),
-            triage=bool(getattr(args, "triage", False)),
-            idempotency_key=getattr(args, "idempotency_key", None),
-            max_runtime_seconds=max_runtime,
-            skills=getattr(args, "skills", None) or None,
-            max_retries=max_retries,
-            goal_mode=bool(getattr(args, "goal_mode", False)),
-            goal_max_turns=getattr(args, "goal_max_turns", None),
-            initial_status=getattr(args, "initial_status", "running"),
-        )
-        task = kb.get_task(conn, task_id)
+    try:
+        with kb.connect_closing() as conn:
+            task_id = kb.create_task(
+                conn,
+                title=args.title,
+                body=args.body,
+                assignee=args.assignee,
+                created_by=args.created_by or _profile_author(),
+                workspace_kind=ws_kind,
+                workspace_path=ws_path,
+                branch_name=branch_name,
+                tenant=args.tenant,
+                priority=args.priority,
+                parents=tuple(args.parent or ()),
+                triage=bool(getattr(args, "triage", False)),
+                idempotency_key=getattr(args, "idempotency_key", None),
+                max_runtime_seconds=max_runtime,
+                skills=getattr(args, "skills", None) or None,
+                max_retries=max_retries,
+                goal_mode=bool(getattr(args, "goal_mode", False)),
+                goal_max_turns=getattr(args, "goal_max_turns", None),
+                initial_status=getattr(args, "initial_status", "running"),
+            )
+            task = kb.get_task(conn, task_id)
+    except ValueError as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
     if getattr(args, "json", False):
         print(json.dumps(_task_to_dict(task), indent=2, ensure_ascii=False))
     else:
@@ -1617,8 +1621,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
 def _cmd_assign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.assign_task(conn, args.task_id, profile)
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.assign_task(conn, args.task_id, profile)
+    except ValueError as exc:
+        print(f"kanban assign: {exc}", file=sys.stderr)
+        return 2
     if not ok:
         print(f"no such task: {args.task_id}", file=sys.stderr)
         return 1
@@ -1644,12 +1652,16 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
-    with kb.connect_closing() as conn:
-        ok = kb.reassign_task(
-            conn, args.task_id, profile,
-            reclaim_first=bool(getattr(args, "reclaim", False)),
-            reason=getattr(args, "reason", None),
-        )
+    try:
+        with kb.connect_closing() as conn:
+            ok = kb.reassign_task(
+                conn, args.task_id, profile,
+                reclaim_first=bool(getattr(args, "reclaim", False)),
+                reason=getattr(args, "reason", None),
+            )
+    except ValueError as exc:
+        print(f"kanban reassign: {exc}", file=sys.stderr)
+        return 2
     if not ok:
         print(
             f"cannot reassign {args.task_id} "
