@@ -304,6 +304,42 @@ platforms:
             }
         ]
 
+    def test_configured_telegram_topic_label_overrides_stale_session_label(self, tmp_path):
+        self._write_sessions(tmp_path, {
+            "topic_1970": {
+                "origin": {
+                    "platform": "telegram",
+                    "chat_id": "-1003828321118",
+                    "chat_name": "Dolly Main Projects",
+                    "thread_id": "1970",
+                    "chat_topic": "Dolly Main Projects",
+                },
+                "chat_type": "group",
+            },
+        })
+        (tmp_path / "config.yaml").write_text("""
+platforms:
+  telegram:
+    extra:
+      group_topics:
+      - chat_id: -1003828321118
+        topics:
+        - name: External-services Stand intake / Messe stand app
+          thread_id: 1970
+""")
+
+        with patch.dict(os.environ, {"HERMES_HOME": str(tmp_path)}):
+            entries = _build_from_sessions("telegram")
+
+        assert entries == [
+            {
+                "id": "-1003828321118:1970",
+                "name": "Dolly Main Projects / External-services Stand intake / Messe stand app",
+                "type": "group",
+                "thread_id": "1970",
+            }
+        ]
+
 
 class TestFormatDirectoryForDisplay:
     def test_empty_directory(self, tmp_path):

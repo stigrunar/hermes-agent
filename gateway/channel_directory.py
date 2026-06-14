@@ -95,7 +95,11 @@ def _session_entry_name(origin: Dict[str, Any], topic_labels: Optional[Dict[str,
 
     entry_id = _session_entry_id(origin)
     configured_label = (topic_labels or {}).get(entry_id or "")
-    topic_label = origin.get("chat_topic") or configured_label or f"topic {thread_id}"
+    # Telegram forum topic names from session origins are best-effort cache data;
+    # the explicit group_topics config is the durable binding source and must win
+    # when both are present, otherwise directory refresh can reintroduce stale
+    # labels from old sessions.
+    topic_label = configured_label or origin.get("chat_topic") or f"topic {thread_id}"
     return f"{base_name} / {topic_label}"
 
 
