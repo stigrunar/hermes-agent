@@ -500,6 +500,23 @@ class WebhookAdapter(BasePlatformAdapter):
                 {"status": "ignored", "event": event_type}
             )
 
+        # Fast-path action filtering before prompt rendering, skill injection,
+        # or agent dispatch. GitHub/GitLab PR hooks can emit label/admin event
+        # bursts where the prompt itself would instruct the agent to return
+        # [SILENT]; doing that after an LLM call still burns quota. Route
+        # configs may declare payload action names that are safe to ignore.
+        ignored_actions = route_config.get("ignored_actions") or []
+        action = payload.get("action") if isinstance(payload, dict) else None
+        if action and action in ignored_actions:
+            logger.info(
+                "[webhook] Ignoring action %s for route %s before agent dispatch",
+                action,
+                route_name,
+            )
+            return web.json_response(
+                {"status": "ignored", "event": event_type, "action": action}
+            )
+
         # Format prompt from template
         prompt_template = route_config.get("prompt", "")
         prompt = self._render_prompt(
