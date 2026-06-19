@@ -3598,6 +3598,15 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+    # ``kanban_complete(summary=...)`` is the normal worker path. Older
+    # behavior persisted that handoff only on ``task_runs.summary`` while
+    # leaving the visible ``tasks.result`` field NULL unless callers also
+    # duplicated it as ``result=``. Mirror summary into result when no
+    # explicit result was provided so completed cards remain self-auditing
+    # on the canonical task row.
+    visible_result = result
+    if not (visible_result and str(visible_result).strip()) and summary:
+        visible_result = summary
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -3640,7 +3649,7 @@ def complete_task(
                  WHERE id = ?
                    AND status IN ('running', 'ready', 'blocked')
                 """,
-                (result, now, task_id),
+                (visible_result, now, task_id),
             )
         else:
             cur = conn.execute(
@@ -3656,7 +3665,7 @@ def complete_task(
                    AND status IN ('running', 'ready', 'blocked')
                    AND current_run_id = ?
                 """,
-                (result, now, task_id, int(expected_run_id)),
+                (visible_result, now, task_id, int(expected_run_id)),
             )
         if cur.rowcount != 1:
             return False
@@ -3684,7 +3693,7 @@ def complete_task(
         ev_summary = (summary if summary is not None else result) or ""
         ev_summary = ev_summary.strip().splitlines()[0][:400] if ev_summary else ""
         completed_payload: dict = {
-            "result_len": len(result) if result else 0,
+            "result_len": len(visible_result) if visible_result else 0,
             "summary": ev_summary or None,
         }
         if verified_cards:
@@ -3712,7 +3721,7 @@ def complete_task(
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
     # time we emit the warning.
-    scan_text = " ".join(filter(None, [summary, result]))
+    scan_text = " ".join(filter(None, [summary, visible_result]))
     if scan_text:
         phantom_refs = _scan_prose_for_phantom_ids(conn, scan_text)
         # Drop any phantom refs that were already flagged as verified
@@ -7696,11 +7705,11 @@ def latest_summary(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     """Return the latest non-null ``task_runs.summary`` for ``task_id``.
 
     The kanban-worker skill writes its handoff to ``task_runs.summary``
-    via ``complete_task(summary=...)``; ``tasks.result`` is left empty
-    unless the caller passes ``result=`` explicitly. Dashboards and CLI
-    "show" views need this value to surface what a worker actually did
-    — without it, ``tasks.result`` is NULL and the task looks like a
-    no-op even when the run completed.
+    via ``complete_task(summary=...)``. ``complete_task`` now mirrors that
+    summary into ``tasks.result`` when no explicit result is supplied, but
+    older rows and externally-written rows may still need this fallback.
+    Dashboards and CLI "show" views use it to surface what a worker did
+    when the task row has no visible result.
 
     Picks the most recent run by ``ended_at`` (falling back to ``id``
     for ties or unfinished rows). Returns None if no run has a summary.

@@ -173,8 +173,10 @@ def test_successful_completion_resets_failure_counter(kanban_home, all_assignees
         ok = kb.complete_task(conn, tid, summary="done")
         assert ok
         task = kb.get_task(conn, tid)
+        assert task is not None
         assert task.consecutive_failures == 0
         assert task.last_failure_error is None
+        assert task.result == "done"
     finally:
         conn.close()
 
