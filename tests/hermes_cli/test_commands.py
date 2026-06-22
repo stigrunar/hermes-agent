@@ -1154,6 +1154,46 @@ class TestTelegramMenuCommands:
         ):
             assert name in names
 
+    def test_prioritized_skills_survive_thirty_command_cap(self, tmp_path, monkeypatch):
+        """Visible Telegram menu should reserve room for high-value skill commands."""
+        from unittest.mock import patch
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        skills_dir = tmp_path / "skills"
+        fake_cmds = {
+            "/roadmap": {
+                "name": "roadmap",
+                "description": "Roadmap repair",
+                "skill_md_path": f"{skills_dir}/roadmap/SKILL.md",
+                "skill_dir": f"{skills_dir}/roadmap",
+            },
+            "/storm": {
+                "name": "storm",
+                "description": "STORM research",
+                "skill_md_path": f"{skills_dir}/storm/SKILL.md",
+                "skill_dir": f"{skills_dir}/storm",
+            },
+            "/zzzz-low-priority": {
+                "name": "zzzz-low-priority",
+                "description": "Low priority skill",
+                "skill_md_path": f"{skills_dir}/zzzz/SKILL.md",
+                "skill_dir": f"{skills_dir}/zzzz",
+            },
+        }
+        with (
+            patch("agent.skill_commands.get_skill_commands", return_value=fake_cmds),
+            patch("tools.skills_tool.SKILLS_DIR", skills_dir),
+        ):
+            skills_dir.mkdir(exist_ok=True)
+            menu, hidden = telegram_menu_commands(max_commands=30)
+
+        names = [name for name, _desc in menu]
+        assert len(names) == 30
+        assert hidden > 0
+        assert "roadmap" in names
+        assert "storm" in names
+        assert names.index("roadmap") < names.index("zzzz_low_priority")
+
     def test_includes_plugin_commands_via_lazy_discovery(self, tmp_path, monkeypatch):
         """Telegram menu generation should discover plugin slash commands on first access."""
         from unittest.mock import patch

@@ -534,6 +534,7 @@ _TELEGRAM_MENU_PRIORITY = (
     # Most-typed everyday commands first.
     "help",
     "new",
+    "reload-skills",
     "stop",
     "status",
     "resume",
@@ -565,6 +566,33 @@ Telegram only displays a small BotCommand menu in practice.  The full Hermes
 registry is still dispatchable when typed manually, but operational commands
 need to survive the visible menu cap ahead of lower-priority built-ins.
 """
+
+
+_TELEGRAM_MENU_SKILL_PRIORITY = (
+    # Stig's everyday skill surface. Telegram's BotCommand menu is capped,
+    # while all skill commands remain typeable manually. Keep the menu biased
+    # toward high-value workflows instead of letting alphabetic skill order or
+    # built-ins consume every slot.
+    "roadmap",
+    "gstack",
+    "storm",
+    "office-hours",
+    "autoplan",
+    "plan-ceo-review",
+    "plan-eng-review",
+    "plan-design-review",
+    "plan-devex-review",
+    "review",
+    "qa",
+    "qa-only",
+    "investigate",
+    "design-review",
+    "document-release",
+    "ship",
+    "health",
+    "cso",
+)
+"""Skill commands that should appear in Telegram's visible BotCommand menu."""
 
 
 def _prioritize_telegram_menu_commands(
@@ -664,6 +692,32 @@ _clamp_telegram_names = _clamp_command_names
 # ---------------------------------------------------------------------------
 # Shared skill/plugin collection for gateway platforms
 # ---------------------------------------------------------------------------
+
+def _prioritize_telegram_skill_commands(
+    commands: list[tuple[str, str, str]],
+) -> list[tuple[str, str, str]]:
+    """Prioritize selected skills for Telegram's capped BotCommand menu."""
+    priority = {
+        _sanitize_telegram_name(name): index
+        for index, name in enumerate(_TELEGRAM_MENU_SKILL_PRIORITY)
+    }
+    return [
+        command
+        for _index, command in sorted(
+            enumerate(commands),
+            key=lambda item: (
+                0,
+                priority[item[1][0]],
+                item[0],
+            )
+            if item[1][0] in priority
+            else (
+                1,
+                item[0],
+            ),
+        )
+    ]
+
 
 def _collect_gateway_skill_entries(
     platform: str,
@@ -808,21 +862,37 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
         commands omitted due to the cap.
     """
     core_commands = _prioritize_telegram_menu_commands(list(telegram_bot_commands()))
-    reserved_names = {n for n, _ in core_commands}
-    all_commands = list(core_commands)
-    hidden_core_count = max(0, len(all_commands) - max_commands)
 
-    remaining_slots = max(0, max_commands - len(all_commands))
-    entries, hidden_count = _collect_gateway_skill_entries(
+    # Telegram's visible menu is small in practice.  Keep a compact set of
+    # operational built-ins visible, but reserve room for the high-value skill
+    # workflows Stig actually invokes day to day.  All omitted commands remain
+    # typeable manually and visible through /commands.
+    preferred_core_slots = min(
+        len(core_commands),
+        14 if max_commands <= 30 else max_commands,
+    )
+
+    reserved_names = {n for n, _ in core_commands}
+    entries, _raw_hidden_count = _collect_gateway_skill_entries(
         platform="telegram",
-        max_slots=remaining_slots,
-        reserved_names=reserved_names,
+        max_slots=10_000,
+        reserved_names=set(reserved_names),
         desc_limit=40,
         sanitize_name=_sanitize_telegram_name,
     )
+    entries = _prioritize_telegram_skill_commands(entries)
+
+    skill_slots = max(0, max_commands - preferred_core_slots)
+    selected_skills = entries[:skill_slots]
+    remaining_core_slots = max(0, max_commands - len(selected_skills))
+    selected_core = core_commands[:remaining_core_slots]
+
+    hidden_core_count = max(0, len(core_commands) - len(selected_core))
+    hidden_skill_count = max(0, len(entries) - len(selected_skills))
+    all_commands = list(selected_core)
     # Drop the cmd_key — Telegram only needs (name, desc) pairs.
-    all_commands.extend((n, d) for n, d, _k in entries)
-    return all_commands[:max_commands], hidden_count + hidden_core_count
+    all_commands.extend((n, d) for n, d, _k in selected_skills)
+    return all_commands[:max_commands], hidden_skill_count + hidden_core_count
 
 
 def discord_skill_commands(
