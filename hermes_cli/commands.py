@@ -574,6 +574,7 @@ _TELEGRAM_MENU_SKILL_PRIORITY = (
     # toward high-value workflows instead of letting alphabetic skill order or
     # built-ins consume every slot.
     "roadmap",
+    "backlog",
     "gstack",
     "storm",
     "office-hours",
@@ -869,7 +870,7 @@ def telegram_menu_commands(max_commands: int = 100) -> tuple[list[tuple[str, str
     # typeable manually and visible through /commands.
     preferred_core_slots = min(
         len(core_commands),
-        14 if max_commands <= 30 else max_commands,
+        13 if max_commands <= 30 else max_commands,
     )
 
     reserved_names = {n for n, _ in core_commands}

@@ -1167,6 +1167,12 @@ class TestTelegramMenuCommands:
                 "skill_md_path": f"{skills_dir}/roadmap/SKILL.md",
                 "skill_dir": f"{skills_dir}/roadmap",
             },
+            "/backlog": {
+                "name": "backlog",
+                "description": "Backlog list",
+                "skill_md_path": f"{skills_dir}/backlog/SKILL.md",
+                "skill_dir": f"{skills_dir}/backlog",
+            },
             "/storm": {
                 "name": "storm",
                 "description": "STORM research",
@@ -1191,6 +1197,7 @@ class TestTelegramMenuCommands:
         assert len(names) == 30
         assert hidden > 0
         assert "roadmap" in names
+        assert "backlog" in names
         assert "storm" in names
         assert names.index("roadmap") < names.index("zzzz_low_priority")
 
