@@ -21,6 +21,9 @@ def _make_adapter(
     group_allowed_chats=None,
     guest_mode=None,
     observe_unmentioned_group_messages=None,
+    explicit_mention_only_chats=None,
+    mention_only_chats=None,
+    bot_handoff_chats=None,
     bot_username="hermes_bot",
 ):
     from plugins.platforms.telegram.adapter import TelegramAdapter
@@ -62,6 +65,12 @@ def _make_adapter(
         extra["guest_mode"] = guest_mode
     if observe_unmentioned_group_messages is not None:
         extra["observe_unmentioned_group_messages"] = observe_unmentioned_group_messages
+    if explicit_mention_only_chats is not None:
+        extra["explicit_mention_only_chats"] = explicit_mention_only_chats
+    if mention_only_chats is not None:
+        extra["mention_only_chats"] = mention_only_chats
+    if bot_handoff_chats is not None:
+        extra["bot_handoff_chats"] = bot_handoff_chats
 
     adapter = object.__new__(TelegramAdapter)
     adapter.platform = Platform.TELEGRAM
@@ -91,6 +100,7 @@ def _group_message(
     chat_id=-100,
     from_user_id=111,
     from_user_name="Alice Example",
+    from_user_is_bot=False,
     thread_id=None,
     reply_to_bot=False,
     entities=None,
@@ -109,7 +119,7 @@ def _group_message(
         message_thread_id=thread_id,
         is_topic_message=thread_id is not None,
         chat=SimpleNamespace(id=chat_id, type="group", title="Test Group", is_forum=thread_id is not None),
-        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0]),
+        from_user=SimpleNamespace(id=from_user_id, full_name=from_user_name, first_name=from_user_name.split()[0], is_bot=from_user_is_bot),
         reply_to_message=reply_to_message,
         date=None,
     )
@@ -468,6 +478,53 @@ def test_group_messages_can_require_direct_trigger_via_config():
     # And commands still pass unconditionally when require_mention is disabled
     adapter_no_mention = _make_adapter(require_mention=False)
     assert adapter_no_mention._should_process_message(_group_message("/status"), is_command=True) is True
+
+
+def test_explicit_mention_only_chat_rejects_reply_wakeword_and_free_response():
+    adapter = _make_adapter(
+        require_mention=True,
+        free_response_chats=["-100"],
+        mention_patterns=[r"^Dolly\b"],
+        explicit_mention_only_chats=["-100"],
+    )
+
+    assert adapter._should_process_message(_group_message("plain", chat_id=-100)) is False
+    assert adapter._should_process_message(_group_message("reply", chat_id=-100, reply_to_bot=True)) is False
+    assert adapter._should_process_message(_group_message("Dolly status", chat_id=-100)) is False
+    assert adapter._should_process_message(_group_message("/status", chat_id=-100), is_command=True) is False
+
+    mention = "hi @hermes_bot"
+    assert adapter._should_process_message(
+        _group_message(mention, chat_id=-100, entities=[_mention_entity(mention)])
+    ) is True
+    command = "/status@hermes_bot"
+    assert adapter._should_process_message(
+        _group_message(command, chat_id=-100, entities=[_bot_command_entity(command, command)]),
+        is_command=True,
+    ) is True
+
+
+def test_explicit_mention_only_chat_rejects_peer_bot_without_handoff_allowlist():
+    mention = "hi @hermes_bot"
+    message = _group_message(
+        mention,
+        chat_id=-100,
+        entities=[_mention_entity(mention)],
+        from_user_is_bot=True,
+    )
+    adapter = _make_adapter(explicit_mention_only_chats=["-100"])
+    assert adapter._should_process_message(message) is False
+
+    handoff_adapter = _make_adapter(
+        explicit_mention_only_chats=["-100"],
+        bot_handoff_chats=["-100"],
+    )
+    assert handoff_adapter._should_process_message(message) is True
+
+
+def test_mention_only_chats_compatibility_alias_is_strict():
+    adapter = _make_adapter(mention_only_chats=["-100"])
+    assert adapter._should_process_message(_group_message("reply", chat_id=-100, reply_to_bot=True)) is False
 
 
 def test_explicit_multi_bot_mentions_route_only_to_named_bots():

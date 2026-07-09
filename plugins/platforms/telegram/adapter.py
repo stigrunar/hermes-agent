@@ -6711,6 +6711,35 @@ class TelegramAdapter(BasePlatformAdapter):
             return {str(part).strip() for part in raw if str(part).strip()}
         return {part.strip() for part in str(raw).split(",") if part.strip()}
 
+    def _telegram_explicit_mention_only_chats(self) -> set[str]:
+        """Chats where only a fresh direct address to this bot may trigger.
+
+        This is intentionally stricter than ``require_mention``: replies to the
+        bot, wake-word patterns, and ``free_response_chats`` do not bypass it.
+        ``mention_only_chats`` is retained as a compatibility alias for older
+        Stig-host configs.
+        """
+        values: set[str] = set()
+        for key in ("explicit_mention_only_chats", "mention_only_chats"):
+            raw = self.config.extra.get(key)
+            if isinstance(raw, list):
+                values.update(str(part).strip() for part in raw if str(part).strip())
+            elif raw is not None:
+                values.update(part.strip() for part in str(raw).split(",") if part.strip())
+        for env_key in ("TELEGRAM_EXPLICIT_MENTION_ONLY_CHATS", "TELEGRAM_MENTION_ONLY_CHATS"):
+            raw = os.getenv(env_key, "")
+            values.update(part.strip() for part in raw.split(",") if part.strip())
+        return values
+
+    def _telegram_bot_handoff_chats(self) -> set[str]:
+        """Chats where a directly addressed message from another bot is allowed."""
+        raw = self.config.extra.get("bot_handoff_chats")
+        if raw is None:
+            raw = os.getenv("TELEGRAM_BOT_HANDOFF_CHATS", "")
+        if isinstance(raw, list):
+            return {str(part).strip() for part in raw if str(part).strip()}
+        return {part.strip() for part in str(raw).split(",") if part.strip()}
+
     def _telegram_allowed_chats(self) -> set[str]:
         """Return the whitelist of group/supergroup chat IDs the bot will respond in.
 
@@ -7414,6 +7443,16 @@ class TelegramAdapter(BasePlatformAdapter):
 
         if self._telegram_exclusive_bot_mentions() and self._explicit_bot_mentions_exclude_self(message):
             return False
+
+        # In shared multi-bot rooms, only a fresh direct @mention (or
+        # /cmd@botname) may trigger. Reply-to-bot, wake words and free-response
+        # are deliberately ignored. Peer bots are silent unless the chat has
+        # an explicit handoff allowlist entry.
+        if chat_id_str in self._telegram_explicit_mention_only_chats():
+            from_user = getattr(message, "from_user", None)
+            if bool(getattr(from_user, "is_bot", False)) and chat_id_str not in self._telegram_bot_handoff_chats():
+                return False
+            return self._message_mentions_bot(message)
 
         # Resolve guest-mode mention bypass once so _message_mentions_bot
         # is not called redundantly in the normal flow below.
