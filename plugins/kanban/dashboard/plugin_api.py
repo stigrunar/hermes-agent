@@ -139,8 +139,9 @@ def _conn(board: Optional[str] = None):
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
-# Columns shown by the dashboard, in left-to-right order. "archived" is
-# available via a filter toggle rather than a visible column.
+# Columns shown by the dashboard, in left-to-right order. Non-actionable
+# history statuses are available via a filter toggle rather than visible
+# columns.
 #
 # Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
 # ``scheduled`` is a first-class waiting column used for time-based follow-ups;
@@ -274,7 +275,7 @@ def _compute_task_diagnostics(
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            "SELECT * FROM tasks WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only')",
         ).fetchall()
 
     if not rows:
@@ -452,6 +453,8 @@ def get_board(
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
         if include_archived:
             columns["archived"] = []
+            columns["superseded"] = []
+            columns["stale_continuity_only"] = []
 
         # Batch-fetch the latest non-null run summary per task in one
         # window-function query (avoids N+1 ``latest_summary`` calls
@@ -493,7 +496,7 @@ def get_board(
             r["assignee"]
             for r in conn.execute(
                 "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
+                "AND status NOT IN ('archived', 'superseded', 'stale_continuity_only') ORDER BY assignee"
             )
         ]
 
@@ -592,6 +595,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    required_capabilities: Optional[list[str]] = None
 
 
 @router.post("/tasks")
@@ -616,6 +620,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            required_capabilities=payload.required_capabilities,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -957,18 +962,19 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
 ) -> list:
-    """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
+    """Return parent rows (``id``, ``title``, ``status``) that are non-terminal
     and therefore prevent ``task_id`` from being promoted to ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the
     dashboard can show an actionable toast (#26744) instead of a silent
     no-op.  Returns ``[]`` when nothing blocks the transition (e.g. no
-    parents, or all parents already done).
+    parents, or all parents already terminal).
     """
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? "
+        "AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only')",
         (task_id,),
     ).fetchall()
     return [

@@ -80,6 +80,12 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
+        "superseded_by": t.superseded_by,
+        "live_path_task_id": t.live_path_task_id,
+        "canonical_live_path": t.canonical_live_path,
+        "required_capabilities": list(t.required_capabilities or []),
+        "failure_classification": t.failure_classification,
+        "failure_fingerprint": t.failure_fingerprint,
     }
 
 
@@ -338,6 +344,16 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
+    p_create.add_argument(
+        "--requires",
+        action="append",
+        default=[],
+        dest="required_capabilities",
+        help=(
+            "Required runtime capability for dispatch (repeatable): terminal, "
+            "file, file_patch, process, browser, network, or private:<toolset>."
+        ),
+    )
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -627,6 +643,60 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         default=None,
         help="Permanently delete already-archived task ids from the board",
     )
+
+    p_nonaction = sub.add_parser(
+        "non-actionable",
+        help="Mark a task superseded or stale_continuity_only with live-path audit fields",
+    )
+    p_nonaction.add_argument("task_id")
+    p_nonaction.add_argument(
+        "--status",
+        required=True,
+        choices=["superseded", "stale_continuity_only"],
+    )
+    p_nonaction.add_argument("--superseded-by", default=None)
+    p_nonaction.add_argument("--live-path-task-id", default=None)
+    p_nonaction.add_argument("--canonical-live-path", default=None)
+    p_nonaction.add_argument("--reason", default=None)
+    p_nonaction.add_argument("--actor", default=None)
+    p_nonaction.add_argument("--json", action="store_true")
+
+    p_live = sub.add_parser(
+        "detached-live-path",
+        help="Park parent-gated mirrors behind a blocked source and record a detached live task",
+    )
+    p_live.add_argument("source_task_id")
+    p_live.add_argument("detached_task_id")
+    p_live.add_argument("--reason", default=None)
+    p_live.add_argument("--actor", default=None)
+    p_live.add_argument("--json", action="store_true")
+
+    p_close = sub.add_parser(
+        "controller-closeout",
+        help="Controller-only closeout using a structured acceptance receipt",
+    )
+    p_close.add_argument("task_id")
+    p_close.add_argument("--receipt", required=True, help="JSON receipt object")
+    p_close.add_argument("--result", default=None)
+    p_close.add_argument("--actor", default=None)
+    p_close.add_argument("--json", action="store_true")
+
+    p_migrate = sub.add_parser(
+        "reconcile-live-path",
+        help="Dry-run/apply bounded stale-child reconciliation from explicit IDs or JSON mapping",
+    )
+    p_migrate.add_argument("--mapping", default=None, help="JSON file with reconciliation entries")
+    p_migrate.add_argument("--source", default=None)
+    p_migrate.add_argument("--detached", default=None)
+    p_migrate.add_argument(
+        "--allow-terminal-evidence",
+        action="store_true",
+        help="For explicit --source/--detached only: accept a done detached task with positive completion evidence",
+    )
+    p_migrate.add_argument("--reason", default="bounded live-path reconciliation")
+    p_migrate.add_argument("--actor", default=None)
+    p_migrate.add_argument("--apply", action="store_true")
+    p_migrate.add_argument("--json", action="store_true")
 
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
@@ -958,6 +1028,10 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "non-actionable": _cmd_non_actionable,
+            "detached-live-path": _cmd_detached_live_path,
+            "controller-closeout": _cmd_controller_closeout,
+            "reconcile-live-path": _cmd_reconcile_live_path,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1347,6 +1421,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
+            required_capabilities=getattr(args, "required_capabilities", None) or None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -2096,6 +2171,149 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_non_actionable(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        ok = kb.mark_task_non_actionable(
+            conn,
+            args.task_id,
+            status=args.status,
+            actor=actor,
+            reason=getattr(args, "reason", None),
+            superseded_by=getattr(args, "superseded_by", None),
+            live_path_task_id=getattr(args, "live_path_task_id", None),
+            canonical_live_path=getattr(args, "canonical_live_path", None),
+        )
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
+    else:
+        print(f"{args.task_id} -> {args.status}")
+    return 0 if ok else 1
+
+
+def _cmd_detached_live_path(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        res = kb.park_blocked_source_detached_path(
+            conn,
+            source_task_id=args.source_task_id,
+            detached_task_id=args.detached_task_id,
+            actor=actor,
+            reason=getattr(args, "reason", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Recorded live path {res['live_path_task_id']} for {res['source_task_id']}; "
+            f"parked {len(res['parked_children'])} child task(s)."
+        )
+    return 0
+
+
+def _cmd_controller_closeout(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    try:
+        receipt = json.loads(args.receipt)
+    except json.JSONDecodeError as exc:
+        print(f"kanban controller-closeout: invalid --receipt JSON: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.controller_closeout_task(
+            conn,
+            args.task_id,
+            receipt=receipt,
+            actor=actor,
+            result=getattr(args, "result", None),
+        )
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
+    else:
+        print(f"Controller closeout accepted for {args.task_id}")
+    return 0 if ok else 1
+
+
+def _load_reconcile_entries(args: argparse.Namespace) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if getattr(args, "mapping", None):
+        raw = json.loads(Path(args.mapping).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "entries" in raw:
+            raw = raw["entries"]
+        if not isinstance(raw, list):
+            raise ValueError("mapping file must contain a list or {\"entries\": [...]}")
+        for item in raw:
+            if not isinstance(item, dict):
+                raise ValueError("each mapping entry must be an object")
+            entries.append(item)
+    if getattr(args, "source", None) or getattr(args, "detached", None):
+        if not (getattr(args, "source", None) and getattr(args, "detached", None)):
+            raise ValueError("--source and --detached must be passed together")
+        entries.append(
+            {
+                "source_task_id": args.source,
+                "detached_task_id": args.detached,
+                "allow_terminal_evidence": bool(
+                    getattr(args, "allow_terminal_evidence", False)
+                ),
+            }
+        )
+    if not entries:
+        raise ValueError("pass --mapping or explicit --source/--detached IDs")
+    return entries
+
+
+def _preview_reconcile(conn, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return kb.reconcile_detached_live_paths(
+        conn,
+        entries,
+        actor="preview",
+        apply=False,
+    )["preview"]
+
+
+def _cmd_reconcile_live_path(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    try:
+        entries = _load_reconcile_entries(args)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f"kanban reconcile-live-path: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        db_path = str(kb.kanban_db_path())
+        board = kb.get_current_board()
+        reconciled = kb.reconcile_detached_live_paths(
+            conn,
+            entries,
+            actor=actor,
+            reason=getattr(args, "reason", None),
+            apply=bool(getattr(args, "apply", False)),
+        )
+        preview = reconciled["preview"]
+        applied = reconciled["applied"]
+    payload = {
+        "dry_run": not bool(getattr(args, "apply", False)),
+        "board": board,
+        "db_path": db_path,
+        "preview": preview,
+        "applied": applied,
+        "rollback": "Restore the pre-apply SQLite DB backup; this command does not maintain an internal undo log.",
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        mode = "APPLY" if getattr(args, "apply", False) else "DRY RUN"
+        print(f"{mode}: board={board} db={db_path}")
+        print(f"Entries: {len(preview)}; child rows to park: {sum(len(p['children_to_park']) for p in preview)}")
+        if not getattr(args, "apply", False):
+            print("No changes written. Re-run with --apply to mutate this explicit mapping.")
+        else:
+            print(f"Applied {len(applied)} reconciliation entry(s).")
+        print("Rollback: restore the pre-apply SQLite DB backup.")
+    return 0
+
+
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -2169,6 +2387,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
+            "capability_blocked": [
+                {"task_id": tid, "required": required, "missing": missing}
+                for (tid, required, missing) in res.capability_blocked
+            ],
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2196,6 +2418,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
+    print(f"Capability-blocked: {len(res.capability_blocked)}")
+    for tid, required, missing in res.capability_blocked:
+        tag = " (dry)" if args.dry_run else ""
+        print(f"  - {tid}{tag}: missing {', '.join(missing)} (required {', '.join(required)})")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:

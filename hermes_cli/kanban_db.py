@@ -99,8 +99,15 @@ _log = logging.getLogger(__name__)
 # Constants
 # ---------------------------------------------------------------------------
 
-VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
+VALID_STATUSES = {
+    "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
+    "done", "archived", "superseded", "stale_continuity_only",
+}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+NON_ACTIONABLE_STATUSES = {"archived", "superseded", "stale_continuity_only"}
+TERMINAL_STATUSES = {"done", "archived", "superseded", "stale_continuity_only"}
+CONTROLLER_ACCEPT_VERDICTS = {"accepted", "approved", "approved_not_live"}
+DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -133,6 +140,10 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
+PUBLIC_REQUIRED_CAPABILITIES = {
+    "terminal", "file", "file_patch", "process", "browser", "network",
+}
+NETWORK_CAPABLE_TOOLSETS = {"web", "search", "web_search", "browser", "firecrawl"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 
@@ -914,6 +925,12 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    superseded_by: Optional[str] = None
+    live_path_task_id: Optional[str] = None
+    canonical_live_path: Optional[str] = None
+    required_capabilities: Optional[list[str]] = None
+    failure_classification: Optional[str] = None
+    failure_fingerprint: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -927,6 +944,14 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
+        required_capabilities_value: Optional[list[str]] = None
+        if "required_capabilities" in keys and row["required_capabilities"]:
+            try:
+                parsed = json.loads(row["required_capabilities"])
+                if isinstance(parsed, list):
+                    required_capabilities_value = [str(s) for s in parsed if s]
+            except Exception:
+                required_capabilities_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -997,6 +1022,16 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            superseded_by=row["superseded_by"] if "superseded_by" in keys else None,
+            live_path_task_id=row["live_path_task_id"] if "live_path_task_id" in keys else None,
+            canonical_live_path=row["canonical_live_path"] if "canonical_live_path" in keys else None,
+            required_capabilities=required_capabilities_value,
+            failure_classification=(
+                row["failure_classification"] if "failure_classification" in keys else None
+            ),
+            failure_fingerprint=(
+                row["failure_fingerprint"] if "failure_fingerprint" in keys else None
             ),
         )
 
@@ -1175,7 +1210,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- First-class non-actionable history / live-path routing fields.
+    superseded_by        TEXT,
+    live_path_task_id    TEXT,
+    canonical_live_path  TEXT,
+    -- JSON array of normalized capability names required before dispatch.
+    required_capabilities TEXT,
+    -- Machine-readable deterministic failure bookkeeping.
+    failure_classification TEXT,
+    failure_fingerprint   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1985,6 +2029,18 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
+    if "superseded_by" not in cols:
+        _add_column_if_missing(conn, "tasks", "superseded_by", "superseded_by TEXT")
+    if "live_path_task_id" not in cols:
+        _add_column_if_missing(conn, "tasks", "live_path_task_id", "live_path_task_id TEXT")
+    if "canonical_live_path" not in cols:
+        _add_column_if_missing(conn, "tasks", "canonical_live_path", "canonical_live_path TEXT")
+    if "required_capabilities" not in cols:
+        _add_column_if_missing(conn, "tasks", "required_capabilities", "required_capabilities TEXT")
+    if "failure_classification" not in cols:
+        _add_column_if_missing(conn, "tasks", "failure_classification", "failure_classification TEXT")
+    if "failure_fingerprint" not in cols:
+        _add_column_if_missing(conn, "tasks", "failure_fingerprint", "failure_fingerprint TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -1999,6 +2055,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_live_path ON tasks(live_path_task_id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tasks_superseded_by ON tasks(superseded_by)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2383,6 +2445,89 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def normalize_required_capabilities(
+    required_capabilities: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize and validate the small Kanban capability vocabulary."""
+    if required_capabilities is None:
+        return None
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in required_capabilities:
+        if raw is None:
+            continue
+        cap = str(raw).strip().lower()
+        if not cap:
+            continue
+        if cap.startswith("toolset:"):
+            cap = "private:" + cap.split(":", 1)[1].strip().lower()
+        if cap in PUBLIC_REQUIRED_CAPABILITIES:
+            normalized = cap
+        elif cap.startswith("private:") and cap.split(":", 1)[1].strip():
+            normalized = "private:" + cap.split(":", 1)[1].strip()
+        else:
+            raise ValueError(
+                "required_capabilities must contain only "
+                f"{sorted(PUBLIC_REQUIRED_CAPABILITIES)} plus private:<toolset>"
+            )
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out or None
+
+
+def _validate_worktree_create_contract(
+    *,
+    workspace_path: Optional[str],
+    project_repo: Optional[str],
+    board: Optional[str],
+) -> None:
+    """Validate that a worktree task has an absolute, resolvable git anchor.
+
+    This is intentionally validation-only. It may inspect existing parents and
+    run ``git rev-parse`` but never creates directories or materializes a
+    linked worktree; dispatch remains responsible for the actual worktree add.
+    """
+    candidate: Optional[Path] = None
+    source = "workspace_path"
+    if workspace_path:
+        candidate = Path(workspace_path).expanduser()
+        if not candidate.is_absolute():
+            raise ValueError("worktree workspace_path must be absolute")
+    elif project_repo:
+        candidate = Path(project_repo).expanduser()
+        source = "project primary_path"
+        if not candidate.is_absolute():
+            raise ValueError("project primary_path for worktree task must be absolute")
+    else:
+        board_slug = board if board else get_current_board()
+        board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
+        if board_default:
+            candidate = Path(board_default).expanduser()
+            source = f"board {board_slug!r} default_workdir"
+            if not candidate.is_absolute():
+                raise ValueError(
+                    f"{source} must be absolute for worktree tasks"
+                )
+    if candidate is None:
+        raise ValueError(
+            "workspace_kind=worktree requires an explicit absolute workspace_path, "
+            "a project primary_path, or an absolute board default_workdir inside a git repo"
+        )
+
+    resolved = candidate.resolve(strict=False)
+    if candidate.exists() and _is_linked_worktree_checkout(candidate):
+        return
+    repo_root = _git_toplevel(candidate)
+    if repo_root is not None:
+        return
+    nearest_parent = resolved if resolved.exists() else resolved.parent
+    if _repo_root_for_worktree_target(nearest_parent) is not None:
+        return
+    raise ValueError(f"{source} {str(candidate)!r} is not inside a git repo")
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2407,6 +2552,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2447,6 +2593,7 @@ def create_task(
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
+    required_capabilities_list = normalize_required_capabilities(required_capabilities)
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -2544,7 +2691,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status != 'archived' "
+            "AND status NOT IN ('archived', 'superseded', 'stale_continuity_only') "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
@@ -2572,6 +2719,13 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
+
+    if workspace_kind == "worktree":
+        _validate_worktree_create_contract(
+            workspace_path=workspace_path,
+            project_repo=project_repo,
+            board=board,
+        )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -2601,7 +2755,7 @@ def create_task(
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] != "done" for r in rows):
+                        if any(r["status"] not in TERMINAL_STATUSES for r in rows):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -2635,8 +2789,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id,
+                        required_capabilities
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -2659,6 +2814,10 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        (
+                            json.dumps(required_capabilities_list)
+                            if required_capabilities_list is not None else None
+                        ),
                     ),
                 )
                 for pid in parents:
@@ -2678,6 +2837,7 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "required_capabilities": required_capabilities_list,
                     },
                 )
             return task_id
@@ -2756,8 +2916,8 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
-    if not include_archived and status != "archived":
-        query += " AND status != 'archived'"
+    if not include_archived and status not in NON_ACTIONABLE_STATUSES:
+        query += " AND status NOT IN ('archived', 'superseded', 'stale_continuity_only')"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -2797,7 +2957,8 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL WHERE id = ?",
+                "last_failure_error = NULL, failure_classification = NULL, "
+                "failure_fingerprint = NULL WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -2829,7 +2990,7 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status != "done":
+        if parent_status not in TERMINAL_STATUSES:
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3332,7 +3493,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in ("done", "archived") for p in parents):
+            if all(p["status"] in TERMINAL_STATUSES for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -3396,7 +3557,7 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only') LIMIT 1",
             (task_id,),
         ).fetchone()
         if undone:
@@ -4278,7 +4439,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only', 'failed', 'cancelled') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -4342,7 +4503,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks t ON t.id = l.child_id "
-                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
+                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only', 'failed', 'cancelled') "
                 "LIMIT 1",
                 (parent_id,),
             ).fetchone()
@@ -4795,7 +4956,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in ("done", "archived")
+            if p["status"] not in TERMINAL_STATUSES
         ]
         if unsatisfied:
             return False, (
@@ -4861,7 +5022,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only') LIMIT 1",
             (task_id,),
         ).fetchone()
         new_status = "todo" if undone_parents else "ready"
@@ -4877,7 +5038,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL, "
+            "failure_classification = NULL, failure_fingerprint = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -5209,7 +5371,7 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
-            "WHERE id = ? AND status != 'archived'",
+        "WHERE id = ? AND status NOT IN ('archived', 'superseded', 'stale_continuity_only')",
             (task_id,),
         )
         if cur.rowcount != 1:
@@ -5226,6 +5388,584 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
+    recompute_ready(conn)
+    return True
+
+
+def _close_run_for_control_plane(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    outcome: str,
+    summary: str,
+    metadata: Optional[dict] = None,
+) -> Optional[int]:
+    run_id = _end_run(
+        conn,
+        task_id,
+        outcome=outcome,
+        status=outcome,
+        summary=summary,
+        metadata=metadata,
+    )
+    if run_id is None:
+        run_id = _synthesize_ended_run(
+            conn,
+            task_id,
+            outcome=outcome,
+            summary=summary,
+            metadata=metadata,
+        )
+    return run_id
+
+
+def mark_task_non_actionable(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    status: str,
+    actor: str,
+    reason: Optional[str] = None,
+    superseded_by: Optional[str] = None,
+    live_path_task_id: Optional[str] = None,
+    canonical_live_path: Optional[str] = None,
+) -> bool:
+    """Mark a historical row as explicit non-actionable board history."""
+    if status not in {"superseded", "stale_continuity_only"}:
+        raise ValueError("status must be 'superseded' or 'stale_continuity_only'")
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    target_ids = [t for t in (superseded_by, live_path_task_id) if t]
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if target_ids:
+            missing = _find_missing_parents(conn, target_ids)
+            if missing:
+                raise ValueError(f"unknown target task(s): {', '.join(missing)}")
+        current = row["status"]
+        if current == status:
+            existing = conn.execute(
+                "SELECT superseded_by, live_path_task_id, canonical_live_path "
+                "FROM tasks WHERE id = ?",
+                (task_id,),
+            ).fetchone()
+            if (
+                (existing["superseded_by"] or None) == (superseded_by or None)
+                and (existing["live_path_task_id"] or None) == (live_path_task_id or None)
+                and (existing["canonical_live_path"] or None) == (canonical_live_path or None)
+            ):
+                _append_event(
+                    conn,
+                    task_id,
+                    "non_actionable_noop",
+                    {"status": status, "actor": actor, "reason": reason},
+                )
+                return True
+        run_id = _close_run_for_control_plane(
+            conn,
+            task_id,
+            outcome=status,
+            summary=reason or f"task marked {status}",
+            metadata={
+                "actor": actor,
+                "superseded_by": superseded_by,
+                "live_path_task_id": live_path_task_id,
+                "canonical_live_path": canonical_live_path,
+            },
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = ?,
+                   superseded_by = ?,
+                   live_path_task_id = ?,
+                   canonical_live_path = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ?
+            """,
+            (status, superseded_by, live_path_task_id, canonical_live_path, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            status,
+            {
+                "actor": actor,
+                "reason": reason,
+                "superseded_by": superseded_by,
+                "live_path_task_id": live_path_task_id,
+                "canonical_live_path": canonical_live_path,
+            },
+            run_id=run_id,
+        )
+    recompute_ready(conn)
+    return True
+
+
+def _task_has_ancestor(
+    conn: sqlite3.Connection,
+    task_id: str,
+    ancestor_id: str,
+) -> bool:
+    seen: set[str] = set()
+    stack = parent_ids(conn, task_id)
+    while stack:
+        cur = stack.pop()
+        if cur == ancestor_id:
+            return True
+        if cur in seen:
+            continue
+        seen.add(cur)
+        stack.extend(parent_ids(conn, cur))
+    return False
+
+
+def validate_detached_live_path_mapping(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    detached_task_id: str,
+    allow_terminal_evidence: bool = False,
+) -> dict[str, Any]:
+    source = conn.execute(
+        "SELECT id, status FROM tasks WHERE id = ?",
+        (source_task_id,),
+    ).fetchone()
+    detached = conn.execute(
+        "SELECT id, status, workspace_path FROM tasks WHERE id = ?",
+        (detached_task_id,),
+    ).fetchone()
+    if source is None:
+        raise ValueError(f"unknown source task {source_task_id}")
+    if detached is None:
+        raise ValueError(f"unknown detached task {detached_task_id}")
+    if source["status"] != "blocked":
+        raise ValueError(f"source task {source_task_id} must be blocked")
+    terminal_evidence: Optional[dict[str, Any]] = None
+    if allow_terminal_evidence:
+        if detached["status"] != "done":
+            raise ValueError(
+                "allow_terminal_evidence mappings only accept detached tasks "
+                f"with status=done; got {detached['status']!r}"
+            )
+        terminal_evidence = _validated_terminal_evidence(conn, detached_task_id)
+    elif detached["status"] not in DETACHED_LIVE_PATH_STATUSES:
+        raise ValueError(
+            f"detached task {detached_task_id} is not an actionable live path "
+            f"(status={detached['status']})"
+        )
+    if _task_has_ancestor(conn, detached_task_id, source_task_id):
+        raise ValueError(
+            f"detached task {detached_task_id} is parent-gated behind {source_task_id}"
+        )
+    children = conn.execute(
+        """
+        SELECT t.id, t.status
+          FROM tasks t
+          JOIN task_links l ON l.child_id = t.id
+         WHERE l.parent_id = ?
+           AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only')
+         ORDER BY t.id
+        """,
+        (source_task_id,),
+    ).fetchall()
+    validation = {
+        "source_task_id": source_task_id,
+        "source_status": source["status"],
+        "detached_task_id": detached_task_id,
+        "detached_status": detached["status"],
+        "canonical_live_path": detached["workspace_path"] or detached_task_id,
+        "children_to_park": [{"id": r["id"], "status": r["status"]} for r in children],
+        "mapping_kind": "terminal_evidence" if allow_terminal_evidence else "live_runnable_path",
+    }
+    if terminal_evidence is not None:
+        validation["terminal_evidence"] = terminal_evidence
+    return validation
+
+
+def _validated_terminal_evidence(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> dict[str, Any]:
+    task = conn.execute(
+        "SELECT id, status, completed_at, result FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if task is None:
+        raise ValueError(f"unknown detached task {task_id}")
+    if task["status"] != "done":
+        raise ValueError(f"terminal evidence task {task_id} must be done")
+
+    evidence: dict[str, Any] = {"task_completed_at": task["completed_at"]}
+    completed_event = conn.execute(
+        """
+        SELECT id, payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind = 'completed'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if completed_event is not None:
+        payload: dict[str, Any] = {}
+        if completed_event["payload"]:
+            try:
+                parsed = json.loads(completed_event["payload"])
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+        evidence["completed_event_id"] = int(completed_event["id"])
+        if payload.get("summary"):
+            evidence["summary"] = str(payload["summary"])[:400]
+        if payload.get("verified_cards"):
+            evidence["verified_cards"] = payload["verified_cards"]
+
+    closeout_event = conn.execute(
+        """
+        SELECT id, payload
+          FROM task_events
+         WHERE task_id = ?
+           AND kind = 'controller_closeout'
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if closeout_event is not None:
+        payload = {}
+        if closeout_event["payload"]:
+            try:
+                parsed = json.loads(closeout_event["payload"])
+                if isinstance(parsed, dict):
+                    payload = parsed
+            except Exception:
+                payload = {}
+        receipt = payload.get("receipt") if isinstance(payload, dict) else None
+        verdict = str((receipt or {}).get("verdict") or "").strip().lower()
+        if verdict in CONTROLLER_ACCEPT_VERDICTS:
+            evidence["controller_closeout_event_id"] = int(closeout_event["id"])
+            evidence["acceptance_verdict"] = verdict
+
+    completed_run = conn.execute(
+        """
+        SELECT id, outcome, summary, metadata
+          FROM task_runs
+         WHERE task_id = ?
+           AND ended_at IS NOT NULL
+           AND outcome IN ('completed', 'controller_closeout')
+         ORDER BY id DESC
+         LIMIT 1
+        """,
+        (task_id,),
+    ).fetchone()
+    if completed_run is not None:
+        evidence["run_id"] = int(completed_run["id"])
+        evidence["run_outcome"] = completed_run["outcome"]
+        if completed_run["summary"]:
+            evidence.setdefault("summary", str(completed_run["summary"])[:400])
+
+    if not (
+        evidence.get("completed_event_id")
+        or evidence.get("controller_closeout_event_id")
+        or evidence.get("run_id")
+    ):
+        raise ValueError(
+            f"detached terminal task {task_id} lacks positive completion/acceptance evidence"
+        )
+    return evidence
+
+
+def _park_detached_live_path_locked(
+    conn: sqlite3.Connection,
+    *,
+    validation: dict[str, Any],
+    actor: str,
+    reason: Optional[str],
+) -> dict[str, Any]:
+    source_task_id = validation["source_task_id"]
+    detached_task_id = validation["detached_task_id"]
+    canonical = validation["canonical_live_path"]
+    parked: list[str] = []
+    conn.execute(
+        """
+        UPDATE tasks
+           SET live_path_task_id = ?,
+               canonical_live_path = ?
+         WHERE id = ?
+        """,
+        (detached_task_id, canonical, source_task_id),
+    )
+    _append_event(
+        conn,
+        source_task_id,
+        (
+            "detached_terminal_evidence"
+            if validation.get("mapping_kind") == "terminal_evidence"
+            else "detached_live_path"
+        ),
+        {
+            "actor": actor,
+            "detached_task_id": detached_task_id,
+            "canonical_live_path": canonical,
+            "reason": reason,
+            "mapping_kind": validation.get("mapping_kind", "live_runnable_path"),
+            "terminal_evidence": validation.get("terminal_evidence"),
+        },
+    )
+    for child in validation["children_to_park"]:
+        cid = child["id"]
+        run_id = _close_run_for_control_plane(
+            conn,
+            cid,
+            outcome="stale_continuity_only",
+            summary=reason or f"parked behind detached live path {detached_task_id}",
+            metadata={
+                "actor": actor,
+                "source_task_id": source_task_id,
+                "live_path_task_id": detached_task_id,
+            },
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'stale_continuity_only',
+                   superseded_by = ?,
+                   live_path_task_id = ?,
+                   canonical_live_path = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL
+             WHERE id = ?
+            """,
+            (detached_task_id, detached_task_id, canonical, cid),
+        )
+        _append_event(
+            conn,
+            cid,
+            "stale_continuity_only",
+            {
+                "actor": actor,
+                "source_task_id": source_task_id,
+                "live_path_task_id": detached_task_id,
+                "reason": reason,
+            },
+            run_id=run_id,
+        )
+        parked.append(cid)
+    return {
+        "source_task_id": source_task_id,
+        "live_path_task_id": detached_task_id,
+        "mapping_kind": validation.get("mapping_kind", "live_runnable_path"),
+        "terminal_evidence": validation.get("terminal_evidence"),
+        "parked_children": parked,
+    }
+
+
+def park_blocked_source_detached_path(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    detached_task_id: str,
+    actor: str,
+    reason: Optional[str] = None,
+) -> dict[str, Any]:
+    """Record an explicit detached live path and stale parent-gated mirrors."""
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    with write_txn(conn):
+        # Keep validation and mutation under one write lock so another
+        # controller cannot change either task between the two phases.
+        validation = validate_detached_live_path_mapping(
+            conn,
+            source_task_id=source_task_id,
+            detached_task_id=detached_task_id,
+        )
+        result = _park_detached_live_path_locked(
+            conn,
+            validation=validation,
+            actor=actor,
+            reason=reason,
+        )
+    recompute_ready(conn)
+    return result
+
+
+def reconcile_detached_live_paths(
+    conn: sqlite3.Connection,
+    entries: Iterable[dict[str, Any]],
+    *,
+    actor: str,
+    reason: Optional[str] = None,
+    apply: bool = False,
+) -> dict[str, Any]:
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    normalized_entries: list[tuple[str, str, bool]] = []
+    for item in entries:
+        source = str(item.get("source_task_id") or item.get("source") or "").strip()
+        detached = str(item.get("detached_task_id") or item.get("detached") or "").strip()
+        if not source or not detached:
+            raise ValueError("each entry requires source_task_id and detached_task_id")
+        allow_terminal_evidence = bool(item.get("allow_terminal_evidence"))
+        normalized_entries.append((source, detached, allow_terminal_evidence))
+    validations: list[dict[str, Any]] = []
+    applied: list[dict[str, Any]] = []
+    if apply:
+        with write_txn(conn):
+            # Validate every mapping while holding the write lock and before
+            # the first mutation, preserving the all-or-nothing contract even
+            # when another controller is active.
+            validations = [
+                validate_detached_live_path_mapping(
+                    conn,
+                    source_task_id=source,
+                    detached_task_id=detached,
+                    allow_terminal_evidence=allow_terminal_evidence,
+                )
+                for source, detached, allow_terminal_evidence in normalized_entries
+            ]
+            for validation in validations:
+                applied.append(
+                    _park_detached_live_path_locked(
+                        conn,
+                        validation=validation,
+                        actor=actor,
+                        reason=reason,
+                    )
+                )
+        recompute_ready(conn)
+    else:
+        validations = [
+            validate_detached_live_path_mapping(
+                conn,
+                source_task_id=source,
+                detached_task_id=detached,
+                allow_terminal_evidence=allow_terminal_evidence,
+            )
+            for source, detached, allow_terminal_evidence in normalized_entries
+        ]
+    return {"preview": validations, "applied": applied}
+
+
+def _validate_controller_receipt(
+    conn: sqlite3.Connection,
+    task_id: str,
+    receipt: dict[str, Any],
+) -> dict[str, Any]:
+    if not isinstance(receipt, dict):
+        raise ValueError("receipt must be a JSON object")
+    required = ("accepted_by", "accepted_at", "verdict", "evidence")
+    missing = [k for k in required if not receipt.get(k)]
+    if missing:
+        raise ValueError(f"receipt missing required field(s): {', '.join(missing)}")
+    verdict = str(receipt.get("verdict") or "").strip().lower()
+    verdict = verdict.replace("-", "_").replace(" ", "_")
+    if verdict not in CONTROLLER_ACCEPT_VERDICTS:
+        raise ValueError(
+            "receipt.verdict must be an explicit acceptance verdict "
+            f"({', '.join(sorted(CONTROLLER_ACCEPT_VERDICTS))}); got {receipt.get('verdict')!r}"
+        )
+    evidence = receipt.get("evidence")
+    if isinstance(evidence, str):
+        if not evidence.strip():
+            raise ValueError("receipt.evidence must be nonempty")
+    elif isinstance(evidence, (list, tuple)):
+        if not [x for x in evidence if str(x).strip()]:
+            raise ValueError("receipt.evidence must be nonempty")
+    else:
+        raise ValueError("receipt.evidence must be a nonempty string or list")
+    live_path_task_id = receipt.get("live_path_task_id")
+    row = conn.execute(
+        "SELECT live_path_task_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"unknown task {task_id}")
+    expected_live = row["live_path_task_id"]
+    if expected_live and not live_path_task_id:
+        raise ValueError("receipt.live_path_task_id is required for this task")
+    if live_path_task_id:
+        target = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (str(live_path_task_id),),
+        ).fetchone()
+        if target is None:
+            raise ValueError(f"receipt.live_path_task_id {live_path_task_id} does not exist")
+        receipt = dict(receipt)
+        receipt["live_path_task_id"] = str(live_path_task_id)
+    normalized = dict(receipt)
+    normalized["verdict"] = verdict
+    return normalized
+
+
+def controller_closeout_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    receipt: dict[str, Any],
+    actor: str,
+    result: Optional[str] = None,
+) -> bool:
+    """Controller-only acceptance closeout for helper/source tasks."""
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("actor is required")
+    with write_txn(conn):
+        normalized_receipt = _validate_controller_receipt(conn, task_id, receipt)
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"unknown task {task_id}")
+        if row["status"] in NON_ACTIONABLE_STATUSES:
+            raise ValueError(f"cannot controller-closeout non-actionable task {task_id}")
+        now = int(time.time())
+        summary = result or f"controller accepted: {normalized_receipt['verdict']}"
+        run_id = _close_run_for_control_plane(
+            conn,
+            task_id,
+            outcome="controller_closeout",
+            summary=summary,
+            metadata={"actor": actor, "receipt": normalized_receipt},
+        )
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'done',
+                   result = ?,
+                   completed_at = ?,
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = NULL,
+                   block_recurrences = 0,
+                   consecutive_failures = 0,
+                   last_failure_error = NULL
+             WHERE id = ?
+            """,
+            (summary, now, task_id),
+        )
+        _append_event(
+            conn,
+            task_id,
+            "controller_closeout",
+            {"actor": actor, "receipt": normalized_receipt},
+            run_id=run_id,
+        )
     recompute_ready(conn)
     return True
 
@@ -5738,6 +6478,11 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    capability_blocked: list[tuple[str, list[str], list[str]]] = field(default_factory=list)
+    """Tasks blocked/skipped by capability preflight as
+    ``(task_id, required, missing)``. In dry-run these are reported without
+    mutating the task; in apply mode they become capability-blocked before any
+    claim/run/spawn is created."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6550,6 +7295,8 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    failure_classification: Optional[str] = None,
+    failure_fingerprint: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -6617,9 +7364,14 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "failure_classification = ?, failure_fingerprint = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures, error[:500],
+                        failure_classification, failure_fingerprint,
+                        task_id,
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready``
@@ -6627,9 +7379,14 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "failure_classification = ?, failure_fingerprint = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
-                    (failures, error[:500], task_id),
+                    (
+                        failures, error[:500],
+                        failure_classification, failure_fingerprint,
+                        task_id,
+                    ),
                 )
             run_id = None
             if end_run:
@@ -6651,6 +7408,8 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
+                "failure_classification": failure_classification,
+                "failure_fingerprint": failure_fingerprint,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -6665,17 +7424,27 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ? "
+                    "consecutive_failures = ?, last_failure_error = ?, "
+                    "failure_classification = ?, failure_fingerprint = ? "
                     "WHERE id = ? AND status = 'running'",
-                    (failures, error[:500], task_id),
+                    (
+                        failures, error[:500],
+                        failure_classification, failure_fingerprint,
+                        task_id,
+                    ),
                 )
             else:
                 # Timeout/crash path: task is already at ``ready`` via
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ? WHERE id = ?",
-                    (failures, error[:500], task_id),
+                    "last_failure_error = ?, failure_classification = ?, "
+                    "failure_fingerprint = ? WHERE id = ?",
+                    (
+                        failures, error[:500],
+                        failure_classification, failure_fingerprint,
+                        task_id,
+                    ),
                 )
             if end_run:
                 # Spawn path: close the open run with outcome.
@@ -6746,13 +7515,80 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL WHERE id = ?",
+            "last_failure_error = NULL, failure_classification = NULL, "
+            "failure_fingerprint = NULL WHERE id = ?",
             (task_id,),
         )
 
 
 # Legacy alias for test-code and anything else that still imports it.
 _clear_spawn_failures = _clear_failure_counter
+
+
+def _deterministic_fingerprint(reason_code: str, error: str) -> str:
+    return hashlib.sha256(
+        f"{reason_code}\0{(error or '').strip()}".encode("utf-8", "replace")
+    ).hexdigest()[:24]
+
+
+def _block_deterministic_preflight_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason_code: str,
+    error: str,
+    payload: Optional[dict] = None,
+) -> str:
+    """Block a deterministic workspace/config/capability failure immediately."""
+    fp = _deterministic_fingerprint(reason_code, error)
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return fp
+        if row["status"] in NON_ACTIONABLE_STATUSES or row["status"] == "done":
+            return fp
+        conn.execute(
+            """
+            UPDATE tasks
+               SET status = 'blocked',
+                   claim_lock = NULL,
+                   claim_expires = NULL,
+                   worker_pid = NULL,
+                   block_kind = 'capability',
+                   last_failure_error = ?,
+                   failure_classification = ?,
+                   failure_fingerprint = ?
+             WHERE id = ?
+               AND status IN ('todo', 'ready', 'running', 'review', 'blocked')
+            """,
+            (error[:500], reason_code, fp, task_id),
+        )
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="preflight_failed",
+            status="preflight_failed",
+            error=error[:500],
+            metadata={"reason_code": reason_code, "fingerprint": fp, **(payload or {})},
+        )
+        event_payload = {
+            "reason_code": reason_code,
+            "fingerprint": fp,
+            "error": error[:500],
+        }
+        if payload:
+            event_payload.update(payload)
+        _append_event(
+            conn,
+            task_id,
+            "deterministic_preflight_blocked",
+            event_payload,
+            run_id=run_id,
+        )
+    return fp
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -7184,6 +8020,24 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        preflight_ok, preflight_reason, preflight_payload = _preflight_ready_task(
+            conn,
+            row["id"],
+            board=board,
+            dry_run=dry_run,
+        )
+        if not preflight_ok:
+            if preflight_reason == "capability_mismatch" and preflight_payload:
+                result.capability_blocked.append(
+                    (
+                        row["id"],
+                        list(preflight_payload.get("required") or []),
+                        list(preflight_payload.get("missing") or []),
+                    )
+                )
+            else:
+                result.auto_blocked.append(row["id"])
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -7262,12 +8116,17 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
+            _block_deterministic_preflight_failure(
+                conn,
+                claimed.id,
+                reason_code="workspace_config",
+                error=f"workspace: {exc}",
+                payload={
+                    "workspace_kind": claimed.workspace_kind,
+                    "workspace_path": claimed.workspace_path,
+                },
             )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -7334,6 +8193,24 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        preflight_ok, preflight_reason, preflight_payload = _preflight_ready_task(
+            conn,
+            row["id"],
+            board=board,
+            dry_run=dry_run,
+        )
+        if not preflight_ok:
+            if preflight_reason == "capability_mismatch" and preflight_payload:
+                result.capability_blocked.append(
+                    (
+                        row["id"],
+                        list(preflight_payload.get("required") or []),
+                        list(preflight_payload.get("missing") or []),
+                    )
+                )
+            else:
+                result.auto_blocked.append(row["id"])
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -7354,12 +8231,17 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            auto = _record_spawn_failure(
-                conn, claimed.id, f"workspace: {exc}",
-                failure_limit=failure_limit,
+            _block_deterministic_preflight_failure(
+                conn,
+                claimed.id,
+                reason_code="workspace_config",
+                error=f"workspace: {exc}",
+                payload={
+                    "workspace_kind": claimed.workspace_kind,
+                    "workspace_path": claimed.workspace_path,
+                },
             )
-            if auto:
-                result.auto_blocked.append(claimed.id)
+            result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -7657,6 +8539,117 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+
+def _available_capabilities_from_toolsets(toolsets: Iterable[str]) -> set[str]:
+    names = {str(t).strip().lower() for t in toolsets if str(t).strip()}
+    available: set[str] = set()
+    if "terminal" in names:
+        available.update({"terminal", "process"})
+    if "file" in names:
+        available.update({"file", "file_patch"})
+    if "browser" in names:
+        available.add("browser")
+    if NETWORK_CAPABLE_TOOLSETS & names:
+        available.add("network")
+    for name in names:
+        available.add(f"private:{name}")
+    return available
+
+
+def _resolve_assignee_toolsets(assignee: Optional[str]) -> tuple[Optional[list[str]], Optional[str]]:
+    if not assignee:
+        return None, "task has no assignee"
+    try:
+        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+
+        profile = normalize_profile_name(assignee)
+        hermes_home = resolve_profile_env(profile)
+    except Exception as exc:
+        return None, f"could not resolve profile {assignee!r}: {exc}"
+    toolsets = _resolve_worker_cli_toolsets(hermes_home)
+    if toolsets is None:
+        return None, f"could not resolve CLI toolsets for profile {assignee!r}"
+    return toolsets, None
+
+
+def capability_preflight(
+    task: Task,
+) -> tuple[bool, dict[str, Any]]:
+    required = normalize_required_capabilities(task.required_capabilities) or []
+    if not required:
+        return True, {"required": [], "available": [], "missing": []}
+    toolsets, error = _resolve_assignee_toolsets(task.assignee)
+    if error:
+        return False, {
+            "required": required,
+            "available": [],
+            "missing": required,
+            "assignee": task.assignee,
+            "error": error,
+        }
+    available = _available_capabilities_from_toolsets(toolsets or [])
+    missing: list[str] = []
+    for cap in required:
+        if cap.startswith("private:"):
+            if cap not in available:
+                missing.append(cap)
+        elif cap not in available:
+            missing.append(cap)
+    return not missing, {
+        "required": required,
+        "available": sorted(available),
+        "missing": missing,
+        "assignee": task.assignee,
+        "toolsets": toolsets or [],
+    }
+
+
+def _preflight_ready_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str],
+    dry_run: bool,
+) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
+    task = get_task(conn, task_id)
+    if task is None:
+        return False, "not_found", None
+    if task.workspace_kind == "worktree":
+        try:
+            _validate_worktree_create_contract(
+                workspace_path=task.workspace_path,
+                project_repo=None,
+                board=board,
+            )
+        except Exception as exc:
+            error = f"workspace: {exc}"
+            payload = {"workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path}
+            if not dry_run:
+                _block_deterministic_preflight_failure(
+                    conn,
+                    task.id,
+                    reason_code="workspace_config",
+                    error=error,
+                    payload=payload,
+                )
+            return False, "workspace_config", {"error": error, **payload}
+    ok, cap_payload = capability_preflight(task)
+    if not ok:
+        error = (
+            "missing required capabilities for "
+            f"{task.assignee or '(unassigned)'}: {', '.join(cap_payload['missing'])}"
+        )
+        if not dry_run:
+            _block_deterministic_preflight_failure(
+                conn,
+                task.id,
+                reason_code="capability_mismatch",
+                error=error,
+                payload=cap_payload,
+            )
+        return False, "capability_mismatch", {"error": error, **cap_payload}
+    return True, None, None
 
 
 def _default_spawn(
@@ -8154,14 +9147,14 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' GROUP BY status"
+        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') GROUP BY status"
     ):
         by_status[row["status"]] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
@@ -8593,7 +9586,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     counts: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status != 'archived' AND assignee IS NOT NULL "
+        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
