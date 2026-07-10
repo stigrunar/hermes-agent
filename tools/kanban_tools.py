@@ -602,10 +602,16 @@ def _handle_complete(args: dict, **kw) -> str:
                 verdict = "done"
                 reason = ""
                 try:
-                    verdict, reason, _ = judge_goal(
+                    # judge_goal now returns (verdict, reason, parse_failed,
+                    # wait_directive).  Keep this caller tolerant of the older
+                    # 3-tuple shape used by tests/plugins while ignoring WAIT
+                    # directives for Kanban completion gates (a worker should
+                    # block/continue on the card rather than park completion).
+                    judge_result = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
                     )
+                    verdict, reason = judge_result[0], judge_result[1]
                 except Exception as judge_exc:
                     # Defensive: judge_goal swallows its own errors, but if
                     # it ever raises, fail open rather than wedge the worker.
