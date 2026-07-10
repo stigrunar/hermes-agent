@@ -337,13 +337,15 @@ def run_codex_app_server_turn(
 
         # Gateway / cron contexts have no UI to surface codex's approval
         # requests through, so codex app-server exec / apply_patch requests
-        # fail closed (silently decline) by default. When the user has
-        # explicitly opted out of Hermes approvals — via `approvals.mode: off`
-        # in config, the /yolo session toggle, or --yolo / HERMES_YOLO_MODE —
-        # honor that and let codex's own sandbox permission profile
-        # (~/.codex/config.toml) be the policy gate instead of double-gating
-        # with a missing Hermes UI. Defaults (manual/smart/unset) preserve the
-        # current fail-closed behavior — this is a no-op for those users.
+        # fail closed (silently decline) by default. In human-driven/gateway
+        # contexts, an explicit Hermes approval bypass — `approvals.mode: off`,
+        # the /yolo session toggle, or --yolo / HERMES_YOLO_MODE — lets codex's
+        # own sandbox permission profile (~/.codex/config.toml) be the policy
+        # gate instead of double-gating with a missing Hermes UI. Unattended
+        # cron sessions are different: approvals.cron_mode=deny overrides
+        # those recoverable bypasses and keeps codex app-server requests
+        # fail-closed. Defaults (manual/smart/unset) preserve the current
+        # fail-closed behavior — this is a no-op for those users.
         auto_approve_requests = False
         try:
             from tools.approval import is_approval_bypass_active

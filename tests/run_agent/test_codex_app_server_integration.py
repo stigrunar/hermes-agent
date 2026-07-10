@@ -396,13 +396,14 @@ class TestRunConversationCodexPath:
         self, monkeypatch
     ):
         """When the user disables Hermes approvals, codex app-server approval
-        requests should not fail closed just because no interactive callback is
-        wired (the typical gateway path). Codex's own sandbox permission
-        profile remains the filesystem boundary."""
+        requests in non-cron contexts should not fail closed just because no
+        interactive callback is wired (the typical gateway path). Codex's own
+        sandbox permission profile remains the filesystem boundary."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"approvals": {"mode": "off"}},
+            return_value={"approvals": {"mode": "off", "cron_mode": "deny"}},
         ):
             agent = _make_codex_agent()
             with patch.object(
@@ -418,10 +419,11 @@ class TestRunConversationCodexPath:
     ):
         """YAML 1.1 parses unquoted `off` as False; match the normal approval
         subsystem's compatibility behavior for codex app-server routing too."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"approvals": {"mode": False}},
+            return_value={"approvals": {"mode": False, "cron_mode": "deny"}},
         ):
             agent = _make_codex_agent()
             with patch.object(
@@ -437,10 +439,11 @@ class TestRunConversationCodexPath:
     ):
         """Default (manual) approvals must preserve the fail-closed behavior —
         this fix is a no-op for users who haven't opted out."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"approvals": {"mode": "manual"}},
+            return_value={"approvals": {"mode": "manual", "cron_mode": "deny"}},
         ):
             agent = _make_codex_agent()
             with patch.object(
@@ -456,15 +459,16 @@ class TestRunConversationCodexPath:
     ):
         """--yolo / HERMES_YOLO_MODE (frozen into _YOLO_MODE_FROZEN at import
         time — a prompt-injection-safe process-scoped bypass) should flow
-        through to codex app-server routing so gateway/cron contexts do not
-        fail closed when the user launched with yolo mode."""
+        through to codex app-server routing in non-cron contexts so gateway
+        requests do not fail closed when the user launched with yolo mode."""
         import tools.approval as _approval
 
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         captured = self._capture_routing_agent(monkeypatch)
         monkeypatch.setattr(_approval, "_YOLO_MODE_FROZEN", True)
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"approvals": {"mode": "manual"}},
+            return_value={"approvals": {"mode": "manual", "cron_mode": "deny"}},
         ):
             agent = _make_codex_agent()
             with patch.object(
@@ -479,11 +483,13 @@ class TestRunConversationCodexPath:
         self, monkeypatch
     ):
         """The /yolo session toggle should be honored at Codex session creation
-        time, independent of the startup-time approvals config."""
+        time outside cron-deny, independent of the startup-time approvals
+        config."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
         captured = self._capture_routing_agent(monkeypatch)
         with patch(
             "hermes_cli.config.load_config",
-            return_value={"approvals": {"mode": "manual"}},
+            return_value={"approvals": {"mode": "manual", "cron_mode": "deny"}},
         ):
             agent = _make_codex_agent()
             with patch(
@@ -496,6 +502,72 @@ class TestRunConversationCodexPath:
         routing = captured["request_routing"]
         assert routing.auto_approve_exec is True
         assert routing.auto_approve_apply_patch is True
+
+    def test_cron_deny_overrides_mode_off_for_codex_server_requests(
+        self, monkeypatch
+    ):
+        """Unattended cron-deny keeps codex app-server requests fail-closed
+        even when approvals.mode=off would bypass in non-cron contexts."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        captured = self._capture_routing_agent(monkeypatch)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"approvals": {"mode": "off", "cron_mode": "deny"}},
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+
+    def test_cron_deny_overrides_frozen_yolo_for_codex_server_requests(
+        self, monkeypatch
+    ):
+        """Unattended cron-deny overrides process-scoped yolo for codex
+        app-server approval routing."""
+        import tools.approval as _approval
+
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.setattr(_approval, "_YOLO_MODE_FROZEN", True)
+        captured = self._capture_routing_agent(monkeypatch)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"approvals": {"mode": "manual", "cron_mode": "deny"}},
+        ):
+            agent = _make_codex_agent()
+            with patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
+
+    def test_cron_deny_overrides_session_yolo_for_codex_server_requests(
+        self, monkeypatch
+    ):
+        """Unattended cron-deny overrides the session /yolo bypass for codex
+        app-server approval routing."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        captured = self._capture_routing_agent(monkeypatch)
+        with patch(
+            "hermes_cli.config.load_config",
+            return_value={"approvals": {"mode": "manual", "cron_mode": "deny"}},
+        ):
+            agent = _make_codex_agent()
+            with patch(
+                "tools.approval.is_current_session_yolo_enabled",
+                return_value=True,
+            ), patch.object(
+                agent, "_spawn_background_review", return_value=None
+            ):
+                agent.run_conversation("write something")
+        routing = captured["request_routing"]
+        assert routing.auto_approve_exec is False
+        assert routing.auto_approve_apply_patch is False
 
 
 class TestReviewForkApiModeDowngrade:
@@ -759,4 +831,3 @@ class TestCodexToolProgressBridge:
 
         assert "on_event" in captured_init and captured_init["on_event"] is not None
         assert ("tool.started", "exec_command", "pytest") in events
-

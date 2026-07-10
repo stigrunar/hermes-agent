@@ -110,6 +110,33 @@ class TestRequestToolApproval:
         assert res["approved"] is False
         assert "cron" in res["message"].lower()
 
+    def test_cron_deny_blocks_before_session_cached_approval(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_approved", lambda sk, pk: True)
+        monkeypatch.setattr(approval, "env_var_enabled",
+                            lambda v: v == "HERMES_CRON_SESSION")
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
+        res = request_tool_approval("terminal", "smtp send", rule_key="smtp")
+        assert res["approved"] is False
+        assert "cron" in res["message"].lower()
+
+    def test_cron_deny_blocks_process_yolo(self, monkeypatch):
+        monkeypatch.setattr(approval, "_YOLO_MODE_FROZEN", True, raising=False)
+        monkeypatch.setattr(approval, "env_var_enabled",
+                            lambda v: v == "HERMES_CRON_SESSION")
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
+        res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
+        assert res["approved"] is False
+        assert "cron" in res["message"].lower()
+
+    def test_cron_deny_blocks_session_yolo(self, monkeypatch):
+        monkeypatch.setattr(approval, "is_current_session_yolo_enabled", lambda: True)
+        monkeypatch.setattr(approval, "env_var_enabled",
+                            lambda v: v == "HERMES_CRON_SESSION")
+        monkeypatch.setattr(approval, "_get_cron_approval_mode", lambda: "deny")
+        res = request_tool_approval("terminal", "curl PUT", rule_key="ext")
+        assert res["approved"] is False
+        assert "cron" in res["message"].lower()
+
     def test_cron_approve_mode_allows(self, monkeypatch):
         monkeypatch.setattr(approval, "_is_interactive_cli", lambda: False)
         monkeypatch.setattr(approval, "_is_gateway_approval_context", lambda: False)

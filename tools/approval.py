@@ -1841,9 +1841,15 @@ def is_approval_bypass_active() -> bool:
       - the session-scoped gateway ``/yolo`` toggle,
       - ``approvals.mode: off`` in config.
 
+    Cron-deny is the explicit exception: cron jobs have no human approval
+    surface, so ``approvals.cron_mode: deny`` overrides every recoverable
+    bypass and fails closed for actions that require escalation.
+
     This is the pure-bypass sub-expression only. Callers that also honor a
     hardline blocklist / permanent allowlist must check those separately.
     """
+    if _is_cron_deny_active():
+        return False
     return (
         _YOLO_MODE_FROZEN
         or is_current_session_yolo_enabled()
@@ -1870,6 +1876,14 @@ def _get_cron_approval_mode() -> str:
         return "deny"
     except Exception:
         return "deny"
+
+
+def _is_cron_deny_active() -> bool:
+    """True when this execution is a cron session and cron approval is denied."""
+    return (
+        env_var_enabled("HERMES_CRON_SESSION")
+        and _get_cron_approval_mode() == "deny"
+    )
 
 
 def _strip_shell_comments(command: str) -> str:
@@ -2015,12 +2029,13 @@ def _run_approval_gate(
     escalations). Extracting it keeps the fail-closed / cron / gateway /
     persist policy in ONE place so the two entry points can never drift.
 
-    Ordering mirrors the historical ``check_dangerous_command`` tail:
-    yolo bypass → session-cache short-circuit → interactive/gateway/cron
-    branch → prompt → ``deny/session/always`` persistence. The caller is
-    responsible for the checks that are specific to its input shape
-    (hardline detection, command-string permanent allowlist, dangerous-
-    pattern detection) BEFORE calling this gate.
+    Ordering keeps the unconditional floors in the caller, then applies the
+    cron-deny floor before any recoverable bypass: cron-deny → yolo bypass →
+    session-cache short-circuit → interactive/gateway/cron branch → prompt →
+    ``deny/session/always`` persistence. The caller is responsible for the
+    checks that are specific to its input shape (hardline detection,
+    command-string permanent allowlist, dangerous-pattern detection) BEFORE
+    calling this gate.
 
     Args:
         pattern_key: Allowlist/session key this decision is stored under.
@@ -2047,7 +2062,15 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
-    # --yolo bypasses all approval prompts (session- or process-scoped).
+    if _is_cron_deny_active():
+        return {
+            "approved": False,
+            "message": cron_deny_message,
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
+    # --yolo bypasses approval prompts in human-driven/non-cron contexts.
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
@@ -2068,17 +2091,9 @@ def _run_approval_gate(
     is_gateway = _is_gateway_approval_context()
 
     if not is_cli and not is_gateway:
-        # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
-                return {
-                    "approved": False,
-                    "message": cron_deny_message,
-                    "pattern_key": pattern_key,
-                    "description": description,
-                }
-            # cron_mode: approve — fall through to auto-approve below.
-        elif fail_closed_when_no_human:
+        # Cron-deny returned above; cron_mode: approve falls through to the
+        # historical non-interactive auto-approve path below.
+        if not env_var_enabled("HERMES_CRON_SESSION") and fail_closed_when_no_human:
             # Non-cron, non-interactive, no gateway: no human can answer.
             # The plugin-escalation path opts in to fail-closed here so a
             # plugin-flagged action never runs ungated. (The dangerous-
@@ -2268,12 +2283,18 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
-    # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    cron_deny_active = _is_cron_deny_active()
+
+    # --yolo bypasses approval prompts in human-driven/non-cron contexts.
+    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped via
+    # the env var for local use. Cron-deny must still inspect the command so
+    # dangerous recoverable operations fail closed while safe reads continue.
+    if not cron_deny_active and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not cron_deny_active and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -2582,8 +2603,70 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
-    # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
+    if _is_cron_deny_active():
+        # Run detection to get a description for the block message. Cron-deny
+        # overrides recoverable bypasses/allowlists, but only for commands that
+        # actually require escalation; safe reads still pass.
+        is_dangerous, _pk, description = detect_dangerous_command(command)
+        if is_dangerous:
+            return {
+                "approved": False,
+                "message": (
+                    f"BLOCKED: Command flagged as dangerous ({description}) "
+                    "but cron jobs run without a user present to approve it. "
+                    "Find an alternative approach that avoids this command. "
+                    "To allow dangerous commands in cron jobs, set "
+                    "approvals.cron_mode: approve in config.yaml."
+                ),
+            }
+        # Also run tirith check in cron-deny mode so content-level threats
+        # (homograph URLs, pipe-to-interpreter, terminal injection, etc.) are
+        # caught even when they do not match the pattern-based detection above.
+        try:
+            from tools.tirith_security import check_command_security
+            _cron_tirith = check_command_security(command)
+            if _cron_tirith.get("action") in ("block", "warn"):
+                _cron_desc = _format_tirith_description(_cron_tirith)
+                return {
+                    "approved": False,
+                    "message": (
+                        f"BLOCKED: {_cron_desc} "
+                        "but cron jobs run without a user present to approve it. "
+                        "Find an alternative approach that avoids this command. "
+                        "To allow dangerous commands in cron jobs, set "
+                        "approvals.cron_mode: approve in config.yaml."
+                    ),
+                }
+        except ImportError:
+            # Tirith not installed. Honour security.tirith_fail_open: the
+            # default (True) allows as before, but when an operator has
+            # explicitly opted into fail-closed the command cannot be silently
+            # allowed — and a cron session has no user to approve it.
+            _cron_fail_open = True  # safe default if config is unreadable
+            try:
+                from hermes_cli.config import load_config as _load_cfg
+                _sec = (_load_cfg() or {}).get("security", {}) or {}
+                if _sec.get("tirith_enabled", True):
+                    _cron_fail_open = _sec.get("tirith_fail_open", True)
+            except Exception:
+                pass
+            if not _cron_fail_open:
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: the Tirith security scanner could not be "
+                        "imported and security.tirith_fail_open is false, "
+                        "so this command cannot be silently allowed — and "
+                        "cron jobs run without a user present to approve it. "
+                        "Find an alternative approach, install tirith, or set "
+                        "approvals.cron_mode: approve in config.yaml."
+                    ),
+                }
+        return {"approved": True, "message": None}
+
+    # --yolo or approvals.mode=off: bypass all approval prompts outside
+    # cron-deny. Gateway /yolo is session-scoped; CLI --yolo remains
+    # process-scoped.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
@@ -2598,69 +2681,6 @@ def check_all_command_guards(command: str, env_type: str,
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
     if not is_cli and not is_gateway and not is_ask:
-        # Cron sessions: respect cron_mode config
-        if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
-                # Run detection to get a description for the block message
-                is_dangerous, _pk, description = detect_dangerous_command(command)
-                if is_dangerous:
-                    return {
-                        "approved": False,
-                        "message": (
-                            f"BLOCKED: Command flagged as dangerous ({description}) "
-                            "but cron jobs run without a user present to approve it. "
-                            "Find an alternative approach that avoids this command. "
-                            "To allow dangerous commands in cron jobs, set "
-                            "approvals.cron_mode: approve in config.yaml."
-                        ),
-                    }
-                # Also run tirith check in cron-deny mode so content-level
-                # threats (homograph URLs, pipe-to-interpreter, terminal
-                # injection, etc.) are caught even when they do not match
-                # the pattern-based detection above.
-                try:
-                    from tools.tirith_security import check_command_security
-                    _cron_tirith = check_command_security(command)
-                    if _cron_tirith.get("action") in ("block", "warn"):
-                        _cron_desc = _format_tirith_description(_cron_tirith)
-                        return {
-                            "approved": False,
-                            "message": (
-                                f"BLOCKED: {_cron_desc} "
-                                "but cron jobs run without a user present to approve it. "
-                                "Find an alternative approach that avoids this command. "
-                                "To allow dangerous commands in cron jobs, set "
-                                "approvals.cron_mode: approve in config.yaml."
-                            ),
-                        }
-                except ImportError:
-                    # Tirith not installed. Honour security.tirith_fail_open:
-                    # the default (True) allows as before, but when an operator
-                    # has explicitly opted into fail-closed the command cannot
-                    # be silently allowed — and a cron session has no user to
-                    # approve it, so fail-closed means block (mirrors the
-                    # fail-closed synthesis in the main flow below; see #20733).
-                    _cron_fail_open = True  # safe default if config is unreadable
-                    try:
-                        from hermes_cli.config import load_config as _load_cfg
-                        _sec = (_load_cfg() or {}).get("security", {}) or {}
-                        if _sec.get("tirith_enabled", True):
-                            _cron_fail_open = _sec.get("tirith_fail_open", True)
-                    except Exception:
-                        pass
-                    if not _cron_fail_open:
-                        return {
-                            "approved": False,
-                            "message": (
-                                "BLOCKED: the Tirith security scanner could not be "
-                                "imported and security.tirith_fail_open is false, "
-                                "so this command cannot be silently allowed — and "
-                                "cron jobs run without a user present to approve it. "
-                                "Find an alternative approach, install tirith, or set "
-                                "approvals.cron_mode: approve in config.yaml."
-                            ),
-                        }
-                    # else: tirith_fail_open is True — allow as before
         return {"approved": True, "message": None}
 
     # --- Phase 1: Gather findings from both checks ---
@@ -2985,7 +3005,27 @@ def check_execute_code_guard(code: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    # Cron: no user is present to approve arbitrary code.
+    if _is_cron_deny_active():
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: execute_code runs arbitrary local Python "
+                "(including subprocess calls that bypass shell-string "
+                "approval checks). Cron jobs run without a user present "
+                "to approve it. Use normal tools instead, or set "
+                "approvals.cron_mode: approve only if this cron profile "
+                "is intentionally trusted."
+            ),
+            "pattern_key": pattern_key,
+            "description": description,
+            "outcome": "blocked",
+            "user_consent": False,
+        }
+
+    # --yolo or approvals.mode=off: bypass (session- or process-scoped)
+    # outside cron-deny. ``approvals.cron_mode: approve`` is the explicit
+    # trusted-cron opt-in.
     approval_mode = _get_approval_mode()
     if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
         return {"approved": True, "message": None}
@@ -2993,24 +3033,7 @@ def check_execute_code_guard(code: str, env_type: str,
     is_gateway = _is_gateway_approval_context()
     is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
-    # Cron: no user is present to approve arbitrary code.
     if env_var_enabled("HERMES_CRON_SESSION"):
-        if _get_cron_approval_mode() == "deny":
-            return {
-                "approved": False,
-                "message": (
-                    "BLOCKED: execute_code runs arbitrary local Python "
-                    "(including subprocess calls that bypass shell-string "
-                    "approval checks). Cron jobs run without a user present "
-                    "to approve it. Use normal tools instead, or set "
-                    "approvals.cron_mode: approve only if this cron profile "
-                    "is intentionally trusted."
-                ),
-                "pattern_key": pattern_key,
-                "description": description,
-                "outcome": "blocked",
-                "user_consent": False,
-            }
         return {"approved": True, "message": None}
 
     # Only gateway/ask contexts get the one-shot whole-script approval.

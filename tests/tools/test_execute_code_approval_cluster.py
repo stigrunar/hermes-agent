@@ -167,6 +167,62 @@ def test_guard_cron_deny_blocks(monkeypatch):
     assert res["outcome"] == "blocked"
 
 
+def test_guard_cron_deny_overrides_mode_off(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "off")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+
+
+def test_guard_cron_deny_overrides_process_yolo(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_YOLO_MODE_FROZEN", True, raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is False
+    assert res["outcome"] == "blocked"
+
+
+def test_guard_cron_deny_overrides_session_yolo(monkeypatch, gw_session):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    A.enable_session_yolo(gw_session)
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+        assert res["approved"] is False
+        assert res["outcome"] == "blocked"
+    finally:
+        A.disable_session_yolo(gw_session)
+
+
+def test_guard_cron_deny_overrides_session_approval(monkeypatch, gw_session):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "deny")
+    A.approve_session(gw_session, "execute_code")
+    try:
+        res = A.check_execute_code_guard("import os", "local")
+        assert res["approved"] is False
+        assert res["outcome"] == "blocked"
+    finally:
+        with A._lock:
+            s = A._session_approved.get(gw_session, set())
+            s.discard("execute_code")
+
+
+def test_guard_cron_approve_remains_explicit_allow(monkeypatch):
+    monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+    monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+    monkeypatch.setattr(A, "_get_approval_mode", lambda: "manual")
+    monkeypatch.setattr(A, "_get_cron_approval_mode", lambda: "approve")
+    res = A.check_execute_code_guard("import os", "local")
+    assert res["approved"] is True
+
+
 def test_guard_gateway_user_approves_is_one_shot(gw_session):
     _register_resolver(gw_session, "once")
     res = A.check_execute_code_guard("import os; print(1)", "local")

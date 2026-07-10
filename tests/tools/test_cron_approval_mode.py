@@ -175,6 +175,39 @@ class TestCronApproveMode:
 class TestCronDenyModeAllGuards:
     """The combined guard function also respects cron_mode."""
 
+    def test_safe_command_allowed_with_mode_off_in_cron_deny(self, monkeypatch):
+        """cron_mode=deny only blocks recoverable dangerous/escalated commands."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with (
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval._get_approval_mode", return_value="off"),
+        ):
+            result = check_all_command_guards("ls -la /tmp", "local")
+            assert result["approved"]
+
+    def test_dangerous_combined_command_denied_with_mode_off_in_cron_deny(
+        self, monkeypatch
+    ):
+        """approvals.mode=off must not bypass cron-deny for dangerous commands."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        monkeypatch.delenv("HERMES_EXEC_ASK", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with (
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval._get_approval_mode", return_value="off"),
+        ):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert "cron_mode" in result["message"]
+
     def test_dangerous_command_blocked_in_combined_guard(self, monkeypatch):
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -311,7 +344,7 @@ class TestCronDenyModeAllGuards:
 # ---------------------------------------------------------------------------
 
 class TestCronModeInteractions:
-    """Cron mode should NOT interfere with other approval bypass mechanisms."""
+    """Cron mode precedence and non-cron bypass compatibility."""
 
     def test_container_env_still_auto_approves(self, monkeypatch):
         """Docker/sandbox environments bypass approvals regardless of cron_mode."""
@@ -325,8 +358,8 @@ class TestCronModeInteractions:
             result = check_dangerous_command("rm -rf /", "docker")
             assert result["approved"]
 
-    def test_yolo_overrides_cron_deny(self, monkeypatch):
-        """--yolo still bypasses cron_mode=deny for dangerous (non-hardline) commands."""
+    def test_process_yolo_does_not_override_cron_deny(self, monkeypatch):
+        """Process --yolo must not bypass cron-deny for dangerous commands."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_YOLO_MODE", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -347,6 +380,73 @@ class TestCronModeInteractions:
             # Use a dangerous-but-not-hardline command — `rm -rf /` is now
             # hardline-blocked regardless of yolo (see test_hardline_blocklist.py).
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert "cron_mode" in result["message"]
+
+    def test_session_yolo_does_not_override_cron_deny(self, monkeypatch):
+        """Gateway /yolo must not bypass cron-deny for dangerous commands."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        token = approval_module.set_current_session_key("test-session")
+        approval_module.enable_session_yolo("test-session")
+        try:
+            from unittest.mock import patch as mock_patch
+            with mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"):
+                result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+                assert not result["approved"]
+                assert "cron_mode" in result["message"]
+        finally:
+            approval_module.disable_session_yolo("test-session")
+            approval_module.reset_current_session_key(token)
+
+    def test_permanent_approval_does_not_override_cron_deny(self, monkeypatch):
+        """Cached recoverable approvals must not bypass cron-deny."""
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+
+        from unittest.mock import patch as mock_patch
+        with (
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval._command_matches_permanent_allowlist",
+                       return_value=True),
+        ):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert not result["approved"]
+            assert "cron_mode" in result["message"]
+
+    def test_non_cron_yolo_still_allows_recoverable_dangerous_command(
+        self, monkeypatch
+    ):
+        """Ordinary human-driven yolo behavior is unchanged outside cron."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        from unittest.mock import patch as mock_patch
+        import tools.approval
+        with (
+            mock_patch.object(tools.approval, "_YOLO_MODE_FROZEN", True),
+            mock_patch("tools.approval.prompt_dangerous_approval",
+                       side_effect=AssertionError("yolo must not prompt")),
+        ):
+            result = check_dangerous_command("rm -rf /tmp/stuff", "local")
+            assert result["approved"]
+
+    def test_non_cron_mode_off_still_allows_recoverable_combined_command(
+        self, monkeypatch
+    ):
+        """approvals.mode=off remains an approval bypass outside cron."""
+        monkeypatch.delenv("HERMES_CRON_SESSION", raising=False)
+        monkeypatch.setenv("HERMES_INTERACTIVE", "1")
+
+        from unittest.mock import patch as mock_patch
+        with (
+            mock_patch("tools.approval._get_approval_mode", return_value="off"),
+            mock_patch("tools.approval.prompt_dangerous_approval",
+                       side_effect=AssertionError("mode=off must not prompt")),
+        ):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
             assert result["approved"]
 
     def test_non_cron_non_interactive_still_auto_approves(self, monkeypatch):
