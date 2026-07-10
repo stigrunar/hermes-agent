@@ -1371,6 +1371,29 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
+def _sqlite_connect_readonly_existing(path: Path) -> sqlite3.Connection:
+    """Open an existing Kanban SQLite DB read-only without initialization."""
+    try:
+        resolved = path.expanduser().resolve(strict=True)
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"kanban DB does not exist: {path}") from exc
+    if not resolved.is_file():
+        raise RuntimeError(f"kanban DB path is not a file: {resolved}")
+
+    busy_timeout_ms = _resolve_busy_timeout_ms()
+    try:
+        conn = sqlite3.connect(
+            f"{resolved.as_uri()}?mode=ro",
+            isolation_level=None,
+            timeout=busy_timeout_ms / 1000.0,
+            uri=True,
+        )
+        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"could not open kanban DB read-only: {resolved}: {exc}") from exc
+    return conn
+
+
 @contextlib.contextmanager
 def _cross_process_init_lock(path: Path):
     """Serialize first-connect WAL/schema/integrity setup across processes.
@@ -1854,6 +1877,42 @@ def connect_closing(
     callers) continue to work.
     """
     conn = connect(db_path=db_path, board=board)
+    try:
+        yield conn
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def connect_readonly_existing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an existing kanban DB read-only without creating or migrating it."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    conn = _sqlite_connect_readonly_existing(path)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        conn.execute("PRAGMA foreign_keys=ON")
+        conn.execute("PRAGMA cell_size_check=ON")
+    except Exception:
+        conn.close()
+        raise
+    return conn
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open an existing read-only kanban DB connection and close it on exit."""
+    conn = connect_readonly_existing(db_path=db_path, board=board)
     try:
         yield conn
     finally:

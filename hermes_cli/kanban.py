@@ -2275,12 +2275,14 @@ def _preview_reconcile(conn, entries: list[dict[str, Any]]) -> list[dict[str, An
 
 def _cmd_reconcile_live_path(args: argparse.Namespace) -> int:
     actor = getattr(args, "actor", None) or _profile_author()
+    apply_changes = bool(getattr(args, "apply", False))
     try:
         entries = _load_reconcile_entries(args)
     except (ValueError, OSError, json.JSONDecodeError) as exc:
         print(f"kanban reconcile-live-path: {exc}", file=sys.stderr)
         return 2
-    with kb.connect_closing() as conn:
+    connect_cm = kb.connect_closing if apply_changes else kb.connect_readonly_closing
+    with connect_cm() as conn:
         db_path = str(kb.kanban_db_path())
         board = kb.get_current_board()
         reconciled = kb.reconcile_detached_live_paths(
@@ -2288,12 +2290,12 @@ def _cmd_reconcile_live_path(args: argparse.Namespace) -> int:
             entries,
             actor=actor,
             reason=getattr(args, "reason", None),
-            apply=bool(getattr(args, "apply", False)),
+            apply=apply_changes,
         )
         preview = reconciled["preview"]
         applied = reconciled["applied"]
     payload = {
-        "dry_run": not bool(getattr(args, "apply", False)),
+        "dry_run": not apply_changes,
         "board": board,
         "db_path": db_path,
         "preview": preview,

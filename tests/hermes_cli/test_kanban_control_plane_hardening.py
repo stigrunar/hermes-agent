@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -49,6 +51,10 @@ def _run_cli(argv: list[str]) -> int:
     kanban_cli.build_parser(sub)
     ns = root.parse_args(["kanban", *argv])
     return kanban_cli.kanban_command(ns)
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def test_create_rejects_unanchored_worktree_before_insert(kanban_home):
@@ -426,6 +432,47 @@ def test_reconcile_live_path_dry_run_apply_and_idempotent(kanban_home, capsys):
     again = json.loads(capsys.readouterr().out)
     assert rc == 0
     assert again["applied"][0]["parked_children"] == []
+
+
+def test_reconcile_live_path_dry_run_preserves_copied_db_bytes(
+    kanban_home,
+    monkeypatch,
+    capsys,
+):
+    source_db = kb.kanban_db_path()
+    with kb.connect_closing() as conn:
+        source = kb.create_task(conn, title="blocked source", assignee="worker")
+        kb.block_task(conn, source, reason="review required", kind="capability")
+        child = kb.create_task(conn, title="mirror", assignee="worker", parents=[source])
+        detached = kb.create_task(conn, title="detached", assignee="reviewer")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+    copied_db = kanban_home / "copied-kanban.db"
+    shutil.copyfile(source_db, copied_db)
+    mapping_path = kanban_home / "dry-run-mapping.json"
+    mapping_path.write_text(
+        json.dumps([{"source_task_id": source, "detached_task_id": detached}]),
+        encoding="utf-8",
+    )
+    before_bytes = copied_db.read_bytes()
+    before_sha = _sha256(copied_db)
+
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(copied_db))
+    kb._INITIALIZED_PATHS.clear()
+    rc = _run_cli(["reconcile-live-path", "--mapping", str(mapping_path), "--json"])
+    payload = json.loads(capsys.readouterr().out)
+
+    assert rc == 0
+    assert payload["dry_run"] is True
+    assert payload["applied"] == []
+    assert copied_db.read_bytes() == before_bytes
+    assert _sha256(copied_db) == before_sha
+    with kb.connect_readonly_closing(db_path=copied_db) as conn:
+        source_task = kb.get_task(conn, source)
+        child_task = kb.get_task(conn, child)
+        assert source_task.live_path_task_id is None
+        assert child_task.status == "todo"
+        assert child_task.superseded_by is None
 
 
 def test_reconcile_live_path_invalid_later_mapping_mutates_nothing(kanban_home, capsys):
