@@ -92,6 +92,12 @@ logger = logging.getLogger(__name__)
 # =============================================================================
 
 
+# Hindsight local_embedded and trace upload both use huggingface-hub in the
+# same environment. Keep this bounded range shared so invoking trace upload
+# cannot downgrade a Hindsight-compatible local ML stack.
+HINDSIGHT_LOCAL_EMBEDDED_HUGGINGFACE_HUB_SPEC = "huggingface-hub>=1.5.0,<2.0"
+
+
 LAZY_DEPS: dict[str, tuple[str, ...]] = {
     # ─── Inference providers ───────────────────────────────────────────────
     # Native Anthropic SDK — needed when provider=anthropic (not via
@@ -239,7 +245,7 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
-    "tool.trace_upload": ("huggingface-hub==1.2.3",),
+    "tool.trace_upload": (HINDSIGHT_LOCAL_EMBEDDED_HUGGINGFACE_HUB_SPEC,),
 }
 
 

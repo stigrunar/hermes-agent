@@ -14,6 +14,8 @@ from __future__ import annotations
 
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 import tools.lazy_deps as ld
 
@@ -205,6 +207,44 @@ class TestEnsure:
         )
         with pytest.raises(ld.FeatureUnavailable, match="still not importable"):
             ld.ensure("test.cache", prompt=False)
+
+    def test_trace_upload_compatible_hub_is_noop(self, monkeypatch):
+        from importlib.metadata import PackageNotFoundError
+
+        import importlib.metadata as _md
+
+        def fake_version(pkg):
+            if pkg == "huggingface-hub":
+                return "1.5.0"
+            raise PackageNotFoundError(pkg)
+
+        monkeypatch.setattr(_md, "version", fake_version)
+        monkeypatch.setattr(
+            ld,
+            "_venv_pip_install",
+            lambda *a, **kw: pytest.fail("trace upload must not reinstall or downgrade compatible hub"),
+        )
+
+        ld.ensure("tool.trace_upload", prompt=False)
+
+    def test_trace_upload_hub_requirement_matches_hindsight_local_embedded(self):
+        from plugins.memory.hindsight import _LOCAL_HUGGINGFACE_HUB_CONSTRAINT
+
+        trace_hub_specs = [
+            spec
+            for spec in ld.feature_specs("tool.trace_upload")
+            if Requirement(spec).name == "huggingface-hub"
+        ]
+        assert trace_hub_specs == [_LOCAL_HUGGINGFACE_HUB_CONSTRAINT]
+
+        trace_req = Requirement(trace_hub_specs[0])
+        hindsight_req = Requirement(_LOCAL_HUGGINGFACE_HUB_CONSTRAINT)
+        compatible_version = Version("1.5.0")
+
+        assert trace_req.name == hindsight_req.name == "huggingface-hub"
+        assert compatible_version in trace_req.specifier
+        assert compatible_version in hindsight_req.specifier
+        assert Version("1.2.3") not in trace_req.specifier
 
 
 # ---------------------------------------------------------------------------

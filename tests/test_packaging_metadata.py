@@ -4,6 +4,8 @@ import tomllib
 from pathlib import Path
 
 import pytest
+from packaging.requirements import Requirement
+from packaging.version import Version
 
 # setuptools is declared in the [dev] extra and is the build backend, but
 # guard the import so a runner without it skips these packaging checks
@@ -35,6 +37,21 @@ def _distribution_name(requirement: str) -> str:
 def _packages_find_include():
     data = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     return data["tool"]["setuptools"]["packages"]["find"]["include"]
+
+
+def _assigned_string_constant(path: Path, name: str) -> str:
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        targets = (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(target, ast.Name) and target.id == name for target in targets):
+            if isinstance(node.value, ast.Constant) and isinstance(node.value.value, str):
+                return node.value.value
+            raise AssertionError(f"{name} must be assigned a string literal")
+    raise AssertionError(f"{name} is not assigned in {path}")
 
 
 def test_every_on_disk_subpackage_is_covered_by_packages_find():
@@ -98,6 +115,38 @@ def test_packaging_declared_as_core_dependency():
         "lazy_deps version constraints, requirement parsing) and must be a "
         "declared core dependency, not a transitive — see #40503"
     )
+
+
+def test_hindsight_extra_huggingface_hub_lock_satisfies_shared_range():
+    """Repository-backed installs must match Hindsight's lazy-deps Hub range."""
+    pyproject = tomllib.loads((REPO_ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+    hindsight_deps = pyproject["project"]["optional-dependencies"]["hindsight"]
+    declared_hub_reqs = [
+        Requirement(dep)
+        for dep in hindsight_deps
+        if Requirement(dep).name == "huggingface-hub"
+    ]
+    assert len(declared_hub_reqs) == 1
+
+    shared_spec = _assigned_string_constant(
+        REPO_ROOT / "tools" / "lazy_deps.py",
+        "HINDSIGHT_LOCAL_EMBEDDED_HUGGINGFACE_HUB_SPEC",
+    )
+    shared_req = Requirement(shared_spec)
+    declared_req = declared_hub_reqs[0]
+    assert declared_req.name == shared_req.name
+    assert declared_req.specifier == shared_req.specifier
+    assert declared_req.specifier.contains(Version("1.5.0"))
+    assert not declared_req.specifier.contains(Version("2.0.0"))
+
+    lock = tomllib.loads((REPO_ROOT / "uv.lock").read_text(encoding="utf-8"))
+    locked_hub_versions = [
+        Version(package["version"])
+        for package in lock["package"]
+        if package["name"] == "huggingface-hub"
+    ]
+    assert len(locked_hub_versions) == 1
+    assert declared_req.specifier.contains(locked_hub_versions[0])
 
 
 def test_faster_whisper_is_not_a_base_dependency():

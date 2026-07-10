@@ -21,6 +21,7 @@ from plugins.memory.hindsight import (
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
     RETAIN_SCHEMA,
+    _LOCAL_HUGGINGFACE_HUB_CONSTRAINT,
     _load_config,
     _build_embedded_profile_env,
     _normalize_observation_scopes,
@@ -445,6 +446,30 @@ class TestConfig:
 
 
 class TestPostSetup:
+    def test_local_embedded_setup_constrains_huggingface_hub(self, tmp_path, monkeypatch):
+        """Local setup must not leave Transformers 5.x with an old Hub client."""
+        hermes_home = tmp_path / "hermes-home"
+        user_home = tmp_path / "user-home"
+        user_home.mkdir()
+        monkeypatch.setenv("HOME", str(user_home))
+
+        selections = iter([1, 0])  # local_embedded, openai
+        run = MagicMock()
+        monkeypatch.setattr("hermes_cli.memory_setup._curses_select", lambda *args, **kwargs: next(selections))
+        monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv")
+        monkeypatch.setattr("subprocess.run", run)
+        monkeypatch.setattr("builtins.input", lambda prompt="": "")
+        monkeypatch.setattr("sys.stdin.isatty", lambda: True)
+        monkeypatch.setattr("getpass.getpass", lambda prompt="": "")
+        monkeypatch.setattr("hermes_cli.config.save_config", lambda cfg: None)
+
+        HindsightMemoryProvider().post_setup(str(hermes_home), {"memory": {}})
+
+        assert run.call_args.args[0][-2:] == [
+            "hindsight-all",
+            _LOCAL_HUGGINGFACE_HUB_CONSTRAINT,
+        ]
+
     def test_setup_cancel_at_mode_picker_writes_nothing(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / "hermes-home"
         user_home = tmp_path / "user-home"

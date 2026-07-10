@@ -45,6 +45,7 @@ from typing import Any, Dict, List
 
 from agent.memory_provider import MemoryProvider
 from hermes_constants import get_hermes_home
+from tools.lazy_deps import HINDSIGHT_LOCAL_EMBEDDED_HUGGINGFACE_HUB_SPEC
 from tools.registry import tool_error
 from hermes_cli.config import cfg_get
 
@@ -54,6 +55,10 @@ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 # Keep in sync with tools/lazy_deps.py ("memory.hindsight") and plugin.yaml.
 _MIN_CLIENT_VERSION = "0.6.1"
+# Hindsight's local bundle permits a broad Transformers range. Transformers 5.x
+# requires huggingface-hub >=1.5, while an older Hub install otherwise survives
+# the bundle upgrade and makes the embedded daemon fail only at import time.
+_LOCAL_HUGGINGFACE_HUB_CONSTRAINT = HINDSIGHT_LOCAL_EMBEDDED_HUGGINGFACE_HUB_SPEC
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
@@ -792,9 +797,12 @@ class HindsightMemoryProvider(MemoryProvider):
 
         # Step 2: Install/upgrade deps for selected mode
         cloud_dep = f"hindsight-client>={_MIN_CLIENT_VERSION}"
-        local_dep = "hindsight-all"
+        local_deps = ["hindsight-all", _LOCAL_HUGGINGFACE_HUB_CONSTRAINT]
         if mode == "local_embedded":
-            deps_to_install = [local_dep]
+            # Keep the local ML stack internally consistent. `hindsight-all`
+            # permits newer Transformers, whose Hub lower bound is stricter
+            # than older installations may satisfy.
+            deps_to_install = local_deps
         elif mode == "local_external":
             deps_to_install = [cloud_dep]
         else:
