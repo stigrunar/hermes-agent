@@ -15,6 +15,8 @@ function config(overrides: Partial<DesktopConnectionConfig> = {}): DesktopConnec
     envOverride: false,
     mode: 'remote',
     profile: null,
+    inherited: false,
+    profileOverride: false,
     remoteAuthMode: 'oauth',
     remoteOauthConnected: false,
     remoteTokenPreview: null,

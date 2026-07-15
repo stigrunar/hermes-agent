@@ -270,6 +270,7 @@ export interface Translations {
       providerAccounts: string
       providerApiKeys: string
       gateway: string
+      kanban: string
       apiKeys: string
       keysTools: string
       keysSettings: string
@@ -277,6 +278,30 @@ export interface Translations {
       archivedChats: string
       about: string
       notifications: string
+    }
+    kanban: {
+      title: string
+      loadingBoards: string
+      boardsLoadFailed: string
+      boardLoadFailed: string
+      unavailableTitle: string
+      unavailableDescription: string
+      loadFailedTitle: string
+      loadFailedDescription: string
+      retry: string
+      refresh: string
+      boardCount: (count: number) => string
+      taskCount: (count: number) => string
+      current: string
+      emptyTitle: string
+      emptyDescription: string
+      loadingBoard: string
+      noSelectionTitle: string
+      noSelectionDescription: string
+      boardUnavailableTitle: string
+      boardUnavailableDescription: string
+      untitledTask: string
+      moreTasks: (count: number) => string
     }
     notifications: {
       title: string
@@ -446,6 +471,8 @@ export interface Translations {
       allProfiles: string
       defaultConnection: string
       profileConnection: (profile: string) => string
+      useDefaultTitle: string
+      useDefaultDesc: string
       envOverrideTitle: string
       envOverrideDesc: string
       modeTitle: string

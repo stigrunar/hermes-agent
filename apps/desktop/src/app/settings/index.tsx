@@ -6,7 +6,20 @@ import { Tip } from '@/components/ui/tooltip'
 import { getHermesConfigDefaults, getHermesConfigRecord, saveHermesConfig } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { triggerHaptic } from '@/lib/haptics'
-import { Archive, Bell, Download, Globe, Info, KeyRound, RefreshCw, Settings2, Upload, Wrench, Zap } from '@/lib/icons'
+import {
+  Archive,
+  Bell,
+  Clipboard,
+  Download,
+  Globe,
+  Info,
+  KeyRound,
+  RefreshCw,
+  Settings2,
+  Upload,
+  Wrench,
+  Zap
+} from '@/lib/icons'
 import { notifyError } from '@/store/notifications'
 
 import { useRouteEnumParam } from '../hooks/use-route-enum-param'
@@ -20,6 +33,7 @@ import { AppearanceSettings } from './appearance-settings'
 import { ConfigSettings } from './config-settings'
 import { SECTIONS } from './constants'
 import { GatewaySettings } from './gateway-settings'
+import { KanbanSettings } from './kanban-settings'
 import { KEYS_VIEWS, KeysSettings, type KeysView } from './keys-settings'
 import { NotificationsSettings } from './notifications-settings'
 import { PROVIDER_VIEWS, ProvidersSettings, type ProviderView } from './providers-settings'
@@ -30,13 +44,14 @@ const SETTINGS_VIEWS: readonly SettingsViewId[] = [
   ...SECTIONS.map(s => `config:${s.id}` as SettingsViewId),
   'providers',
   'gateway',
+  'kanban',
   'keys',
   'notifications',
   'sessions',
   'about'
 ]
 
-export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
+export function SettingsView({ gatewayId, onClose, onConfigSaved, onMainModelChanged }: SettingsPageProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
   const { hash, pathname, search } = useLocation()
@@ -164,6 +179,13 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
       onSelect: () => setActiveView('gateway')
     },
     {
+      active: activeView === 'kanban',
+      icon: Clipboard,
+      id: 'kanban',
+      label: t.settings.nav.kanban,
+      onSelect: () => setActiveView('kanban')
+    },
+    {
       active: activeView === 'keys',
       children: [
         {
@@ -246,6 +268,8 @@ export function SettingsView({ onClose, onConfigSaved, onMainModelChanged }: Set
             <AboutSettings />
           ) : activeView === 'gateway' ? (
             <GatewaySettings />
+          ) : activeView === 'kanban' ? (
+            <KanbanSettings gatewayId={gatewayId} />
           ) : activeView.startsWith('config:') ? (
             <ConfigSettings
               activeSectionId={activeView.slice('config:'.length)}

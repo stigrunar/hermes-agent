@@ -46,6 +46,7 @@ export function setPrimaryGateway(gateway: HermesGateway | null, profile = 'defa
 
 // ── Secondary (pool) backends ──────────────────────────────────────────────
 interface Secondary {
+  generation: number
   profile: string
   gateway: HermesGateway
   offEvent: () => void
@@ -104,15 +105,37 @@ function clearTimer(entry: Secondary): void {
 
 async function openSecondary(entry: Secondary): Promise<void> {
   const desktop = window.hermesDesktop
+  const generation = entry.generation
 
   if (!desktop) {
     return
   }
 
   const conn = await desktop.getConnection(entry.profile)
+
+  if (!isCurrentSecondaryOpen(entry, generation)) {
+    return
+  }
+
   const wsUrl = await resolveGatewayWsUrl(desktop, conn)
+
+  if (!isCurrentSecondaryOpen(entry, generation)) {
+    return
+  }
+
   await entry.gateway.connect(wsUrl)
+
+  if (!isCurrentSecondaryOpen(entry, generation)) {
+    entry.gateway.close()
+
+    return
+  }
+
   void desktop.touchBackend?.(entry.profile).catch(() => undefined)
+}
+
+function isCurrentSecondaryOpen(entry: Secondary, generation: number): boolean {
+  return entry.wantOpen && entry.generation === generation && secondaries.get(entry.profile) === entry
 }
 
 function scheduleReconnect(entry: Secondary): void {
@@ -154,6 +177,7 @@ function createSecondary(profile: string): Secondary {
   const gateway = new HermesGateway()
 
   const entry: Secondary = {
+    generation: 0,
     profile,
     gateway,
     offEvent: () => {},
@@ -179,6 +203,15 @@ function createSecondary(profile: string): Secondary {
   secondaries.set(profile, entry)
 
   return entry
+}
+
+function retireSecondary(entry: Secondary): void {
+  entry.wantOpen = false
+  entry.generation += 1
+  clearTimer(entry)
+  entry.offEvent()
+  entry.offState()
+  entry.gateway.close()
 }
 
 // Make `profile` the active gateway, lazily opening its socket if needed. The
@@ -212,6 +245,40 @@ export async function ensureGatewayForProfile(profile: string): Promise<void> {
   }
 
   setActive(key)
+}
+
+/** Re-home only one pooled renderer socket after that profile's Apply. */
+export async function rehomeSecondaryGateway(profile: string): Promise<void> {
+  const key = normKey(profile)
+
+  if (key === primaryProfile) {
+    return
+  }
+
+  const previous = secondaries.get(key)
+
+  // No live renderer socket means there is nothing to reconnect. The next
+  // ensureGatewayForProfile call will resolve the newly-applied connection.
+  if (!previous) {
+    return
+  }
+
+  retireSecondary(previous)
+  secondaries.delete(key)
+
+  const replacement = createSecondary(key)
+
+  try {
+    await openSecondary(replacement)
+  } catch {
+    scheduleReconnect(replacement)
+  }
+
+  // Re-home keeps the active profile active, but does not disturb the primary
+  // socket or any unrelated secondary profile.
+  if (activeKey === key) {
+    setActive(key)
+  }
 }
 
 // Reconnect the active gateway after a transient request failure. Primary
@@ -267,22 +334,14 @@ export function pruneSecondaryGateways(keep: Set<string>): void {
       continue
     }
 
-    entry.wantOpen = false
-    clearTimer(entry)
-    entry.offEvent()
-    entry.offState()
-    entry.gateway.close()
+    retireSecondary(entry)
     secondaries.delete(key)
   }
 }
 
 export function closeSecondaryGateways(): void {
   for (const entry of secondaries.values()) {
-    entry.wantOpen = false
-    clearTimer(entry)
-    entry.offEvent()
-    entry.offState()
-    entry.gateway.close()
+    retireSecondary(entry)
   }
 
   secondaries.clear()

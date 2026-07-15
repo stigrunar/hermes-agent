@@ -24,7 +24,9 @@ type CloudDiscoverStatus = 'idle' | 'loading' | 'done' | 'error'
 
 interface GatewaySettingsState {
   envOverride: boolean
+  inherited: boolean
   mode: Mode
+  profileOverride: boolean
   remoteAuthMode: AuthMode
   remoteOauthConnected: boolean
   remoteTokenPreview: string | null
@@ -35,7 +37,9 @@ interface GatewaySettingsState {
 
 const EMPTY_STATE: GatewaySettingsState = {
   envOverride: false,
+  inherited: false,
   mode: 'local',
+  profileOverride: false,
   remoteAuthMode: 'token',
   remoteOauthConnected: false,
   remoteTokenPreview: null,
@@ -343,6 +347,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   }, [authMode, oauthConnected, remoteToken, state.remoteTokenSet, trimmedUrl])
 
   const payload = () => ({
+    ...(scope !== null && state.inherited ? { inherit: true } : {}),
     mode: state.mode,
     profile: scope ?? undefined,
     remoteAuthMode: authMode,
@@ -351,7 +356,7 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
   })
 
   const save = async (apply: boolean) => {
-    if (state.mode === 'remote' && !canUseRemote) {
+    if (state.mode === 'remote' && !canUseRemote && !(scope !== null && state.inherited)) {
       notify({
         kind: 'warning',
         title: g.incompleteTitle,
@@ -762,29 +767,41 @@ export function GatewaySettings({ embedded = false }: { embedded?: boolean } = {
           {g.modeTitle}
         </div>
         <div className="grid auto-rows-fr grid-cols-1 gap-2 min-[42rem]:grid-cols-3">
+          {scope !== null ? (
+            <ModeCard
+              active={state.inherited}
+              description={g.useDefaultDesc}
+              disabled={state.envOverride}
+              icon={RefreshCw}
+              onSelect={() =>
+                setState(current => ({ ...current, inherited: true, profileOverride: false }))
+              }
+              title={g.useDefaultTitle}
+            />
+          ) : null}
           <ModeCard
-            active={state.mode === 'local'}
+            active={state.mode === 'local' && (scope === null || state.profileOverride)}
             description={g.localDesc}
             disabled={state.envOverride}
             icon={Monitor}
-            onSelect={() => setState(current => ({ ...current, mode: 'local' }))}
+            onSelect={() => setState(current => ({ ...current, inherited: false, mode: 'local', profileOverride: true }))}
             title={g.localTitle}
           />
           <ModeCard
-            active={state.mode === 'cloud'}
+            active={state.mode === 'cloud' && (scope === null || state.profileOverride)}
             description={g.cloudDesc}
             disabled={state.envOverride}
             icon={Cloud}
-            onSelect={() => setState(current => ({ ...current, mode: 'cloud' }))}
+            onSelect={() => setState(current => ({ ...current, inherited: false, mode: 'cloud', profileOverride: true }))}
             title={g.cloudTitle}
           />
           <ModeCard
-            active={state.mode === 'remote'}
+            active={state.mode === 'remote' && (scope === null || state.profileOverride)}
             description={g.remoteDesc}
             disabled={state.envOverride}
             hint={g.remoteAuthHint}
             icon={Globe}
-            onSelect={() => setState(current => ({ ...current, mode: 'remote' }))}
+            onSelect={() => setState(current => ({ ...current, inherited: false, mode: 'remote', profileOverride: true }))}
             title={g.remoteTitle}
           />
         </div>

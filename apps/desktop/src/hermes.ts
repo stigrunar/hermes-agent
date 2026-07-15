@@ -19,6 +19,8 @@ import type {
   EnvVarInfo,
   HermesConfig,
   HermesConfigRecord,
+  KanbanBoardResponse,
+  KanbanBoardsResponse,
   LogsResponse,
   McpCatalogResponse,
   McpServerSummary,
@@ -111,6 +113,8 @@ export type {
   GatewayReadyPayload,
   HermesConfig,
   HermesConfigRecord,
+  KanbanBoardResponse,
+  KanbanBoardsResponse,
   LogsResponse,
   McpCatalogEntry,
   McpCatalogResponse,
@@ -167,6 +171,8 @@ export type {
   ToolsetModelsResponse
 } from '@/types/hermes'
 
+export type { KanbanBoardSummary } from '@/types/hermes'
+
 export class HermesGateway extends JsonRpcGatewayClient {
   constructor() {
     super({
@@ -187,12 +193,23 @@ export class HermesGateway extends JsonRpcGatewayClient {
 // change is needed. Null → primary, so single-profile users are unaffected.
 let _apiProfile: null | string = null
 
+export interface HermesApiTarget {
+  gatewayId?: string
+  profile?: null | string
+}
+
 export function setApiRequestProfile(profile: null | string): void {
   _apiProfile = profile || null
 }
 
-function profileScoped(): { profile?: string } {
-  return _apiProfile ? { profile: _apiProfile } : {}
+function profileScoped(target: HermesApiTarget = {}): HermesApiTarget {
+  const profile = Object.prototype.hasOwnProperty.call(target, 'profile') ? target.profile : _apiProfile
+  const gatewayId = target.gatewayId?.trim()
+
+  return {
+    ...(gatewayId ? { gatewayId } : {}),
+    ...(profile ? { profile } : {})
+  }
 }
 
 export async function listSessions(
@@ -410,6 +427,44 @@ export function saveHermesConfig(config: HermesConfigRecord): Promise<{ ok: bool
     path: '/api/config',
     method: 'PUT',
     body: { config }
+  })
+}
+
+export function listKanbanBoards(target: HermesApiTarget = {}): Promise<KanbanBoardsResponse> {
+  return window.hermesDesktop.api<KanbanBoardsResponse>({
+    ...profileScoped(target),
+    path: '/api/plugins/kanban/boards'
+  })
+}
+
+export function getKanbanBoard(
+  options: {
+    board?: string
+    gatewayId?: string
+    includeArchived?: boolean
+    profile?: null | string
+    tenant?: string
+  } = {}
+): Promise<KanbanBoardResponse> {
+  const query = new URLSearchParams()
+
+  if (options.board) {
+    query.set('board', options.board)
+  }
+
+  if (options.tenant) {
+    query.set('tenant', options.tenant)
+  }
+
+  if (options.includeArchived) {
+    query.set('include_archived', 'true')
+  }
+
+  const suffix = query.toString()
+
+  return window.hermesDesktop.api<KanbanBoardResponse>({
+    ...profileScoped(options),
+    path: suffix ? `/api/plugins/kanban/board?${suffix}` : '/api/plugins/kanban/board'
   })
 }
 
