@@ -658,6 +658,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
+    p_disp.add_argument(
+        "--continue-blockers",
+        action="store_true",
+        help="Record a bounded private/reversible continuation-routing pass",
+    )
+    p_disp.add_argument(
+        "--continuation-limit",
+        type=int,
+        default=kb.DEFAULT_CONTINUATION_LIMIT,
+        help=f"Maximum classified continuations (default: {kb.DEFAULT_CONTINUATION_LIMIT})",
+    )
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
     p_disp.add_argument("--failure-limit", type=int,
@@ -1696,53 +1707,82 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
-        # Either one-task mode or fleet mode.
-        if getattr(args, "task", None):
-            task = kb.get_task(conn, args.task)
-            if task is None:
-                print(f"no such task: {args.task}", file=sys.stderr)
-                return 1
-            diags_by_task = {
-                args.task: kd.compute_task_diagnostics(
-                    task,
-                    kb.list_events(conn, args.task),
-                    kb.list_runs(conn, args.task),
-                    config=diag_config,
-                )
+        requested_task_id = getattr(args, "task", None)
+        requested_task = (
+            kb.get_task(conn, requested_task_id)
+            if requested_task_id else None
+        )
+        if requested_task_id and requested_task is None:
+            print(f"no such task: {requested_task_id}", file=sys.stderr)
+            return 1
+
+        # Graph findings need the linked neighbor rows even in one-task mode.
+        # Keep the task-level API unchanged and merge its results with the
+        # separate chain engine here.
+        rows = list(conn.execute(
+            "SELECT * FROM tasks WHERE status != 'archived'"
+        ).fetchall())
+        if requested_task is not None and requested_task_id not in {
+            r["id"] for r in rows
+        }:
+            rows.append(conn.execute(
+                "SELECT * FROM tasks WHERE id = ?", (requested_task_id,)
+            ).fetchone())
+        # Archived parents still release linked children under the kernel's
+        # dependency semantics. Keep them as graph context without showing
+        # archived cards in the unfiltered CLI result.
+        graph_rows = list(conn.execute("SELECT * FROM tasks").fetchall())
+        ids = [r["id"] for r in graph_rows]
+        ev_by = {i: [] for i in ids}
+        run_by = {i: [] for i in ids}
+        links = []
+        if ids:
+            placeholders = ",".join(["?"] * len(ids))
+            for row in conn.execute(
+                f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            ):
+                ev_by.setdefault(row["task_id"], []).append(row)
+            for row in conn.execute(
+                f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+                tuple(ids),
+            ):
+                run_by.setdefault(row["task_id"], []).append(row)
+            links = list(conn.execute(
+                f"SELECT parent_id, child_id FROM task_links "
+                f"WHERE parent_id IN ({placeholders}) AND child_id IN ({placeholders})",
+                tuple(ids) + tuple(ids),
+            ))
+
+        chain_by_task = kd.compute_chain_diagnostics(
+            graph_rows, links, ev_by, run_by,
+        )
+        reconciliation_context = {
+            str(row["id"]): {
+                "task": row,
+                "_runs": run_by.get(str(row["id"]), []),
             }
-        else:
-            # Fleet mode: pull all non-archived tasks + their events/runs.
-            rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
-            ).fetchall())
-            ids = [r["id"] for r in rows]
-            if not ids:
-                diags_by_task = {}
-            else:
-                placeholders = ",".join(["?"] * len(ids))
-                ev_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    ev_by.setdefault(row["task_id"], []).append(row)
-                run_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    run_by.setdefault(row["task_id"], []).append(row)
-                diags_by_task = {}
-                for r in rows:
-                    tid = r["id"]
-                    dl = kd.compute_task_diagnostics(
-                        r,
-                        ev_by.get(tid, []),
-                        run_by.get(tid, []),
-                        config=diag_config,
-                    )
-                    if dl:
-                        diags_by_task[tid] = dl
+            for row in graph_rows
+        }
+        git_probe = kd.GitProbeSession()
+        try:
+            from hermes_cli.profiles import profile_exists
+            profile_roster = profile_exists
+        except Exception:
+            profile_roster = None
+        diags_by_task = {}
+        for row in rows:
+            tid = row["id"]
+            if requested_task_id and tid != requested_task_id:
+                continue
+            dl = kd.compute_task_diagnostics(
+                row, ev_by.get(tid, []), run_by.get(tid, []), config=diag_config,
+                tasks=reconciliation_context,
+                git_probe=git_probe,
+                profile_roster=profile_roster,
+            ) + chain_by_task.get(tid, [])
+            if dl:
+                diags_by_task[tid] = dl
 
         # Severity filter.
         sev = getattr(args, "severity", None)
@@ -2043,18 +2083,24 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            if reason:
-                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
-            if not kb.block_task(
-                conn,
-                tid,
-                reason=reason,
-                kind=kind,
-                expected_run_id=_worker_run_id_for(tid),
-            ):
+            try:
+                ok = kb.block_task(
+                    conn,
+                    tid,
+                    reason=reason,
+                    kind=kind,
+                    expected_run_id=_worker_run_id_for(tid),
+                )
+            except ValueError as exc:
+                failed.append(tid)
+                print(f"cannot block {tid}: {exc}", file=sys.stderr)
+                continue
+            if not ok:
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
+                if reason:
+                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2260,6 +2306,10 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            enable_continuations=bool(getattr(args, "continue_blockers", False)),
+            continuation_limit=getattr(
+                args, "continuation_limit", kb.DEFAULT_CONTINUATION_LIMIT,
+            ),
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2275,6 +2325,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_reconciliation": [
+                {"task_id": task_id, "finding": finding}
+                for task_id, finding in res.skipped_reconciliation
+            ],
+            "reconciliation": res.reconciliation,
+            "continuations": res.continuations,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
@@ -2317,6 +2373,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.skipped_reconciliation:
+        print(
+            "Skipped (reconciliation guard): "
+            + ", ".join(
+                f"{task_id} [{finding}]"
+                for task_id, finding in res.skipped_reconciliation
+            )
+        )
+    if res.continuations:
+        print(f"Continuation decisions: {len(res.continuations)}")
     return 0
 
 

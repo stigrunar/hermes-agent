@@ -313,6 +313,70 @@ def test_complete_happy_path(worker_env):
         conn.close()
 
 
+def test_external_complete_refuses_dispatcher_owned_active_run(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="active", assignee="worker")
+        kb.claim_task(conn, tid, claimer="host:worker")
+        kb._set_worker_pid(conn, tid, 424242)
+
+        with pytest.raises(ValueError, match="active_run_requires_stop"):
+            kb.complete_task(conn, tid, summary="external close")
+
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 424242
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.status == "running"
+        assert run.ended_at is None
+    finally:
+        conn.close()
+
+
+def test_claim_fences_legacy_duplicate_scope_in_same_workspace(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    conn = kb.connect()
+    try:
+        first = kb.create_task(
+            conn, title="first", assignee="worker",
+            workspace_kind="dir", workspace_path="/shared/repo",
+        )
+        second = kb.create_task(
+            conn, title="second", assignee="worker",
+            workspace_kind="dir", workspace_path="/shared/repo",
+        )
+        # Simulate imported/legacy rows that predate the unique idempotency
+        # index; claim_task must still fence execution defensively.
+        conn.execute("DROP INDEX idx_tasks_idempotency")
+        conn.execute(
+            "UPDATE tasks SET idempotency_key = 'same-scope' WHERE id IN (?, ?)",
+            (first, second),
+        )
+        conn.commit()
+
+        claimed = kb.claim_task(conn, first, claimer="host:first")
+        assert claimed is not None
+        assert kb.claim_task(conn, second, claimer="host:second") is None
+
+        second_task = kb.get_task(conn, second)
+        assert second_task is not None
+        assert second_task.status == "ready"
+        event = kb.list_events(conn, second)[-1]
+        assert event.kind == "claim_rejected"
+        assert event.payload == {
+            "reason": "duplicate_active_execution_requires_fence",
+            "conflicting_task_id": first,
+            "conflicting_run_id": claimed.current_run_id,
+        }
+    finally:
+        conn.close()
+
+
 def test_complete_metadata_round_trips_through_show(worker_env):
     """Structured completion metadata should be visible to downstream agents."""
     from tools import kanban_tools as kt
@@ -819,6 +883,14 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     from hermes_cli import kanban_db as kb
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(
+            conn, title="unfinished dependency", assignee="test-worker",
+        )
+        kb.link_tasks(conn, parent_id=parent, child_id=tid)
+    finally:
+        conn.close()
     out = kt._handle_block({"reason": "waiting on another task", "kind": "dependency"})
     d = json.loads(out)
     assert d.get("ok") is True
@@ -826,6 +898,34 @@ def test_block_goal_mode_allows_dependency_kind(monkeypatch, tmp_path):
     conn = kb.connect()
     try:
         assert kb.get_task(conn, tid).status == "todo"
+    finally:
+        conn.close()
+
+
+def test_block_dependency_without_unfinished_parent_returns_actionable_error(
+    monkeypatch, tmp_path,
+):
+    """The worker tool must surface the DB invariant without mutating the task."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+
+    tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    out = kt._handle_block({"reason": "waiting", "kind": "dependency"})
+    result = json.loads(out)
+
+    assert "dependency_wait_requires_unfinished_parent" in result["error"]
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        run = kb.latest_run(conn, tid)
+        assert run is not None
+        assert run.ended_at is None
+        assert not [
+            event for event in kb.list_events(conn, tid)
+            if event.kind == "dependency_wait"
+        ]
     finally:
         conn.close()
 

@@ -1264,6 +1264,26 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Durable, bounded reconciliation work.  The dispatcher records controller
+-- decisions here; it never creates follow-up cards or performs product
+-- actions (merge/deploy/restart/notification).  ``lock_identity`` is derived
+-- from the task id, action, and stable failure fingerprint, so duplicate
+-- controller ticks collapse onto one row.
+CREATE TABLE IF NOT EXISTS kanban_continuations (
+    lock_identity       TEXT PRIMARY KEY,
+    task_id             TEXT NOT NULL,
+    classification      TEXT NOT NULL,
+    action              TEXT NOT NULL,
+    state               TEXT NOT NULL,
+    source_fingerprint  TEXT NOT NULL,
+    failure_fingerprint TEXT NOT NULL,
+    next_retry_at       INTEGER,
+    attempts            INTEGER NOT NULL DEFAULT 0,
+    payload             TEXT,
+    created_at          INTEGER NOT NULL,
+    updated_at          INTEGER NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1274,6 +1294,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_continuations_due     ON kanban_continuations(state, next_retry_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_continuations_task    ON kanban_continuations(task_id, updated_at);
 """
 
 
@@ -3254,11 +3276,31 @@ def _end_run(
     """
     now = int(time.time())
     row = conn.execute(
-        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
+        "SELECT t.current_run_id, r.metadata AS run_metadata "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
+        "WHERE t.id = ?",
+        (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
+    # Reconciliation is a continuity receipt, not an outcome detail. Failure,
+    # timeout, reclaim, and retry close the active run through this helper and
+    # must not erase a receipt the worker already persisted on that same run.
+    # Other metadata keeps the historical replacement semantics expected by
+    # completion callers; only this reserved namespace is carried forward.
+    merged_metadata = dict(metadata or {})
+    try:
+        previous_metadata = json.loads(row["run_metadata"] or "{}")
+    except (TypeError, ValueError):
+        previous_metadata = {}
+    if (
+        isinstance(previous_metadata, dict)
+        and isinstance(previous_metadata.get("reconciliation"), dict)
+        and previous_metadata["reconciliation"]
+        and "reconciliation" not in merged_metadata
+    ):
+        merged_metadata["reconciliation"] = previous_metadata["reconciliation"]
     conn.execute(
         """
         UPDATE task_runs
@@ -3279,7 +3321,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(metadata, ensure_ascii=False) if metadata else None,
+            json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
             now,
             run_id,
         ),
@@ -3390,6 +3432,61 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    """Fingerprint relevant dependency state without volatile timestamps."""
+    task = conn.execute("SELECT status, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
+    if task is None:
+        return None
+    run = conn.execute(
+        "SELECT outcome, summary, metadata FROM task_runs WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    state = {"status": task["status"], "result": task["result"], "run": (
+        {"outcome": run["outcome"], "summary": run["summary"], "metadata": run["metadata"]}
+        if run else None)}
+    encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _dependency_wait_payload(conn, task_id, reason, dependency_task_id) -> dict:
+    candidates = [str(dependency_task_id)] if dependency_task_id else []
+    candidates.extend(_TASK_ID_PROSE_RE.findall(reason or ""))
+    candidates.extend(row["parent_id"] for row in conn.execute(
+        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,)
+    ).fetchall())
+    dependency_ids = list(dict.fromkeys(candidates))
+    fingerprints = {}
+    for dep_id in dependency_ids:
+        fingerprint = _dependency_fingerprint(conn, dep_id)
+        if fingerprint is not None:
+            fingerprints[dep_id] = fingerprint
+    return {"reason": reason, "kind": "dependency", "dependency_ids": dependency_ids,
+            "dependency_fingerprints": fingerprints}
+
+
+def _dependency_wait_changed(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Wake only when a persisted dependency state/verdict changes."""
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
+        "ORDER BY id DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if event is None:
+        return False
+    try:
+        payload = json.loads(event["payload"]) if event["payload"] else {}
+    except (TypeError, ValueError):
+        payload = {}
+    observed = payload.get("dependency_fingerprints")
+    if isinstance(observed, dict) and observed:
+        return any(_dependency_fingerprint(conn, dep_id) != fingerprint
+                   for dep_id, fingerprint in observed.items())
+    parents = conn.execute(
+        "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
+        "WHERE l.child_id = ?", (task_id,),
+    ).fetchall()
+    return bool(parents) and all(parent["status"] in ("done", "archived") for parent in parents)
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -3432,6 +3529,12 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            block_kind = conn.execute(
+                "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()["block_kind"]
+            if (cur_status == "todo" and block_kind == "dependency"
+                    and not _dependency_wait_changed(conn, task_id)):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -3469,12 +3572,192 @@ def recompute_ready(
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
-                        (task_id,),
+                        "UPDATE tasks SET status = 'ready', block_kind = NULL "
+                        "WHERE id = ? AND status = 'todo'", (task_id,),
                     )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
+
+
+def _reconciliation_data_version(conn: sqlite3.Connection) -> int:
+    """Return SQLite's external-commit generation for reconciliation CAS."""
+    return int(conn.execute("PRAGMA data_version").fetchone()[0])
+
+
+def _load_reconciliation_context(
+    conn: sqlite3.Connection,
+) -> tuple[list[Any], dict[str, list[Any]], dict[str, Any]]:
+    """Load one board snapshot used by every report in a dispatch tick."""
+    rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+    runs_by_task: dict[str, list[Any]] = {str(row["id"]): [] for row in rows}
+    for run in conn.execute("SELECT * FROM task_runs ORDER BY id"):
+        runs_by_task.setdefault(str(run["task_id"]), []).append(run)
+    context = {
+        str(row["id"]): {
+            "task": row,
+            "_runs": runs_by_task.get(str(row["id"]), []),
+        }
+        for row in rows
+    }
+    return rows, runs_by_task, context
+
+
+def _reconciliation_context_token(context: dict[str, Any]) -> str:
+    """Hash the DB-backed reconciliation inputs for snapshot stability."""
+    material = []
+    for task_id, item in sorted(context.items()):
+        task = item["task"]
+        runs = item["_runs"]
+        material.append({
+            "task": {
+                key: task[key]
+                for key in (
+                    "id", "status", "assignee", "workspace_kind",
+                    "workspace_path", "branch_name", "current_run_id",
+                    "claim_lock",
+                )
+            },
+            "runs": [
+                {
+                    "id": int(run["id"]),
+                    "status": run["status"],
+                    "metadata": run["metadata"],
+                    "ended_at": run["ended_at"],
+                }
+                for run in runs
+            ],
+        })
+    return hashlib.sha256(
+        json.dumps(material, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _reconciliation_reports_from_context(
+    rows: list[Any],
+    runs_by_task: dict[str, list[Any]],
+    context: dict[str, Any],
+    wanted: set[str],
+    *,
+    git_probe: Any,
+    profile_roster: Any,
+) -> dict[str, Any]:
+    from hermes_cli import kanban_diagnostics as _kd
+
+    return {
+        task_id: _kd.reconcile_task(
+            row,
+            runs_by_task.get(task_id, []),
+            tasks=context,
+            git_probe=git_probe,
+            profile_roster=profile_roster,
+        )
+        for row in rows
+        if (task_id := str(row["id"])) in wanted
+    }
+
+
+def _reconciliation_reports(
+    conn: sqlite3.Connection,
+    task_ids: Optional[Iterable[str]] = None,
+    *,
+    git_probe=None,
+    profile_roster=None,
+) -> dict[str, Any]:
+    """Probe once against a stable read snapshot, retrying one raced read.
+
+    Git/network work happens outside a write transaction.  A request-scoped
+    probe cache prevents N identical exact-ref calls.  The before/after board
+    token plus ``PRAGMA data_version`` detects both same-connection and
+    cross-connection mutations during the sensor window.
+    """
+    from hermes_cli import kanban_diagnostics as _kd
+
+    probe = (
+        git_probe
+        if isinstance(git_probe, _kd.GitProbeSession)
+        else _kd.cached_git_probe(git_probe)
+    )
+    last_reports: dict[str, Any] = {}
+    for _attempt in range(2):
+        version_before = _reconciliation_data_version(conn)
+        rows, runs_by_task, context = _load_reconciliation_context(conn)
+        wanted = (
+            {str(item) for item in task_ids}
+            if task_ids is not None
+            else {str(row["id"]) for row in rows}
+        )
+        token_before = _reconciliation_context_token(context)
+        reports = _reconciliation_reports_from_context(
+            rows,
+            runs_by_task,
+            context,
+            wanted,
+            git_probe=probe,
+            profile_roster=profile_roster,
+        )
+        version_after = _reconciliation_data_version(conn)
+        _rows_after, _runs_after, context_after = _load_reconciliation_context(conn)
+        token_after = _reconciliation_context_token(context_after)
+        stable = version_before == version_after and token_before == token_after
+        for report in reports.values():
+            report.data_version = version_after
+            report.snapshot_stable = stable
+        if stable:
+            return reports
+        last_reports = reports
+
+    now = int(time.time())
+    for report in last_reports.values():
+        report.snapshot_stable = False
+        report.findings.insert(0, _kd.Diagnostic(
+            kind="reconciliation_changed",
+            severity="warning",
+            title="Reconciliation inputs changed during probe",
+            detail="The board changed twice while the exact-head sensor was running.",
+            actions=[_kd.DiagnosticAction(
+                kind="cli_hint",
+                label="retry the bounded reconciliation probe",
+                suggested=True,
+            )],
+            first_seen_at=now,
+            last_seen_at=now,
+            data={
+                "finding_code": "reconciliation_changed",
+                "dispatch_blocked": True,
+                "blocker_class": "transient",
+                "sla_seconds": 900,
+                "next_owner": "retry",
+            },
+        ))
+    return last_reports
+
+
+def _reconciliation_claim_allowed(
+    conn: sqlite3.Connection,
+    task_id: str,
+    report: Any,
+) -> bool:
+    """Validate the pre-probe fingerprint inside the claim transaction."""
+    if report is None or not report.opted_in:
+        return True
+    if not report.snapshot_stable or not report.actionable:
+        return False
+    if (
+        report.data_version is not None
+        and _reconciliation_data_version(conn) != report.data_version
+    ):
+        return False
+    from hermes_cli import kanban_diagnostics as _kd
+
+    _rows, runs_by_task, context = _load_reconciliation_context(conn)
+    item = context.get(str(task_id))
+    if item is None:
+        return False
+    current = _kd.reconciliation_state_fingerprint(
+        item["task"], runs_by_task.get(str(task_id), []), tasks=context,
+    )
+    return current == report.db_fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -3487,16 +3770,46 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    reconciliation_probe=None,
+    profile_roster=None,
+    reconciliation_report=None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    if reconciliation_report is None:
+        if profile_roster is None:
+            try:
+                from hermes_cli.profiles import profile_exists as profile_roster
+            except Exception:
+                profile_roster = None
+        reconciliation_report = _reconciliation_reports(
+            conn,
+            [task_id],
+            git_probe=reconciliation_probe,
+            profile_roster=profile_roster,
+        ).get(str(task_id))
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _reconciliation_claim_allowed(
+            conn, task_id, reconciliation_report,
+        ):
+            return None
+        wait = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if (wait and wait["status"] == "ready" and wait["block_kind"] == "dependency"
+                and not _dependency_wait_changed(conn, task_id)):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(conn, task_id, "claim_rejected", {"reason": "dependency_unchanged"})
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -3520,6 +3833,38 @@ def claim_task(
             _append_event(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
+            )
+            return None
+        # Defensive duplicate-execution fence. Normal creation-time
+        # idempotency already prevents this state, but imported/legacy/manual
+        # rows may violate it. Never let a second task with the same explicit
+        # scope key enter the same workspace while the first is running.
+        duplicate = conn.execute(
+            """
+            SELECT other.id, other.current_run_id
+              FROM tasks candidate
+              JOIN tasks other
+                ON other.id != candidate.id
+               AND other.status = 'running'
+               AND other.workspace_path = candidate.workspace_path
+               AND other.idempotency_key = candidate.idempotency_key
+             WHERE candidate.id = ?
+               AND candidate.workspace_path IS NOT NULL
+               AND candidate.workspace_path != ''
+               AND candidate.idempotency_key IS NOT NULL
+               AND candidate.idempotency_key != ''
+             LIMIT 1
+            """,
+            (task_id,),
+        ).fetchone()
+        if duplicate:
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {
+                    "reason": "duplicate_active_execution_requires_fence",
+                    "conflicting_task_id": duplicate["id"],
+                    "conflicting_run_id": duplicate["current_run_id"],
+                },
             )
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
@@ -3609,6 +3954,9 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    reconciliation_probe=None,
+    profile_roster=None,
+    reconciliation_report=None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -3622,10 +3970,26 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
+    if reconciliation_report is None:
+        if profile_roster is None:
+            try:
+                from hermes_cli.profiles import profile_exists as profile_roster
+            except Exception:
+                profile_roster = None
+        reconciliation_report = _reconciliation_reports(
+            conn,
+            [task_id],
+            git_probe=reconciliation_probe,
+            profile_roster=profile_roster,
+        ).get(str(task_id))
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        if not _reconciliation_claim_allowed(
+            conn, task_id, reconciliation_report,
+        ):
+            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -3713,6 +4077,7 @@ def release_stale_claims(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    process_effects: bool = True,
 ) -> int:
     """Reset any ``running`` task whose claim has expired.
 
@@ -3803,8 +4168,19 @@ def release_stale_claims(
                 )
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+        termination = (
+            _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+            )
+            if process_effects
+            else {
+                "prev_pid": int(row["worker_pid"]) if row["worker_pid"] else None,
+                "host_local": host_local,
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+                "preview": True,
+            }
         )
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -4130,6 +4506,22 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    # A controller must not mark a dispatcher-owned running task terminal
+    # while its worker process can still mutate the workspace.  The active
+    # worker proves ownership by passing its current run id; external callers
+    # must stop/reclaim the run first, which clears worker_pid.
+    active = conn.execute(
+        "SELECT status, worker_pid, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if (
+        active is not None
+        and active["status"] == "running"
+        and active["worker_pid"] is not None
+        and expected_run_id is None
+    ):
+        raise ValueError("active_run_requires_stop")
 
     # Gate: verify created_cards BEFORE the main write txn. A rejected
     # completion still needs an auditable event, so we emit it in a
@@ -4879,6 +5271,7 @@ def block_task(
     *,
     reason: Optional[str] = None,
     kind: Optional[str] = None,
+    dependency_task_id: Optional[str] = None,
     expected_run_id: Optional[int] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
@@ -4934,6 +5327,24 @@ def block_task(
         # here (rather than ``blocked``) is what keeps a cron from ever seeing
         # a dependency-wait as something to "unblock".
         if kind == "dependency":
+            if dependency_task_id and get_task(conn, dependency_task_id) is None:
+                raise ValueError(f"dependency task {dependency_task_id} not found")
+            dependency_payload = _dependency_wait_payload(
+                conn, task_id, reason, dependency_task_id,
+            )
+            # A dependency wait without a stable unfinished dependency has no
+            # valid release condition. Explicit dependency ids, task ids in
+            # the reason, and linked parents are all compatibility-supported
+            # identity sources; at least one must resolve to a non-terminal
+            # task. Validate before the CAS/update and all run/event writes so
+            # rejection is completely mutation-free.
+            unfinished_dependency = any(
+                (dependency := get_task(conn, dep_id)) is not None
+                and dependency.status not in ("done", "archived")
+                for dep_id in dependency_payload["dependency_ids"]
+            )
+            if not unfinished_dependency:
+                raise ValueError("dependency_wait_requires_unfinished_parent")
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -4961,7 +5372,7 @@ def block_task(
                 )
             _append_event(
                 conn, task_id, "dependency_wait",
-                {"reason": reason, "kind": kind}, run_id=run_id,
+                dependency_payload, run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -5143,7 +5554,7 @@ def promote_task(
 
     with write_txn(conn):
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready' "
+            "UPDATE tasks SET status = 'ready', block_kind = NULL "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
             (task_id,),
         )
@@ -5587,6 +5998,7 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
@@ -5610,6 +6022,7 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
     recompute_ready(conn)
     return True
 
@@ -6073,6 +6486,12 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
+    skipped_reconciliation: list[tuple[str, str]] = field(default_factory=list)
+    """Task ids skipped by the repo/ref/worktree/claim reconciliation guard."""
+    reconciliation: dict[str, dict[str, Any]] = field(default_factory=dict)
+    """Machine-readable reports from the single bounded sensor snapshot."""
+    continuations: list[dict[str, Any]] = field(default_factory=list)
+    """Bounded classified controller decisions (never product actions)."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
@@ -6421,6 +6840,7 @@ def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
     signal_fn=None,
+    process_effects: bool = True,
 ) -> list[str]:
     """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
 
@@ -6469,7 +6889,7 @@ def enforce_max_runtime(
         kill = signal_fn if signal_fn is not None else (
             os.kill if hasattr(os, "kill") else None
         )
-        if kill is not None:
+        if process_effects and kill is not None:
             try:
                 kill(pid, signal.SIGTERM)
             except (ProcessLookupError, OSError):
@@ -6503,6 +6923,7 @@ def enforce_max_runtime(
                     "elapsed_seconds": int(elapsed),
                     "limit_seconds": int(row["max_runtime_seconds"]),
                     "sigkill": killed,
+                    "preview": not process_effects,
                 }
                 run_id = _end_run(
                     conn, tid,
@@ -6543,6 +6964,7 @@ def detect_stale_running(
     *,
     stale_timeout_seconds: int = 0,
     signal_fn=None,
+    process_effects: bool = True,
 ) -> list[str]:
     """Reclaim ``running`` tasks that show no progress (heartbeat) within the
     staleness window.
@@ -6601,8 +7023,17 @@ def detect_stale_running(
         lock = row["claim_lock"] or ""
 
         # Terminate the worker if it's still host-local.
-        termination = _terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn,
+        termination = (
+            _terminate_reclaimed_worker(pid, lock, signal_fn=signal_fn)
+            if process_effects
+            else {
+                "prev_pid": int(pid) if pid else None,
+                "host_local": lock.startswith(host_prefix),
+                "termination_attempted": False,
+                "terminated": False,
+                "sigkill": False,
+                "preview": True,
+            }
         )
 
         # Never release a claim while our own worker is still alive: that would
@@ -7436,6 +7867,311 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
+DEFAULT_CONTINUATION_LIMIT = 25
+MAX_CONTINUATION_LIMIT = 100
+CONTINUATION_AUDIT_SCAN_LIMIT = 250
+CONTINUATION_RETRY_BASE_SECONDS = 60
+CONTINUATION_RETRY_MAX_SECONDS = 900
+CONTINUATION_BLOCKER_SLA_SECONDS = 900
+
+_CONTINUATION_ACTIONS = frozenset({
+    "record_superseded",
+    "route_repair",
+    "route_review",
+    "route_ops",
+    "retry_probe",
+    "request_proof",
+})
+_FORBIDDEN_CONTINUATION_ACTIONS = frozenset({
+    "merge", "deploy", "restart", "notify", "complete_product",
+})
+
+
+def _stable_continuation_value(value: Any) -> Any:
+    """Remove clock/probe-noise fields from a durable failure identity."""
+    ignored = {
+        "age_seconds", "last_verified_at", "blocked_since", "now",
+        "next_retry_at", "updated_at", "created_at", "first_seen_at",
+        "last_seen_at", "count", "error",
+    }
+    if isinstance(value, dict):
+        return {
+            str(key): _stable_continuation_value(item)
+            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            if str(key) not in ignored
+        }
+    if isinstance(value, (list, tuple)):
+        return [_stable_continuation_value(item) for item in value]
+    return value
+
+
+def _continuation_route(report: Any) -> Optional[tuple[str, str, dict[str, Any]]]:
+    """Classify one reconciliation report into a controller-only route."""
+    findings = list(report.findings if report is not None else [])
+    by_kind = {finding.kind: finding for finding in findings}
+    routes = (
+        ({"replacement_suppressed"}, "board_hygiene", "record_superseded"),
+        ({"head_superseded", "branch_missing"}, "repair", "route_repair"),
+        ({"review_stale"}, "review", "route_review"),
+        ({
+            "workspace_missing", "workspace_not_git", "workspace_not_linked",
+            "workspace_wrong_repo", "workspace_wrong_head", "workspace_retired",
+            "workspace_unsafe_tmp", "assignee_non_runnable",
+        }, "ops", "route_ops"),
+    )
+    for kinds, classification, action in routes:
+        selected = next((by_kind[kind] for kind in sorted(kinds) if kind in by_kind), None)
+        if selected is not None:
+            return classification, action, selected.to_dict()
+
+    unknown = next((
+        finding for finding in findings
+        if finding.kind in {
+            "branch_unknown", "workspace_unknown", "replacement_unproven",
+            "reconciliation_changed",
+        }
+    ), None)
+    if unknown is None:
+        return None
+    evidence = unknown.data.get("evidence") or {}
+    reason = str(evidence.get("reason") or "").lower()
+    transient = unknown.kind == "reconciliation_changed" or any(
+        marker in reason
+        for marker in ("timeout", "budget", "probe_error", "probe_failed", "remote")
+    )
+    return (
+        ("transient_retry", "retry_probe", unknown.to_dict())
+        if transient
+        else ("proof_needed", "request_proof", unknown.to_dict())
+    )
+
+
+def _blocked_continuation_route(
+    conn: sqlite3.Connection,
+    row: Any,
+    *,
+    now: int,
+) -> Optional[tuple[str, str, dict[str, Any]]]:
+    status = str(row["status"] or "")
+    since = int(row["started_at"] or row["created_at"] or now)
+    if status not in {"blocked", "triage", "todo"} or now - since < CONTINUATION_BLOCKER_SLA_SECONDS:
+        return None
+    event = conn.execute(
+        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
+        "ORDER BY id DESC LIMIT 1",
+        (row["id"],),
+    ).fetchone()
+    payload: dict[str, Any] = {}
+    if event and event["payload"]:
+        try:
+            payload = json.loads(event["payload"])
+        except (TypeError, ValueError):
+            payload = {}
+    reason = str(payload.get("reason") or payload.get("block_reason") or "")
+    kind = str(row["block_kind"] or "")
+    evidence = {
+        "block_kind": kind or None,
+        "reason": reason,
+        "age_seconds": max(0, now - since),
+        "sla_seconds": CONTINUATION_BLOCKER_SLA_SECONDS,
+    }
+    known_parent_wait = status == "todo" and conn.execute(
+        "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+        "WHERE l.child_id = ? AND p.status NOT IN ('done','archived') LIMIT 1",
+        (row["id"],),
+    ).fetchone() is not None
+    if kind == "dependency" or known_parent_wait:
+        # Parent-gated work has an exact automatic release condition in the
+        # kernel. It is neither an unknown nor a retry candidate.
+        return None
+    if status == "triage" or kind == "needs_input" or re.search(
+        r"\b(human|approval|credential|secret|policy|privacy|destructive)\b",
+        reason,
+        re.IGNORECASE,
+    ):
+        return "human_required", "", evidence
+    if reason.strip().lower().startswith("review-required:"):
+        return "review", "route_review", evidence
+    if kind == "capability":
+        return "ops", "route_ops", evidence
+    if kind == "transient" or re.search(
+        r"\b(timeout|temporary|transient|rate.?limit|unavailable)\b",
+        reason,
+        re.IGNORECASE,
+    ):
+        return "transient_retry", "retry_probe", evidence
+    if re.search(
+        r"\b(workspace|profile|runner|daemon|checkout|worktree)\b",
+        reason,
+        re.IGNORECASE,
+    ):
+        return "ops", "route_ops", evidence
+    return "proof_needed", "request_proof", evidence
+
+
+def queue_reconciliation_continuations(
+    conn: sqlite3.Connection,
+    reports: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+    limit: int = DEFAULT_CONTINUATION_LIMIT,
+) -> list[dict[str, Any]]:
+    """Classify and durably deduplicate a bounded backlog controller pass.
+
+    Rows describe private, reversible follow-up routing only.  This sensor is
+    deliberately incapable of merging, deploying, restarting services,
+    notifying people, creating cards, or declaring product completion.
+    """
+    now_ts = int(now if now is not None else time.time())
+    bounded = max(1, min(int(limit), MAX_CONTINUATION_LIMIT))
+    rows = conn.execute(
+        "SELECT * FROM tasks "
+        "WHERE status IN ('ready','review','blocked','triage','todo') "
+        "ORDER BY priority DESC, COALESCE(started_at, created_at) ASC, id ASC "
+        "LIMIT ?",
+        (CONTINUATION_AUDIT_SCAN_LIMIT,),
+    ).fetchall()
+    candidates: list[tuple[int, int, int, str, Any, str, str, dict[str, Any]]] = []
+    rank = {
+        "board_hygiene": 0,
+        "repair": 1,
+        "review": 2,
+        "ops": 3,
+        "transient_retry": 4,
+        "proof_needed": 5,
+        "human_required": 6,
+    }
+    for row in rows:
+        task_id = str(row["id"])
+        routed = _continuation_route(reports.get(task_id))
+        if routed is None:
+            routed = _blocked_continuation_route(conn, row, now=now_ts)
+        if routed is None:
+            continue
+        classification, action, evidence = routed
+        candidates.append((
+            rank[classification],
+            -int(row["priority"] or 0),
+            int(row["started_at"] or row["created_at"] or 0),
+            task_id,
+            row,
+            classification,
+            action,
+            evidence,
+        ))
+
+    decisions: list[dict[str, Any]] = []
+    with write_txn(conn):
+        for _rank, _priority, _since, task_id, row, classification, action, evidence in sorted(candidates)[:bounded]:
+            report = reports.get(task_id)
+            source_fingerprint = (
+                str(report.db_fingerprint)
+                if report is not None and report.db_fingerprint
+                else hashlib.sha256(
+                    json.dumps({
+                        "task_id": task_id,
+                        "status": row["status"],
+                        "assignee": row["assignee"],
+                        "block_kind": row["block_kind"],
+                    }, sort_keys=True, default=str).encode("utf-8")
+                ).hexdigest()
+            )
+            failure_material = {
+                "task_id": task_id,
+                "classification": classification,
+                "action": action,
+                "source_fingerprint": source_fingerprint,
+                "evidence": _stable_continuation_value(evidence),
+            }
+            failure_fingerprint = hashlib.sha256(
+                json.dumps(
+                    failure_material, sort_keys=True, separators=(",", ":"), default=str,
+                ).encode("utf-8")
+            ).hexdigest()
+            if classification == "human_required":
+                conn.execute(
+                    "UPDATE kanban_continuations SET state = 'superseded', "
+                    "updated_at = ? WHERE task_id = ? "
+                    "AND state IN ('pending','retry_wait','proof_needed')",
+                    (now_ts, task_id),
+                )
+                decisions.append({
+                    "task_id": task_id,
+                    "classification": classification,
+                    "state": "untouched",
+                    "failure_fingerprint": failure_fingerprint,
+                })
+                continue
+            if action not in _CONTINUATION_ACTIONS or action in _FORBIDDEN_CONTINUATION_ACTIONS:
+                raise ValueError(f"unsafe continuation action: {action}")
+            lock_identity = "kanban-reconcile:v1:" + hashlib.sha256(
+                f"{task_id}\0{action}\0{failure_fingerprint}".encode("utf-8")
+            ).hexdigest()
+            state = "retry_wait" if classification == "transient_retry" else (
+                "proof_needed" if classification == "proof_needed" else "pending"
+            )
+            next_retry_at = (
+                now_ts + CONTINUATION_RETRY_BASE_SECONDS
+                if classification == "transient_retry" else None
+            )
+            conn.execute(
+                "UPDATE kanban_continuations SET state = 'superseded', updated_at = ? "
+                "WHERE task_id = ? AND lock_identity != ? "
+                "AND state IN ('pending','retry_wait','proof_needed')",
+                (now_ts, task_id, lock_identity),
+            )
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO kanban_continuations "
+                "(lock_identity, task_id, classification, action, state, "
+                " source_fingerprint, failure_fingerprint, next_retry_at, payload, "
+                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    lock_identity, task_id, classification, action, state,
+                    source_fingerprint, failure_fingerprint, next_retry_at,
+                    json.dumps(evidence, sort_keys=True, default=str), now_ts, now_ts,
+                ),
+            )
+            disposition = "queued" if cur.rowcount == 1 else "duplicate"
+            existing = conn.execute(
+                "SELECT state, attempts, next_retry_at FROM kanban_continuations "
+                "WHERE lock_identity = ?",
+                (lock_identity,),
+            ).fetchone()
+            if (
+                classification == "transient_retry"
+                and existing is not None
+                and int(existing["next_retry_at"] or 0) <= now_ts
+            ):
+                attempts = int(existing["attempts"] or 0) + 1
+                delay = min(
+                    CONTINUATION_RETRY_BASE_SECONDS * (2 ** min(attempts, 4)),
+                    CONTINUATION_RETRY_MAX_SECONDS,
+                )
+                updated = conn.execute(
+                    "UPDATE kanban_continuations SET attempts = ?, next_retry_at = ?, "
+                    "updated_at = ? WHERE lock_identity = ? AND next_retry_at <= ?",
+                    (attempts, now_ts + delay, now_ts, lock_identity, now_ts),
+                )
+                disposition = "retry_due" if updated.rowcount == 1 else "duplicate"
+                existing = conn.execute(
+                    "SELECT state, attempts, next_retry_at FROM kanban_continuations "
+                    "WHERE lock_identity = ?",
+                    (lock_identity,),
+                ).fetchone()
+            decisions.append({
+                "task_id": task_id,
+                "classification": classification,
+                "action": action,
+                "state": existing["state"] if existing else state,
+                "disposition": disposition,
+                "lock_identity": lock_identity,
+                "failure_fingerprint": failure_fingerprint,
+                "next_retry_at": existing["next_retry_at"] if existing else next_retry_at,
+                "attempts": int(existing["attempts"] or 0) if existing else 0,
+            })
+    return decisions
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -7449,6 +8185,10 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    reconciliation_probe=None,
+    profile_roster=None,
+    enable_continuations: bool = False,
+    continuation_limit: int = DEFAULT_CONTINUATION_LIMIT,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -7465,25 +8205,47 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
+    if dry_run:
+        # Preview against a private copy.  This avoids every database write,
+        # lockfile touch, signal, waitpid, workspace creation, and spawn while
+        # still exercising the same maintenance/promotion/classification SQL.
+        preview = sqlite3.connect(":memory:", isolation_level=None)
+        preview.row_factory = sqlite3.Row
+        try:
+            conn.backup(preview)
+            return _dispatch_once_locked(
+                preview,
+                spawn_fn=spawn_fn,
+                ttl_seconds=ttl_seconds,
+                dry_run=True,
+                preview_mode=True,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+                failure_limit=failure_limit,
+                stale_timeout_seconds=stale_timeout_seconds,
+                board=board,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                reconciliation_probe=reconciliation_probe,
+                profile_roster=profile_roster,
+                enable_continuations=enable_continuations,
+                continuation_limit=continuation_limit,
+            )
+        finally:
+            preview.close()
+
     try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+        database_rows = conn.execute("PRAGMA database_list").fetchall()
+        main_path = next(
+            (str(row[2]) for row in database_rows if str(row[1]) == "main" and row[2]),
+            "",
         )
+        db_path = Path(main_path).resolve(strict=False) if main_path else kanban_db_path(board=board)
+    except Exception:
+        # Reconciliation and claim CAS are useful only if the controller tick
+        # itself is single-writer.  Fail closed when its lock identity cannot
+        # be established instead of silently running an unguarded writer.
+        return DispatchResult(skipped_locked=True)
     with _dispatch_tick_lock(db_path) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
@@ -7499,6 +8261,10 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            reconciliation_probe=reconciliation_probe,
+            profile_roster=profile_roster,
+            enable_continuations=enable_continuations,
+            continuation_limit=continuation_limit,
         )
 
 
@@ -7508,6 +8274,7 @@ def _dispatch_once_locked(
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
+    preview_mode: bool = False,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
@@ -7515,6 +8282,10 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    reconciliation_probe=None,
+    profile_roster=None,
+    enable_continuations: bool = False,
+    continuation_limit: int = DEFAULT_CONTINUATION_LIMIT,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -7546,13 +8317,21 @@ def _dispatch_once_locked(
     """
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
-    reap_worker_zombies()
+    if not preview_mode:
+        reap_worker_zombies()
 
     result = DispatchResult()
-    result.reclaimed = release_stale_claims(conn)
+    result.reclaimed = release_stale_claims(
+        conn, process_effects=not preview_mode,
+    )
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
+        process_effects=not preview_mode,
     )
+    crash_attrs = {
+        name: getattr(detect_crashed_workers, name, None)
+        for name in ("_last_auto_blocked", "_last_rate_limited")
+    }
     result.crashed = detect_crashed_workers(conn)
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
@@ -7570,8 +8349,79 @@ def _dispatch_once_locked(
     )
     if _crash_rate_limited:
         result.rate_limited.extend(_crash_rate_limited)
-    result.timed_out = enforce_max_runtime(conn)
+    if preview_mode:
+        for name, value in crash_attrs.items():
+            if value is None:
+                try:
+                    delattr(detect_crashed_workers, name)
+                except AttributeError:
+                    pass
+            else:
+                setattr(detect_crashed_workers, name, value)
+    result.timed_out = enforce_max_runtime(
+        conn, process_effects=not preview_mode,
+    )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+
+    # One bounded sensor session feeds dispatch, review dispatch, CAS, and the
+    # optional controller ledger.  No Git/network probe occurs under a write
+    # transaction, and no claim re-probes the same ref.
+    from hermes_cli import kanban_diagnostics as _kd
+
+    if profile_roster is None:
+        try:
+            from hermes_cli.profiles import profile_exists as profile_roster
+        except Exception:
+            profile_roster = None
+    probe_session = (
+        reconciliation_probe
+        if isinstance(reconciliation_probe, _kd.GitProbeSession)
+        else _kd.cached_git_probe(reconciliation_probe)
+    )
+    report_statuses = (
+        "'ready','review','blocked','triage','todo'"
+        if enable_continuations else "'ready','review'"
+    )
+    report_ids = [
+        str(row["id"])
+        for row in conn.execute(
+            f"SELECT id FROM tasks WHERE status IN ({report_statuses}) "
+            "ORDER BY priority DESC, created_at ASC, id ASC"
+        )
+    ]
+    reconciliation_reports = _reconciliation_reports(
+        conn,
+        report_ids,
+        git_probe=probe_session,
+        profile_roster=profile_roster,
+    )
+    result.reconciliation = {
+        task_id: report.to_dict()
+        for task_id, report in reconciliation_reports.items()
+        if report.opted_in or report.findings
+    }
+    if enable_continuations:
+        result.continuations = queue_reconciliation_continuations(
+            conn,
+            reconciliation_reports,
+            limit=continuation_limit,
+        )
+
+    def _profile_can_spawn(name: str) -> bool:
+        if profile_roster is None:
+            return True
+        if callable(profile_roster):
+            try:
+                return bool(profile_roster(name))
+            except Exception:
+                return True
+        try:
+            return str(name).casefold() in {
+                str(getattr(item, "name", item)).casefold()
+                for item in profile_roster
+            }
+        except TypeError:
+            return True
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -7634,20 +8484,22 @@ def _dispatch_once_locked(
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
-        try:
-            from hermes_cli.profiles import profile_exists as _pe
-            _default_assignee_resolved = bool(_pe(_default_assignee))
-        except Exception:
-            # Profiles module not importable (test stubs, exotic envs).
-            # Trust the operator's config and try the assignment; the
-            # downstream profile_exists check on the assigned row will
-            # bucket it as nonspawnable if the profile genuinely isn't
-            # there, with the existing diagnostic.
-            _default_assignee_resolved = True
+        _default_assignee_resolved = _profile_can_spawn(_default_assignee)
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         row_assignee = row["assignee"]
+        report = reconciliation_reports.get(str(row["id"]))
+        if report is not None and not report.actionable:
+            blocking = [
+                finding.kind for finding in report.findings
+                if finding.data.get("dispatch_blocked") is True
+            ]
+            code = blocking[0] if blocking else "reconciliation_changed"
+            result.skipped_reconciliation.append((row["id"], code))
+            if code == "assignee_non_runnable":
+                result.skipped_nonspawnable.append(row["id"])
+            continue
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -7666,18 +8518,19 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            conn.execute(
+                            assigned = conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
-                            _append_event(
-                                conn, row["id"], "assigned",
-                                {
-                                    "assignee": _default_assignee,
-                                    "source": "kanban.default_assignee",
-                                },
-                            )
+                            if assigned.rowcount == 1:
+                                _append_event(
+                                    conn, row["id"], "assigned",
+                                    {
+                                        "assignee": _default_assignee,
+                                        "source": "kanban.default_assignee",
+                                    },
+                                )
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
@@ -7688,6 +8541,16 @@ def _dispatch_once_locked(
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
+                if not dry_run and report is not None and report.opted_in:
+                    report = _reconciliation_reports(
+                        conn,
+                        [str(row["id"])],
+                        git_probe=probe_session,
+                        profile_roster=profile_roster,
+                    ).get(str(row["id"]))
+                    reconciliation_reports[str(row["id"])] = report
+                    if report is not None:
+                        result.reconciliation[str(row["id"])] = report.to_dict()
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
@@ -7701,11 +8564,7 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        try:
-            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row_assignee):
+        if not _profile_can_spawn(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -7759,8 +8618,17 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            reconciliation_report=report,
+        )
         if claimed is None:
+            if report is not None and report.opted_in:
+                result.skipped_reconciliation.append(
+                    (row["id"], "reconciliation_changed")
+                )
             continue
         try:
             resolved_branch_name = None
@@ -7838,21 +8706,37 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        report = reconciliation_reports.get(str(row["id"]))
+        if report is not None and not report.actionable:
+            blocking = [
+                finding.kind for finding in report.findings
+                if finding.data.get("dispatch_blocked") is True
+            ]
+            code = blocking[0] if blocking else "reconciliation_changed"
+            result.skipped_reconciliation.append((row["id"], code))
+            if code == "assignee_non_runnable":
+                result.skipped_nonspawnable.append(row["id"])
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        try:
-            from hermes_cli.profiles import profile_exists
-        except Exception:
-            profile_exists = None  # type: ignore[assignment]
-        if profile_exists is not None and not profile_exists(row["assignee"]):
+        if not _profile_can_spawn(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
+        claimed = claim_review_task(
+            conn,
+            row["id"],
+            ttl_seconds=ttl_seconds,
+            reconciliation_report=report,
+        )
         if claimed is None:
+            if report is not None and report.opted_in:
+                result.skipped_reconciliation.append(
+                    (row["id"], "reconciliation_changed")
+                )
             continue
         try:
             resolved_branch_name = None

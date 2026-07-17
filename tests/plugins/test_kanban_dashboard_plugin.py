@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 import subprocess
 import sys
@@ -113,6 +114,55 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+def test_proven_replacement_leaves_columns_but_remains_auditable(client):
+    source = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "superseded source", "assignee": "alice"},
+    ).json()["task"]
+    target = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "canonical replacement", "assignee": "alice"},
+    ).json()["task"]
+    head = "c" * 40
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (target["id"],))
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'done', 'completed', 1, 2, ?)",
+            (
+                target["id"],
+                json.dumps({"reconciliation": {
+                    "supersedes_task_id": source["id"],
+                    "canonical_live_task": target["id"],
+                    "candidate_head": head,
+                    "terminal_receipt": {
+                        "state": "merged",
+                        "task_id": target["id"],
+                        "head": head,
+                    },
+                }}),
+            ),
+        )
+
+    board = client.get("/api/plugins/kanban/board").json()
+    ordinary_ids = {
+        task["id"]
+        for column in board["columns"]
+        for task in column["tasks"]
+    }
+    assert source["id"] not in ordinary_ids
+    assert source["id"] in {task["id"] for task in board["suppressed"]}
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{source['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["task"]["id"] == source["id"]
+    assert any(
+        diagnostic["kind"] == "replacement_suppressed"
+        for diagnostic in detail.json()["task"]["diagnostics"]
+    )
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
@@ -2200,6 +2250,35 @@ def test_diagnostics_endpoint_severity_filter(client):
     data = r.json()
     assert data["count"] == 1
     assert data["diagnostics"][0]["task_id"] == p2
+
+
+def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="source", assignee="worker")
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[parent],
+        )
+        kb.claim_task(conn, parent, claimer="worker")
+        assert kb.block_task(
+            conn, parent,
+            reason="review-required: inspect the source handoff",
+        )
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/diagnostics")
+    assert response.status_code == 200
+    rows = response.json()["diagnostics"]
+    child_row = next(row for row in rows if row["task_id"] == child)
+    kinds = {diag["kind"] for diag in child_row["diagnostics"]}
+    assert "review_parent_gates_child" in kinds
+    finding = next(
+        diag for diag in child_row["diagnostics"]
+        if diag["kind"] == "review_parent_gates_child"
+    )
+    assert finding["data"]["parent_id"] == parent
+    assert finding["data"]["child_status"] == "todo"
 
 
 def test_board_exposes_diagnostics_list_and_summary(client):

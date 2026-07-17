@@ -687,6 +687,7 @@ def _handle_block(args: dict, **kw) -> str:
         return tool_error("reason is required — explain what input you need")
     reason = redact_sensitive_text(str(reason), force=True)
     kind = args.get("kind")
+    dependency_task_id = args.get("dependency_task_id")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -724,6 +725,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                dependency_task_id=dependency_task_id,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -1551,6 +1553,14 @@ KANBAN_BLOCK_SCHEMA = {
                     "Why you're blocked. 'dependency' waits in todo and "
                     "resumes automatically; the others surface to a human. "
                     "Omit only if none apply."
+                ),
+            },
+            "dependency_task_id": {
+                "type": "string",
+                "description": (
+                    "Stable task id being waited on. Supply this with kind "
+                    "'dependency'; the task resumes only after that task's "
+                    "relevant state or verdict changes."
                 ),
             },
             "board": _board_schema_prop(),

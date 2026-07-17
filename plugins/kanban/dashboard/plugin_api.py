@@ -263,7 +263,8 @@ def _compute_task_diagnostics(
 
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
-    # poorly; do three aggregate queries instead.
+    # poorly; do three aggregate queries instead. A task subset still
+    # needs linked neighbors for cross-task chain diagnostics.
     if task_ids is not None:
         if not task_ids:
             return {}
@@ -280,11 +281,16 @@ def _compute_task_diagnostics(
     if not rows:
         return {}
 
+    # Archived parents can still release children under the kernel's
+    # done-or-archived dependency semantics, so retain them as graph context
+    # even though archived cards remain omitted from normal dashboard output.
+    graph_rows = conn.execute("SELECT * FROM tasks").fetchall()
+
     # Index events + runs by task id. For very large boards this will
     # slurp a lot — acceptable on the dashboard's typical working set
     # (hundreds of tasks), but we can add pagination / filtering later
     # if profiling shows it's a hotspot.
-    row_ids = [r["id"] for r in rows]
+    row_ids = [r["id"] for r in graph_rows]
     placeholders = ",".join(["?"] * len(row_ids))
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
     for ev_row in conn.execute(
@@ -299,6 +305,28 @@ def _compute_task_diagnostics(
     ).fetchall():
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
+    links = conn.execute(
+        f"SELECT parent_id, child_id FROM task_links "
+        f"WHERE parent_id IN ({placeholders}) AND child_id IN ({placeholders})",
+        tuple(row_ids) + tuple(row_ids),
+    ).fetchall()
+    chain_by_task = kd.compute_chain_diagnostics(
+        graph_rows, links, events_by_task, runs_by_task,
+    )
+    reconciliation_context = {
+        str(row["id"]): {
+            "task": row,
+            "_runs": runs_by_task.get(str(row["id"]), []),
+        }
+        for row in graph_rows
+    }
+    git_probe = kd.GitProbeSession()
+    try:
+        from hermes_cli.profiles import profile_exists
+        profile_roster = profile_exists
+    except Exception:
+        profile_roster = None
+
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
@@ -307,7 +335,10 @@ def _compute_task_diagnostics(
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
             config=diag_config,
-        )
+            tasks=reconciliation_context,
+            git_probe=git_probe,
+            profile_roster=profile_roster,
+        ) + chain_by_task.get(tid, [])
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -450,6 +481,7 @@ def get_board(
         ).fetchone()["m"]
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
+        suppressed: list[dict] = []
         if include_archived:
             columns["archived"] = []
 
@@ -475,6 +507,16 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
+            if any(
+                diag.get("kind") == "replacement_suppressed"
+                and diag.get("data", {}).get("suppressed") is True
+                for diag in (diags or [])
+            ):
+                # Keep a first-class audit surface and the normal detail/event
+                # endpoint, but never leave a proven superseded source in an
+                # ordinary actionable board column.
+                suppressed.append(d)
+                continue
             col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
@@ -501,6 +543,7 @@ def get_board(
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
+            "suppressed": suppressed,
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),

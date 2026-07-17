@@ -773,3 +773,180 @@ def test_severity_at_or_above_uses_threshold_semantics():
     assert kd.severity_at_or_above("error", "critical") is False
     assert kd.severity_at_or_above("mystery", "warning") is False
     assert kd.severity_at_or_above("warning", None) is True
+
+
+# ---------------------------------------------------------------------------
+# Cross-task verdict and dependency-chain diagnostics
+# ---------------------------------------------------------------------------
+
+
+def test_chain_diagnostics_review_required_parent_gates_todo_child():
+    parent = _task(id="t_parent", status="blocked", title="arbitrary source")
+    child = _task(id="t_child", status="todo", title="arbitrary child")
+    events = {
+        "t_parent": [
+            _event("blocked", ts=100, reason="review-required: inspect handoff"),
+        ],
+        "t_child": [],
+    }
+    diags = kd.compute_chain_diagnostics(
+        [parent, child], [("t_parent", "t_child")], events, {}, now=200,
+    )
+
+    assert "t_child" in diags
+    assert [d.kind for d in diags["t_child"]] == ["review_parent_gates_child"]
+    finding = diags["t_child"][0]
+    assert finding.data == {
+        "parent_id": "t_parent",
+        "parent_status": "blocked",
+        "child_id": "t_child",
+        "child_status": "todo",
+        "matched_reason_prefix": "review-required:",
+        "reason": "review-required: inspect handoff",
+    }
+    assert "t_parent" in finding.detail
+    assert finding.actions[0].payload["command"] == "hermes kanban show t_parent"
+
+
+def test_chain_diagnostics_negative_structured_parent_verdict_releases_child():
+    parent = _task(id="t_parent", status="done", title="not a deploy")
+    child = _task(id="t_child", status="ready", title="also not a deploy")
+    runs = {
+        "t_parent": [{
+            "id": 7,
+            "started_at": 100,
+            "ended_at": 150,
+            "metadata": {"review": {"verdict": "changes_requested"}},
+        }],
+    }
+    diags = kd.compute_chain_diagnostics(
+        [parent, child],
+        [{"parent_id": "t_parent", "child_id": "t_child"}],
+        {},
+        runs,
+        now=200,
+    )
+
+    finding = diags["t_child"][0]
+    assert finding.kind == "negative_parent_verdict_released_child"
+    assert finding.data["matched_field"] == "review.verdict"
+    assert finding.data["matched_value"] == "changes_requested"
+    assert finding.data["parent_status"] == "done"
+    assert finding.data["child_status"] == "ready"
+
+
+def test_chain_diagnostics_archived_negative_parent_releases_child():
+    parent = _task(id="t_parent", status="archived")
+    child = _task(id="t_child", status="ready")
+    runs = {"t_parent": [{
+        "id": 7,
+        "started_at": 100,
+        "ended_at": 150,
+        "metadata": {"review": {"verdict": "changes_requested"}},
+    }]}
+
+    finding = kd.compute_chain_diagnostics(
+        [parent, child], [("t_parent", "t_child")], {}, runs, now=200,
+    )["t_child"][0]
+
+    assert finding.kind == "negative_parent_verdict_released_child"
+    assert finding.data["parent_status"] == "archived"
+    assert "Parent t_parent is archived with a structured negative verdict" in finding.detail
+    assert "is done" not in finding.detail
+
+
+def test_chain_diagnostics_uses_only_explicit_negative_metadata():
+    parent = _task(id="t_parent", status="done", title="deploy rejected in prose")
+    child = _task(id="t_child", status="running", title="deploy child")
+    links = [("t_parent", "t_child")]
+
+    prose_only = {"t_parent": [{
+        "id": 1, "started_at": 100, "metadata": {"summary": "rejected"},
+    }]}
+    assert kd.compute_chain_diagnostics(
+        [parent, child], links, {}, prose_only,
+    ) == {}
+
+    approved_false = {"t_parent": [{
+        "id": 2, "started_at": 100, "metadata": {"qa": {"approved": False}},
+    }]}
+    diags = kd.compute_chain_diagnostics(
+        [parent, child], links, {}, approved_false,
+    )
+    assert diags["t_child"][0].data["matched_field"] == "qa.approved"
+    assert diags["t_child"][0].data["matched_value"] is False
+
+
+def test_chain_diagnostics_flags_repeated_dependency_wait_repromotion():
+    task = _task(id="t_loop", status="todo")
+    events = {
+        "t_loop": [
+            _event("dependency_wait", ts=100, reason="parent pending"),
+            _event("promoted", ts=110),
+            _event("dependency_wait", ts=120, reason="parent pending"),
+        ],
+    }
+    diags = kd.compute_chain_diagnostics([task], [], events, {}, now=200)
+    finding = diags["t_loop"][0]
+    assert finding.kind == "dependency_wait_loop"
+    assert finding.data["dependency_wait_count"] == 2
+    assert finding.data["repromotion_count"] == 1
+
+
+def test_chain_diagnostics_clears_dependency_loop_for_terminal_task():
+    task = _task(id="t_loop", status="done")
+    events = {
+        "t_loop": [
+            _event("dependency_wait", ts=100),
+            _event("promoted", ts=110),
+            _event("dependency_wait", ts=120),
+        ],
+    }
+    assert kd.compute_chain_diagnostics([task], [], events, {}, now=200) == {}
+
+
+def test_chain_diagnostics_flags_terminal_task_with_active_run():
+    task = _task(
+        id="t_terminal", status="done", worker_pid=4321, current_run_id=8,
+    )
+    runs = {"t_terminal": [{
+        "id": 8, "status": "running", "started_at": 100, "ended_at": None,
+    }]}
+
+    finding = kd.compute_chain_diagnostics(
+        [task], [], {}, runs, now=200,
+    )["t_terminal"][0]
+
+    assert finding.kind == "terminal_task_active_run"
+    assert finding.data["run_id"] == 8
+    assert finding.data["worker_pid"] == 4321
+    assert finding.actions[0].kind == "reclaim"
+
+
+def test_chain_diagnostics_flags_explicit_duplicate_active_execution():
+    tasks = [
+        _task(
+            id="t_first", status="running", workspace_path="/repo",
+            idempotency_key="scope-1", current_run_id=11, started_at=100,
+        ),
+        _task(
+            id="t_second", status="running", workspace_path="/repo",
+            idempotency_key="scope-1", current_run_id=12, started_at=110,
+        ),
+    ]
+
+    diags = kd.compute_chain_diagnostics(tasks, [], {}, {}, now=200)
+
+    assert diags["t_first"][0].kind == "duplicate_active_execution"
+    assert diags["t_first"][0].data["conflicting_task_ids"] == ["t_second"]
+    assert diags["t_first"][0].data["conflicting_run_ids"] == [12]
+    assert diags["t_second"][0].actions[0].kind == "reclaim"
+
+
+def test_chain_diagnostics_does_not_infer_duplicates_from_workspace_alone():
+    tasks = [
+        _task(id="t_first", status="running", workspace_path="/repo"),
+        _task(id="t_second", status="running", workspace_path="/repo"),
+    ]
+
+    assert kd.compute_chain_diagnostics(tasks, [], {}, {}, now=200) == {}
