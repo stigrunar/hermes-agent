@@ -4828,6 +4828,14 @@ class AIAgent:
         if visible:
             return visible
         content = assistant_msg.get("content")
+        # Codex/vision turns may preserve assistant content as OpenAI-style
+        # typed parts instead of a plain string. This helper is also called on
+        # the previous assistant message while pairing consecutive tool rounds;
+        # passing the raw list into ``_strip_think_blocks`` crashes in
+        # ``re.sub`` and the outer loop retries the same response indefinitely.
+        # Flatten only for visible-text comparison; keep the source untouched.
+        if not isinstance(content, str):
+            content = _summarize_user_message_for_log(content, sep="\n")
         return self._strip_think_blocks(content or "").strip()
 
     def _interim_text_was_delivered(self, text: str) -> bool:

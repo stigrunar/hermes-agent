@@ -445,6 +445,20 @@ class TestStripThinkBlocks:
     def test_none_returns_empty(self, agent):
         assert agent._strip_think_blocks(None) == ""
 
+    def test_interim_visible_text_flattens_typed_assistant_parts(self, agent):
+        """Vision/Codex typed parts must not reach the regex think scrubber."""
+        message = {
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "<think>hidden</think>Visible"},
+                {"type": "input_image", "image_url": "data:image/png;base64,AAAA"},
+            ],
+        }
+
+        assert agent._interim_assistant_visible_text(message) == "[1 image] Visible"
+        # The comparison helper must not mutate the provider-shaped message.
+        assert isinstance(message["content"], list)
+
     def test_no_blocks_unchanged(self, agent):
         assert agent._strip_think_blocks("hello world") == "hello world"
 

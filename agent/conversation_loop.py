@@ -659,6 +659,12 @@ def run_conversation(
     truncated_response_parts: List[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
+    # Outer-loop failures can happen after a valid provider response. A
+    # deterministic local post-processing bug used to consume the complete
+    # model-call budget because every retry produced the same traceback.
+    # Three identical failures are enough evidence to stop the turn.
+    outer_error_fingerprint = None
+    outer_error_streak = 0
     # Last composed answer intentionally held back by a verification gate. If
     # that continuation consumes the remaining budget, this is the best
     # user-facing result available; it must not be confused with error or
@@ -5610,6 +5616,13 @@ def run_conversation(
             # recover the call site.  logger.exception() includes the
             # traceback automatically and emits at ERROR.
             logger.exception("Outer loop error in API call #%d", api_call_count)
+
+            current_error_fingerprint = (type(e).__name__, str(e))
+            if current_error_fingerprint == outer_error_fingerprint:
+                outer_error_streak += 1
+            else:
+                outer_error_fingerprint = current_error_fingerprint
+                outer_error_streak = 1
             
             # If an assistant message with tool_calls was already appended,
             # the API expects a role="tool" result for every tool_call_id.
@@ -5644,10 +5657,26 @@ def run_conversation(
             # message pollutes history, burns tokens, and risks violating
             # role-alternation invariants.
 
-            # If we're near the limit, break to avoid infinite loops
-            if api_call_count >= agent.max_iterations - 1:
-                _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
-                final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
+            # Deterministic local failures do not improve by spending another
+            # 80 provider calls. Three identical outer-loop failures are enough
+            # evidence to stop this turn; headless-worker retry policy can then
+            # take over at the task boundary.
+            repeated_outer_error = outer_error_streak >= 3
+            # If we're near the limit, break to avoid infinite loops.
+            if repeated_outer_error or api_call_count >= agent.max_iterations - 1:
+                if repeated_outer_error:
+                    failed = True
+                    _turn_exit_reason = (
+                        "repeated_outer_loop_error("
+                        f"streak={outer_error_streak}, {error_msg[:80]})"
+                    )
+                    final_response = (
+                        "I stopped after the same internal error repeated "
+                        f"{outer_error_streak} times: {error_msg}"
+                    )
+                else:
+                    _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
+                    final_response = f"I apologize, but I encountered repeated errors: {error_msg}"
                 # Append as assistant so the history stays valid for
                 # session resume (avoids consecutive user messages).
                 messages.append({"role": "assistant", "content": final_response})
