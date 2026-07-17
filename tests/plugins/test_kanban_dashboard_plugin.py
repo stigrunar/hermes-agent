@@ -214,9 +214,9 @@ function useState(initial) {
   const index = hookIndex++;
   if (!(index in stateValues)) {
     const value = typeof initial === "function" ? initial() : initial;
-    // KanbanPage's fourth state slot is its loaded board; the sixth is its
+    // KanbanPage's fifth state slot is its loaded board; the seventh is its
     // loading flag. Seed those real component states for this render.
-    stateValues[index] = index === 3 ? boardFixture : index === 5 ? false : value;
+    stateValues[index] = index === 4 ? boardFixture : index === 6 ? false : value;
   }
   return [stateValues[index], function (next) {
     stateValues[index] = typeof next === "function" ? next(stateValues[index]) : next;
