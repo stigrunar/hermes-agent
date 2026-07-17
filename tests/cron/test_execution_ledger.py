@@ -121,6 +121,23 @@ def test_failed_execution_keeps_error(monkeypatch, tmp_path):
     assert failed["error"] == "provider exploded"
 
 
+def test_failed_execution_redacts_durable_error(monkeypatch, tmp_path):
+    executions = _point_ledger(monkeypatch, tmp_path)
+    marker = "sk-syntheticcronledger123456789"
+    opaque = "opaque-ledger-query-value"
+    record = executions.create_execution("job-redacted", source="external")
+
+    failed = executions.finish_execution(
+        record["id"],
+        success=False,
+        error=f"provider failed {marker} https://example.invalid/cb?token={opaque}",
+    )
+
+    assert marker not in failed["error"]
+    assert opaque not in failed["error"]
+    assert "token=***" in failed["error"]
+
+
 def test_recovery_does_not_mark_live_process_execution_unknown(monkeypatch, tmp_path):
     executions = _point_ledger(monkeypatch, tmp_path)
     record = executions.create_execution("still-live", source="builtin")

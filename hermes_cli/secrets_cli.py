@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
 from pathlib import Path
 from typing import List, Optional
@@ -23,7 +22,9 @@ from rich.panel import Panel
 from rich.table import Table
 
 from agent.secret_sources import bitwarden as bw
+from agent.secret_sources.base import run_secret_cli
 from hermes_cli.config import (
+    get_env_value_prefer_dotenv,
     get_env_path,
     load_config,
     save_config,
@@ -52,10 +53,6 @@ def register_cli(parent_parser: argparse.ArgumentParser) -> None:
     setup.add_argument(
         "--project-id",
         help="Pre-select a project UUID instead of prompting",
-    )
-    setup.add_argument(
-        "--access-token",
-        help="Provide the access token non-interactively (will be stored in .env)",
     )
     setup.add_argument(
         "--server-url",
@@ -130,11 +127,17 @@ def cmd_setup(args: argparse.Namespace) -> int:
         )
         return 1
 
+    cfg = load_config()
+    secrets_cfg = (cfg.setdefault("secrets", {})
+                     .setdefault("bitwarden", {}))
+    token_env = secrets_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
+    token = (get_env_value_prefer_dotenv(token_env) or "").strip()
+
     # -- non-interactive guard --
     if not sys.stdin.isatty():
         missing = []
-        if not (args.access_token and args.access_token.strip()):
-            missing.append("--access-token")
+        if not token:
+            missing.append(token_env)
         if not (args.server_url and args.server_url.strip()):
             # Also accept BWS_SERVER_URL env var as non-interactive substitute
             if not os.environ.get("BWS_SERVER_URL", "").strip():
@@ -143,11 +146,11 @@ def cmd_setup(args: argparse.Namespace) -> int:
             missing.append("--project-id")
         if missing:
             console.print(
-                f"  [red]Non-interactive mode (no TTY) requires all setup flags.[/red]\n"
+                f"  [red]Non-interactive mode (no TTY) requires all setup inputs.[/red]\n"
                 f"  Missing: {', '.join(missing)}\n\n"
-                "  Usage:\n"
+                f"  Inject {token_env} through a protected process environment "
+                "or store it in the profile .env, then run:\n"
                 "    hermes secrets bitwarden setup \\\n"
-                "      --access-token '0.xxx' \\\n"
                 "      --server-url 'https://vault.bitwarden.com' \\\n"
                 "      --project-id 'xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx'"
             )
@@ -156,12 +159,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
     # ------------------------------------------------------------------- token
     console.print()
     console.print("[bold]Step 2[/bold]  Provide your access token")
-    cfg = load_config()
-    secrets_cfg = (cfg.setdefault("secrets", {})
-                     .setdefault("bitwarden", {}))
-    token_env = secrets_cfg.get("access_token_env", "BWS_ACCESS_TOKEN")
-
-    token = (args.access_token or "").strip()
     if not token:
         token = masked_secret_prompt(f"  Paste access token ({token_env}): ").strip()
     if not token:
@@ -449,15 +446,13 @@ def _yn(b: bool) -> str:
 
 def _bws_version(binary: Path) -> str:
     try:
-        res = subprocess.run(
+        res = run_secret_cli(
             [str(binary), "--version"],
-            capture_output=True,
-            text=True,
             timeout=5,
         )
         if res.returncode == 0:
             return (res.stdout or res.stderr).strip().splitlines()[0]
-    except (OSError, subprocess.TimeoutExpired):
+    except RuntimeError:
         pass
     return "version unknown"
 
@@ -466,27 +461,27 @@ def _list_projects(
     binary: Path, token: str, console: Console, *, server_url: str = ""
 ) -> Optional[List[dict]]:
     """Call ``bws project list`` and return the parsed list, or None on failure."""
-    env = os.environ.copy()
-    env["BWS_ACCESS_TOKEN"] = token
-    env.setdefault("NO_COLOR", "1")
+    extra_env = {"BWS_ACCESS_TOKEN": token}
     if server_url:
-        env["BWS_SERVER_URL"] = server_url
+        extra_env["BWS_SERVER_URL"] = server_url
     try:
-        res = subprocess.run(
+        res = run_secret_cli(
             [str(binary), "project", "list", "--output", "json"],
-            env=env,
-            capture_output=True,
-            text=True,
+            allow_env=("BWS_SERVER_URL",),
+            extra_env=extra_env,
             timeout=15,
         )
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except RuntimeError as exc:
         console.print(f"  [red]Couldn't list projects: {exc}[/red]")
         return None
 
     if res.returncode != 0:
-        err = (res.stderr or res.stdout).strip()[:300]
-        console.print(f"  [red]bws project list failed: {err}[/red]")
-        lowered = err.lower()
+        diagnostic = (res.stderr or res.stdout or "").strip()
+        console.print(
+            f"  [red]bws project list failed: "
+            f"{bw._safe_bws_failure_message(res.returncode, diagnostic)}[/red]"
+        )
+        lowered = diagnostic.lower()
         if "invalid_client" in lowered or "400 bad request" in lowered:
             console.print(
                 "  [yellow]'invalid_client' from the US identity endpoint usually "

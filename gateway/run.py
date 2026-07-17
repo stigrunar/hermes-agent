@@ -17682,12 +17682,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 thread_id=getattr(source, "thread_id", None),
                 parent_chat_id=getattr(source, "parent_chat_id", None),
             )
-        except Exception:
-            logger.warning(
-                "Profile route matching failed for %s/%s, falling back to default",
-                source.platform, source.chat_id, exc_info=True,
+        except Exception as exc:
+            logger.error(
+                "Profile route matching failed; refusing default-profile fallback",
+                exc_info=True,
             )
-            return None
+            raise RuntimeError(
+                "Profile route matching failed; refusing default-profile fallback"
+            ) from exc
         if matched:
             return matched.profile
         logger.debug(
@@ -17712,9 +17714,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             get_profile_dir,
             profile_exists,
         )
-        from hermes_constants import get_hermes_home
-        
-        # Track whether a profile was explicitly requested (vs. falling back to default)
+        # Track whether a profile was explicitly requested (vs. the configured
+        # active/default profile). Explicit selection and session namespacing
+        # must never be served by a different profile's home or credentials.
         explicit_profile = None
         try:
             name = (source.profile or "").strip()
@@ -17728,30 +17730,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 name = get_active_profile_name() or "default"
             
             profile_dir = get_profile_dir(name)
-            # Warn if an explicit profile doesn't exist on disk
-            if explicit_profile and not profile_exists(name):
-                logger.warning(
-                    "Profile %r does not exist for source %s/%s (guild_id=%s), "
-                    "falling back to global HERMES_HOME",
-                    explicit_profile,
-                    source.platform.value,
-                    source.chat_id,
-                    getattr(source, "guild_id", None),
+        except Exception as exc:
+            selected = explicit_profile or locals().get("name") or "default"
+            raise RuntimeError(
+                f"Failed to resolve profile {selected!r}; "
+                "refusing global-profile fallback"
+            ) from exc
+
+        # Refuse an explicit profile that does not exist. Falling back to the
+        # global home here crosses the profile's credential, memory, and
+        # capability boundary while retaining its session namespace.
+        if explicit_profile:
+            try:
+                exists = profile_exists(name)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to validate profile {explicit_profile!r}; "
+                    "refusing global-profile fallback"
+                ) from exc
+            if not exists:
+                raise RuntimeError(
+                    f"Profile {explicit_profile!r} does not exist; "
+                    "refusing global-profile fallback"
                 )
-                return get_hermes_home()
-            return profile_dir
-        except Exception:
-            # Catch normalization errors, path errors, etc.
-            logger.warning(
-                "Failed to resolve profile directory for source %s/%s (guild_id=%s), "
-                "falling back to global HERMES_HOME: %s",
-                source.platform.value,
-                source.chat_id,
-                getattr(source, "guild_id", None),
-                explicit_profile or "(no profile)",
-                exc_info=True,
-            )
-            return get_hermes_home()
+        return profile_dir
 
     async def _run_agent_inner(
         self,

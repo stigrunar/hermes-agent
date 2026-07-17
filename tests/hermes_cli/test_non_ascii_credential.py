@@ -34,7 +34,10 @@ class TestCheckNonAsciiCredential:
         result = _check_non_ascii_credential("OPENAI_API_KEY", key)
         assert result == "sk-proj-abcd"
         captured = capsys.readouterr()
-        assert "U+028B" in captured.err  # reports the char
+        assert "2 non-ASCII characters" in captured.err
+        assert "ʋ" not in captured.err
+        assert "é" not in captured.err
+        assert "U+028B" not in captured.err
 
     def test_empty_key(self):
         result = _check_non_ascii_credential("TEST_KEY", "")
@@ -96,7 +99,7 @@ class TestEnvLoaderSanitization:
 
         captured = capsys.readouterr()
         assert "GOOGLE_API_KEY" in captured.err
-        assert "U+200B" in captured.err
+        assert "U+200B" not in captured.err
         assert "re-copy" in captured.err.lower()
 
     def test_warning_fires_only_once_per_key(self, monkeypatch, capsys):

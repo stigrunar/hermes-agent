@@ -7748,21 +7748,16 @@ def _check_non_ascii_credential(key: str, value: str) -> str:
     except UnicodeEncodeError:
         pass
 
-    # Build a readable list of the offending characters
-    bad_chars: list[str] = []
-    for i, ch in enumerate(value):
-        if ord(ch) > 127:
-            bad_chars.append(f"  position {i}: {ch!r} (U+{ord(ch):04X})")
     sanitized = value.encode("ascii", errors="ignore").decode("ascii")
+    stripped = len(value) - len(sanitized)
 
     print(
         f"\n  Warning: {key} contains non-ASCII characters that will break API requests.\n"
         f"  This usually happens when copy-pasting from a PDF, rich-text editor,\n"
         f"  or web page that substitutes lookalike Unicode glyphs for ASCII letters.\n"
-        f"\n"
-        + "\n".join(f"  {line}" for line in bad_chars[:5])
-        + ("\n  ... and more" if len(bad_chars) > 5 else "")
-        + "\n\n  The non-ASCII characters have been stripped automatically.\n"
+        f"  Removed {stripped} non-ASCII character"
+        f"{'s' if stripped != 1 else ''}; their values and positions are not logged.\n"
+        "\n  The non-ASCII characters have been stripped automatically.\n"
         "  If authentication fails, re-copy the key from the provider's dashboard.\n",
         file=sys.stderr,
     )

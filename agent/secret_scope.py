@@ -195,11 +195,32 @@ def load_env_file(env_path: Path) -> Dict[str, str]:
 
 
 def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
-    """Build a profile's secret mapping from its ``<home>/.env``.
+    """Build a profile's complete secret mapping without mutating the process.
 
-    Returns a fresh dict (safe to install via ``set_secret_scope``). Genuinely
-    global vars are intentionally NOT copied in — ``get_secret`` reads those
-    from ``os.environ`` directly, so the scope holds only profile secrets.
+    The profile's ``.env`` and gitignored ``.op.env`` bootstrap file seed an
+    isolated mapping. Enabled external secret sources are then resolved into
+    that mapping under a temporary scope, so their auth also comes from this
+    profile rather than from another profile's process-global environment.
+    Genuinely global vars are intentionally not copied in — ``get_secret``
+    reads those from ``os.environ`` directly.
     """
-    return load_env_file(Path(hermes_home) / ".env")
+    home = Path(hermes_home)
+    secrets = load_env_file(home / ".env")
+    for key, value in load_env_file(home / ".op.env").items():
+        secrets.setdefault(key, value)
 
+    try:
+        from hermes_cli.env_loader import _load_secrets_config
+        from agent.secret_sources.registry import apply_all
+
+        source_cfg = _load_secrets_config(home)
+    except Exception:
+        source_cfg = {}
+
+    if source_cfg:
+        token = set_secret_scope(secrets)
+        try:
+            apply_all(source_cfg, home, environ=secrets)
+        finally:
+            reset_secret_scope(token)
+    return secrets

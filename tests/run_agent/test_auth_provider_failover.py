@@ -15,11 +15,13 @@ fell through to "switch providers manually" advice and never called
   3. The one-shot guard flag exists on TurnRetryState.
 """
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.turn_retry_state import TurnRetryState
+from agent.conversation_loop import _activate_auth_failure_fallback
 
 
 def _make_agent(fallback_model=None):
@@ -27,6 +29,9 @@ def _make_agent(fallback_model=None):
         patch("run_agent.get_tool_definitions", return_value=[]),
         patch("run_agent.check_toolset_requirements", return_value={}),
         patch("run_agent.OpenAI"),
+        patch("agent.agent_init.fetch_model_metadata"),
+        patch("hermes_logging.setup_logging"),
+        patch("hermes_logging.setup_verbose_logging"),
     ):
         agent = AIAgent(
             api_key="test-key",
@@ -116,6 +121,35 @@ class TestAuthFailoverActivation:
         retry.auth_failover_attempted = True  # already escalated this attempt
         classified = classify_api_error(_auth_error(401))
         assert self._should_failover(agent, classified, retry) is False
+
+    def test_auth_failures_advance_across_multiple_fallbacks_boundedly(self):
+        """One dead fallback must not consume the guard for the whole chain."""
+        agent = SimpleNamespace(
+            _fallback_chain=[
+                {"provider": "openai", "model": "gpt-4o"},
+                {"provider": "anthropic", "model": "claude-sonnet-4"},
+            ],
+            _fallback_index=0,
+            _buffer_status=MagicMock(),
+        )
+        retry = TurnRetryState()
+        classified = classify_api_error(_auth_error(401))
+
+        def advance(*, reason):
+            assert reason == classified.reason
+            if agent._fallback_index >= len(agent._fallback_chain):
+                return False
+            agent._fallback_index += 1
+            return True
+
+        agent._try_activate_fallback = MagicMock(side_effect=advance)
+        assert _activate_auth_failure_fallback(agent, classified, retry) is True
+        assert retry.auth_failover_attempted is False
+        assert _activate_auth_failure_fallback(agent, classified, retry) is True
+        assert retry.auth_failover_attempted is False
+        assert _activate_auth_failure_fallback(agent, classified, retry) is False
+        assert agent._fallback_index == 2
+        assert agent._try_activate_fallback.call_count == 2
 
     def test_non_auth_error_does_not_trigger_auth_failover(self):
         agent = _make_agent(fallback_model=[{"provider": "openai", "model": "gpt-4o"}])

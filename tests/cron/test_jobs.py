@@ -631,6 +631,25 @@ class TestMarkJobRun:
         assert updated["last_error"] == "model timeout"
         assert updated["last_delivery_error"] == "platform 'discord' not enabled"
 
+    def test_errors_are_redacted_before_jobs_json_persistence(self, tmp_cron_dir):
+        marker = "sk-syntheticcronjoberror123456789"
+        opaque = "opaque-delivery-query-value"
+        job = create_job(prompt="Report", schedule="every 1h")
+
+        mark_job_run(
+            job["id"],
+            success=False,
+            error=f"model failed {marker}",
+            delivery_error=f"https://example.invalid/cb?access_token={opaque}",
+        )
+
+        updated = get_job(job["id"])
+        persisted = (tmp_cron_dir / "cron" / "jobs.json").read_text()
+        assert marker not in updated["last_error"]
+        assert opaque not in updated["last_delivery_error"]
+        assert marker not in persisted
+        assert opaque not in persisted
+
     def test_recurring_cron_not_disabled_when_croniter_missing(self, tmp_cron_dir, monkeypatch):
         """Regression test for issue #16265.
 
@@ -1724,6 +1743,20 @@ class TestSaveJobOutput:
         assert output_file.exists()
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
+
+    def test_redacts_output_before_durable_write(self, tmp_cron_dir):
+        marker = "sk-syntheticcronoutput123456789"
+        opaque = "opaque-output-query-value"
+
+        output_file = save_job_output(
+            "redacted-output",
+            f"result {marker} https://example.invalid/x?api_key={opaque}",
+        )
+
+        persisted = output_file.read_text()
+        assert marker not in persisted
+        assert opaque not in persisted
+        assert "api_key=***" in persisted
 
     @pytest.mark.parametrize("bad_job_id", ["../escape", "nested/escape", ".", "..", ""])
     def test_rejects_unsafe_job_id(self, tmp_cron_dir, bad_job_id):

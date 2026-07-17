@@ -512,12 +512,10 @@ def _apply_profile_override() -> None:
             print(f"Error: {exc}", file=sys.stderr)
             sys.exit(1)
         except Exception as exc:
-            # A bug in profiles.py must NEVER prevent hermes from starting
-            print(
-                f"Warning: profile override failed ({exc}), using default",
-                file=sys.stderr,
-            )
-            return
+            # Continuing under the default home after selecting a profile
+            # crosses its credential/memory boundary. Fail before startup.
+            print(f"Error: profile override failed ({exc})", file=sys.stderr)
+            sys.exit(1)
         os.environ["HERMES_HOME"] = hermes_home
         # Strip the flag from argv so argparse doesn't choke
         if consume > 0 and profile_index is not None:

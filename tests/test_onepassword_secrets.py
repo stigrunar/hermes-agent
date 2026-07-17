@@ -146,8 +146,13 @@ def test_fetch_empty_rc0_does_not_clobber(monkeypatch, tmp_path):
 def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
     fake_op = tmp_path / "op"
     fake_op.write_text("")
+    marker = "sk-syntheticophelperstderr123456789"
     monkeypatch.setattr(
-        op.subprocess, "run", lambda *a, **k: _err(1, "\x1b[31m[ERROR] not signed in\x1b[0m")
+        op.subprocess,
+        "run",
+        lambda *a, **k: _err(
+            1, f"\x1b[31m[ERROR] not signed in {marker}\x1b[0m"
+        ),
     )
 
     secrets, warnings = op.fetch_onepassword_secrets(
@@ -155,10 +160,43 @@ def test_fetch_read_failure_becomes_warning(monkeypatch, tmp_path):
     )
     assert secrets == {}
     assert len(warnings) == 1
-    # ANSI control sequences are fully scrubbed from the surfaced message.
+    # Helper diagnostics are classified but never surfaced verbatim.
     assert "\x1b" not in warnings[0]
     assert "[31m" not in warnings[0]
-    assert "not signed in" in warnings[0]
+    assert marker not in warnings[0]
+    assert "authentication failed" in warnings[0]
+
+
+def test_fetch_uses_installed_profile_scope_for_op_auth(monkeypatch, tmp_path):
+    from agent.secret_scope import reset_secret_scope, set_secret_scope
+
+    fake_op = tmp_path / "op"
+    fake_op.write_text("")
+    monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN", "global-wrong-token")
+    captured = {}
+
+    def fake_run(_cmd, **kwargs):
+        captured["env"] = kwargs["env"]
+        return _ok("resolved")
+
+    monkeypatch.setattr(op.subprocess, "run", fake_run)
+    token = set_secret_scope(
+        {
+            "OP_SERVICE_ACCOUNT_TOKEN": "profile-token",
+            "OP_SESSION_profile": "profile-session",
+        }
+    )
+    try:
+        secrets, _warnings = op.fetch_onepassword_secrets(
+            references={"K": "op://V/I/F"}, binary=fake_op, use_cache=False
+        )
+    finally:
+        reset_secret_scope(token)
+
+    assert secrets == {"K": "resolved"}
+    assert captured["env"]["OP_SERVICE_ACCOUNT_TOKEN"] == "profile-token"
+    assert captured["env"]["OP_SESSION_profile"] == "profile-session"
+    assert "global-wrong-token" not in captured["env"].values()
 
 
 def test_fetch_one_bad_one_good(monkeypatch, tmp_path):

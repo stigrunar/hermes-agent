@@ -56,6 +56,7 @@ from agent.secret_sources._cache import (
     is_valid_env_name,
 )
 from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_scope import current_secret_scope, get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -180,12 +181,15 @@ def _auth_fingerprint(token_env: str) -> str:
     displayed; the raw token never leaves this hash.
     """
     parts: List[str] = [
-        f"token={os.environ.get(token_env, '')}",
-        f"account={os.environ.get('OP_ACCOUNT', '')}",
+        f"token={get_secret(token_env, '') or ''}",
+        f"account={get_secret('OP_ACCOUNT', '') or ''}",
     ]
-    for key in sorted(os.environ):
+    auth_env = current_secret_scope()
+    if auth_env is None:
+        auth_env = os.environ
+    for key in sorted(auth_env):
         if key.startswith("OP_SESSION_"):
-            parts.append(f"{key}={os.environ[key]}")
+            parts.append(f"{key}={auth_env[key]}")
     material = "\n".join(parts)
     return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
@@ -231,12 +235,20 @@ def _scrub(text: str) -> str:
 def _op_child_env(token_value: str) -> Dict[str, str]:
     """Build a minimal allowlisted environment for the ``op`` child process."""
     env: Dict[str, str] = {}
+    profile_auth_keys = {"OP_ACCOUNT", "OP_CONNECT_HOST", "OP_CONNECT_TOKEN"}
     for key in _OP_ENV_ALLOWLIST:
-        val = os.environ.get(key)
+        val = (
+            get_secret(key)
+            if key in profile_auth_keys
+            else os.environ.get(key)
+        )
         if val is not None:
             env[key] = val
     # Desktop / interactive session credentials.
-    for key, val in os.environ.items():
+    auth_env = current_secret_scope()
+    if auth_env is None:
+        auth_env = os.environ
+    for key, val in auth_env.items():
         if key.startswith("OP_SESSION_"):
             env[key] = val
     # `op` reads OP_SERVICE_ACCOUNT_TOKEN regardless of which env var the user
@@ -279,18 +291,14 @@ def _run_op_read(
         )
     except subprocess.TimeoutExpired as exc:
         raise RuntimeError(
-            f"op read timed out after {_OP_RUN_TIMEOUT}s for {reference!r}"
+            f"op read timed out after {_OP_RUN_TIMEOUT}s"
         ) from exc
     except OSError as exc:
         raise RuntimeError(f"failed to invoke op: {exc}") from exc
 
     if proc.returncode != 0:
-        err = _scrub(proc.stderr or "")[:200]
-        if err:
-            raise RuntimeError(f"op read failed for {reference!r}: {err}")
-        raise RuntimeError(
-            f"op read exited {proc.returncode} for {reference!r}"
-        )
+        diagnostic = _scrub(proc.stderr or proc.stdout or "")
+        raise RuntimeError(_safe_op_failure_message(proc.returncode, diagnostic))
 
     # `op` appends a trailing newline; strip only that so a value with
     # intentional internal/edge spaces survives.  But a value that is empty or
@@ -298,8 +306,32 @@ def _run_op_read(
     # good .env/shell credential with effectively nothing.
     value = (proc.stdout or "").rstrip("\r\n")
     if not value.strip():
-        raise RuntimeError(f"op read returned an empty value for {reference!r}")
+        raise RuntimeError("op read returned an empty value")
     return value
+
+
+def _safe_op_failure_message(returncode: int, diagnostic: str) -> str:
+    """Classify an ``op`` failure without echoing helper diagnostics."""
+    lowered = (diagnostic or "").lower()
+    if any(
+        token in lowered
+        for token in (
+            "not signed in",
+            "unauthorized",
+            "forbidden",
+            "session expired",
+            "authentication",
+            "401",
+            "403",
+        )
+    ):
+        return "op read authentication failed"
+    if any(
+        token in lowered
+        for token in ("network", "connection", "resolve", "dns", "timed out")
+    ):
+        return "op read network request failed"
+    return f"op read failed (exit {int(returncode)})"
 
 
 # ---------------------------------------------------------------------------
@@ -332,7 +364,7 @@ def fetch_onepassword_secrets(
     if not valid:
         return {}, warnings
 
-    token_value = os.environ.get(token_env, "").strip()
+    token_value = (get_secret(token_env, "") or "").strip()
     cache_key: _CacheKey = (
         _auth_fingerprint(token_env),
         account or "",

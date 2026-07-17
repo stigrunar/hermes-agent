@@ -190,3 +190,25 @@ def test_provider_not_in_registry_but_in_models_dev(tmp_path, monkeypatch):
 
     from hermes_cli.auth import is_provider_explicitly_configured
     assert is_provider_explicitly_configured("openrouter") is True
+
+
+def test_provider_env_detection_honors_profile_secret_scope(tmp_path, monkeypatch):
+    """An ambient key from another profile cannot grant local capability."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-ambient-profile-key-12345678")
+    (tmp_path / "hermes").mkdir(parents=True, exist_ok=True)
+
+    from agent.secret_scope import (
+        reset_secret_scope,
+        set_multiplex_active,
+        set_secret_scope,
+    )
+    from hermes_cli.auth import is_provider_explicitly_configured
+
+    set_multiplex_active(True)
+    token = set_secret_scope({})
+    try:
+        assert is_provider_explicitly_configured("openrouter") is False
+    finally:
+        reset_secret_scope(token)
+        set_multiplex_active(False)

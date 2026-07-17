@@ -60,9 +60,10 @@ class TurnRetryState:
     has_retried_429: bool = False
 
     # ── Auth-failure provider failover ───────────────────────────────────
-    # Set once we've escalated a persistent 401/403 (after the per-provider
-    # credential-refresh attempt above failed) to the fallback chain, so we
-    # don't loop on the same auth failover within one attempt.
+    # Set while escalating a persistent 401/403 (after the per-provider
+    # credential-refresh attempt above failed). A successful provider switch
+    # clears it, allowing the next independently broken fallback to advance one
+    # more bounded chain hop; an unsuccessful switch leaves it set.
     auth_failover_attempted: bool = False
 
     # ── Restart signals (read by the outer loop after the attempt) ───────

@@ -4,7 +4,12 @@ import logging
 
 import pytest
 
-from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    redact_cdp_url,
+    redact_for_persistence,
+    redact_sensitive_text,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -1046,3 +1051,44 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
+
+
+class TestPersistenceRedaction:
+    def test_forces_secret_and_url_credential_redaction(self, monkeypatch):
+        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
+        opaque = "persistence-only-opaque-value"
+        value = (
+            "Authorization: Bearer synthetic-bearer-value "
+            f"https://user:synthetic-password@example.invalid/cb?token={opaque}"
+        )
+
+        redacted = redact_for_persistence(value)
+
+        assert opaque not in redacted
+        assert "synthetic-bearer-value" not in redacted
+        assert "synthetic-password" not in redacted
+        assert "token=***" in redacted
+
+    def test_recursively_redacts_structured_receipts(self):
+        marker = "sk-syntheticreceiptvalue123456"
+        value = {"nested": [marker, {"error": f"token={marker}"}], "count": 2}
+
+        redacted = redact_for_persistence(value)
+
+        assert marker not in str(redacted)
+        assert redacted["count"] == 2
+
+    def test_persistence_masks_all_random_secret_and_pii_bytes(self):
+        secret = "sk-syntheticfullmaskvalue123456789"
+        phone = "+4798765432"
+
+        redacted = redact_for_persistence(
+            f"credential={secret}; caller={phone}"
+        )
+
+        assert secret not in redacted
+        assert "sk-syn" not in redacted
+        assert "6789" not in redacted
+        assert phone not in redacted
+        assert "+479" not in redacted
+        assert "5432" not in redacted

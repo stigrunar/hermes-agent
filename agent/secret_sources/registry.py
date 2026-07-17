@@ -28,6 +28,7 @@ third-party backends ship as standalone plugin repos implementing
 from __future__ import annotations
 
 import concurrent.futures
+import contextvars
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -40,6 +41,7 @@ from agent.secret_sources.base import (
     SecretSource,
     is_valid_env_name,
 )
+from agent.redact import redact_for_persistence
 
 logger = logging.getLogger(__name__)
 
@@ -203,7 +205,11 @@ def _fetch_with_timeout(
         max_workers=1, thread_name_prefix=f"secret-src-{source.name}"
     )
     try:
-        future = executor.submit(source.fetch, cfg, home_path)
+        # Context vars carry the profile's isolated secret scope. Without
+        # copying them into the timeout worker, a source silently reads the
+        # process-global bootstrap token from another profile.
+        context = contextvars.copy_context()
+        future = executor.submit(context.run, source.fetch, cfg, home_path)
         try:
             result = future.result(timeout=timeout)
         except concurrent.futures.TimeoutError:
@@ -218,7 +224,8 @@ def _fetch_with_timeout(
             return res
         except Exception as exc:  # noqa: BLE001 — contract violation, contain it
             res = FetchResult()
-            res.error = f"fetch raised {type(exc).__name__}: {exc}"
+            safe_error = redact_for_persistence(str(exc))
+            res.error = f"fetch raised {type(exc).__name__}: {safe_error}"
             res.error_kind = ErrorKind.INTERNAL
             return res
     finally:
@@ -231,6 +238,10 @@ def _fetch_with_timeout(
         )
         res.error_kind = ErrorKind.INTERNAL
         return res
+    result.error = redact_for_persistence(result.error)
+    result.warnings = [
+        redact_for_persistence(warning) for warning in result.warnings
+    ]
     return result
 
 

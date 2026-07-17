@@ -128,3 +128,47 @@ class TestEnvFileParsing:
         assert ss.build_profile_secret_scope(tmp_path) == {
             "ANTHROPIC_API_KEY": "sk-profile"
         }
+
+    def test_build_scope_resolves_external_sources_without_global_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.secret_sources import registry as reg
+        from agent.secret_sources.base import FetchResult, SecretSource
+
+        class ScopedSource(SecretSource):
+            name = "scoped_test"
+            label = "Scoped test source"
+
+            def fetch(self, cfg, home_path):
+                bootstrap = ss.get_secret("SCOPE_BOOTSTRAP_TOKEN", "")
+                return FetchResult(
+                    secrets={"PROFILE_FETCHED_SECRET": f"resolved:{bootstrap}"}
+                )
+
+        (tmp_path / ".env").write_text(
+            "SCOPE_BOOTSTRAP_TOKEN=profile-bootstrap\n", encoding="utf-8"
+        )
+        (tmp_path / "config.yaml").write_text(
+            "secrets:\n  scoped_test:\n    enabled: true\n", encoding="utf-8"
+        )
+        monkeypatch.setenv("SCOPE_BOOTSTRAP_TOKEN", "global-wrong-bootstrap")
+        monkeypatch.delenv("PROFILE_FETCHED_SECRET", raising=False)
+        reg._reset_registry_for_tests()
+        reg.register_source(ScopedSource())
+        try:
+            scope = ss.build_profile_secret_scope(tmp_path)
+        finally:
+            reg._reset_registry_for_tests()
+
+        assert scope["SCOPE_BOOTSTRAP_TOKEN"] == "profile-bootstrap"
+        assert scope["PROFILE_FETCHED_SECRET"] == "resolved:profile-bootstrap"
+        assert "PROFILE_FETCHED_SECRET" not in __import__("os").environ
+
+    def test_build_scope_includes_profile_op_bootstrap_file(self, tmp_path):
+        (tmp_path / ".op.env").write_text(
+            "OP_SERVICE_ACCOUNT_TOKEN=profile-op-bootstrap\n", encoding="utf-8"
+        )
+
+        scope = ss.build_profile_secret_scope(tmp_path)
+
+        assert scope["OP_SERVICE_ACCOUNT_TOKEN"] == "profile-op-bootstrap"

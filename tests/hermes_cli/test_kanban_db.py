@@ -1637,6 +1637,85 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
     assert "child" in ctx
 
 
+def test_receipt_fields_redacted_before_kanban_persistence(kanban_home):
+    marker = "sk-synthetickanbanreceipt123456789"
+    opaque = "opaque-kanban-query-value"
+    receipt = f"failed {marker} https://example.invalid/cb?token={opaque}"
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="redaction boundary", assignee="a")
+        kb.add_comment(conn, task_id, "worker", receipt)
+        kb.claim_task(conn, task_id, claimer="worker")
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result=receipt,
+            summary=receipt,
+            metadata={"diagnostic": receipt},
+        )
+        rows = {
+            "task": conn.execute(
+                "SELECT result FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()[0],
+            "comment": conn.execute(
+                "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
+            ).fetchone()[0],
+            "runs": [
+                tuple(row)
+                for row in conn.execute(
+                    "SELECT summary, error, metadata FROM task_runs WHERE task_id = ?",
+                    (task_id,),
+                ).fetchall()
+            ],
+            "events": [
+                row[0]
+                for row in conn.execute(
+                    "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
+                ).fetchall()
+            ],
+        }
+
+    persisted = str(rows)
+    assert marker not in persisted
+    assert opaque not in persisted
+    assert "token=***" in persisted
+
+
+def test_failure_receipts_redacted_across_task_run_and_event(kanban_home):
+    marker = "sk-synthetickanbanfailure123456789"
+    error = f"worker failed Authorization: Bearer {marker}"
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="failure redaction", assignee="a")
+        kb.claim_task(conn, task_id, claimer="worker")
+        assert kb._record_task_failure(
+            conn,
+            task_id,
+            error,
+            outcome="spawn_failed",
+            failure_limit=1,
+            release_claim=True,
+            end_run=True,
+        )
+        values = conn.execute(
+            "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()[0]
+        values += str([
+            tuple(row)
+            for row in conn.execute(
+                "SELECT error, metadata FROM task_runs WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        ])
+        values += str([
+            tuple(row)
+            for row in conn.execute(
+                "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
+            ).fetchall()
+        ])
+
+    assert marker not in values
+
+
 # ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------

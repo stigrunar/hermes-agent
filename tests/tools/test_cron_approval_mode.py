@@ -325,8 +325,8 @@ class TestCronModeInteractions:
             result = check_dangerous_command("rm -rf /", "docker")
             assert result["approved"]
 
-    def test_yolo_overrides_cron_deny(self, monkeypatch):
-        """--yolo still bypasses cron_mode=deny for dangerous (non-hardline) commands."""
+    def test_cron_deny_overrides_yolo(self, monkeypatch):
+        """Startup yolo cannot silently weaken the cron-specific deny policy."""
         monkeypatch.setenv("HERMES_CRON_SESSION", "1")
         monkeypatch.setenv("HERMES_YOLO_MODE", "1")
         monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
@@ -347,7 +347,40 @@ class TestCronModeInteractions:
             # Use a dangerous-but-not-hardline command — `rm -rf /` is now
             # hardline-blocked regardless of yolo (see test_hardline_blocklist.py).
             result = check_dangerous_command("rm -rf /tmp/stuff", "local")
-            assert result["approved"]
+            assert not result["approved"]
+            assert "cron_mode" in result["message"]
+
+    def test_combined_guard_cron_deny_overrides_mode_off(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        monkeypatch.delenv("HERMES_INTERACTIVE", raising=False)
+        monkeypatch.delenv("HERMES_GATEWAY_SESSION", raising=False)
+        from unittest.mock import patch as mock_patch
+
+        with (
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval._get_approval_mode", return_value="off"),
+        ):
+            result = check_all_command_guards("rm -rf /tmp/stuff", "local")
+
+        assert not result["approved"]
+        assert "cron_mode" in result["message"]
+
+    def test_execute_code_cron_deny_overrides_yolo_and_mode_off(self, monkeypatch):
+        monkeypatch.setenv("HERMES_CRON_SESSION", "1")
+        from unittest.mock import patch as mock_patch
+        import tools.approval
+
+        with (
+            mock_patch.object(tools.approval, "_YOLO_MODE_FROZEN", True),
+            mock_patch("tools.approval._get_cron_approval_mode", return_value="deny"),
+            mock_patch("tools.approval._get_approval_mode", return_value="off"),
+        ):
+            result = tools.approval.check_execute_code_guard(
+                "print('synthetic')", "local"
+            )
+
+        assert not result["approved"]
+        assert "Cron jobs" in result["message"]
 
     def test_non_cron_non_interactive_still_auto_approves(self, monkeypatch):
         """Non-cron, non-interactive sessions (e.g. scripted usage) still auto-approve."""

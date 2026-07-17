@@ -262,10 +262,15 @@ def test_fetch_happy_path(monkeypatch, tmp_path):
         {"key": "ANTHROPIC_API_KEY", "value": "sk-ant-xyz"},
     ])
 
+    unrelated = "sk-syntheticunrelatedchildenv123456"
+    monkeypatch.setenv("UNRELATED_SYNTHETIC_SECRET", unrelated)
+
     def fake_run(cmd, **kwargs):
         assert cmd[0] == str(fake_binary)
         assert "secret" in cmd and "list" in cmd
         assert kwargs["env"]["BWS_ACCESS_TOKEN"] == "0.fake.token"
+        assert "UNRELATED_SYNTHETIC_SECRET" not in kwargs["env"]
+        assert unrelated not in kwargs["env"].values()
         return mock.Mock(returncode=0, stdout=payload, stderr="")
 
     monkeypatch.setattr(bw.subprocess, "run", fake_run)
@@ -321,13 +326,14 @@ def test_fetch_auth_failure(monkeypatch, tmp_path):
         ),
     )
 
-    with pytest.raises(RuntimeError, match="invalid access token"):
+    with pytest.raises(RuntimeError, match="authentication failed") as exc_info:
         bw.fetch_bitwarden_secrets(
             access_token="0.bad",
             project_id="p",
             binary=fake_binary,
             use_cache=False,
         )
+    assert "invalid access token" not in str(exc_info.value)
 
 
 def test_fetch_timeout(monkeypatch, tmp_path):
@@ -601,7 +607,8 @@ def test_apply_swallows_fetch_errors(monkeypatch, tmp_path):
         enabled=True, project_id="p", auto_install=False,
     )
     assert not result.ok
-    assert "bad token" in result.error
+    assert "bad token" not in result.error
+    assert "bws command failed" in result.error
 
 
 # ---------------------------------------------------------------------------

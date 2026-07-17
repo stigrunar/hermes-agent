@@ -15,9 +15,9 @@ Design summary
   ``secrets.bitwarden.access_token_env``).  This is the one
   bootstrap secret — every other provider key can live in Bitwarden.
 * Pulling secrets is a single ``bws secret list <project_id>
-  --output json`` call.  We cache the result in-process for
-  ``cache_ttl_seconds`` so back-to-back ``hermes`` invocations don't
-  hammer the API.
+  --output json`` call. Results are cached in memory and in a protected
+  profile-local disk cache for ``cache_ttl_seconds`` so back-to-back
+  ``hermes`` invocations don't hammer the API.
 * Failures NEVER block Hermes startup.  Missing binary, no network,
   expired token, etc. all emit a one-line warning and continue with
   whatever credentials ``.env`` already had.
@@ -51,7 +51,8 @@ from agent.secret_sources._cache import (
     FetchResult,
     is_valid_env_name as _is_valid_env_name,
 )
-from agent.secret_sources.base import ErrorKind, SecretSource
+from agent.secret_sources.base import ErrorKind, SecretSource, run_secret_cli
+from agent.secret_scope import get_secret
 
 logger = logging.getLogger(__name__)
 
@@ -419,41 +420,25 @@ def _run_bws_list(
     bws: Path, access_token: str, project_id: str, server_url: str = ""
 ) -> Tuple[Dict[str, str], List[str]]:
     cmd = [str(bws), "secret", "list", project_id, "--output", "json"]
-    env = os.environ.copy()
-    env["BWS_ACCESS_TOKEN"] = access_token
-    # Make sure we're not echoing telemetry / colour codes into json.
-    env.setdefault("NO_COLOR", "1")
-    # Region / self-hosted support.  bws defaults to https://vault.bitwarden.com
-    # (US Cloud); EU Cloud users need https://vault.bitwarden.eu, and
-    # self-hosted users need their own URL.  When unset, fall back to whatever
-    # BWS_SERVER_URL the caller already had in their shell env (preserved by
-    # the copy above) so manual overrides keep working too.
+    extra_env = {"BWS_ACCESS_TOKEN": access_token}
+    # Region / self-hosted support. When no config value is supplied, the
+    # narrowly allowlisted BWS_SERVER_URL shell override remains available.
     if server_url:
-        env["BWS_SERVER_URL"] = server_url
+        extra_env["BWS_SERVER_URL"] = server_url
 
     try:
-        proc = subprocess.run(  # noqa: S603 — bws path is trusted
+        proc = run_secret_cli(
             cmd,
-            env=env,
-            capture_output=True,
-            text=True,
+            allow_env=("BWS_SERVER_URL",),
+            extra_env=extra_env,
             timeout=_BWS_RUN_TIMEOUT,
-            stdin=subprocess.DEVNULL,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RuntimeError(
-            f"bws timed out after {_BWS_RUN_TIMEOUT}s fetching secrets"
-        ) from exc
-    except OSError as exc:
-        raise RuntimeError(f"failed to invoke bws: {exc}") from exc
+    except RuntimeError:
+        raise
 
     if proc.returncode != 0:
-        # bws writes auth/network errors to stderr in plain English.
-        # Strip ANSI just in case and surface the first 200 chars.
-        err = (proc.stderr or proc.stdout or "").strip().replace("\x1b", "")
-        raise RuntimeError(
-            f"bws exited {proc.returncode}: {err[:200]}"
-        )
+        diagnostic = (proc.stderr or proc.stdout or "").strip()
+        raise RuntimeError(_safe_bws_failure_message(proc.returncode, diagnostic))
 
     raw = proc.stdout.strip()
     if not raw:
@@ -485,6 +470,37 @@ def _run_bws_list(
             continue
         secrets[key] = value
     return secrets, warnings
+
+
+def _safe_bws_failure_message(returncode: int, diagnostic: str) -> str:
+    """Classify helper failure without surfacing untrusted stdout/stderr.
+
+    Helper diagnostics can echo request material, access tokens, or secret
+    values. They are useful for internal classification only; durable and
+    user-facing errors carry a bounded category plus the exit status.
+    """
+    lowered = (diagnostic or "").lower()
+    if "invalid_client" in lowered or "400 bad request" in lowered:
+        return "bws authentication failed for the configured Bitwarden region"
+    if any(
+        token in lowered
+        for token in (
+            "unauthorized",
+            "forbidden",
+            "invalid access token",
+            "invalid token",
+            "authorization",
+            "401",
+            "403",
+        )
+    ):
+        return "bws authentication failed"
+    if any(
+        token in lowered
+        for token in ("network", "connection", "resolve", "dns", "timed out")
+    ):
+        return "bws network request failed"
+    return f"bws command failed (exit {int(returncode)})"
 
 
 # ---------------------------------------------------------------------------
@@ -644,7 +660,7 @@ class BitwardenSource(SecretSource):
         result = FetchResult()
 
         access_token_env = str(cfg.get("access_token_env") or "BWS_ACCESS_TOKEN")
-        access_token = os.environ.get(access_token_env, "").strip()
+        access_token = (get_secret(access_token_env, "") or "").strip()
         if not access_token:
             result.error = (
                 f"secrets.bitwarden.enabled is true but {access_token_env} is "
@@ -684,7 +700,10 @@ class BitwardenSource(SecretSource):
                 project_id=project_id,
                 binary=binary,
                 cache_ttl_seconds=ttl,
-                server_url=str(cfg.get("server_url", "") or "").strip(),
+                server_url=(
+                    str(cfg.get("server_url", "") or "").strip()
+                    or (get_secret("BWS_SERVER_URL", "") or "").strip()
+                ),
                 home_path=home_path,
             )
         except RuntimeError as exc:
@@ -704,8 +723,8 @@ def _classify_bws_error(message: str) -> ErrorKind:
         return ErrorKind.TIMEOUT
     if "binary not available" in lowered or "failed to invoke" in lowered:
         return ErrorKind.BINARY_MISSING
-    if any(tok in lowered for tok in ("unauthorized", "invalid token",
-                                      "access token", "401", "403")):
+    if any(tok in lowered for tok in ("authentication failed", "unauthorized",
+                                      "invalid token", "access token", "401", "403")):
         return ErrorKind.AUTH_FAILED
     if any(tok in lowered for tok in ("network", "connection", "resolve",
                                       "download", "dns")):

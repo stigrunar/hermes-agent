@@ -494,6 +494,7 @@ def redact_sensitive_text(
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
+    full_mask: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
 
@@ -501,6 +502,9 @@ def redact_sensitive_text(
     Enabled by default. Disable via security.redact_secrets: false in config.yaml.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
+
+    Set full_mask=True for durable diagnostics/receipts. No random credential
+    bytes or phone-number digits are retained in that mode.
 
     Set code_file=True to skip the ENV-assignment and JSON-field regex
     patterns when the text is known to be source code (e.g. MAX_TOKENS=***
@@ -541,9 +545,11 @@ def redact_sensitive_text(
     if file_read:
         code_file = True
 
+    _mask = _mask_token_nonreusable if full_mask else _mask_token
+
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
-        _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
+        _prefix_sub = _mask_token_nonreusable if (file_read or full_mask) else _mask_token
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
@@ -556,7 +562,7 @@ def redact_sensitive_text(
                 # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{name}={quote}{_mask_token(value)}{quote}"
+                return f"{name}={quote}{_mask(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -575,7 +581,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask_token(value)}"'
+                return f'{key}: "{_mask(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -589,7 +595,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{key}{sep}{_mask_token(value)}"
+                return f"{key}{sep}{_mask(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -597,7 +603,7 @@ def redact_sensitive_text(
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
+            lambda m: m.group(1) + (m.group(2) or "") + _mask(m.group(3)),
             text,
         )
 
@@ -605,7 +611,7 @@ def redact_sensitive_text(
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask_token(m.group(2)),
+            lambda m: m.group(1) + _mask(m.group(2)),
             text,
         )
 
@@ -614,6 +620,8 @@ def redact_sensitive_text(
         def _redact_telegram(m):
             prefix = m.group(1) or ""
             digits = m.group(2)
+            if full_mask:
+                return f"{prefix}***"
             return f"{prefix}{digits}:***"
         text = _TELEGRAM_RE.sub(_redact_telegram, text)
 
@@ -644,13 +652,13 @@ def redact_sensitive_text(
         # query-string tokens are left to pass through (see the web-URL note
         # below). See _URL_BARE_TOKEN_RE for the false-positive guards.
         text = _URL_BARE_TOKEN_RE.sub(
-            lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}",
+            lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}",
             text,
         )
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:
-        text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
+        text = _JWT_RE.sub(lambda m: _mask(m.group(0)), text)
 
     # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log
     # request targets) is intentionally OFF. Many legitimate workflows pass
@@ -674,12 +682,45 @@ def redact_sensitive_text(
     if "+" in text:
         def _redact_phone(m):
             phone = m.group(1)
+            if full_mask:
+                return "***"
             if len(phone) <= 8:
                 return phone[:2] + "****" + phone[-2:]
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
+
+
+def redact_for_persistence(value):
+    """Force-redact text before it crosses a durable receipt boundary.
+
+    Active browser/tool workflows intentionally preserve web query credentials
+    and ``user:password@`` URLs because masking them can destroy a callback or
+    signed URL the user asked the agent to follow. Durable logs, scheduler
+    receipts, and coordination records have no such need. This stricter pass
+    therefore forces the normal redactor on and additionally masks URL query
+    credentials, URL userinfo, and HTTP request-target query strings.
+
+    Dictionaries and sequences are handled recursively so structured event
+    payloads and diagnostic metadata cannot bypass the text boundary.
+    Non-text scalar values pass through unchanged.
+    """
+    if isinstance(value, str):
+        text = redact_sensitive_text(value, force=True, full_mask=True)
+        if not text:
+            return text
+        text = _redact_url_query_params(text)
+        text = _redact_url_userinfo(text)
+        text = _redact_http_request_target_query_params(text)
+        return text
+    if isinstance(value, dict):
+        return {key: redact_for_persistence(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_for_persistence(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_for_persistence(item) for item in value)
+    return value
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),

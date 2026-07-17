@@ -3,7 +3,8 @@
 When ``HERMES_HOME`` points to a named profile, ``read_credential_pool()``
 and ``get_provider_auth_state()`` fall back to the global-root
 ``auth.json`` per-provider when the profile has no entries for that
-provider.  Writes still target the profile only.
+provider. Explicit administrative writes target the profile; runtime health
+and token-rotation writes follow inherited credentials back to their owner.
 
 See the #18594 follow-up report: profile workers couldn't see providers
 authenticated only at the global root.
@@ -451,6 +452,130 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
 
     # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_runtime_pool_status_update_persists_to_global_source_without_profile_shadow(
+    profile_env,
+    monkeypatch,
+):
+    """Runtime health state follows the inherited row back to its owner.
+
+    Merely selecting and exhausting a globally inherited credential must not
+    materialize a profile copy.  Such a copy shadows future root rotations and
+    leaves the profile pinned to stale credential state.
+    """
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-runtime",
+            "label": "global-runtime",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-syntheticglobalruntime123456",
+        }],
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={}))
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.select() is not None
+    pool.mark_exhausted_and_rotate(status_code=429)
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    global_entry = global_data["credential_pool"]["openrouter"][0]
+    assert global_entry["id"] == "glob-runtime"
+    assert global_entry["last_status"] == "exhausted"
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_data.get("credential_pool", {}).get("openrouter") in (None, [])
+
+
+def test_runtime_codex_rotation_updates_global_owner_without_selecting_or_shadowing(
+    profile_env,
+):
+    """A background refresh is neither a profile login nor a provider choice."""
+    _write(
+        profile_env["global"] / "auth.json",
+        {
+            "version": 1,
+            "active_provider": "nous",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "synthetic-old-access",
+                        "refresh_token": "synthetic-old-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        {"version": 1, "active_provider": "anthropic", "providers": {}},
+    )
+
+    from hermes_cli.auth import _save_codex_tokens
+
+    _save_codex_tokens({
+        "access_token": "synthetic-new-access",
+        "refresh_token": "synthetic-new-refresh",
+    })
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert (
+        global_data["providers"]["openai-codex"]["tokens"]["refresh_token"]
+        == "synthetic-new-refresh"
+    )
+    assert global_data["active_provider"] == "nous"
+    assert "openai-codex" not in profile_data["providers"]
+    assert profile_data["active_provider"] == "anthropic"
+
+
+def test_runtime_singleton_pool_state_stays_with_global_owner(
+    profile_env,
+    monkeypatch,
+):
+    """A root singleton without a pool row must not seed a profile shadow."""
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    _write(
+        profile_env["global"] / "auth.json",
+        {
+            "version": 1,
+            "active_provider": "nous",
+            "providers": {
+                "openai-codex": {
+                    "tokens": {
+                        "access_token": "synthetic-singleton-access",
+                        "refresh_token": "synthetic-singleton-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write(
+        profile_env["profile"] / "auth.json",
+        {"version": 1, "active_provider": "anthropic", "providers": {}},
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openai-codex")
+    assert pool.select() is not None
+    pool.mark_exhausted_and_rotate(status_code=429)
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    global_entry = global_data["credential_pool"]["openai-codex"][0]
+    assert global_entry["source"] == "device_code"
+    assert global_entry["last_status"] == "exhausted"
+    assert global_data["active_provider"] == "nous"
+
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_data.get("credential_pool", {}).get("openai-codex") in (None, [])
+    assert "openai-codex" not in profile_data["providers"]
+    assert profile_data["active_provider"] == "anthropic"
 
 
 def test_provider_state_transaction_locks_global_fallback_before_use(

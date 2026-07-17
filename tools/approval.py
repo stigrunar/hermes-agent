@@ -2654,9 +2654,10 @@ def _run_approval_gate(
     escalations). Extracting it keeps the fail-closed / cron / gateway /
     persist policy in ONE place so the two entry points can never drift.
 
-    Ordering mirrors the historical ``check_dangerous_command`` tail:
-    yolo bypass → session-cache short-circuit → interactive/gateway/cron
-    branch → prompt → ``deny/session/always`` persistence. The caller is
+    Ordering mirrors the ``check_dangerous_command`` tail with the cron floor:
+    cron deny → yolo bypass → session-cache short-circuit →
+    interactive/gateway/cron branch → prompt → ``deny/session/always``
+    persistence. The caller is
     responsible for the checks that are specific to its input shape
     (hardline detection, command-string permanent allowlist, dangerous-
     pattern detection) BEFORE calling this gate.
@@ -2686,6 +2687,20 @@ def _run_approval_gate(
         ``{"approved": bool, "message": str|None, ...}`` — shape shared with
         ``check_dangerous_command`` so all callers handle it uniformly.
     """
+    # Cron deny is a narrower, explicit policy than the general yolo setting.
+    # No user is present to approve a recovery, so it must win over yolo and
+    # any cached session approval.
+    if (
+        env_var_enabled("HERMES_CRON_SESSION")
+        and _get_cron_approval_mode() == "deny"
+    ):
+        return {
+            "approved": False,
+            "message": cron_deny_message,
+            "pattern_key": pattern_key,
+            "description": description,
+        }
+
     # --yolo bypasses all approval prompts (session- or process-scoped).
     # Hardline blocks are handled by the caller BEFORE this gate, so yolo
     # here only skips the recoverable approval layer.
@@ -2907,12 +2922,19 @@ def check_dangerous_command(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
+    cron_deny = (
+        env_var_enabled("HERMES_CRON_SESSION")
+        and _get_cron_approval_mode() == "deny"
+    )
+
     # --yolo: bypass all approval prompts. Gateway /yolo is session-scoped;
     # CLI --yolo remains process-scoped via the env var for local use.
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled():
+    if not cron_deny and (
+        _YOLO_MODE_FROZEN or is_current_session_yolo_enabled()
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not cron_deny and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_dangerous, pattern_key, description = detect_dangerous_command(command)
@@ -3218,13 +3240,23 @@ def check_all_command_guards(command: str, env_type: str,
                        deny_pattern, command[:200])
         return _user_deny_block_result(deny_pattern)
 
-    # --yolo or approvals.mode=off: bypass all approval prompts.
+    cron_deny = (
+        env_var_enabled("HERMES_CRON_SESSION")
+        and _get_cron_approval_mode() == "deny"
+    )
+
+    # --yolo or approvals.mode=off: bypass all approval prompts, except when
+    # the narrower cron policy explicitly denies unattended dangerous work.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if not cron_deny and (
+        _YOLO_MODE_FROZEN
+        or is_current_session_yolo_enabled()
+        or approval_mode == "off"
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if not cron_deny and _command_matches_permanent_allowlist(command):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -3233,10 +3265,10 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if cron_deny or (not is_cli and not is_gateway and not is_ask):
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
-            if _get_cron_approval_mode() == "deny":
+            if cron_deny:
                 # Run detection to get a description for the block message
                 is_dangerous, _pk, description = detect_dangerous_command(command)
                 if is_dangerous:
@@ -3647,14 +3679,6 @@ def check_execute_code_guard(code: str, env_type: str,
     if _should_skip_container_guards(env_type, has_host_access=has_host_access):
         return {"approved": True, "message": None}
 
-    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
-    approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
-        return {"approved": True, "message": None}
-
-    is_gateway = _is_gateway_approval_context()
-    is_ask = env_var_enabled("HERMES_EXEC_ASK")
-
     # Cron: no user is present to approve arbitrary code.
     if env_var_enabled("HERMES_CRON_SESSION"):
         if _get_cron_approval_mode() == "deny":
@@ -3674,6 +3698,14 @@ def check_execute_code_guard(code: str, env_type: str,
                 "user_consent": False,
             }
         return {"approved": True, "message": None}
+
+    # --yolo or approvals.mode=off: bypass (session- or process-scoped).
+    approval_mode = _get_approval_mode()
+    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+        return {"approved": True, "message": None}
+
+    is_gateway = _is_gateway_approval_context()
+    is_ask = env_var_enabled("HERMES_EXEC_ASK")
 
     # Only gateway/ask contexts get the one-shot whole-script approval.
     #   * CLI interactive: the script's terminal() calls are guarded per-call
