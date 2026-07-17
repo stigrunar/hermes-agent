@@ -861,6 +861,21 @@ class UpdateTaskBody(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _review_handoff_status_error(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    handoff = kanban_db._protected_review_handoff_for_task(
+        conn, task_id, role="next",
+    )
+    if handoff is None:
+        return None
+    return (
+        "explicit review successor gate is protected while the review handoff "
+        f"is {handoff['state']}; status changes are released by an approved "
+        "review verdict"
+    )
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -870,6 +885,9 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
         if payload.status is not None:
+            status_error = _review_handoff_status_error(conn, task_id)
+            if status_error is not None:
+                raise HTTPException(status_code=409, detail=status_error)
             active_handoff = kanban_db._active_review_handoff_for_task(conn, task_id)
             if active_handoff is not None:
                 raise HTTPException(
@@ -1052,6 +1070,8 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if _review_handoff_status_error(conn, task_id) is not None:
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
@@ -1271,6 +1291,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                if payload.status is not None and not payload.archive:
+                    status_error = _review_handoff_status_error(conn, tid)
+                    if status_error is not None:
+                        entry.update(ok=False, error=status_error)
+                        results.append(entry)
+                        continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")

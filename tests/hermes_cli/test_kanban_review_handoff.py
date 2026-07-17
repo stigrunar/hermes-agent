@@ -325,6 +325,71 @@ def test_active_review_reclaim_unblock_and_promote_stay_in_review_lane(kanban_ho
         assert kb.get_task(conn, source).status == "blocked"
 
 
+@pytest.mark.parametrize("state", ["active", "changes_requested"])
+def test_review_successor_cannot_be_force_promoted_before_approval(kanban_home, state):
+    with kb.connect() as conn:
+        source, _, nxt = _registered_chain(conn)
+        _activate(conn, source)
+        if state == "changes_requested":
+            review = kb.list_review_handoffs(conn)[0]["review_task_id"]
+            claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+            assert claimed is not None
+            assert kb.submit_review_verdict(
+                conn,
+                review,
+                verdict="changes_requested",
+                summary="please recut",
+                expected_run_id=claimed.current_run_id,
+            )
+
+        promoted, reason = kb.promote_task(
+            conn, nxt, actor="operator", force=True,
+        )
+        assert promoted is False
+        assert "successor gate" in reason
+        assert kb.get_task(conn, nxt).status == "todo"
+
+
+@pytest.mark.parametrize("state", ["active", "changes_requested"])
+def test_review_successor_blocks_all_ordinary_mutations(kanban_home, state):
+    with kb.connect() as conn:
+        source, _, nxt = _registered_chain(conn)
+        _activate(conn, source)
+        if state == "changes_requested":
+            review = kb.list_review_handoffs(conn)[0]["review_task_id"]
+            claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+            assert claimed is not None
+            assert kb.submit_review_verdict(
+                conn,
+                review,
+                verdict="changes_requested",
+                summary="please recut",
+                expected_run_id=claimed.current_run_id,
+            )
+
+        for operation in (
+            lambda: kb.complete_task(conn, nxt, result="must not complete"),
+            lambda: kb.block_task(conn, nxt, reason="must not block"),
+            lambda: kb.schedule_task(conn, nxt, reason="must not schedule"),
+            lambda: kb.unblock_task(conn, nxt),
+        ):
+            with pytest.raises(ValueError, match="successor gate"):
+                operation()
+            assert kb.get_task(conn, nxt).status == "todo"
+
+        if state == "changes_requested":
+            source_claim = kb.claim_task(conn, source, claimer="builder:2")
+            assert source_claim is not None
+            assert kb.block_task(
+                conn,
+                source,
+                reason="review-required: recut ready",
+                expected_run_id=source_claim.current_run_id,
+            )
+            assert kb.get_task(conn, source).status == "blocked"
+            assert kb.get_task(conn, nxt).status == "todo"
+
+
 @pytest.mark.parametrize("state", ["waiting", "active", "changes_requested"])
 def test_review_lifecycle_protects_all_three_task_roles(kanban_home, state):
     with kb.connect() as conn:

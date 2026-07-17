@@ -3820,6 +3820,8 @@ def recompute_ready(
             if (cur_status == "todo" and block_kind == "dependency"
                     and not _dependency_wait_changed(conn, task_id)):
                 continue
+            if _protected_review_handoff_for_task(conn, task_id, role="next"):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4105,6 +4107,18 @@ def claim_task(
         wait = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            if wait and wait["status"] == "ready":
+                conn.execute(
+                    "UPDATE tasks SET status = 'todo', block_kind = NULL "
+                    "WHERE id = ? AND status = 'ready'",
+                    (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "review_successor_protected"},
+                )
+            return None
         if (wait and wait["status"] == "ready" and wait["block_kind"] == "dependency"
                 and not _dependency_wait_changed(conn, task_id)):
             conn.execute(
@@ -4363,6 +4377,8 @@ def claim_review_task(
 
 def _claim_retry_status(conn: sqlite3.Connection, task_id: str) -> str:
     """Return the lane an interrupted claim must re-enter."""
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        return "todo"
     active_review = conn.execute(
         "SELECT 1 FROM review_handoffs WHERE review_task_id=? AND state='active'",
         (task_id,),
@@ -4811,6 +4827,11 @@ def _assert_task_completion_allowed(
     conn: sqlite3.Connection, task_id: str,
 ) -> None:
     """Reject ordinary completion while an explicit review lifecycle is open."""
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        raise ValueError(
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
     active_handoff = _active_review_handoff_for_task(conn, task_id)
     if active_handoff is not None:
         if active_handoff["review_task_id"] == task_id:
@@ -5688,6 +5709,11 @@ def block_task(
         ).fetchone()
         if cur_row is None:
             return False
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         prev_kind = cur_row["block_kind"] if "block_kind" in cur_row.keys() else None
         prev_recurrences = (
             int(cur_row["block_recurrences"])
@@ -6140,6 +6166,11 @@ def promote_task(
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        return False, (
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
     if conn.execute(
         "SELECT 1 FROM review_handoffs WHERE source_task_id=? AND state='active'",
         (task_id,),
@@ -6187,6 +6218,11 @@ def promote_task(
     with write_txn(conn):
         # Repeat the precheck under the write lock so activation cannot race
         # this ordinary todo/blocked -> ready transition.
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            return False, (
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         if conn.execute(
             "SELECT 1 FROM review_handoffs "
             "WHERE source_task_id=? AND state='active'",
@@ -6234,6 +6270,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         if conn.execute(
             "SELECT 1 FROM review_handoffs WHERE source_task_id=? AND state='active'",
             (task_id,),
@@ -6612,15 +6653,27 @@ def decompose_triage_task(
 
 
 def _protected_review_handoff_for_task(
-    conn: sqlite3.Connection, task_id: str,
+    conn: sqlite3.Connection, task_id: str, *, role: Optional[str] = None,
 ) -> Optional[sqlite3.Row]:
-    """Return any non-terminal review lifecycle touching ``task_id``."""
+    """Return a non-terminal review lifecycle touching ``task_id``.
+
+    When ``role`` is ``"next"``, only the explicit successor gate is
+    considered. The default retains the broader source/review/next protection
+    used by archive and delete operations.
+    """
+    if role == "next":
+        role_clause = "next_task_id=?"
+    elif role is None:
+        role_clause = "source_task_id=? OR review_task_id=? OR next_task_id=?"
+    else:
+        raise ValueError(f"unknown review handoff role: {role!r}")
+    params = (task_id,) if role == "next" else (task_id, task_id, task_id)
     return conn.execute(
         "SELECT * FROM review_handoffs "
         "WHERE state != 'approved' "
-        "AND (source_task_id=? OR review_task_id=? OR next_task_id=?) "
+        f"AND ({role_clause}) "
         "LIMIT 1",
-        (task_id, task_id, task_id),
+        params,
     ).fetchone()
 
 
@@ -7037,6 +7090,11 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks

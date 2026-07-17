@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
@@ -1007,6 +1007,87 @@ def test_explicit_review_handoff_api_direct(tmp_path, monkeypatch):
     assert verdict == {"ok": True, "verdict": "approved"}
     with kb.connect(db_path) as conn:
         assert kb.get_task(conn, nxt["id"]).status == "ready"
+
+
+@pytest.mark.parametrize("state", ["active", "changes_requested"])
+def test_dashboard_protects_review_successor_status_mutations(
+    tmp_path, monkeypatch, state,
+):
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
+    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
+
+    source = pa.create_task(
+        pa.CreateTaskBody(title="source", assignee="builder"), board="test",
+    )["task"]
+    review = pa.create_task(
+        pa.CreateTaskBody(
+            title="review", assignee="reviewer", parents=[source["id"]],
+        ),
+        board="test",
+    )["task"]
+    nxt = pa.create_task(
+        pa.CreateTaskBody(title="next"), board="test",
+    )["task"]
+    assert pa.add_link(pa.LinkBody(
+        parent_id=source["id"],
+        child_id=review["id"],
+        relationship="review_gate",
+        next_task_id=nxt["id"],
+    ), board="test") == {"ok": True, "relationship": "review_gate"}
+    handed_off = pa.update_task(
+        source["id"],
+        pa.UpdateTaskBody(
+            status="blocked", block_reason="review-required: inspect",
+        ),
+        board="test",
+    )
+    assert handed_off["task"]["status"] == "blocked"
+
+    if state == "changes_requested":
+        verdict = pa.submit_review_verdict(
+            review["id"],
+            pa.ReviewVerdictBody(
+                verdict="changes_requested", summary="please recut",
+            ),
+            board="test",
+        )
+        assert verdict == {"ok": True, "verdict": "changes_requested"}
+
+    with pytest.raises(HTTPException) as single:
+        pa.update_task(
+            nxt["id"], pa.UpdateTaskBody(status="ready"), board="test",
+        )
+    assert single.value.status_code == 409
+    assert "successor gate" in single.value.detail
+
+    bulk = pa.bulk_update(
+        pa.BulkTaskBody(ids=[nxt["id"]], status="ready"), board="test",
+    )
+    bulk_result = bulk["results"]
+    assert len(bulk_result) == 1
+    assert bulk_result[0]["id"] == nxt["id"]
+    assert bulk_result[0]["ok"] is False
+    assert "successor gate" in bulk_result[0]["error"]
+
+    ordinary = pa.create_task(
+        pa.CreateTaskBody(title="ordinary"), board="test",
+    )["task"]
+    ordinary_patch = pa.update_task(
+        ordinary["id"],
+        pa.UpdateTaskBody(status="blocked", block_reason="wait"),
+        board="test",
+    )
+    assert ordinary_patch["task"]["status"] == "blocked"
+    ordinary_bulk = pa.bulk_update(
+        pa.BulkTaskBody(ids=[ordinary["id"]], status="ready"), board="test",
+    )
+    assert ordinary_bulk["results"][0]["ok"] is True
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, nxt["id"]).status == "todo"
 
 
 # ---------------------------------------------------------------------------
