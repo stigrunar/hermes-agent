@@ -966,6 +966,49 @@ def test_add_link_cycle_rejected(client):
     assert r.status_code == 400
 
 
+def test_explicit_review_handoff_api_direct(tmp_path, monkeypatch):
+    """Exercise the endpoint functions without the sandbox-blocked TestClient."""
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
+    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
+
+    source = pa.create_task(pa.CreateTaskBody(title="source"), board="test")["task"]
+    review = pa.create_task(
+        pa.CreateTaskBody(title="review", parents=[source["id"]]), board="test",
+    )["task"]
+    nxt = pa.create_task(pa.CreateTaskBody(title="next"), board="test")["task"]
+    linked = pa.add_link(pa.LinkBody(
+        parent_id=source["id"],
+        child_id=review["id"],
+        relationship="review_gate",
+        next_task_id=nxt["id"],
+    ), board="test")
+    assert linked == {"ok": True, "relationship": "review_gate"}
+
+    handed_off = pa.update_task(
+        source["id"],
+        pa.UpdateTaskBody(
+            status="blocked", block_reason="review-required: inspect",
+        ),
+        board="test",
+    )
+    assert handed_off["task"]["status"] == "blocked"
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, review["id"]).status == "review"
+
+    verdict = pa.submit_review_verdict(
+        review["id"],
+        pa.ReviewVerdictBody(verdict="approved", summary="verified"),
+        board="test",
+    )
+    assert verdict == {"ok": True, "verdict": "approved"}
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, nxt["id"]).status == "ready"
+
+
 # ---------------------------------------------------------------------------
 # Dispatch nudge
 # ---------------------------------------------------------------------------
@@ -2428,11 +2471,22 @@ def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
         child = kb.create_task(
             conn, title="child", assignee="worker", parents=[parent],
         )
-        kb.claim_task(conn, parent, claimer="worker")
-        assert kb.block_task(
-            conn, parent,
-            reason="review-required: inspect the source handoff",
+        # Reproduce the pre-review-handoff persisted shape directly.  The live
+        # transition now rejects this unsafe graph before mutating either task.
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?",
+            (parent,),
         )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (
+                parent,
+                '{"reason":"review-required: inspect the source handoff"}',
+                int(time.time()),
+            ),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -2441,10 +2495,10 @@ def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
     rows = response.json()["diagnostics"]
     child_row = next(row for row in rows if row["task_id"] == child)
     kinds = {diag["kind"] for diag in child_row["diagnostics"]}
-    assert "review_parent_gates_child" in kinds
+    assert "legacy_review_parent_gates_child" in kinds
     finding = next(
         diag for diag in child_row["diagnostics"]
-        if diag["kind"] == "review_parent_gates_child"
+        if diag["kind"] == "legacy_review_parent_gates_child"
     )
     assert finding["data"]["parent_id"] == parent
     assert finding["data"]["child_status"] == "todo"

@@ -794,7 +794,7 @@ def test_chain_diagnostics_review_required_parent_gates_todo_child():
     )
 
     assert "t_child" in diags
-    assert [d.kind for d in diags["t_child"]] == ["review_parent_gates_child"]
+    assert [d.kind for d in diags["t_child"]] == ["legacy_review_parent_gates_child"]
     finding = diags["t_child"][0]
     assert finding.data == {
         "parent_id": "t_parent",
@@ -806,6 +806,31 @@ def test_chain_diagnostics_review_required_parent_gates_todo_child():
     }
     assert "t_parent" in finding.detail
     assert finding.actions[0].payload["command"] == "hermes kanban show t_parent"
+
+
+def test_chain_diagnostics_explicit_review_invariant_is_distinct_from_legacy():
+    source = _task(id="t_source", status="blocked")
+    review = _task(id="t_review", status="todo")
+    handoff = {
+        "source_task_id": "t_source",
+        "review_task_id": "t_review",
+        "next_task_id": None,
+        "state": "active",
+        "updated_at": 150,
+    }
+    diags = kd.compute_chain_diagnostics(
+        [source, review],
+        [("t_source", "t_review")],
+        {},
+        {},
+        now=200,
+        review_handoffs=[handoff],
+    )
+    finding = diags["t_review"][0]
+    assert finding.kind == "review_handoff_invariant_violation"
+    assert finding.severity == "critical"
+    assert finding.actions[0].payload["bounded"] is True
+    assert finding.actions[0].payload["bulk_promote"] is False
 
 
 def test_chain_diagnostics_negative_structured_parent_verdict_releases_child():

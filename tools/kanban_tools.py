@@ -514,6 +514,7 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    review_verdict = args.get("review_verdict")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -592,6 +593,20 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            if review_verdict is not None:
+                ok = kb.submit_review_verdict(
+                    conn,
+                    tid,
+                    verdict=str(review_verdict),
+                    summary=summary or result,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if not ok:
+                    return tool_error(
+                        "review verdict lost ownership of the active run; retry/reclaim first"
+                    )
+                return _ok(task_id=tid, review_verdict=review_verdict)
+
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -1306,17 +1321,30 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_link(args: dict, **kw) -> str:
-    """Add a parent→child dependency edge after the fact."""
+    """Add an ordinary dependency or explicit review-gate relationship."""
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
         return tool_error("both parent_id and child_id are required")
     board = args.get("board")
+    relationship = args.get("relationship") or "dependency"
+    next_task_id = args.get("next_task_id")
     try:
         kb, conn = _connect(board=board)
         try:
-            kb.link_tasks(conn, parent_id=parent_id, child_id=child_id)
-            return _ok(parent_id=parent_id, child_id=child_id)
+            kb.link_tasks(
+                conn,
+                parent_id=parent_id,
+                child_id=child_id,
+                relationship=relationship,
+                next_task_id=next_task_id,
+            )
+            return _ok(
+                parent_id=parent_id,
+                child_id=child_id,
+                relationship=relationship,
+                next_task_id=next_task_id,
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -1454,6 +1482,15 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Human-readable handoff, 1-3 sentences. Appears in "
                     "Run History on the dashboard and in downstream "
                     "workers' context."
+                ),
+            },
+            "review_verdict": {
+                "type": "string",
+                "enum": ["approved", "changes_requested"],
+                "description": (
+                    "Explicit verdict for a registered active review gate. "
+                    "Omit for ordinary completion; completing a review without "
+                    "this field is rejected and never implies approval."
                 ),
             },
             "metadata": {
@@ -1904,21 +1941,33 @@ KANBAN_UNBLOCK_SCHEMA = {
 KANBAN_LINK_SCHEMA = {
     "name": "kanban_link",
     "description": (
-        "Add a parent→child dependency edge after both tasks already "
-        "exist. The child won't promote to 'ready' until all parents "
-        "are 'done'. Cycles and self-links are rejected."
+        "Add a parent→child relationship after both tasks exist. The default "
+        "is an ordinary dependency. Use relationship='review_gate' to register "
+        "an explicit one-to-one review handoff; that gate is released only by "
+        "a review-required block and closes only through an explicit verdict."
     ),
     "parameters": {
         "type": "object",
         "properties": {
             "parent_id": {"type": "string", "description": "Parent task id."},
             "child_id":  {"type": "string", "description": "Child task id."},
+            "relationship": {
+                "type": "string",
+                "enum": ["dependency", "review_gate"],
+                "description": "Relationship lifecycle; defaults to dependency.",
+            },
+            "next_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional successor released only by an approved verdict. "
+                    "Valid only with relationship='review_gate'."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["parent_id", "child_id"],
     },
 }
-
 
 # ---------------------------------------------------------------------------
 # Registration

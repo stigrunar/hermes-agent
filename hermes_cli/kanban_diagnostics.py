@@ -1447,6 +1447,7 @@ def compute_chain_diagnostics(
     runs_by_task: Any,
     *,
     now: Optional[int] = None,
+    review_handoffs: Iterable[Any] = (),
 ) -> dict[str, list[Diagnostic]]:
     """Return diagnostics that require task links and cross-task history.
 
@@ -1462,6 +1463,7 @@ def compute_chain_diagnostics(
     """
     now_ts = int(now if now is not None else time.time())
     task_map = _task_map(tasks)
+    links = list(links)
     out: dict[str, list[Diagnostic]] = {}
     for link in links:
         parent_id, child_id = _link_ids(link)
@@ -1481,7 +1483,7 @@ def compute_chain_diagnostics(
             reason = _review_required_reason(parent_events)
             if reason is not None:
                 out.setdefault(child_id_str, []).append(Diagnostic(
-                    kind="review_parent_gates_child",
+                    kind="legacy_review_parent_gates_child",
                     severity="warning",
                     title="Review-required parent is gating this task",
                     detail=(
@@ -1489,7 +1491,21 @@ def compute_chain_diagnostics(
                         f"handoff while this child remains todo. The status-only "
                         "link does not carry a review verdict or release policy."
                     ),
-                    actions=[_chain_inspection_action(parent_id_str)],
+                    actions=[
+                        _chain_inspection_action(parent_id_str),
+                        DiagnosticAction(
+                            kind="cli_hint",
+                            label="Register this one review gate after inspecting the chain",
+                            payload={
+                                "command": (
+                                    f"hermes kanban link {parent_id_str} {child_id_str} "
+                                    "--relationship review_gate"
+                                ),
+                                "bounded": True,
+                                "bulk_promote": False,
+                            },
+                        ),
+                    ],
                     first_seen_at=_event_ts(_latest_event(parent_events, {"blocked"})) or now_ts,
                     last_seen_at=_event_ts(_latest_event(parent_events, {"blocked"})) or now_ts,
                     data={
@@ -1532,6 +1548,77 @@ def compute_chain_diagnostics(
                         **negative,
                     },
                 ))
+
+    links_set = {
+        tuple(str(item) for item in _link_ids(link))
+        for link in links
+        if all(_link_ids(link))
+    }
+    for handoff in review_handoffs:
+        source_id = str(_task_field(handoff, "source_task_id") or "")
+        review_id = str(_task_field(handoff, "review_task_id") or "")
+        next_id_raw = _task_field(handoff, "next_task_id")
+        next_id = str(next_id_raw) if next_id_raw else None
+        state = str(_task_field(handoff, "state") or "")
+        source = task_map.get(source_id)
+        review = task_map.get(review_id)
+        problems: list[str] = []
+        if source is None or review is None:
+            problems.append("relationship references a missing source or review task")
+        else:
+            source_status = str(_task_field(source, "status") or "")
+            review_status = str(_task_field(review, "status") or "")
+            parked = (source_id, review_id) in links_set
+            if state == "waiting":
+                if not parked or review_status != "todo":
+                    problems.append("waiting gate is not parked as a todo child of its source")
+            elif state == "active":
+                if parked:
+                    problems.append("active review gate is still parent-gated")
+                if source_status != "blocked":
+                    problems.append(f"active source is {source_status}, expected blocked")
+                if review_status not in {"review", "running", "blocked"}:
+                    problems.append(
+                        f"active review gate is {review_status}, expected review/running/blocked"
+                    )
+            elif state == "changes_requested":
+                if source_status not in {"todo", "ready", "running"}:
+                    problems.append(f"recut source is {source_status}, expected todo/ready/running")
+                if review_status != "done":
+                    problems.append(f"closed review gate is {review_status}, expected done")
+            elif state == "approved":
+                if source_status != "done" or review_status != "done":
+                    problems.append("approved handoff did not close source and review gate")
+            else:
+                problems.append(f"unknown review handoff state {state!r}")
+        if next_id and next_id not in task_map:
+            problems.append("relationship references a missing next gate")
+        if problems:
+            out.setdefault(review_id or source_id, []).append(Diagnostic(
+                kind="review_handoff_invariant_violation",
+                severity="critical",
+                title="Explicit review handoff invariant is broken",
+                detail="; ".join(problems),
+                actions=[DiagnosticAction(
+                    kind="cli_hint",
+                    label="Inspect the three-card chain; do not bulk-promote",
+                    payload={
+                        "command": f"hermes kanban show {source_id}",
+                        "bounded": True,
+                        "bulk_promote": False,
+                    },
+                    suggested=True,
+                )],
+                first_seen_at=int(_task_field(handoff, "updated_at", now_ts) or now_ts),
+                last_seen_at=now_ts,
+                data={
+                    "source_task_id": source_id,
+                    "review_task_id": review_id,
+                    "next_task_id": next_id,
+                    "state": state,
+                    "problems": problems,
+                },
+            ))
 
     for task_id, task in task_map.items():
         diagnostic = _dependency_wait_loop_diagnostic(
@@ -2376,7 +2463,8 @@ DIAGNOSTIC_KINDS = (
     "stuck_in_blocked",
     "block_unblock_cycling",
     "stranded_in_ready",
-    "review_parent_gates_child",
+    "legacy_review_parent_gates_child",
+    "review_handoff_invariant_violation",
     "negative_parent_verdict_released_child",
     "dependency_wait_loop",
     "terminal_task_active_run",

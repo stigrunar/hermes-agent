@@ -1379,6 +1379,37 @@ def test_link_happy_path(worker_env):
     assert d["ok"] is True
 
 
+def test_complete_requires_explicit_review_verdict(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        review = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[worker_env],
+        )
+        kb.register_review_handoff(conn, worker_env, review)
+        source = kb.get_task(conn, worker_env)
+        assert kb.block_task(
+            conn,
+            worker_env,
+            reason="review-required: inspect",
+            expected_run_id=source.current_run_id,
+        )
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:tool")
+        assert claimed is not None
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(claimed.current_run_id))
+    rejected = json.loads(kt._handle_complete({"summary": "verified"}))
+    assert "explicit approved or changes_requested" in rejected["error"]
+    approved = json.loads(kt._handle_complete({
+        "summary": "verified",
+        "review_verdict": "approved",
+    }))
+    assert approved["ok"] is True
+    assert approved["review_verdict"] == "approved"
+
+
 def test_link_rejects_self_reference(worker_env):
     from tools import kanban_tools as kt
     out = kt._handle_link({"parent_id": worker_env, "child_id": worker_env})
