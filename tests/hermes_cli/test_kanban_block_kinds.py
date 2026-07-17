@@ -168,6 +168,7 @@ def test_dependency_wait_does_not_repromote_until_named_task_changes(kanban_home
             conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("approved", upstream))
         assert kb.recompute_ready(conn) == 1
         assert kb.get_task(conn, child).status == "ready"
+        assert kb.recompute_ready(conn) == 0
 
 
 def test_claim_rejects_stale_ready_dependency_wait(kanban_home: Path) -> None:
