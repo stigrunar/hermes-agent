@@ -496,9 +496,24 @@ def test_continuation_queue_is_bounded_ordered_idempotent_and_classified(
         conn.execute(
             "UPDATE tasks SET created_at = 1 WHERE id = ?", (dependency,)
         )
+        # A sensor may independently observe an automatic ops repair, but a
+        # structured human boundary on the same card is authoritative.
+        human_report = kd.ReconciliationResult(
+            task_id=human,
+            db_fingerprint="f" * 64,
+            opted_in=True,
+        )
+        human_report.findings.append(kd.Diagnostic(
+            kind="workspace_missing",
+            severity="error",
+            title="Workspace missing",
+            detail="fixture",
+            data={"evidence": {"path": "/missing"}},
+        ))
+        reports = {human: human_report}
 
         first = kb.queue_reconciliation_continuations(
-            conn, {}, now=1000, limit=3,
+            conn, reports, now=1000, limit=3,
         )
         assert [item["task_id"] for item in first] == [review, ops, transient]
         assert [item["classification"] for item in first] == [
@@ -509,10 +524,10 @@ def test_continuation_queue_is_bounded_ordered_idempotent_and_classified(
         ).fetchone()[0] == 3
 
         all_first = kb.queue_reconciliation_continuations(
-            conn, {}, now=1000, limit=20,
+            conn, reports, now=1000, limit=20,
         )
         all_second = kb.queue_reconciliation_continuations(
-            conn, {}, now=1000, limit=20,
+            conn, reports, now=1000, limit=20,
         )
         assert len(all_first) == len(all_second) == 5
         assert dependency not in {item["task_id"] for item in all_second}
@@ -528,7 +543,7 @@ def test_continuation_queue_is_bounded_ordered_idempotent_and_classified(
         assert proof_row["state"] == "proof_needed"
 
         retry_due = kb.queue_reconciliation_continuations(
-            conn, {}, now=1060, limit=20,
+            conn, reports, now=1060, limit=20,
         )
         transient_row = next(
             item for item in retry_due if item["task_id"] == transient

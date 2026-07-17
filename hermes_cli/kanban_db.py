@@ -8043,9 +8043,15 @@ def queue_reconciliation_continuations(
     }
     for row in rows:
         task_id = str(row["id"])
-        routed = _continuation_route(reports.get(task_id))
-        if routed is None:
-            routed = _blocked_continuation_route(conn, row, now=now_ts)
+        blocked_route = _blocked_continuation_route(conn, row, now=now_ts)
+        # A structured human/policy boundary always wins over automatic
+        # reconciliation routing, even if sensors also found a repairable
+        # repo/workspace issue on the same card.
+        routed = (
+            blocked_route
+            if blocked_route is not None and blocked_route[0] == "human_required"
+            else (_continuation_route(reports.get(task_id)) or blocked_route)
+        )
         if routed is None:
             continue
         classification, action, evidence = routed

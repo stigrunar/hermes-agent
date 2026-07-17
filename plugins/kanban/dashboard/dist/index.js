@@ -712,6 +712,9 @@
         columns: boardData.columns.map(function (col) {
           return Object.assign({}, col, { tasks: col.tasks.filter(filterTask) });
         }),
+        // Proven superseded cards are intentionally absent from ordinary
+        // columns, but remain searchable in the explicit audit surface.
+        suppressed: (boardData.suppressed || []).filter(filterTask),
       });
     }, [boardData, tenantFilter, assigneeFilter, search]);
 
@@ -1071,6 +1074,10 @@
           boardData,
           onOpen: setSelectedTaskId,
         }),
+        h(SuppressedAuditSection, {
+          boardData: filteredBoard,
+          onOpen: setSelectedTaskId,
+        }),
         h(BoardToolbar, {
           board: boardData,
           tenantFilter, setTenantFilter,
@@ -1237,6 +1244,52 @@
             }),
           )
         : null,
+    );
+  }
+
+  // Proven superseded cards are not actionable work and must stay out of the
+  // ordinary columns and attention strip. Keep a visible, read-only audit
+  // section here so an operator can still discover the source card and open
+  // the existing task drawer for its history, receipt, and replacement link.
+  function SuppressedAuditSection(props) {
+    const { t } = useI18n();
+    const tasks = (props.boardData && props.boardData.suppressed) || [];
+    if (tasks.length === 0) return null;
+    return h("section", {
+      className: "hermes-kanban-suppressed-audit",
+      "aria-label": tx(t, "suppressedAudit", "Suppressed / audit"),
+    },
+      h("div", { className: "hermes-kanban-suppressed-audit-head" },
+        h("div", null,
+          h("div", { className: "hermes-kanban-suppressed-audit-title" },
+            tx(t, "suppressedAudit", "Suppressed / audit")),
+          h("div", { className: "hermes-kanban-suppressed-audit-help" },
+            tx(t, "suppressedAuditHelp",
+              "Proven superseded cards are hidden from actionable columns but retained here for history.")),
+        ),
+        h("span", { className: "hermes-kanban-suppressed-audit-count" }, tasks.length),
+      ),
+      h("div", { className: "hermes-kanban-suppressed-audit-list" },
+        tasks.map(function (task) {
+          return h("div", {
+            key: task.id,
+            className: "hermes-kanban-suppressed-audit-row",
+          },
+            h("div", { className: "hermes-kanban-suppressed-audit-meta" },
+              h("span", { className: "hermes-kanban-suppressed-audit-id" }, task.id),
+              h("span", { className: "hermes-kanban-suppressed-audit-name" },
+                task.title || tx(t, "untitled", "(untitled)")),
+              h("span", { className: "hermes-kanban-suppressed-audit-status" },
+                tx(t, "superseded", "superseded")),
+            ),
+            h("button", {
+              type: "button",
+              className: "hermes-kanban-suppressed-audit-open",
+              onClick: function () { props.onOpen(task.id); },
+            }, tx(t, "open", "Open")),
+          );
+        }),
+      ),
     );
   }
 
