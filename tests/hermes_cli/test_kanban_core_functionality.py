@@ -2820,6 +2820,114 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
+def test_systemd_worker_scope_argv_isolates_service_hosted_worker():
+    """Service workers launch in sibling scopes, outside the dispatcher unit.
+
+    Stopping/restarting a systemd service applies its kill policy to members of
+    that service's cgroup. The transient scope wrapper is therefore the
+    deterministic boundary that lets the worker survive dispatcher shutdown.
+    """
+    tid = "t_scope_worker"
+    task = SimpleNamespace(id=tid, current_run_id=17)
+
+    worker_cmd = ["/opt/hermes/bin/hermes", "chat", "-q", f"work kanban task {tid}"]
+    wrapped = kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path=(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-kanban-safe-dispatcher.service"
+        ),
+        systemd_run="/usr/bin/systemd-run",
+        platform="linux",
+    )
+
+    assert wrapped[:5] == [
+        "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect",
+    ]
+    assert wrapped[5] == f"--unit=hermes-kanban-worker-{tid}-17.scope"
+    assert wrapped[6] == "--"
+    assert wrapped[7:] == worker_cmd
+    assert "hermes-kanban-safe-dispatcher.service" not in wrapped[5]
+
+
+@pytest.mark.parametrize(
+    ("cgroup_path", "systemd_run"),
+    [
+        ("/user.slice/user-1000.slice/session-4.scope", "/usr/bin/systemd-run"),
+        ("/docker/012345", "/usr/bin/systemd-run"),
+        ("/user.slice/user-1000.slice/example.service", ""),
+    ],
+)
+def test_systemd_worker_scope_argv_preserves_non_systemd_fallback(
+    cgroup_path, systemd_run,
+):
+    task = SimpleNamespace(id="t_direct_worker", current_run_id=1)
+    worker_cmd = ["hermes", "chat"]
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path=cgroup_path,
+        systemd_run=systemd_run,
+        platform="linux",
+    ) is worker_cmd
+
+
+def test_systemd_worker_scope_argv_preserves_non_linux_fallback():
+    task = SimpleNamespace(id="t_windows_worker", current_run_id=1)
+    worker_cmd = ["hermes.exe", "chat"]
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path="/user.slice/dispatcher.service",
+        systemd_run="/usr/bin/systemd-run",
+        platform="win32",
+    ) is worker_cmd
+
+
+def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
+    kanban_home, monkeypatch,
+):
+    """The scope launcher execs in-place, so Popen's PID remains canonical."""
+    captured = {}
+
+    class FakeProc:
+        pid = 424242
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb,
+        "_current_cgroup_path",
+        lambda: "/user.slice/user-1000.slice/dispatcher.service",
+    )
+    monkeypatch.setattr(
+        kb.shutil,
+        "which",
+        lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None,
+    )
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="tracked scope worker", assignee="ops")
+        task = kb.get_task(conn, tid)
+        workspace = kb.resolve_workspace(task)
+        pid = kb._default_spawn(task, str(workspace))
+    finally:
+        conn.close()
+
+    assert pid == 424242
+    assert captured["cmd"][0:3] == [
+        "/usr/bin/systemd-run", "--user", "--scope",
+    ]
+    assert captured["kwargs"]["start_new_session"] is True
+    assert captured["kwargs"]["env"]["HERMES_KANBAN_TASK"] == tid
+
+
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
     """A task runtime cap should raise the worker's terminal default.
 

@@ -8186,6 +8186,73 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _current_cgroup_path() -> Optional[str]:
+    """Return this process's systemd/unified cgroup path on Linux, if available."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            hierarchy, controllers, path = line.split(":", 2)
+            if (
+                (hierarchy == "0" and not controllers)
+                or "name=systemd" in controllers.split(",")
+            ):
+                return path
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _systemd_worker_scope_argv(
+    cmd: list[str],
+    task: Task,
+    *,
+    cgroup_path: Optional[str] = None,
+    systemd_run: Optional[str] = None,
+    platform: Optional[str] = None,
+) -> list[str]:
+    """Wrap a worker argv in an independent transient user scope when needed.
+
+    ``start_new_session=True`` isolates Unix signals but does not move a child
+    out of its parent's systemd cgroup. A gateway/dispatcher service restart
+    with cgroup-wide kill semantics would therefore kill every active Kanban
+    worker and its descendants. ``systemd-run --scope`` moves the launched
+    process into a sibling transient scope while preserving its PID (the
+    ``systemd-run`` client execs the requested command after the move), so the
+    existing PID/run/crash/cancellation tracking remains valid.
+
+    Only service-hosted Linux dispatchers need this wrapper. Direct CLI,
+    launchd, Windows, containers without systemd-run, and other non-systemd
+    environments keep the existing direct subprocess path.
+    """
+    active_platform = platform if platform is not None else sys.platform
+    if not active_platform.startswith("linux"):
+        return cmd
+    current = cgroup_path if cgroup_path is not None else _current_cgroup_path()
+    # Match the leaf only: every user process has a ``user@UID.service``
+    # ancestor, but only a service-hosted dispatcher has a .service leaf.
+    if not current or not current.rstrip("/").rsplit("/", 1)[-1].endswith(".service"):
+        return cmd
+    runner = systemd_run if systemd_run is not None else shutil.which("systemd-run")
+    if not runner:
+        return cmd
+
+    attempt = str(task.current_run_id) if task.current_run_id is not None else secrets.token_hex(4)
+    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "-", task.id).strip("-.") or "task"
+    # Keep ample room below systemd's 255-byte unit-name limit.
+    unit = f"hermes-kanban-worker-{safe_task[:120]}-{attempt}.scope"
+    return [
+        runner,
+        "--user",
+        "--scope",
+        "--quiet",
+        "--collect",
+        f"--unit={unit}",
+        "--",
+        *cmd,
+    ]
+
+
 def _default_spawn(
     task: Task,
     workspace: str,
@@ -8338,6 +8405,7 @@ def _default_spawn(
         # turn, prints text, exits rc=0, and the dispatcher records a
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
+    cmd = _systemd_worker_scope_argv(cmd, task)
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
