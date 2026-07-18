@@ -43,6 +43,13 @@ export {
   type WebSocketLike
 } from './json-rpc-gateway'
 export {
+  buildDashboardPluginAssetPath,
+  buildPluginApiPath,
+  isValidPluginManifestId,
+  normalizeDashboardPluginAssetPath,
+  normalizePluginRelativePath
+} from './plugin-api-path'
+export {
   buildHermesWebSocketUrl,
   type GatewayAuthMode,
   GatewayReauthRequiredError,

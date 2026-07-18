@@ -1,4 +1,10 @@
-import { JsonRpcGatewayClient } from '@hermes/shared'
+import {
+  buildDashboardPluginAssetPath,
+  buildPluginApiPath,
+  JsonRpcGatewayClient,
+  normalizeDashboardPluginAssetPath,
+  normalizePluginRelativePath
+} from '@hermes/shared'
 
 import type {
   ActionResponse,
@@ -191,6 +197,10 @@ export function setApiRequestProfile(profile: null | string): void {
   _apiProfile = profile || null
 }
 
+export function getApiRequestProfile(): null | string {
+  return _apiProfile
+}
+
 function profileScoped(): { profile?: string } {
   return _apiProfile ? { profile: _apiProfile } : {}
 }
@@ -205,18 +215,30 @@ export interface PluginRestOptions {
   timeoutMs?: number
 }
 
-// Normalize `path` to a leading-slash suffix relative to `/api/plugins/<id>`.
-// The namespace is the boundary — reject `..` so a relative segment can't
-// normalize out into another plugin's API or a core route. Check the path
-// portion only (before any query/hash).
-function pluginPathSuffix(caller: string, path: string): string {
-  const suffix = path.startsWith('/') ? path : `/${path}`
-
-  if (suffix.split(/[?#]/, 1)[0].split('/').includes('..')) {
-    throw new Error(`${caller}: illegal path traversal in "${path}"`)
+export async function getDashboardPluginManifests<T = unknown[]>(): Promise<T> {
+  if (!window.hermesDesktop?.api) {
+    throw new Error('Hermes desktop bridge unavailable')
   }
 
-  return suffix
+  return window.hermesDesktop.api<T>({ path: '/api/dashboard/plugins', ...profileScoped() })
+}
+
+export async function getDashboardPluginAsset(manifestId: string, assetPath: string): Promise<Response> {
+  if (!window.hermesDesktop?.dashboardPluginAsset) {
+    throw new Error('Hermes desktop dashboard plugin asset bridge unavailable')
+  }
+
+  buildDashboardPluginAssetPath(manifestId, assetPath)
+
+  const result = await window.hermesDesktop.dashboardPluginAsset({
+    assetPath: normalizeDashboardPluginAssetPath(assetPath),
+    manifestId,
+    ...profileScoped()
+  })
+
+  const body = result.body instanceof ArrayBuffer ? result.body : new Uint8Array(result.body).buffer
+
+  return new Response(body, { headers: result.headers, status: result.status })
 }
 
 /** The plugin REST door. Every call is scoped BY CONSTRUCTION to the plugin's
@@ -230,10 +252,8 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
     throw new Error('Hermes desktop bridge unavailable')
   }
 
-  const suffix = pluginPathSuffix('pluginRest', path)
-
   return window.hermesDesktop.api<T>({
-    path: `/api/plugins/${pluginId}${suffix}`,
+    path: buildPluginApiPath(pluginId, path),
     method: opts.method,
     body: opts.body,
     upload: opts.upload,
@@ -242,33 +262,61 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
   })
 }
 
+export async function pluginFetchJSON<T>(url: string, init: RequestInit = {}, ownerId?: string): Promise<T> {
+  const { pluginId, suffix } = pluginEndpointParts(url)
+  assertPluginOwner(pluginId, ownerId)
+  const body = typeof init.body === 'string' ? parseJsonBody(init.body) : init.body
+
+  return pluginRest<T>(pluginId, suffix, { body, method: init.method })
+}
+
+export async function pluginRawFetch(url: string, init: RequestInit = {}, ownerId?: string): Promise<Response> {
+  const { pluginId, suffix } = pluginEndpointParts(url)
+  assertPluginOwner(pluginId, ownerId)
+  const upload = init.body instanceof FormData ? await uploadFromFormData(init.body) : undefined
+
+  if (!window.hermesDesktop?.pluginRaw) {
+    throw new Error('Hermes desktop plugin raw bridge unavailable')
+  }
+
+  const result = await window.hermesDesktop.pluginRaw({
+    path: buildPluginApiPath(pluginId, suffix),
+    method: init.method,
+    upload,
+    body: upload ? undefined : typeof init.body === 'string' ? parseJsonBody(init.body) : init.body,
+    ...profileScoped()
+  })
+
+  const body = result.body instanceof ArrayBuffer ? result.body : new Uint8Array(result.body).buffer
+
+  return new Response(body, { headers: result.headers, status: result.status })
+}
+
+function assertPluginOwner(pluginId: string, ownerId: string | undefined): void {
+  if (ownerId && pluginId !== ownerId) {
+    throw new Error(`Plugin ${ownerId} cannot access plugin namespace ${pluginId}`)
+  }
+}
+
 /** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
  *  way: `path` is relative to `/api/plugins/<pluginId>` ('/events' → the
- *  plugin's own event stream). Token-mode backends auth via the same query
- *  credential the app's own sockets use; OAuth remotes resolve null (callers
- *  keep their polling fallback — every consumer must have one anyway, since a
- *  socket can drop). Auto-reconnects with backoff until disposed. */
+ *  plugin's own event stream). Electron owns auth URL construction, including
+ *  a fresh one-time OAuth ticket for every reconnect. */
 export function pluginSocket(pluginId: string, path: string, onMessage: (data: unknown) => void): () => void {
-  const suffix = pluginPathSuffix('pluginSocket', path)
+  const suffix = normalizePluginRelativePath(path)
 
   let socket: null | WebSocket = null
   let disposed = false
   let attempt = 0
 
   const connect = async () => {
-    const connection = await window.hermesDesktop.getConnection().catch(() => null)
+    const url = await window.hermesDesktop.getPluginWsUrl(pluginId, suffix, _apiProfile).catch(() => null)
 
-    // No bridge / OAuth cookie auth (WS tickets are single-use, core-managed):
-    // stay on the polling fallback rather than half-working.
-    if (disposed || !connection || connection.authMode === 'oauth') {
+    if (disposed || !url) {
       return
     }
 
-    const base = connection.baseUrl.replace(/^http/, 'ws')
-    const join = suffix.includes('?') ? '&' : '?'
-    socket = new WebSocket(
-      `${base}/api/plugins/${pluginId}${suffix}${join}token=${encodeURIComponent(connection.token)}`
-    )
+    socket = new WebSocket(url)
 
     socket.onmessage = event => {
       attempt = 0
@@ -295,6 +343,43 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
   return () => {
     disposed = true
     socket?.close()
+  }
+}
+
+function pluginEndpointParts(url: string): { pluginId: string; suffix: string } {
+  const normalized = url.startsWith('/') ? url : `/${url}`
+  const match = normalized.match(/^\/api\/plugins\/([^/?#]+)(\/.*)?$/)
+
+  if (!match) {
+    throw new Error(`Plugin API path must target /api/plugins/<id>: ${url}`)
+  }
+
+  return { pluginId: decodeURIComponent(match[1]), suffix: match[2] || '/' }
+}
+
+function parseJsonBody(body: string): unknown {
+  if (!body) {
+    return undefined
+  }
+
+  try {
+    return JSON.parse(body)
+  } catch {
+    return body
+  }
+}
+
+async function uploadFromFormData(form: FormData): Promise<PluginRestOptions['upload']> {
+  const file = form.get('file')
+
+  if (!(file instanceof File)) {
+    throw new Error('Plugin upload FormData must include a file field')
+  }
+
+  return {
+    bytes: await file.arrayBuffer(),
+    contentType: file.type || 'application/octet-stream',
+    filename: file.name || 'file'
   }
 }
 

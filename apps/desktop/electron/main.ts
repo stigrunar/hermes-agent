@@ -55,6 +55,7 @@ import {
   resolveTestWsUrl,
   tokenPreview
 } from './connection-config'
+import { dashboardPluginAssetBackendPath } from './dashboard-plugin-assets'
 import { adoptServedDashboardToken } from './dashboard-token'
 import {
   buildPosixCleanupScript,
@@ -104,7 +105,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { serializeJsonBody, setRequestContentType } from './oauth-net-request'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
   buildSessionWindowUrl,
@@ -3779,6 +3780,59 @@ function multipartBody(upload) {
   return { body, contentType: `multipart/form-data; boundary=${boundary}` }
 }
 
+const PLUGIN_MANIFEST_ID_RE = /^[a-z0-9](?:[a-z0-9._-]*[a-z0-9])?$/
+
+function pluginWsEndpoint(pluginId, path) {
+  if (typeof pluginId !== 'string' || !PLUGIN_MANIFEST_ID_RE.test(pluginId)) {
+    throw new Error('Invalid plugin manifest id')
+  }
+
+  const suffix = String(path || '').startsWith('/') ? String(path || '') : `/${String(path || '')}`
+  const queryIndex = suffix.indexOf('?')
+  const pathname = queryIndex === -1 ? suffix : suffix.slice(0, queryIndex)
+  const search = queryIndex === -1 ? '' : suffix.slice(queryIndex)
+  let decodedPathname = pathname
+
+  for (let pass = 0; pass < 2; pass += 1) {
+    if (unsafePluginWsPath(decodedPathname)) {
+      throw new Error('Invalid plugin WebSocket path')
+    }
+
+    try {
+      decodedPathname = decodeURIComponent(decodedPathname)
+    } catch {
+      throw new Error('Invalid plugin WebSocket path')
+    }
+  }
+
+  if (unsafePluginWsPath(decodedPathname)) {
+    throw new Error('Invalid plugin WebSocket path')
+  }
+
+  return { pathname: `/api/plugins/${pluginId}${pathname}`, search }
+}
+
+function unsafePluginWsPath(pathname) {
+  return (
+    pathname === '/' ||
+    pathname.includes('\\') ||
+    pathname.split('/').some(segment => segment === '.' || segment === '..')
+  )
+}
+
+function validatePluginRawPath(path) {
+  const raw = String(path || '')
+  const match = raw.match(/^\/api\/plugins\/([^/?#]+)(\/.*)?$/)
+
+  if (!match || !PLUGIN_MANIFEST_ID_RE.test(match[1])) {
+    throw new Error('Invalid plugin raw API path')
+  }
+
+  pluginWsEndpoint(match[1], match[2] || '/')
+
+  return raw
+}
+
 function fetchJson(url, token, options: any = {}) {
   return new Promise((resolve, reject) => {
     const { body, contentType } = options.upload
@@ -3850,6 +3904,64 @@ function fetchJson(url, token, options: any = {}) {
           } catch {
             reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
           }
+        })
+      }
+    )
+
+    req.on('error', reject)
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    })
+
+    if (body) {
+      req.write(body)
+    }
+
+    req.end()
+  })
+}
+
+function fetchRaw(url, token, options: any = {}) {
+  return new Promise((resolve, reject) => {
+    const { body, contentType } = options.upload
+      ? multipartBody(options.upload)
+      : {
+          body: options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body)),
+          contentType: 'application/json'
+        }
+
+    const parsed = new URL(url)
+    const client = parsed.protocol === 'https:' ? https : http
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
+
+      return
+    }
+
+    const req = client.request(
+      parsed,
+      {
+        method: options.method || 'GET',
+        headers: {
+          'Content-Type': contentType,
+          'X-Hermes-Session-Token': token,
+          ...(body ? { 'Content-Length': String(body.length) } : {})
+        }
+      },
+      res => {
+        const chunks = []
+        res.on('error', reject)
+        res.on('data', chunk => chunks.push(Buffer.from(chunk)))
+        res.on('end', () => {
+          const headers = {}
+
+          for (const [key, value] of Object.entries(res.headers)) {
+            headers[key] = Array.isArray(value) ? value.join(', ') : String(value ?? '')
+          }
+
+          resolve({ body: Buffer.concat(chunks), headers, status: res.statusCode || 500 })
         })
       }
     )
@@ -5474,7 +5586,8 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
       return
     }
 
-    const body = serializeJsonBody(options.body)
+    const multipart = options.upload ? multipartBody(options.upload) : null
+    const body = multipart ? multipart.body : serializeJsonBody(options.body)
     const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
 
     const request = electronNet.request({
@@ -5485,7 +5598,7 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
       redirect: 'follow'
     } as any)
 
-    setJsonRequestHeaders(request)
+    setRequestContentType(request, multipart ? multipart.contentType : 'application/json')
 
     let timedOut = false
 
@@ -5560,6 +5673,77 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
   })
 }
 
+function fetchRawViaOauthSession(url, options: any = {}) {
+  return new Promise((resolve, reject) => {
+    const sess = getOauthSession()
+
+    if (!sess) {
+      reject(new Error('OAuth session partition is unavailable.'))
+
+      return
+    }
+
+    const multipart = options.upload ? multipartBody(options.upload) : null
+    const body = multipart ? multipart.body : serializeJsonBody(options.body)
+    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
+
+    const request = electronNet.request({
+      method: options.method || 'GET',
+      url,
+      session: sess,
+      useSessionCookies: true,
+      redirect: 'follow'
+    } as any)
+
+    setRequestContentType(request, multipart ? multipart.contentType : 'application/json')
+
+    let timedOut = false
+
+    const timer = setTimeout(() => {
+      timedOut = true
+
+      try {
+        request.abort()
+      } catch {
+        // already finished
+      }
+
+      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    request.on('response', res => {
+      const chunks = []
+      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
+      res.on('end', () => {
+        if (timedOut) {
+          return
+        }
+
+        clearTimeout(timer)
+        const headers = {}
+
+        for (const [key, value] of Object.entries(res.headers)) {
+          headers[key] = Array.isArray(value) ? value.join(', ') : String(value ?? '')
+        }
+
+        resolve({ body: Buffer.concat(chunks), headers, status: res.statusCode || 500 })
+      })
+    })
+    request.on('error', error => {
+      if (!timedOut) {
+        clearTimeout(timer)
+        reject(error)
+      }
+    })
+
+    if (body) {
+      request.write(body)
+    }
+
+    request.end()
+  })
+}
+
 // Mint a single-use WS ticket for a gated gateway. Returns the ticket string.
 // Throws (with statusCode 401) if the session cookie is missing/expired —
 // callers treat that as "needs re-login".
@@ -5601,6 +5785,24 @@ async function freshGatewayWsUrl(profile) {
 
   // Local/token: the cached wsUrl already carries the (long-lived) token.
   return connection.wsUrl
+}
+
+async function freshPluginWsUrl(pluginId, path, profile) {
+  const connection = await ensureBackend(profile)
+  const endpoint = pluginWsEndpoint(pluginId, path)
+  const parsed = new URL(connection.baseUrl)
+  const prefix = parsed.pathname.replace(/\/+$/, '')
+  parsed.protocol = parsed.protocol === 'https:' ? 'wss:' : 'ws:'
+  parsed.pathname = `${prefix}${endpoint.pathname}`
+  parsed.search = endpoint.search
+
+  if (connection.authMode === 'oauth') {
+    parsed.searchParams.set('ticket', await mintGatewayWsTicket(connection.baseUrl))
+  } else {
+    parsed.searchParams.set('token', connection.token)
+  }
+
+  return parsed.toString()
 }
 
 // --- Hermes Cloud discovery + silent per-agent sign-in (cloud-auto-discovery
@@ -7724,6 +7926,26 @@ ipcMain.handle('hermes:backend:touch', async (_event, profile) => {
   return { ok: true }
 })
 ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayWsUrl(profile))
+ipcMain.handle('hermes:plugin:ws-url', async (_event, pluginId, path, profile) =>
+  freshPluginWsUrl(pluginId, path, profile)
+)
+ipcMain.handle('hermes:plugin:raw', async (_event, request) => {
+  const profile = request?.profile
+  const connection = await ensureBackend(profile)
+  const url = `${connection.baseUrl}${validatePluginRawPath(request?.path)}`
+  const opts = { body: request?.body, method: request?.method, timeoutMs: request?.timeoutMs, upload: request?.upload }
+
+  return connection.authMode === 'oauth' ? fetchRawViaOauthSession(url, opts) : fetchRaw(url, connection.token, opts)
+})
+ipcMain.handle('hermes:dashboard-plugin:asset', async (_event, request) => {
+  const profile = request?.profile
+  const connection = await ensureBackend(profile)
+  const url = `${connection.baseUrl}${dashboardPluginAssetBackendPath(request?.manifestId, request?.assetPath)}`
+
+  return connection.authMode === 'oauth'
+    ? fetchRawViaOauthSession(url, { method: 'GET', timeoutMs: request?.timeoutMs })
+    : fetchRaw(url, connection.token, { method: 'GET', timeoutMs: request?.timeoutMs })
+})
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }
@@ -8238,15 +8460,10 @@ ipcMain.handle('hermes:api', async (_event, request) => {
   // session so the cookie attaches automatically. Token/local modes keep using
   // the static session-token header.
   if (connection.authMode === 'oauth') {
-    // The OAuth path rides electron.net with JSON headers; multipart isn't
-    // wired there. Fail loudly rather than corrupting the upload.
-    if (request?.upload) {
-      throw new Error('File uploads are not supported against OAuth-gated remote backends yet.')
-    }
-
     return fetchJsonViaOauthSession(url, {
       method: request?.method,
       body: request?.body,
+      upload: request?.upload,
       timeoutMs
     })
   }

@@ -8,7 +8,7 @@ import assert from 'node:assert/strict'
 
 import { test } from 'vitest'
 
-import { serializeJsonBody, setJsonRequestHeaders } from './oauth-net-request'
+import { serializeJsonBody, setRequestContentType } from './oauth-net-request'
 
 test('serializeJsonBody returns undefined for absent bodies', () => {
   assert.equal(serializeJsonBody(undefined), undefined)
@@ -20,7 +20,7 @@ test('serializeJsonBody JSON-encodes request bodies', () => {
   assert.equal(body.toString('utf8'), '{"archived":true}')
 })
 
-test('setJsonRequestHeaders does not set Electron-restricted Content-Length', () => {
+test('setRequestContentType does not set Electron-restricted Content-Length', () => {
   const headers = []
 
   const request = {
@@ -29,11 +29,25 @@ test('setJsonRequestHeaders does not set Electron-restricted Content-Length', ()
     }
   }
 
-  setJsonRequestHeaders(request)
+  setRequestContentType(request)
 
   assert.deepEqual(headers, [['Content-Type', 'application/json']])
   assert.equal(
     headers.some(([name]) => name.toLowerCase() === 'content-length'),
     false
   )
+})
+
+test('setRequestContentType accepts multipart content types', () => {
+  const headers = []
+
+  const request = {
+    setHeader(name, value) {
+      headers.push([name, value])
+    }
+  }
+
+  setRequestContentType(request, 'multipart/form-data; boundary=abc')
+
+  assert.deepEqual(headers, [['Content-Type', 'multipart/form-data; boundary=abc']])
 })

@@ -1,6 +1,7 @@
 import { isGatewayReauthRequired, resolveGatewayWsUrl } from '@hermes/shared'
 import { useEffect, useRef } from 'react'
 
+import { refreshDashboardPlugins } from '@/contrib/dashboard-plugins'
 import type { HermesConnection } from '@/global'
 import { HermesGateway } from '@/hermes'
 import { translateNow } from '@/i18n'
@@ -116,6 +117,7 @@ export function useGatewayBoot({
     // recovery overlay replaces the dead-end CONNECTING screen. Reset on a clean
     // open or a manual/wake-driven reconnect.
     let escalated = false
+    let lastDashboardProfile = normalizeProfileKey($activeGatewayProfile.get())
 
     // Wrap the live getter in a call so TS control-flow analysis doesn't narrow
     // `connectionState` to a constant across the early-return guards (the state
@@ -193,6 +195,17 @@ export function useGatewayBoot({
           scheduleReconnect()
         }
       }
+    }
+
+    const refreshDashboardManifestsIfNeeded = (force = false) => {
+      const profile = normalizeProfileKey($activeGatewayProfile.get())
+
+      if (!force && profile === lastDashboardProfile) {
+        return
+      }
+
+      lastDashboardProfile = profile
+      void refreshDashboardPlugins().catch(() => undefined)
     }
 
     function scheduleReconnect() {
@@ -292,6 +305,7 @@ export function useGatewayBoot({
           callbacksRef.current.refreshHermesConfig().catch(() => undefined),
           callbacksRef.current.refreshSessions().catch(() => undefined)
         ])
+        refreshDashboardManifestsIfNeeded(true)
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {
@@ -411,7 +425,11 @@ export function useGatewayBoot({
 
     const offWorking = $workingSessionIds.subscribe(() => recomputeKeptGateways())
     const offAttention = $attentionSessionIds.subscribe(() => recomputeKeptGateways())
-    const offActiveProfile = $activeGatewayProfile.subscribe(() => recomputeKeptGateways())
+
+    const offActiveProfile = $activeGatewayProfile.subscribe(() => {
+      recomputeKeptGateways()
+      refreshDashboardManifestsIfNeeded()
+    })
 
     const offWindowState = desktop.onWindowStateChanged?.(payload => {
       const current = $connection.get()
@@ -487,6 +505,7 @@ export function useGatewayBoot({
           return
         }
 
+        refreshDashboardManifestsIfNeeded(true)
         completeDesktopBoot()
         bootCompleted = true
       } catch (err) {

@@ -84,6 +84,7 @@ function fakeDesktop() {
   }
 
   return {
+    api: vi.fn(async () => []),
     getConnection: vi.fn(async () => conn),
     getGatewayWsUrl: vi.fn(async () => conn.wsUrl),
     getBootProgress: vi.fn(async () => ({

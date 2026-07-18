@@ -10,8 +10,8 @@ function serializeJsonBody(body) {
   return body === undefined ? undefined : Buffer.from(JSON.stringify(body))
 }
 
-function setJsonRequestHeaders(request) {
-  request.setHeader('Content-Type', 'application/json')
+function setRequestContentType(request, contentType = 'application/json') {
+  request.setHeader('Content-Type', contentType)
 }
 
-export { serializeJsonBody, setJsonRequestHeaders }
+export { serializeJsonBody, setRequestContentType }

@@ -21,6 +21,12 @@ import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
+import {
+  $dashboardPluginDiscovery,
+  dashboardPluginPendingPath,
+  isDashboardPluginPathCandidate,
+  setDashboardPluginPendingPath
+} from '@/contrib/dashboard-discovery-state'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
@@ -72,7 +78,14 @@ import { PetGenerateOverlay } from '../pet-generate/pet-generate-overlay'
 import { FileActionDialogs } from '../right-sidebar/file-actions'
 import { RemoteFolderPicker } from '../right-sidebar/files/remote-picker'
 import { PersistentTerminal } from '../right-sidebar/terminal/persistent'
-import { CRON_ROUTE, routeSessionId, sessionRoute, SETTINGS_ROUTE, syncWorkspaceIsPage } from '../routes'
+import {
+  CRON_ROUTE,
+  routeSessionId,
+  routeTileCandidateForPath,
+  sessionRoute,
+  SETTINGS_ROUTE,
+  syncWorkspaceIsPage
+} from '../routes'
 import { SessionPickerOverlay } from '../session-picker-overlay'
 import { SessionSwitcher } from '../session-switcher'
 import { useBackgroundQueueDrain } from '../session/hooks/use-background-queue-drain'
@@ -130,6 +143,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const actionsRef = useRef<WiringActions | null>(null)
 
   const gatewayState = useStore($gatewayState)
+  const dashboardPluginDiscovery = useStore($dashboardPluginDiscovery)
   const activeSessionId = useStore($activeSessionId)
   const currentCwd = useStore($currentCwd)
   const freshDraftReady = useStore($freshDraftReady)
@@ -159,7 +173,23 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // zone's tab bar stands down on pages (and returns with the chat).
   useEffect(() => {
     syncWorkspaceIsPage(location.pathname)
-  }, [location.pathname])
+
+    if (dashboardPluginDiscovery.phase === 'pending' && isDashboardPluginPathCandidate(location.pathname)) {
+      setDashboardPluginPendingPath(location.pathname)
+    } else if (
+      dashboardPluginDiscovery.phase === 'resolved' &&
+      dashboardPluginDiscovery.reservedPaths.includes(location.pathname)
+    ) {
+      // Remember the active manifest route so a reconnect/profile refresh can
+      // reserve it synchronously while the old contributions are replaced.
+      setDashboardPluginPendingPath(location.pathname)
+    } else if (
+      dashboardPluginDiscovery.phase === 'resolved' ||
+      (dashboardPluginDiscovery.phase === 'failed' && dashboardPluginPendingPath() !== location.pathname)
+    ) {
+      setDashboardPluginPendingPath(null)
+    }
+  }, [dashboardPluginDiscovery.phase, dashboardPluginDiscovery.reservedPaths, location.pathname])
 
   const {
     agentsOpen,
@@ -844,7 +874,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // Pane-registered tools (preview's monitor/devtools cluster) anchor flush
   // against the static system cluster — in the tree layout the titlebar band
   // sits ABOVE the grid, so AppShell's pane-width anchoring doesn't apply.
-  const SYSTEM_TOOL_COUNT = 4
+  const SYSTEM_TOOL_COUNT = routeTileCandidateForPath(location.pathname) ? 5 : 4
   const paneToolCount = rightTitlebarTools.filter(tool => !tool.hidden).length
   const systemToolsWidth = `calc(${SYSTEM_TOOL_COUNT} * (var(--titlebar-control-size) + 0.25rem))`
 

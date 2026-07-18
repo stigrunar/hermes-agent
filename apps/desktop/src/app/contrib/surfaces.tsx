@@ -9,8 +9,10 @@
 
 import { useStore } from '@nanostores/react'
 import { type ComponentProps, lazy, memo, type ReactNode, Suspense, useMemo } from 'react'
-import { Navigate, Route, Routes, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useLocation, useParams } from 'react-router-dom'
 
+import { $dashboardPluginDiscovery } from '@/contrib/dashboard-discovery-state'
+import { DashboardPluginDiscoveryFailurePage, DashboardPluginPendingPage } from '@/contrib/dashboard-plugins'
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { $freshDraftReady, $gatewayState } from '@/store/session'
@@ -109,9 +111,21 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
   actions: WiringActions
   maxVoiceRecordingSeconds?: number
 }) {
+  const dashboardPluginDiscovery = useStore($dashboardPluginDiscovery)
   const gatewayState = useStore($gatewayState)
+  const { pathname } = useLocation()
   useContributions(ROUTES_AREA)
   const routeContributions = contributedRoutes()
+  const indexOverride = routeContributions.find(route => route.path === '/' && route.override)
+  // Guard the current bundled/discovered candidate synchronously on the first
+  // render. The wiring effect mirrors it into pendingPath later, but waiting for
+  // that effect lets the wildcard/session route win during a cold deep-link.
+  const discoveryPath =
+    dashboardPluginDiscovery.pendingPath ??
+    (dashboardPluginDiscovery.phase !== 'resolved' && dashboardPluginDiscovery.candidatePaths.includes(pathname)
+      ? pathname
+      : null)
+  const pendingPluginPath = discoveryPath?.replace(/^\//, '')
 
   // Recapture the live gateway instance whenever the connection state flips.
   // getGateway reads a controller ref, so gatewayState is the intentional
@@ -175,7 +189,33 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
 
   return (
     <Routes>
-      <Route element={chatView} index />
+      {discoveryPath === '/' && dashboardPluginDiscovery.phase === 'pending' ? (
+        <Route element={page(<DashboardPluginPendingPage />)} index />
+      ) : discoveryPath === '/' && dashboardPluginDiscovery.phase === 'failed' ? (
+        <Route element={page(<DashboardPluginDiscoveryFailurePage path={discoveryPath} />)} index />
+      ) : indexOverride ? (
+        <Route
+          element={page(<ContribBoundary id={indexOverride.key}>{indexOverride.render()}</ContribBoundary>)}
+          index
+        />
+      ) : (
+        <Route element={chatView} index />
+      )}
+      {discoveryPath && discoveryPath !== '/' && dashboardPluginDiscovery.phase === 'pending' ? (
+        <Route element={page(<DashboardPluginPendingPage />)} path={pendingPluginPath} />
+      ) : discoveryPath && discoveryPath !== '/' && dashboardPluginDiscovery.phase === 'failed' ? (
+        <Route
+          element={page(<DashboardPluginDiscoveryFailurePage path={discoveryPath} />)}
+          path={pendingPluginPath}
+        />
+      ) : null}
+      {routeContributions.filter(route => route !== indexOverride).map(route => (
+        <Route
+          element={page(<ContribBoundary id={route.key}>{route.render()}</ContribBoundary>)}
+          key={route.key}
+          path={route.path.slice(1)}
+        />
+      ))}
       <Route element={chatView} path=":sessionId" />
       <Route element={page(<SkillsView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="skills" />
       <Route element={page(<MessagingView setStatusbarItemGroup={setStatusbarItemGroup} />)} path="messaging" />
@@ -186,16 +226,8 @@ export const ChatRoutesSurface = memo(function ChatRoutesSurface({
       <Route element={null} path="profiles" />
       <Route element={null} path="settings" />
       <Route element={null} path="starmap" />
-      {/* Registry-contributed pages (core features + plugins) render in the
-          workspace pane like any built-in view — behind the same blast wall
-          as every other contribution mount. */}
-      {routeContributions.map(route => (
-        <Route
-          element={page(<ContribBoundary id={route.key}>{route.render()}</ContribBoundary>)}
-          key={route.key}
-          path={route.path.slice(1)}
-        />
-      ))}
+      {/* Registry-contributed pages are mounted above built-ins so explicit
+          manifest overrides replace reserved routes deterministically. */}
       <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="new" />
       <Route element={<LegacySessionRedirect />} path="sessions/:sessionId" />
       <Route element={<Navigate replace to={NEW_CHAT_ROUTE} />} path="*" />

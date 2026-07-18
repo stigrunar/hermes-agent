@@ -1,3 +1,5 @@
+import type { ComponentType } from 'react'
+
 import type {
   PetOverlayBounds,
   PetOverlayControl,
@@ -9,6 +11,11 @@ export {}
 
 declare global {
   interface Window {
+    __HERMES_PLUGINS__?: {
+      register: (name: string, component: ComponentType<Record<string, never>>) => void
+      registerSlot: (...args: unknown[]) => void
+    }
+    __HERMES_PLUGIN_SDK__?: Record<string, unknown>
     hermesDesktop: {
       // Resolve a backend connection. Omit `profile` (or pass the primary) for
       // the window's backend; pass a named profile to lazily spawn/reuse that
@@ -25,6 +32,9 @@ declare global {
       // reaper spares it while its chat is active.
       touchBackend: (profile?: string | null) => Promise<{ ok: boolean }>
       getGatewayWsUrl: (profile?: null | string) => Promise<string>
+      getPluginWsUrl: (pluginId: string, path: string, profile?: null | string) => Promise<string>
+      pluginRaw: (request: HermesPluginRawRequest) => Promise<HermesPluginRawResponse>
+      dashboardPluginAsset: (request: HermesDashboardPluginAssetRequest) => Promise<HermesPluginRawResponse>
       // Open (or focus) a standalone OS window for a single chat session so
       // the user can work with multiple chats side by side. Returns ok:false
       // with an error code when the sessionId is empty/invalid. `watch` opens
@@ -610,12 +620,34 @@ export interface HermesApiRequest {
   body?: unknown
   // Single-file multipart upload (FastAPI UploadFile endpoints). Mutually
   // exclusive with `body`; bytes transfer over IPC as a structured-clone
-  // ArrayBuffer. Token-mode backends only.
+  // ArrayBuffer.
   upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
   timeoutMs?: number
   // Route this REST call to a specific profile's backend. Omit for the primary
   // (window) backend. Read-only cross-profile data is served by the primary, so
   // this is only needed for profile-scoped live/settings calls.
+  profile?: string | null
+}
+
+export interface HermesPluginRawRequest {
+  path: string
+  method?: string
+  body?: unknown
+  upload?: { filename: string; contentType?: string; bytes: ArrayBuffer }
+  timeoutMs?: number
+  profile?: string | null
+}
+
+export interface HermesPluginRawResponse {
+  body: ArrayBuffer | Uint8Array
+  headers: Record<string, string>
+  status: number
+}
+
+export interface HermesDashboardPluginAssetRequest {
+  manifestId: string
+  assetPath: string
+  timeoutMs?: number
   profile?: string | null
 }
 
