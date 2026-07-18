@@ -91,7 +91,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from agent.redact import redact_for_persistence
+from agent.redact import redact_for_persistence as _redact_diagnostic
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -3051,7 +3051,6 @@ def add_comment(
         raise ValueError("comment body is required")
     if not author or not author.strip():
         raise ValueError("comment author is required")
-    body = redact_for_persistence(body)
     now = int(time.time())
     with write_txn(conn):
         if not conn.execute(
@@ -3348,14 +3347,35 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
+
+    Event payloads are general functional/audit data and are stored without
+    content-based rewriting. Callers persisting machine-generated failure text
+    must use :func:`_append_diagnostic_event` instead.
     """
     now = int(time.time())
-    payload = redact_for_persistence(payload)
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
     conn.execute(
         "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
         "VALUES (?, ?, ?, ?, ?)",
         (task_id, run_id, kind, pl, now),
+    )
+
+
+def _append_diagnostic_event(
+    conn: sqlite3.Connection,
+    task_id: str,
+    kind: str,
+    payload: Optional[dict] = None,
+    *,
+    run_id: Optional[int] = None,
+) -> None:
+    """Record a machine-generated diagnostic event with strict masking."""
+    _append_event(
+        conn,
+        task_id,
+        kind,
+        _redact_diagnostic(payload),
+        run_id=run_id,
     )
 
 
@@ -3378,9 +3398,7 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
-    summary = redact_for_persistence(summary)
-    error = redact_for_persistence(error)
-    metadata = redact_for_persistence(metadata)
+    error = _redact_diagnostic(error)
     now = int(time.time())
     row = conn.execute(
         "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
@@ -3450,9 +3468,7 @@ def _synthesize_ended_run(
     (or for clearing it elsewhere in the same txn) since this
     function does NOT touch the tasks row.
     """
-    summary = redact_for_persistence(summary)
-    error = redact_for_persistence(error)
-    metadata = redact_for_persistence(metadata)
+    error = _redact_diagnostic(error)
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
@@ -4293,11 +4309,6 @@ def complete_task(
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
-    # Artifact discovery above needs the original local paths. Once that
-    # functional step is complete, all user-visible receipt prose is made
-    # non-sensitive before it reaches tasks, runs, events, or lifecycle hooks.
-    result = redact_for_persistence(result)
-    summary = redact_for_persistence(summary)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -4952,9 +4963,6 @@ def edit_completed_task_result(
     metadata: Optional[dict] = None,
 ) -> bool:
     """Backfill the user-visible result for an already completed task."""
-    result = redact_for_persistence(result)
-    summary = redact_for_persistence(summary)
-    metadata = redact_for_persistence(metadata)
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
         row = conn.execute(
@@ -5048,7 +5056,6 @@ def block_task(
     Returns True on any successful transition (to ``blocked``, ``todo``, or
     ``triage``), False when the task wasn't in a blockable state.
     """
-    reason = redact_for_persistence(reason)
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
@@ -7221,8 +7228,7 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
-    error = redact_for_persistence(error)
-    event_payload_extra = redact_for_persistence(event_payload_extra)
+    error = _redact_diagnostic(error)
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
@@ -7292,7 +7298,7 @@ def _record_task_failure(
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
-            _append_event(
+            _append_diagnostic_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
             blocked = True
@@ -7323,7 +7329,7 @@ def _record_task_failure(
                     error=error[:500],
                     metadata={"failures": failures},
                 )
-                _append_event(
+                _append_diagnostic_event(
                     conn, task_id, outcome,
                     {"error": error[:500], "failures": failures},
                     run_id=run_id,

@@ -693,18 +693,24 @@ def redact_sensitive_text(
 
 
 def redact_for_persistence(value):
-    """Force-redact text before it crosses a durable receipt boundary.
+    """Force-redact an explicitly classified durable diagnostic value.
 
-    Active browser/tool workflows intentionally preserve web query credentials
-    and ``user:password@`` URLs because masking them can destroy a callback or
-    signed URL the user asked the agent to follow. Durable logs, scheduler
-    receipts, and coordination records have no such need. This stricter pass
-    therefore forces the normal redactor on and additionally masks URL query
-    credentials, URL userinfo, and HTTP request-target query strings.
+    Active browser/tool workflows and functional persistence fields preserve
+    web query credentials and ``user:password@`` URLs because masking them can
+    destroy a callback, signed URL, handoff, or archived result. Callers use
+    this stricter pass only for schema fields whose producer classifies them as
+    machine-generated diagnostics, such as authentication, delivery, or fixed
+    execution failures. It forces the normal redactor on and additionally
+    masks URL query credentials, URL userinfo, and HTTP request-target query
+    strings.
 
     Dictionaries and sequences are handled recursively so structured event
     payloads and diagnostic metadata cannot bypass the text boundary.
     Non-text scalar values pass through unchanged.
+
+    This targets recognized secret, URL-auth, and phone-number patterns. It is
+    not a comprehensive arbitrary-PII sanitizer and must not be applied to
+    opaque functional content merely because that content is persisted.
     """
     if isinstance(value, str):
         text = redact_sensitive_text(value, force=True, full_mask=True)

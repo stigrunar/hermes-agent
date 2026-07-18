@@ -1744,19 +1744,26 @@ class TestSaveJobOutput:
         assert output_file.read_text() == "# Results\nEverything ok."
         assert "test123" in str(output_file)
 
-    def test_redacts_output_before_durable_write(self, tmp_cron_dir):
-        marker = "sk-syntheticcronoutput123456789"
-        opaque = "opaque-output-query-value"
-
-        output_file = save_job_output(
-            "redacted-output",
-            f"result {marker} https://example.invalid/x?api_key={opaque}",
+    def test_preserves_functional_output_as_exact_utf8_bytes(self, tmp_cron_dir):
+        signed_url = (
+            "https://files.example.invalid/report?X-Amz-Credential=synthetic"
+            "&X-Amz-Signature=0123456789abcdef0123456789abcdef"
+        )
+        userinfo_url = "https://demo-user:demo-pass@example.invalid/private/report"
+        query_url = (
+            "https://handoff.example.invalid/continue?token=functional-token"
+            "&code=resume-code"
+        )
+        output = (
+            f'{{"signed":"{signed_url}","userinfo":"{userinfo_url}",'
+            f'"query":"{query_url}","note":"résumé 日本語 🔐",'
+            '"literal":"sk-syntheticfunctionalvalue123456789"}\r\n'
+            "token=functional-token&code=resume-code\n"
         )
 
-        persisted = output_file.read_text()
-        assert marker not in persisted
-        assert opaque not in persisted
-        assert "api_key=***" in persisted
+        output_file = save_job_output("functional-output", output)
+
+        assert output_file.read_bytes() == output.encode("utf-8")
 
     @pytest.mark.parametrize("bad_job_id", ["../escape", "nested/escape", ".", "..", ""])
     def test_rejects_unsafe_job_id(self, tmp_cron_dir, bad_job_id):

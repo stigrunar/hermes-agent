@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import json
 import os
 import sqlite3
 import subprocess
@@ -1637,53 +1638,124 @@ def test_worker_context_includes_parent_results_and_comments(kanban_home):
     assert "child" in ctx
 
 
-def test_receipt_fields_redacted_before_kanban_persistence(kanban_home):
-    marker = "sk-synthetickanbanreceipt123456789"
-    opaque = "opaque-kanban-query-value"
-    receipt = f"failed {marker} https://example.invalid/cb?token={opaque}"
+def test_functional_handoffs_preserve_opaque_content_across_persistence(
+    kanban_home,
+):
+    signed_url = (
+        "https://files.example.invalid/report?X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=synthetic-credential"
+        "&X-Amz-Signature=0123456789abcdef0123456789abcdef"
+    )
+    userinfo_url = "https://demo-user:demo-pass@example.invalid/private/report"
+    query_url = (
+        "https://handoff.example.invalid/continue?state=state-fixture-123"
+        "&token=token-fixture-456&code=fixture-code"
+    )
+    query_body = "token=functional-token&code=resume-code&next=%2Freports%3Fpage%3D2"
+    unicode_text = "résumé 日本語 🔐 café — søren"
+    summary = " | ".join((signed_url, userinfo_url, query_url, unicode_text))
+    comment_body = f"{summary}\n{query_body}"
+    metadata = {
+        "handoff": {
+            "signed_url": signed_url,
+            "userinfo_url": userinfo_url,
+            "query_url": query_url,
+            "query_body": query_body,
+            "labels": [unicode_text, {"diagnostic": query_url}],
+        }
+    }
+    result = json.dumps(metadata, ensure_ascii=False, separators=(",", ":"))
 
     with kb.connect() as conn:
-        task_id = kb.create_task(conn, title="redaction boundary", assignee="a")
-        kb.add_comment(conn, task_id, "worker", receipt)
-        kb.claim_task(conn, task_id, claimer="worker")
+        parent_id = kb.create_task(
+            conn, title="functional parent", assignee="worker"
+        )
+        kb.claim_task(conn, parent_id, claimer="worker")
         assert kb.complete_task(
             conn,
-            task_id,
-            result=receipt,
-            summary=receipt,
-            metadata={"diagnostic": receipt},
+            parent_id,
+            result=result,
+            summary=summary,
+            metadata=metadata,
         )
-        rows = {
-            "task": conn.execute(
-                "SELECT result FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()[0],
-            "comment": conn.execute(
-                "SELECT body FROM task_comments WHERE task_id = ?", (task_id,)
-            ).fetchone()[0],
-            "runs": [
-                tuple(row)
-                for row in conn.execute(
-                    "SELECT summary, error, metadata FROM task_runs WHERE task_id = ?",
-                    (task_id,),
-                ).fetchall()
-            ],
-            "events": [
-                row[0]
-                for row in conn.execute(
-                    "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
-                ).fetchall()
-            ],
-        }
 
-    persisted = str(rows)
-    assert marker not in persisted
-    assert opaque not in persisted
-    assert "token=***" in persisted
+        task = kb.get_task(conn, parent_id)
+        run = kb.latest_run(conn, parent_id)
+        completed = next(
+            event
+            for event in kb.list_events(conn, parent_id)
+            if event.kind == "completed"
+        )
+        assert task is not None and task.result == result
+        assert json.loads(task.result) == metadata
+        assert run is not None and run.summary == summary
+        assert run.metadata == metadata
+        assert completed.payload["summary"] == summary
+
+        child_id = kb.create_task(conn, title="functional child", parents=[parent_id])
+        kb.add_comment(conn, child_id, "operator", comment_body)
+        assert kb.list_comments(conn, child_id)[0].body == comment_body
+        child_context = kb.build_worker_context(conn, child_id)
+        for value in (signed_url, userinfo_url, query_url, query_body, unicode_text):
+            assert value in child_context
+
+        edited_metadata = {"edited": metadata, "note": unicode_text}
+        edited_result = json.dumps(
+            edited_metadata, ensure_ascii=False, separators=(",", ":")
+        )
+        edited_summary = f"edited | {summary}"
+        assert kb.edit_completed_task_result(
+            conn,
+            parent_id,
+            result=edited_result,
+            summary=edited_summary,
+            metadata=edited_metadata,
+        )
+        edited_task = kb.get_task(conn, parent_id)
+        edited_run = kb.latest_run(conn, parent_id)
+        edited_event = next(
+            event
+            for event in reversed(kb.list_events(conn, parent_id))
+            if event.kind == "edited"
+        )
+        assert edited_task is not None and edited_task.result == edited_result
+        assert edited_run is not None and edited_run.summary == edited_summary
+        assert edited_run.metadata == edited_metadata
+        assert edited_event.payload["summary"] == edited_summary
+        assert edited_summary in kb.build_worker_context(conn, child_id)
+
+        block_reason = f"{query_body} | {userinfo_url} | {unicode_text}"
+        blocked_id = kb.create_task(conn, title="functional block")
+        assert kb.block_task(conn, blocked_id, reason=block_reason)
+        blocked_run = kb.latest_run(conn, blocked_id)
+        blocked_event = next(
+            event
+            for event in kb.list_events(conn, blocked_id)
+            if event.kind == "blocked"
+        )
+        assert blocked_run is not None and blocked_run.summary == block_reason
+        assert blocked_event.payload["reason"] == block_reason
+        assert block_reason in kb.build_worker_context(conn, blocked_id)
 
 
 def test_failure_receipts_redacted_across_task_run_and_event(kanban_home):
     marker = "sk-synthetickanbanfailure123456789"
-    error = f"worker failed Authorization: Bearer {marker}"
+    opaque = "opaque-diagnostic-query-value"
+    diagnostic_url = (
+        "https://diagnostic-user:diagnostic-pass@example.invalid/cb"
+        f"?token={opaque}"
+    )
+    error = (
+        f"配置エラー Authorization: Bearer {marker} "
+        f"callback={diagnostic_url}"
+    )
+    event_extra = {
+        "nested": {
+            "credential": marker,
+            "callback": diagnostic_url,
+            "note": "日本語 café",
+        }
+    }
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="failure redaction", assignee="a")
@@ -1696,24 +1768,30 @@ def test_failure_receipts_redacted_across_task_run_and_event(kanban_home):
             failure_limit=1,
             release_claim=True,
             end_run=True,
+            event_payload_extra=event_extra,
         )
-        values = conn.execute(
+        task_error = conn.execute(
             "SELECT last_failure_error FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()[0]
-        values += str([
-            tuple(row)
-            for row in conn.execute(
-                "SELECT error, metadata FROM task_runs WHERE task_id = ?", (task_id,)
-            ).fetchall()
-        ])
-        values += str([
-            tuple(row)
-            for row in conn.execute(
-                "SELECT payload FROM task_events WHERE task_id = ?", (task_id,)
-            ).fetchall()
-        ])
+        run = kb.latest_run(conn, task_id)
+        event = next(
+            item
+            for item in kb.list_events(conn, task_id)
+            if item.kind == "gave_up"
+        )
 
-    assert marker not in values
+    assert run is not None and run.error == task_error
+    assert event.payload["error"] == task_error
+    persisted = json.dumps(
+        {"task_error": task_error, "run": run.error, "event": event.payload},
+        ensure_ascii=False,
+    )
+    for forbidden in (marker, "sk-syn", opaque, "diagnostic-pass"):
+        assert forbidden not in persisted
+    assert "token=***" in persisted
+    assert "diagnostic-user:***@" in persisted
+    assert "配置エラー" in persisted
+    assert "日本語 café" in persisted
 
 
 # ---------------------------------------------------------------------------
