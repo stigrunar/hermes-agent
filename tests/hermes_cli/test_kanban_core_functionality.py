@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -2820,7 +2821,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
-def test_systemd_worker_scope_argv_isolates_service_hosted_worker():
+def test_systemd_worker_scope_argv_isolates_service_hosted_worker(kanban_home):
     """Service workers launch in sibling scopes, outside the dispatcher unit.
 
     Stopping/restarting a systemd service applies its kill policy to members of
@@ -2840,15 +2841,151 @@ def test_systemd_worker_scope_argv_isolates_service_hosted_worker():
         ),
         systemd_run="/usr/bin/systemd-run",
         platform="linux",
+        user_manager_ready=True,
     )
 
     assert wrapped[:5] == [
         "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect",
     ]
-    assert wrapped[5] == f"--unit=hermes-kanban-worker-{tid}-17.scope"
+    unit = wrapped[5].removeprefix("--unit=")
+    assert kb._SYSTEMD_WORKER_SCOPE_RE.fullmatch(unit)
+    assert tid not in unit
     assert wrapped[6] == "--"
     assert wrapped[7:] == worker_cmd
     assert "hermes-kanban-safe-dispatcher.service" not in wrapped[5]
+
+
+@pytest.mark.parametrize(
+    ("cgroup_path", "expected"),
+    [
+        (
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway.service",
+            "user",
+        ),
+        ("/system.slice/hermes-gateway.service", "system"),
+        ("/user.slice/user-1000.slice/example.service", None),
+        ("/user.slice/user-1000.slice/session-4.scope", None),
+    ],
+)
+def test_systemd_service_manager_classifies_manager_not_suffix(
+    cgroup_path, expected,
+):
+    assert kb._systemd_service_manager(cgroup_path) == expected
+
+
+def test_worker_scope_unit_name_is_opaque_deterministic_and_board_scoped(tmp_path):
+    first = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+    repeated = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+    other_board = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "other-secret" / "kanban.db",
+    )
+    other_run = kb._worker_scope_unit_name(
+        "t_shared", 8, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+
+    assert first == repeated
+    assert first != other_board
+    assert first != other_run
+    assert "secret-board" not in first
+    assert "t_shared" not in first
+    assert kb._SYSTEMD_WORKER_SCOPE_RE.fullmatch(first)
+
+
+def test_system_service_and_unreachable_user_manager_use_direct_spawn():
+    task = SimpleNamespace(id="t_direct", current_run_id=3)
+    worker_cmd = ["hermes", "chat"]
+
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path="/system.slice/hermes-gateway.service",
+        systemd_run="/usr/bin/systemd-run",
+        platform="linux",
+        user_manager_ready=True,
+    ) is worker_cmd
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path=(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway.service"
+        ),
+        systemd_run="/usr/bin/systemd-run",
+        platform="linux",
+        user_manager_ready=False,
+    ) is worker_cmd
+
+
+def test_systemd_user_scope_availability_requires_version_and_user_bus():
+    def reachable(cmd, **_kwargs):
+        if cmd[-1] == "--version":
+            return SimpleNamespace(returncode=0, stdout="systemd 255\n")
+        return SimpleNamespace(returncode=0, stdout="255\n")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        systemctl="/usr/bin/systemctl",
+        run_fn=reachable,
+    ) is True
+
+    def too_old(cmd, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="systemd 235\n")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        systemctl="/usr/bin/systemctl",
+        run_fn=too_old,
+    ) is False
+
+    def no_bus(cmd, **_kwargs):
+        if cmd[-1] == "--version":
+            return SimpleNamespace(returncode=0, stdout="systemd 255\n")
+        return SimpleNamespace(returncode=1, stdout="")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        systemctl="/usr/bin/systemctl",
+        run_fn=no_bus,
+    ) is False
+
+
+def test_scope_exec_ack_accepts_pre_exec_byte():
+    ready_read, ready_write = os.pipe()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,sys; os.write(int(sys.argv[1]), b'1')",
+            str(ready_write),
+        ],
+        pass_fds=(ready_write,),
+    )
+    os.close(ready_write)
+    try:
+        kb._await_scope_exec_ack(proc, ready_read, timeout=1.0)
+    finally:
+        os.close(ready_read)
+        proc.wait(timeout=1.0)
+
+
+def test_scope_exec_ack_rejects_pre_exec_exit():
+    ready_read, ready_write = os.pipe()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        pass_fds=(ready_write,),
+    )
+    os.close(ready_write)
+    try:
+        with pytest.raises(RuntimeError, match="exited before"):
+            kb._await_scope_exec_ack(proc, ready_read, timeout=1.0)
+    finally:
+        os.close(ready_read)
+        proc.wait(timeout=1.0)
 
 
 @pytest.mark.parametrize(
@@ -2885,10 +3022,10 @@ def test_systemd_worker_scope_argv_preserves_non_linux_fallback():
     ) is worker_cmd
 
 
-def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
+def test_default_spawn_wraps_scope_and_returns_popen_pid(
     kanban_home, monkeypatch,
 ):
-    """The scope launcher execs in-place, so Popen's PID remains canonical."""
+    """The mock proves wrapper selection and Popen PID passthrough only."""
     captured = {}
 
     class FakeProc:
@@ -2903,8 +3040,13 @@ def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
     monkeypatch.setattr(
         kb,
         "_current_cgroup_path",
-        lambda: "/user.slice/user-1000.slice/dispatcher.service",
+        lambda: (
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "dispatcher.service"
+        ),
     )
+    monkeypatch.setattr(kb, "_systemd_user_scope_available", lambda _runner: True)
+    monkeypatch.setattr(kb, "_await_scope_exec_ack", lambda _proc, _fd: None)
     monkeypatch.setattr(
         kb.shutil,
         "which",
@@ -2914,7 +3056,8 @@ def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="tracked scope worker", assignee="ops")
-        task = kb.get_task(conn, tid)
+        task = kb.claim_task(conn, tid)
+        assert task is not None
         workspace = kb.resolve_workspace(task)
         pid = kb._default_spawn(task, str(workspace))
     finally:
@@ -2925,6 +3068,7 @@ def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
         "/usr/bin/systemd-run", "--user", "--scope",
     ]
     assert captured["kwargs"]["start_new_session"] is True
+    assert captured["kwargs"]["pass_fds"]
     assert captured["kwargs"]["env"]["HERMES_KANBAN_TASK"] == tid
 
 
