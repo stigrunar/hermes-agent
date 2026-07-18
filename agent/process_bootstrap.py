@@ -28,6 +28,7 @@ import sys
 import urllib.request
 from typing import Any, Optional
 
+from agent.secret_scope import get_deployment_env
 from utils import base_url_hostname, normalize_proxy_url
 
 
@@ -117,7 +118,7 @@ def _get_proxy_from_env() -> Optional[str]:
     """
     for key in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
                 "https_proxy", "http_proxy", "all_proxy"):
-        value = os.environ.get(key, "").strip()
+        value = (get_deployment_env(key, "") or "").strip()
         if value:
             return normalize_proxy_url(value)
     return None

@@ -8,6 +8,8 @@ import ssl
 from pathlib import Path
 from typing import Any, Optional
 
+from agent.secret_scope import get_deployment_env
+
 logger = logging.getLogger(__name__)
 
 
@@ -47,10 +49,10 @@ def resolve_httpx_verify(
 
     effective_ca = (
         (ca_bundle or "").strip()
-        or os.getenv("HERMES_CA_BUNDLE", "").strip()
-        or os.getenv("SSL_CERT_FILE", "").strip()
-        or os.getenv("REQUESTS_CA_BUNDLE", "").strip()
-        or os.getenv("CURL_CA_BUNDLE", "").strip()
+        or (get_deployment_env("HERMES_CA_BUNDLE", "") or "").strip()
+        or (get_deployment_env("SSL_CERT_FILE", "") or "").strip()
+        or (get_deployment_env("REQUESTS_CA_BUNDLE", "") or "").strip()
+        or (get_deployment_env("CURL_CA_BUNDLE", "") or "").strip()
     )
     if effective_ca:
         ca_path = str(Path(effective_ca).expanduser())

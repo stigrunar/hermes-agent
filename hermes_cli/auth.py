@@ -46,11 +46,17 @@ import httpx
 from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
+    get_env_value_prefer_dotenv,
     read_raw_config,
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
+from agent.secret_scope import (
+    UnscopedSecretError,
+    get_deployment_env,
+    get_secret,
+)
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -565,6 +571,18 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
+def _profile_env(name: str, default: str = "") -> str:
+    """Read a profile-owned credential, selector, or endpoint override."""
+    value = get_env_value_prefer_dotenv(name)
+    return value if value is not None else default
+
+
+def _deployment_env(name: str, default: str = "") -> str:
+    """Read a name explicitly classified as process/deployment-global."""
+    value = get_deployment_env(name, default)
+    return value if value is not None else default
+
+
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -577,6 +595,8 @@ def _resolve_api_key_provider_secret(
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
+        except UnscopedSecretError:
+            raise
         except ValueError as exc:
             logger.warning(
                 "Copilot token validation failed: %s",
@@ -586,7 +606,6 @@ def _resolve_api_key_provider_secret(
             pass
         return "", ""
 
-    from hermes_cli.config import get_env_value_prefer_dotenv
     for env_var in pconfig.api_key_env_vars:
         # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
         # in the user's .env file isn't shadowed by a stale shell export
@@ -606,6 +625,8 @@ def _resolve_api_key_provider_secret(
                 key = str(key).strip()
                 if has_usable_secret(key):
                     return key, f"credential_pool:{provider_id}"
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -860,6 +881,8 @@ def _format_nous_entitlement_auth_error(error: AuthError) -> str:
         )
         if message:
             return message
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
     return f"{error} Check credits or billing in Nous Portal, then retry."
@@ -884,7 +907,7 @@ def _redact_auth_diagnostic(value: Any) -> Any:
 
 
 def _oauth_trace_enabled() -> bool:
-    raw = os.getenv("HERMES_OAUTH_TRACE", "").strip().lower()
+    raw = _deployment_env("HERMES_OAUTH_TRACE").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -1629,14 +1652,14 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
     """
     normalized = (provider_id or "").strip().lower()
 
-    from agent.secret_scope import get_secret
-
     # 1. Check auth.json active_provider
     try:
         auth_store = _load_auth_store()
         active = (auth_store.get("active_provider") or "").strip().lower()
         if active and active == normalized:
             return True
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -1649,6 +1672,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             cfg_provider = (model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == normalized:
                 return True
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -1694,6 +1719,8 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 or source.startswith("manual:")
             ):
                 return True
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -1890,10 +1917,14 @@ def resolve_provider(
             _cfg_provider = _model_cfg.get("provider")
             if isinstance(_cfg_provider, str) and _cfg_provider.strip().lower() in PROVIDER_REGISTRY:
                 return _cfg_provider.strip().lower()
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
 
-    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
+    if has_usable_secret(_profile_env("OPENAI_API_KEY")) or has_usable_secret(
+        _profile_env("OPENROUTER_API_KEY")
+    ):
         return "openrouter"
 
     # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
@@ -1908,6 +1939,8 @@ def resolve_provider(
 
         if _load_pool("openrouter").has_credentials():
             return "openrouter"
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         logger.debug("Could not check OpenRouter credential pool: %s", e)
 
@@ -1920,6 +1953,8 @@ def resolve_provider(
         _maybe = _store.get("active_provider")
         if _maybe and _maybe in PROVIDER_REGISTRY and get_auth_status(_maybe).get("logged_in"):
             _oauth_active = _maybe
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         logger.debug("Could not pre-read active auth provider: %s", e)
 
@@ -1936,7 +1971,7 @@ def resolve_provider(
         if pid in {"copilot", "lmstudio"}:
             continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(os.getenv(env_var, "")):
+            if has_usable_secret(_profile_env(env_var)):
                 # An exported API key now wins over a logged-in OAuth provider
                 # (the #29285 fix). Surface that so a user who deliberately uses
                 # OAuth but has a stale key in ~/.hermes/.env isn't silently
@@ -2120,35 +2155,36 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
 def _nous_inference_env_override() -> Optional[str]:
     """Return the user-set ``NOUS_INFERENCE_BASE_URL`` override, if any.
 
-    This is the documented dev/staging escape hatch. The env source is
-    trusted (the OS user set it themselves), so it is intentionally NOT
-    gated by the network host allowlist — unlike Portal-returned URLs.
+    This is the documented dev/staging escape hatch. It is profile-owned in
+    multiplex mode because the selected URL receives that profile's bearer;
+    the active secret scope is therefore authoritative. The configured value
+    is intentionally NOT gated by the network host allowlist, unlike an
+    untrusted Portal-returned URL.
 
     Returns a trailing-slash-stripped non-empty string, or ``None`` when
     the env var is unset/blank.
     """
-    return _optional_base_url(os.getenv("NOUS_INFERENCE_BASE_URL"))
+    return _optional_base_url(_profile_env("NOUS_INFERENCE_BASE_URL"))
 
 
 def _nous_portal_env_override() -> Optional[str]:
-    """Return the user/deployment-set Portal base URL override, if any.
+    """Return the trusted deployment/profile Portal override, if any.
 
     Mirrors ``_nous_inference_env_override()``: ``HERMES_PORTAL_BASE_URL`` /
     ``NOUS_PORTAL_BASE_URL`` are the documented dev/staging escape hatch for
-    pointing Hermes at a non-production Nous Portal (e.g. a hosted agent
-    provisioned on nous-account-service's `staging` environment, which stamps
-    ``HERMES_PORTAL_BASE_URL=https://portal.staging-nousresearch.com`` into
-    the container env). The env source is trusted (the OS user/deployment
-    set it themselves), so — like the inference override — it must NOT be
-    gated by ``_NOUS_PORTAL_ALLOWED_HOSTS``: that allowlist exists to reject
-    an untrusted NETWORK-provided value (a poisoned portal_base_url
-    persisted to auth.json), not a value the operator explicitly configured.
+    pointing Hermes at a non-production Nous Portal. The ``HERMES_*`` name is
+    an explicit hosted-deployment route stamped into containers and therefore
+    wins process-wide; ``NOUS_PORTAL_BASE_URL`` remains profile-owned under
+    multiplexing. Neither trusted override is gated by
+    ``_NOUS_PORTAL_ALLOWED_HOSTS``; that allowlist rejects an untrusted network
+    value persisted to auth state.
 
     Returns a trailing-slash-stripped non-empty string, or ``None`` when
     neither env var is set/blank.
     """
     return _optional_base_url(
-        os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
+        _deployment_env("HERMES_PORTAL_BASE_URL")
+        or _profile_env("NOUS_PORTAL_BASE_URL")
     )
 
 
@@ -2531,7 +2567,10 @@ def resolve_qwen_runtime_credentials(
             code="qwen_access_token_missing",
         )
 
-    base_url = os.getenv("HERMES_QWEN_BASE_URL", "").strip().rstrip("/") or DEFAULT_QWEN_BASE_URL
+    base_url = (
+        _profile_env("HERMES_QWEN_BASE_URL").strip().rstrip("/")
+        or DEFAULT_QWEN_BASE_URL
+    )
     return {
         "provider": "qwen-oauth",
         "base_url": base_url,
@@ -2589,12 +2628,10 @@ def _spotify_client_id(
     explicit: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> str:
-    from hermes_cli.config import get_env_value
-
     candidates = (
         explicit,
-        get_env_value("HERMES_SPOTIFY_CLIENT_ID"),
-        get_env_value("SPOTIFY_CLIENT_ID"),
+        _profile_env("HERMES_SPOTIFY_CLIENT_ID"),
+        _profile_env("SPOTIFY_CLIENT_ID"),
         state.get("client_id") if isinstance(state, dict) else None,
     )
     for candidate in candidates:
@@ -2612,12 +2649,10 @@ def _spotify_redirect_uri(
     explicit: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> str:
-    from hermes_cli.config import get_env_value
-
     candidates = (
         explicit,
-        get_env_value("HERMES_SPOTIFY_REDIRECT_URI"),
-        get_env_value("SPOTIFY_REDIRECT_URI"),
+        _profile_env("HERMES_SPOTIFY_REDIRECT_URI"),
+        _profile_env("SPOTIFY_REDIRECT_URI"),
         state.get("redirect_uri") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_REDIRECT_URI,
     )
@@ -2629,10 +2664,8 @@ def _spotify_redirect_uri(
 
 
 def _spotify_api_base_url(state: Optional[Dict[str, Any]] = None) -> str:
-    from hermes_cli.config import get_env_value
-
     candidates = (
-        get_env_value("HERMES_SPOTIFY_API_BASE_URL"),
+        _profile_env("HERMES_SPOTIFY_API_BASE_URL"),
         state.get("api_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_API_BASE_URL,
     )
@@ -2644,10 +2677,8 @@ def _spotify_api_base_url(state: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _spotify_accounts_base_url(state: Optional[Dict[str, Any]] = None) -> str:
-    from hermes_cli.config import get_env_value
-
     candidates = (
-        get_env_value("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
+        _profile_env("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
         state.get("accounts_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL,
     )
@@ -3210,7 +3241,7 @@ def _is_remote_session() -> bool:
     set ``SSH_CLIENT`` / ``SSH_TTY``, so the SSH-only check left
     them with no guidance and no fallback.
     """
-    if os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"):
+    if _deployment_env("SSH_CLIENT") or _deployment_env("SSH_TTY"):
         return True
     # Browser-only remote IDEs / cloud shells.  Keep this list narrow
     # (well-known, documented env vars set by the host platform) so
@@ -3223,7 +3254,7 @@ def _is_remote_session() -> bool:
         "REPL_ID",             # Replit
         "STACKBLITZ",          # StackBlitz
     ):
-        if os.getenv(var):
+        if _deployment_env(var):
             return True
     return False
 
@@ -3274,13 +3305,13 @@ def _can_open_graphical_browser() -> bool:
         base = os.path.basename(token).lower()
         return base in _CONSOLE_BROWSER_NAMES
 
-    browser_env = os.environ.get("BROWSER", "")
+    browser_env = _deployment_env("BROWSER")
     if browser_env and _names_console_browser(browser_env):
         return False
 
     if sys.platform.startswith("linux"):
         has_display = bool(
-            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
+            _deployment_env("DISPLAY") or _deployment_env("WAYLAND_DISPLAY")
         )
         # An explicit graphical $BROWSER can work without $DISPLAY in odd
         # setups, but a console $BROWSER already returned False above, so the
@@ -3316,7 +3347,7 @@ def _ssh_user_at_host() -> str:
         hostname = _socket.gethostname() or "<this-host>"
     except OSError:
         hostname = "<this-host>"
-    user = os.getenv("USER") or os.getenv("LOGNAME") or "<user>"
+    user = _deployment_env("USER") or _deployment_env("LOGNAME") or "<user>"
     return f"{user}@{hostname}"
 
 
@@ -3776,7 +3807,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
-    codex_home = os.getenv("CODEX_HOME", "").strip()
+    codex_home = _deployment_env("CODEX_HOME").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
     auth_path = Path(codex_home).expanduser() / "auth.json"
@@ -3843,7 +3874,7 @@ def resolve_codex_runtime_credentials(
         pool_token = _pool_codex_access_token()
         if pool_token:
             base_url = (
-                os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
                 or DEFAULT_CODEX_BASE_URL
             )
             return {
@@ -3912,7 +3943,7 @@ def resolve_codex_runtime_credentials(
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
-        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
 
@@ -4608,8 +4639,8 @@ def resolve_xai_oauth_runtime_credentials(
                     raise
 
     base_url = _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-        or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
+        _profile_env("HERMES_XAI_BASE_URL").strip().rstrip("/")
+        or _profile_env("XAI_BASE_URL").strip().rstrip("/"),
         fallback=DEFAULT_XAI_OAUTH_BASE_URL,
     )
     return {
@@ -4663,9 +4694,9 @@ def _resolve_verify(
     effective_ca = (
         ca_bundle
         or tls_state.get("ca_bundle")
-        or os.getenv("HERMES_CA_BUNDLE")
-        or os.getenv("SSL_CERT_FILE")
-        or os.getenv("REQUESTS_CA_BUNDLE")
+        or _deployment_env("HERMES_CA_BUNDLE")
+        or _deployment_env("SSL_CERT_FILE")
+        or _deployment_env("REQUESTS_CA_BUNDLE")
     )
 
     if effective_insecure:
@@ -4802,7 +4833,7 @@ def _nous_shared_auth_dir() -> Path:
     ``<HERMES_HOME>/shared/``. Sits outside any named profile so all
     profiles under the same root share the store.
     """
-    override = os.getenv("HERMES_SHARED_AUTH_DIR", "").strip()
+    override = _deployment_env("HERMES_SHARED_AUTH_DIR").strip()
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
@@ -5696,6 +5727,8 @@ def _sync_nous_pool_from_auth_store() -> None:
         from agent.credential_pool import load_pool
 
         load_pool("nous")
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug(
             "Failed to sync Nous credential pool from auth store: %s",
@@ -5738,8 +5771,8 @@ def resolve_nous_runtime_credentials(
             """Resolve every routing value that shared OAuth state can replace."""
             portal_url = (
                 _optional_base_url(state.get("portal_base_url"))
-                or os.getenv("HERMES_PORTAL_BASE_URL")
-                or os.getenv("NOUS_PORTAL_BASE_URL")
+                or _profile_env("HERMES_PORTAL_BASE_URL")
+                or _profile_env("NOUS_PORTAL_BASE_URL")
                 or DEFAULT_NOUS_PORTAL_URL
             ).rstrip("/")
 
@@ -6094,6 +6127,8 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
             "credential_source": f"pool:{label}",
             "source": f"pool:{label}",
         }
+    except UnscopedSecretError:
+        raise
     except Exception:
         return _empty_nous_auth_status()
 
@@ -6259,6 +6294,8 @@ def get_nous_session_validity() -> str:
     # so we report "terminal" even after the in-memory AuthError is long gone.
     try:
         state = get_provider_auth_state("nous")
+    except UnscopedSecretError:
+        raise
     except Exception:
         state = None
 
@@ -6273,6 +6310,8 @@ def get_nous_session_validity() -> str:
 
     try:
         status = get_nous_auth_status()
+    except UnscopedSecretError:
+        raise
     except Exception:
         # Status computation itself failed — indeterminate, not terminal.
         return NOUS_SESSION_UNKNOWN
@@ -6334,6 +6373,8 @@ def get_codex_auth_status() -> Dict[str, Any]:
                     ),
                     "reset_at": rate_limit.get("reset_at"),
                 }
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -6380,6 +6421,8 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
                         "source": f"pool:{getattr(entry, 'label', 'unknown')}",
                         "api_key": api_key,
                     }
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -6413,7 +6456,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        env_url = _profile_env(pconfig.base_url_env_var).strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -6439,13 +6482,17 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         return {"configured": False}
 
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        _deployment_env("HERMES_COPILOT_ACP_COMMAND").strip()
+        or _deployment_env("COPILOT_CLI_PATH").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw_args = _deployment_env("HERMES_COPILOT_ACP_ARGS").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    base_url = (
+        _profile_env(pconfig.base_url_env_var).strip()
+        if pconfig.base_url_env_var
+        else ""
+    )
     if not base_url:
         base_url = pconfig.inference_base_url
 
@@ -6516,6 +6563,8 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config, get_env_value_prefer_dotenv
         cfg = load_config()
+    except UnscopedSecretError:
+        raise
     except Exception:
         cfg = {}
 
@@ -6539,9 +6588,15 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
             entra_cfg = {}
             if isinstance(model_cfg, dict) and isinstance(model_cfg.get("entra"), dict):
                 entra_cfg = model_cfg["entra"]
-            identity_config = EntraIdentityConfig.from_dict(
+            stored_identity_config = EntraIdentityConfig.from_dict(
                 entra_cfg,
                 default_scope=SCOPE_AI_AZURE_DEFAULT,
+            )
+            identity_config = EntraIdentityConfig.from_active_scope(
+                scope=stored_identity_config.scope,
+                exclude_interactive_browser=(
+                    stored_identity_config.exclude_interactive_browser
+                ),
             )
             info["azure_identity_installed"] = installed
             info["scope"] = identity_config.scope
@@ -6560,16 +6615,15 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
                     "is skipped here. Run `hermes doctor` to verify token acquisition."
                 )
             return info
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             info["logged_in"] = False
             info["error"] = f"azure-identity check failed: {exc}"
             return info
 
     # api_key mode (default)
-    try:
-        api_key = get_env_value_prefer_dotenv("AZURE_FOUNDRY_API_KEY") or ""
-    except Exception:
-        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
+    api_key = _profile_env("AZURE_FOUNDRY_API_KEY")
     info["logged_in"] = has_usable_secret(api_key)
     return info
 
@@ -6600,7 +6654,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
+        env_url = _profile_env(pconfig.base_url_env_var).strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -6624,6 +6678,8 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
                 resolved = (resolved or "").strip()
                 if resolved:
                     base_url = resolved
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Copilot base URL resolution fell back to default: %s", exc)
     elif env_url:
@@ -6658,16 +6714,20 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
+    base_url = (
+        _profile_env(pconfig.base_url_env_var).strip()
+        if pconfig.base_url_env_var
+        else ""
+    )
     if not base_url:
         base_url = pconfig.inference_base_url
 
     command = (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        _deployment_env("HERMES_COPILOT_ACP_COMMAND").strip()
+        or _deployment_env("COPILOT_CLI_PATH").strip()
         or "copilot"
     )
-    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw_args = _deployment_env("HERMES_COPILOT_ACP_ARGS").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
@@ -7131,7 +7191,10 @@ def _login_openai_codex(
                 do_import = "n"
             if do_import in {"y", "yes"}:
                 _save_codex_tokens(cli_tokens, to_active_profile=True)
-                base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
+                base_url = (
+                    _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
+                    or DEFAULT_CODEX_BASE_URL
+                )
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
                 print("Credentials imported. Note: if Codex CLI refreshes its token,")
@@ -7395,8 +7458,8 @@ def _xai_oauth_device_code_login(
             code="xai_device_token_invalid",
         )
     base_url = _xai_validate_inference_base_url(
-        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-        or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
+        _profile_env("HERMES_XAI_BASE_URL").strip().rstrip("/")
+        or _profile_env("XAI_BASE_URL").strip().rstrip("/"),
         fallback=DEFAULT_XAI_OAUTH_BASE_URL,
     )
     return {
@@ -7598,7 +7661,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
 
     # Return tokens for the caller to persist (no longer writes to ~/.codex/)
     base_url = (
-        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
 
@@ -8065,13 +8128,13 @@ def _nous_device_code_login(
     pconfig = PROVIDER_REGISTRY["nous"]
     portal_base_url = (
         portal_base_url
-        or os.getenv("HERMES_PORTAL_BASE_URL")
-        or os.getenv("NOUS_PORTAL_BASE_URL")
+        or _profile_env("HERMES_PORTAL_BASE_URL")
+        or _profile_env("NOUS_PORTAL_BASE_URL")
         or pconfig.portal_base_url
     ).rstrip("/")
     requested_inference_url = (
         inference_base_url
-        or os.getenv("NOUS_INFERENCE_BASE_URL")
+        or _profile_env("NOUS_INFERENCE_BASE_URL")
         or pconfig.inference_base_url
     ).rstrip("/")
     client_id = client_id or pconfig.client_id
@@ -8199,6 +8262,8 @@ def nous_token_has_billing_scope() -> bool:
     """
     try:
         state = get_provider_auth_state("nous") or {}
+    except UnscopedSecretError:
+        raise
     except Exception:
         return False
     scope = state.get("scope")
@@ -8280,8 +8345,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     insecure = bool(getattr(args, "insecure", False))
     ca_bundle = (
         getattr(args, "ca_bundle", None)
-        or os.getenv("HERMES_CA_BUNDLE")
-        or os.getenv("SSL_CERT_FILE")
+        or _deployment_env("HERMES_CA_BUNDLE")
+        or _deployment_env("SSL_CERT_FILE")
     )
 
     try:
@@ -8396,6 +8461,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                             )
                             or ""
                         )
+                    except UnscopedSecretError:
+                        raise
                     except Exception:
                         unavailable_message = ""
                     # The Portal's freeRecommendedModels endpoint is the
@@ -8435,6 +8502,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 print(unavailable_message or f"Upgrade at {_url} to access paid models.")
             else:
                 print("No curated models available for Nous Portal.")
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             message = format_auth_error(exc) if isinstance(exc, AuthError) else str(exc)
             print()
@@ -8473,6 +8542,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     except KeyboardInterrupt:
         print("\nLogin cancelled.")
         raise SystemExit(130)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         print(f"Login failed: {exc}")
         raise SystemExit(1)
@@ -8500,7 +8571,7 @@ def logout_command(args) -> None:
         if should_reset_config:
             _reset_config_provider()
         print(f"Logged out of {provider_name}.")
-        if should_reset_config and os.getenv("OPENROUTER_API_KEY"):
+        if should_reset_config and _profile_env("OPENROUTER_API_KEY"):
             print("Hermes will use OpenRouter for inference.")
         elif should_reset_config:
             print("Run `hermes model` or configure an API key to use Hermes.")

@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 import requests
 import yaml
 
+from agent.secret_scope import UnscopedSecretError, get_deployment_env
 from utils import atomic_json_write, base_url_host_matches, base_url_hostname
 
 from hermes_constants import OPENROUTER_MODELS_URL
@@ -36,8 +37,13 @@ def _resolve_requests_verify() -> bool | str:
     Returns either a filesystem path to a CA bundle, or True to defer to
     the requests default (certifi).
     """
-    for env_var in ("HERMES_CA_BUNDLE", "REQUESTS_CA_BUNDLE", "SSL_CERT_FILE"):
-        val = os.getenv(env_var)
+    for env_var in (
+        "HERMES_CA_BUNDLE",
+        "REQUESTS_CA_BUNDLE",
+        "SSL_CERT_FILE",
+        "CURL_CA_BUNDLE",
+    ):
+        val = get_deployment_env(env_var)
         if val and os.path.isfile(val):
             return val
     return True
@@ -2128,6 +2134,8 @@ def get_model_context_length(
                     api_key=rt.get("api_key", "") or "",
                     provider=agg_provider,
                 )
+        except UnscopedSecretError:
+            raise
         except Exception:
             logger.debug("MoA aggregator context-length resolution failed", exc_info=True)
         # Fall through to the generic default if aggregator resolution failed.

@@ -55,6 +55,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.secret_scope import UnscopedSecretError, get_deployment_env, get_secret
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -72,6 +74,11 @@ if TYPE_CHECKING:
     from openai import OpenAI  # noqa: F401 — type hints only
 
 _OPENAI_CLS_CACHE: Optional[type] = None
+
+
+def _profile_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return value if value is not None else default
 
 
 def _load_openai_cls() -> type:
@@ -804,6 +811,8 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
     """Return (pool_exists_for_provider, selected_entry)."""
     try:
         pool = load_pool(provider)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: could not load pool for %s: %s", provider, exc)
         return False, None
@@ -811,6 +820,8 @@ def _select_pool_entry(provider: str) -> Tuple[bool, Optional[Any]]:
         return False, None
     try:
         return True, pool.select()
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: could not select pool entry for %s: %s", provider, exc)
         return True, None
@@ -820,6 +831,8 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
     """Best-effort current/next pool entry without mutating selection order."""
     try:
         pool = load_pool(provider)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: could not load pool for %s (peek): %s", provider, exc)
         return None
@@ -834,6 +847,8 @@ def _peek_pool_entry(provider: str) -> Optional[Any]:
         peek_fn = getattr(pool, "peek", None)
         if callable(peek_fn):
             return peek_fn()
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: could not peek pool entry for %s: %s", provider, exc)
     return None
@@ -894,7 +909,10 @@ def _is_anthropic_compatible_host(url: str) -> bool:
 
 def _nous_min_key_ttl_seconds() -> int:
     try:
-        return max(60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")))
+        return max(
+            60,
+            int(get_deployment_env("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800")),
+        )
     except (TypeError, ValueError):
         return 1800
 
@@ -1738,7 +1756,7 @@ def _nous_api_key(provider: dict) -> str:
 
 def _nous_base_url() -> str:
     """Resolve the Nous inference base URL from env or default."""
-    return os.getenv("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
+    return _profile_env("NOUS_INFERENCE_BASE_URL", _NOUS_DEFAULT_BASE_URL)
 
 
 def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[str, str]]:
@@ -1747,6 +1765,8 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
         from hermes_cli.auth import _agent_key_is_usable
 
         pool = load_pool("nous")
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary Nous pool credential resolution failed: %s", exc)
         return None
@@ -1756,6 +1776,8 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
 
     try:
         entry = pool.select()
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary Nous pool selection failed: %s", exc)
         return None
@@ -1771,6 +1793,8 @@ def _resolve_nous_pool_runtime_api(*, force_refresh: bool = False) -> Optional[t
     if force_refresh or not _agent_key_is_usable(state, _nous_min_key_ttl_seconds()):
         try:
             refreshed = pool.try_refresh_current()
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Auxiliary Nous pool refresh failed: %s", exc)
             refreshed = None
@@ -1811,6 +1835,8 @@ def _resolve_nous_runtime_api(*, force_refresh: bool = False) -> Optional[tuple[
             timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
             force_refresh=force_refresh,
         )
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary Nous runtime credential resolution failed: %s", exc)
         return None
@@ -1851,14 +1877,16 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
                     or ""
                 ).strip()
                 base_url = _xai_validate_inference_base_url(
-                    os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
-                    or os.getenv("XAI_BASE_URL", "").strip().rstrip("/")
+                    _profile_env("HERMES_XAI_BASE_URL").strip().rstrip("/")
+                    or _profile_env("XAI_BASE_URL").strip().rstrip("/")
                     or str(getattr(entry, "runtime_base_url", None) or "").strip().rstrip("/")
                     or str(getattr(entry, "base_url", None) or "").strip().rstrip("/"),
                     fallback=DEFAULT_XAI_OAUTH_BASE_URL,
                 )
                 if api_key and base_url:
                     return api_key, base_url
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth pool credential resolution failed: %s", exc)
 
@@ -1866,6 +1894,8 @@ def _resolve_xai_oauth_for_aux() -> Optional[Tuple[str, str]]:
         from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
         creds = resolve_xai_oauth_runtime_credentials()
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary xAI OAuth runtime credential resolution failed: %s", exc)
         return None
@@ -2051,7 +2081,7 @@ def _try_openrouter(explicit_api_key: str = None, model: str = None) -> Tuple[Op
         # the OPENROUTER_API_KEY env-var path rather than failing outright.
         logger.debug("Auxiliary client: OpenRouter pool exhausted, trying OPENROUTER_API_KEY")
 
-    or_key = explicit_api_key or os.getenv("OPENROUTER_API_KEY")
+    or_key = explicit_api_key or _profile_env("OPENROUTER_API_KEY")
     if not or_key:
         _mark_provider_unhealthy("openrouter", ttl=60)
         return None, None
@@ -2068,7 +2098,7 @@ def _describe_openrouter_unavailable() -> str:
             return "OpenRouter credential pool has no usable entries (credentials may be exhausted)"
         if not _pool_runtime_api_key(entry):
             return "OpenRouter credential pool entry is missing a runtime API key"
-    if not str(os.getenv("OPENROUTER_API_KEY") or "").strip():
+    if not _profile_env("OPENROUTER_API_KEY").strip():
         return "OPENROUTER_API_KEY not set"
     return "no usable OpenRouter credentials found"
 
@@ -2471,13 +2501,15 @@ def _resolve_custom_runtime() -> Tuple[Optional[str], Optional[str], Optional[st
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         runtime = resolve_runtime_provider(requested="custom")
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary client: custom runtime resolution failed: %s", exc)
         runtime = None
 
     if not isinstance(runtime, dict):
-        openai_base = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
-        openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+        openai_base = _profile_env("OPENAI_BASE_URL").strip().rstrip("/")
+        openai_key = _profile_env("OPENAI_API_KEY").strip()
         if not openai_base:
             return None, None, None
         runtime = {
@@ -2721,6 +2753,8 @@ def _try_azure_foundry(
         model_cfg = cfg.get("model") if isinstance(cfg, dict) else {}
         if not isinstance(model_cfg, dict):
             model_cfg = {}
+    except UnscopedSecretError:
+        raise
     except Exception:
         model_cfg = {}
 
@@ -2735,6 +2769,8 @@ def _try_azure_foundry(
     except AuthError as exc:
         logger.debug("Auxiliary azure-foundry: %s", exc)
         return None, None
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary azure-foundry runtime error: %s", exc)
         return None, None
@@ -3078,6 +3114,8 @@ def _nous_portal_account_has_fresh_paid_access() -> bool:
 
         account_info = get_nous_portal_account_info(force_fresh=True)
         return account_info.paid_service_access is True
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary Nous paid-entitlement refresh check failed: %s", exc)
         return False
@@ -3533,6 +3571,8 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
     normalized = _normalize_aux_provider(provider)
     try:
         pool = load_pool(normalized)
+    except UnscopedSecretError:
+        raise
     except Exception as load_exc:
         logger.debug("Auxiliary client: could not load pool for %s recovery: %s", normalized, load_exc)
         return False
@@ -3757,6 +3797,8 @@ def _refresh_provider_credentials(provider: str) -> bool:
                 return False
             _evict_cached_clients(normalized)
             return True
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary provider credential refresh failed for %s: %s", normalized, exc)
         return False
@@ -4056,6 +4098,8 @@ def _try_main_agent_model_fallback(
         client, resolved_model = resolve_provider_client(
             provider=main_provider, model=main_model,
         )
+    except UnscopedSecretError:
+        raise
     except Exception:
         client, resolved_model = None, None
 
@@ -4190,6 +4234,8 @@ def _try_configured_fallback_chain(
 
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
+        except UnscopedSecretError:
+            raise
         except Exception:
             fb_client, resolved_model = None, None
 
@@ -4252,7 +4298,7 @@ def _fallback_entry_api_key(entry: Dict[str, Any]) -> Optional[str]:
         return explicit
     key_env = str(entry.get("key_env") or entry.get("api_key_env") or "").strip()
     if key_env:
-        return os.getenv(key_env, "").strip() or None
+        return _profile_env(key_env).strip() or None
     return None
 
 
@@ -4292,6 +4338,8 @@ def _try_main_fallback_chain(
         from hermes_cli.fallback_config import get_fallback_chain
 
         chain = get_fallback_chain(load_config())
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug("Auxiliary %s: could not load main fallback chain: %s", task or "call", exc)
         return None, None, ""
@@ -4323,6 +4371,8 @@ def _try_main_fallback_chain(
             continue
         try:
             fb_client, resolved_model = _resolve_fallback_entry(entry)
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Auxiliary %s: main fallback %s failed to resolve: %s", task or "call", label, exc)
             fb_client, resolved_model = None, None
@@ -4408,7 +4458,7 @@ def _resolve_auto(
     #    scenario where a user switches providers via `hermes model` but the
     #    old OPENAI_BASE_URL lingers in ~/.hermes/.env. ──
     if not _stale_base_url_warned:
-        _env_base = os.getenv("OPENAI_BASE_URL", "").strip()
+        _env_base = _profile_env("OPENAI_BASE_URL").strip()
         _cfg_provider = runtime_provider or _read_main_provider()
         if (_env_base and _cfg_provider
                 and _cfg_provider != "custom"
@@ -4912,7 +4962,7 @@ def resolve_provider_client(
             custom_base = _to_openai_base_url(explicit_base_url).strip()
             custom_key = (
                 (explicit_api_key or "").strip()
-                or os.getenv("OPENAI_API_KEY", "").strip()
+                or _profile_env("OPENAI_API_KEY").strip()
                 or _read_main_api_key_if_same_host(custom_base)
                 or "no-key-required"  # local servers don't need auth
             )
@@ -5008,7 +5058,7 @@ def resolve_provider_client(
             custom_key = (custom_entry.get("api_key") or "").strip()
             custom_key_env = (custom_entry.get("key_env") or custom_entry.get("api_key_env") or "").strip()
             if not custom_key and custom_key_env:
-                custom_key = os.getenv(custom_key_env, "").strip()
+                custom_key = _profile_env(custom_key_env).strip()
             custom_key = custom_key or "no-key-required"
             if custom_key == "no-key-required":
                 logger.warning(
@@ -5353,7 +5403,13 @@ def resolve_provider_client(
                          "no AWS credentials found")
             return None, None
 
-        region = resolve_bedrock_region()
+        from hermes_cli.config import load_config
+
+        region = str(load_config().get("bedrock", {}).get("region") or "").strip()
+        region = region or resolve_bedrock_region()
+        if not region:
+            logger.debug("resolve_provider_client: bedrock region is not profile-owned")
+            return None, None
         default_model = "anthropic.claude-haiku-4-5-20251001-v1:0"
         final_model = _normalize_resolved_model(model or default_model, provider)
         base_url = f"https://bedrock-runtime.{region}.amazonaws.com"
@@ -5479,6 +5535,8 @@ def _main_model_supports_vision(provider: str, model: Optional[str]) -> bool:
         return True
     try:
         supports = _lookup_supports_vision(provider, model, load_config())
+    except UnscopedSecretError:
+        raise
     except Exception:  # pragma: no cover - defensive
         return True
     if supports is None:
@@ -5798,7 +5856,7 @@ def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> di
     misses the case where a custom base URL serves e.g. ``gpt-5.4``.
     """
     custom_base = _current_custom_base_url()
-    or_key = os.getenv("OPENROUTER_API_KEY")
+    or_key = _profile_env("OPENROUTER_API_KEY")
     # Use max_completion_tokens for direct OpenAI-compatible providers that reject
     # max_tokens on newer GPT-4o/o-series/GPT-5-style models.
     _custom_host = base_url_hostname(custom_base) or ""

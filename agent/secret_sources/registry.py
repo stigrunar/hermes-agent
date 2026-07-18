@@ -42,6 +42,7 @@ from agent.secret_sources.base import (
     is_valid_env_name,
 )
 from agent.redact import redact_for_persistence
+from agent.secret_scope import UnscopedSecretError
 
 logger = logging.getLogger(__name__)
 
@@ -222,6 +223,8 @@ def _fetch_with_timeout(
             )
             res.error_kind = ErrorKind.TIMEOUT
             return res
+        except UnscopedSecretError:
+            raise
         except Exception as exc:  # noqa: BLE001 — contract violation, contain it
             res = FetchResult()
             safe_error = redact_for_persistence(str(exc))

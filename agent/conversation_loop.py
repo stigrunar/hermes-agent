@@ -28,6 +28,7 @@ import uuid
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
+from agent.secret_scope import UnscopedSecretError
 from agent.conversation_compression import conversation_history_after_compression
 from agent.display import KawaiiSpinner
 from agent.error_classifier import FailoverReason, classify_api_error
@@ -174,6 +175,8 @@ def _nous_entitlement_message(capability: str) -> str:
             capability=capability,
         )
         return message or ""
+    except UnscopedSecretError:
+        raise
     except Exception:
         return ""
 
@@ -274,6 +277,8 @@ def _try_refresh_nous_paid_entitlement_credentials(agent) -> bool:
         return agent._try_refresh_nous_client_credentials(
             force=True,
         )
+    except UnscopedSecretError:
+        raise
     except Exception:
         return False
 

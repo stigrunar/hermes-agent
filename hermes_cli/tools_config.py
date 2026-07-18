@@ -127,21 +127,18 @@ def _xai_credentials_present() -> bool:
     auth store and environment. The tool's runtime ``check_fn`` still
     gates schema registration if creds later expire or get revoked.
     """
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         from hermes_cli.auth import _read_xai_oauth_tokens
 
         _read_xai_oauth_tokens()
         return True
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
-    try:
-        from tools.xai_http import get_env_value as _xai_get_env_value
-
-        if str(_xai_get_env_value("XAI_API_KEY") or "").strip():
-            return True
-    except Exception:
-        pass
-    return bool(str(os.environ.get("XAI_API_KEY") or "").strip())
+    return bool(str(get_env_value("XAI_API_KEY") or "").strip())
 
 # Platform-scoped toolsets: only appear in the `hermes tools` checklist for
 # these platforms, and only resolve/save for these platforms.  A toolset
