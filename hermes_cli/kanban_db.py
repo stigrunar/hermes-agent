@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import errno
 import hashlib
 import json
 import os
@@ -79,6 +80,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -1413,13 +1415,59 @@ def _cross_process_init_lock(path: Path):
             handle.close()
 
 
+@dataclass(frozen=True)
+class _DispatchLockOutcome:
+    """Value-safe outcome from attempting one board's dispatch lock."""
+
+    acquired: bool
+    reason: Optional[str] = None
+
+
+def _dispatch_effective_uid() -> Optional[int]:
+    """Return the POSIX effective uid when that identity is available."""
+    getter = getattr(os, "geteuid", None)
+    return getter() if getter is not None else None
+
+
+def _open_dispatch_lock_fd(lock_path: Path) -> int:
+    """Open a dispatch lock without following its final path component."""
+    flags = os.O_RDWR | os.O_CREAT
+    flags |= getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    if _IS_WINDOWS:
+        flags |= getattr(os, "O_BINARY", 0)
+        flags |= getattr(os, "O_NOINHERIT", 0)
+    return os.open(lock_path, flags, 0o600)
+
+
+def _inspect_dispatch_lock_fd(
+    fd: int,
+) -> tuple[os.stat_result, Optional[str]]:
+    """Classify an opened lock descriptor and return ``(stat, error)``."""
+    fd_stat = os.fstat(fd)
+    if not stat_module.S_ISREG(fd_stat.st_mode):
+        return fd_stat, "untrusted_type"
+    if not _IS_WINDOWS:
+        effective_uid = _dispatch_effective_uid()
+        if effective_uid is not None and fd_stat.st_uid != effective_uid:
+            return fd_stat, "untrusted_owner"
+        if fd_stat.st_mode & (stat_module.S_IWGRP | stat_module.S_IWOTH):
+            return fd_stat, "unsafe_permissions"
+    return fd_stat, None
+
+
+def _is_dispatch_lock_contention(exc: OSError) -> bool:
+    return exc.errno in {errno.EACCES, errno.EAGAIN}
+
+
 @contextlib.contextmanager
 def _dispatch_tick_lock(db_path: Path):
     """Non-blocking single-writer guard around one dispatcher tick.
 
-    Yields ``True`` when this process holds the board's dispatch lock and
-    may proceed with the tick, or ``False`` when another process already
-    holds it (the caller should skip the tick this round).
+    Yields a :class:`_DispatchLockOutcome` whose ``acquired`` flag is true
+    only when this process may proceed. ``reason="contention"`` identifies
+    the ordinary losing-dispatcher case; every other bounded reason is a
+    trust/setup failure and must fail the tick closed.
 
     Motivation (issue #35240): a ``hermes gateway run --replace`` /
     ``gateway restart`` invoked from a shell on a systemd/launchd host can
@@ -1439,63 +1487,138 @@ def _dispatch_tick_lock(db_path: Path):
     again next interval.
 
     Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
-    board's ``kanban.db``, so unrelated boards tick independently. On
-    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
-    (yields ``True``) — single-writer enforcement is best-effort and the
-    orphan-dispatcher scenario is specific to POSIX service managers.
+    board's ``kanban.db``, so unrelated boards tick independently. On a
+    platform that genuinely lacks its native locking primitive the guard
+    retains the documented no-op fallback after safely opening and
+    classifying the path. Setup, trust, identity, and acquisition failures
+    on supported platforms never degrade to an unguarded dispatch.
     """
-    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
-    handle = None
-    acquired = False
+    lock_path = None
+    fd = None
+    lock_held = False
+    unlock_fn = None
+    outcome = _DispatchLockOutcome(False, "path_setup_failed")
     try:
-        lock_path.parent.mkdir(parents=True, exist_ok=True)
-        handle = lock_path.open("a+b")
-        if _IS_WINDOWS:
+        try:
+            lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                existing_stat = os.stat(lock_path, follow_symlinks=False)
+            except FileNotFoundError:
+                existing_stat = None
+            if existing_stat is not None and not stat_module.S_ISREG(
+                existing_stat.st_mode
+            ):
+                outcome = _DispatchLockOutcome(False, "untrusted_type")
+            else:
+                try:
+                    fd = _open_dispatch_lock_fd(lock_path)
+                except Exception:
+                    outcome = _DispatchLockOutcome(False, "open_failed")
+                else:
+                    try:
+                        _, inspection_error = _inspect_dispatch_lock_fd(fd)
+                    except Exception:
+                        outcome = _DispatchLockOutcome(False, "classification_failed")
+                    else:
+                        if inspection_error is not None:
+                            outcome = _DispatchLockOutcome(False, inspection_error)
+                        else:
+                            outcome = _DispatchLockOutcome(True)
+        except Exception:
+            outcome = _DispatchLockOutcome(False, "path_setup_failed")
+
+        if outcome.acquired and _IS_WINDOWS:
             try:
                 import msvcrt
 
-                handle.seek(0)
                 locking = getattr(msvcrt, "locking")
-                # LK_NBLCK = non-blocking exclusive byte-range lock.
                 nb_lock = getattr(msvcrt, "LK_NBLCK")
-                locking(handle.fileno(), nb_lock, 1)
-                acquired = True
-            except (OSError, AttributeError):
-                acquired = False
-        else:
+                unlock_mode = getattr(msvcrt, "LK_UNLCK")
+            except (ImportError, AttributeError):
+                # The native primitive is genuinely unavailable. Preserve the
+                # documented compatibility fallback, but only after the path
+                # itself has passed descriptor-based trust checks.
+                pass
+            else:
+                try:
+                    os.lseek(fd, 0, os.SEEK_SET)
+                    locking(fd, nb_lock, 1)
+                except OSError as exc:
+                    reason = (
+                        "contention"
+                        if _is_dispatch_lock_contention(exc)
+                        else "acquisition_failed"
+                    )
+                    outcome = _DispatchLockOutcome(False, reason)
+                except Exception:
+                    outcome = _DispatchLockOutcome(False, "acquisition_failed")
+                else:
+                    lock_held = True
+
+                    def _unlock_windows():
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        locking(fd, unlock_mode, 1)
+
+                    unlock_fn = _unlock_windows
+        elif outcome.acquired:
             try:
                 import fcntl
 
-                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                acquired = True
-            except (BlockingIOError, OSError):
-                acquired = False
-    except OSError:
-        # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
-        handle = None
-    try:
-        yield acquired
-    finally:
-        if handle is not None:
+                flock_fn = getattr(fcntl, "flock")
+            except (ImportError, AttributeError):
+                # See the Windows fallback above.
+                pass
+            else:
+                try:
+                    flock_fn(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError as exc:
+                    reason = (
+                        "contention"
+                        if _is_dispatch_lock_contention(exc)
+                        else "acquisition_failed"
+                    )
+                    outcome = _DispatchLockOutcome(False, reason)
+                except Exception:
+                    outcome = _DispatchLockOutcome(False, "acquisition_failed")
+                else:
+                    lock_held = True
+                    unlock_fn = lambda: flock_fn(fd, fcntl.LOCK_UN)
+
+        if outcome.acquired:
+            # Reclassify after acquisition, then bind the pathname to the
+            # descriptor. A replaced/unlinked file is not a usable board lock:
+            # another dispatcher could otherwise lock the replacement and race.
             try:
-                if acquired:
-                    if _IS_WINDOWS:
-                        import msvcrt
-
-                        handle.seek(0)
-                        locking = getattr(msvcrt, "locking")
-                        unlock_mode = getattr(msvcrt, "LK_UNLCK")
-                        locking(handle.fileno(), unlock_mode, 1)
+                post_fd_stat, inspection_error = _inspect_dispatch_lock_fd(fd)
+            except Exception:
+                outcome = _DispatchLockOutcome(False, "classification_failed")
+            else:
+                if inspection_error is not None:
+                    outcome = _DispatchLockOutcome(False, inspection_error)
+                else:
+                    try:
+                        path_stat = os.stat(lock_path, follow_symlinks=False)
+                    except Exception:
+                        outcome = _DispatchLockOutcome(False, "identity_failed")
                     else:
-                        import fcntl
+                        if (
+                            not stat_module.S_ISREG(path_stat.st_mode)
+                            or (post_fd_stat.st_dev, post_fd_stat.st_ino)
+                            != (path_stat.st_dev, path_stat.st_ino)
+                        ):
+                            outcome = _DispatchLockOutcome(False, "identity_mismatch")
 
-                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-            except (OSError, AttributeError):
+        yield outcome
+    finally:
+        if fd is not None:
+            try:
+                if lock_held and unlock_fn is not None:
+                    unlock_fn()
+            except (OSError, AttributeError, ValueError):
                 pass
             finally:
-                handle.close()
+                os.close(fd)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
@@ -6097,6 +6220,12 @@ class DispatchResult:
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
+    dispatch_lock_error: Optional[str] = None
+    """Bounded, value-safe lock trust/setup failure category, or ``None``.
+
+    Unlike ``skipped_locked``, this means no verified competing dispatcher
+    exists to make progress. Values are internal literals and never include
+    paths, exception text, task data, or secrets."""
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -7479,7 +7608,9 @@ def dispatch_once(
     cgroup — can never run a reclaim/spawn/write tick concurrently and
     race on WAL frames. The losing dispatcher returns an empty
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board.
+    the holder is already making progress on the same board. Lock trust or
+    setup failures instead populate ``dispatch_lock_error`` with a bounded
+    diagnostic and likewise return before any reclaim, claim, or spawn.
 
     The lock is keyed off the board's resolved DB path, so unrelated
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
@@ -7488,25 +7619,16 @@ def dispatch_once(
     try:
         db_path = kanban_db_path(board=board)
     except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+        return DispatchResult(
+            dispatch_lock_error="path_resolution_failed",
         )
-    with _dispatch_tick_lock(db_path) as held:
-        if not held:
-            return DispatchResult(skipped_locked=True)
+    with _dispatch_tick_lock(db_path) as lock_outcome:
+        if not lock_outcome.acquired:
+            if lock_outcome.reason == "contention":
+                return DispatchResult(skipped_locked=True)
+            return DispatchResult(
+                dispatch_lock_error=lock_outcome.reason or "unknown_failure",
+            )
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,

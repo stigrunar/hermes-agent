@@ -2283,8 +2283,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
+            "skipped_locked": res.skipped_locked,
+            "dispatch_lock_error": res.dispatch_lock_error,
         }, indent=2))
         return 0
+    if res.skipped_locked:
+        print("Dispatch lock: contended (tick skipped)")
+    elif res.dispatch_lock_error is not None:
+        print(f"Dispatch lock error: {res.dispatch_lock_error} (tick skipped)")
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
