@@ -123,7 +123,11 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient", "review_gate",
+}
+VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
+_GIT_OBJECT_ID_RE = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -1186,6 +1190,29 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Exact, typed source -> review control-plane relationship. Review tasks are
+-- deliberately NOT task_links children: a parent edge would keep the review
+-- parked while its blocked source can never become done. A pending gate parks
+-- the detached review task in todo; block_task(kind='review_gate') activates
+-- it atomically and moves the review task to ready. Only an exact approved
+-- receipt may release the source.
+CREATE TABLE IF NOT EXISTS review_gates (
+    review_task_id         TEXT PRIMARY KEY,
+    source_task_id         TEXT NOT NULL,
+    candidate_sha          TEXT NOT NULL,
+    candidate_tree         TEXT NOT NULL,
+    status                 TEXT NOT NULL
+                           CHECK (status IN ('pending', 'active', 'released', 'held')),
+    verdict                TEXT
+                           CHECK (verdict IS NULL OR verdict IN ('approved', 'changes_requested')),
+    receipt_candidate_sha  TEXT,
+    receipt_candidate_tree TEXT,
+    reconciliation_reason  TEXT,
+    created_at             INTEGER NOT NULL,
+    updated_at             INTEGER NOT NULL,
+    reconciled_at          INTEGER
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1269,6 +1296,9 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_review_gates_source   ON review_gates(source_task_id, status);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_review_gates_unresolved_source
+    ON review_gates(source_task_id) WHERE status IN ('pending', 'active');
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
@@ -2385,6 +2415,78 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
+def _normalize_git_object_id(value: Any, field_name: str) -> str:
+    """Return a canonical full Git object id or raise a contract error."""
+    if not isinstance(value, str):
+        raise ValueError(f"review_gate.{field_name} must be a full Git object id")
+    normalized = value.strip().lower()
+    if not _GIT_OBJECT_ID_RE.fullmatch(normalized):
+        raise ValueError(
+            f"review_gate.{field_name} must be a full 40- or 64-character "
+            "hex Git object id"
+        )
+    return normalized
+
+
+def _normalize_review_gate_spec(
+    review_gate: Optional[dict[str, Any]],
+) -> Optional[dict[str, str]]:
+    if review_gate is None:
+        return None
+    if not isinstance(review_gate, dict):
+        raise ValueError("review_gate must be an object")
+    source_task_id = review_gate.get("source_task_id")
+    if not isinstance(source_task_id, str) or not source_task_id.strip():
+        raise ValueError("review_gate.source_task_id is required")
+    return {
+        "source_task_id": source_task_id.strip(),
+        "candidate_sha": _normalize_git_object_id(
+            review_gate.get("candidate_sha"), "candidate_sha"
+        ),
+        "candidate_tree": _normalize_git_object_id(
+            review_gate.get("candidate_tree"), "candidate_tree"
+        ),
+    }
+
+
+def get_review_gate(
+    conn: sqlite3.Connection,
+    *,
+    review_task_id: Optional[str] = None,
+    source_task_id: Optional[str] = None,
+    unresolved_only: bool = False,
+) -> Optional[dict[str, Any]]:
+    """Return one explicit review gate without consulting task prose.
+
+    ``review_task_id`` is unique. A source may have historical reconciled
+    gates, so source lookup prefers its unresolved gate and then the newest
+    reconciled gate for diagnostics.
+    """
+    if (review_task_id is None) == (source_task_id is None):
+        raise ValueError("provide exactly one of review_task_id or source_task_id")
+    where = "review_task_id = ?" if review_task_id is not None else "source_task_id = ?"
+    value = review_task_id if review_task_id is not None else source_task_id
+    if unresolved_only:
+        where += " AND status IN ('pending', 'active')"
+    row = conn.execute(
+        f"SELECT * FROM review_gates WHERE {where} "
+        "ORDER BY CASE WHEN status IN ('pending','active') THEN 0 ELSE 1 END, "
+        "created_at DESC, review_task_id DESC LIMIT 1",
+        (value,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def _has_unresolved_review_gate_for_source(
+    conn: sqlite3.Connection, task_id: str,
+) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM review_gates WHERE source_task_id = ? "
+        "AND status IN ('pending', 'active') LIMIT 1",
+        (task_id,),
+    ).fetchone() is not None
+
+
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -2409,6 +2511,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    review_gate: Optional[dict[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -2434,6 +2537,7 @@ def create_task(
     translation skill regardless of the profile's default config).
     """
     assignee = _canonical_assignee(assignee)
+    review_gate_spec = _normalize_review_gate_spec(review_gate)
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -2492,6 +2596,17 @@ def create_task(
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
+    if review_gate_spec is not None:
+        if parents:
+            raise ValueError(
+                "a review-gate task must be detached; omit parents and use "
+                "review_gate.source_task_id"
+            )
+        if triage or initial_status == "blocked":
+            raise ValueError(
+                "a review-gate task is parked by its typed gate; do not set "
+                "triage or initial_status='blocked'"
+            )
 
     # Normalise + validate skills: strip whitespace, drop empties, dedupe
     # (preserving order). Refuse commas inside a single name so we don't
@@ -2551,6 +2666,25 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
+            if review_gate_spec is not None:
+                existing_gate = get_review_gate(
+                    conn, review_task_id=row["id"],
+                )
+                expected = (
+                    review_gate_spec["source_task_id"],
+                    review_gate_spec["candidate_sha"],
+                    review_gate_spec["candidate_tree"],
+                )
+                actual = (
+                    existing_gate.get("source_task_id") if existing_gate else None,
+                    existing_gate.get("candidate_sha") if existing_gate else None,
+                    existing_gate.get("candidate_tree") if existing_gate else None,
+                )
+                if actual != expected:
+                    raise ValueError(
+                        "idempotency_key already belongs to a task with a "
+                        "different or missing review_gate"
+                    )
             return row["id"]
 
     now = int(time.time())
@@ -2583,7 +2717,32 @@ def create_task(
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
-                if initial_status == "blocked":
+                if review_gate_spec is not None:
+                    source = conn.execute(
+                        "SELECT status FROM tasks WHERE id = ?",
+                        (review_gate_spec["source_task_id"],),
+                    ).fetchone()
+                    if source is None:
+                        raise ValueError(
+                            "unknown review gate source task: "
+                            f"{review_gate_spec['source_task_id']}"
+                        )
+                    if _has_unresolved_review_gate_for_source(
+                        conn, review_gate_spec["source_task_id"]
+                    ):
+                        raise ValueError(
+                            f"source {review_gate_spec['source_task_id']} already "
+                            "has an unresolved review gate"
+                        )
+                    if source["status"] not in ("ready", "running"):
+                        raise ValueError(
+                            "review gate source must be ready or running before "
+                            "the typed review block is activated"
+                        )
+                    # No dependency edge is written. The review stays parked
+                    # until the source atomically activates the typed block.
+                    task_status = "todo"
+                elif initial_status == "blocked":
                     task_status = "blocked"
                     if parents:
                         missing = _find_missing_parents(conn, parents)
@@ -2668,6 +2827,21 @@ def create_task(
                         "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
                         (pid, task_id),
                     )
+                if review_gate_spec is not None:
+                    conn.execute(
+                        "INSERT INTO review_gates ("
+                        "review_task_id, source_task_id, candidate_sha, "
+                        "candidate_tree, status, created_at, updated_at"
+                        ") VALUES (?, ?, ?, ?, 'pending', ?, ?)",
+                        (
+                            task_id,
+                            review_gate_spec["source_task_id"],
+                            review_gate_spec["candidate_sha"],
+                            review_gate_spec["candidate_tree"],
+                            now,
+                            now,
+                        ),
+                    )
                 _append_event(
                     conn,
                     task_id,
@@ -2680,8 +2854,21 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "review_gate": review_gate_spec,
                     },
                 )
+                if review_gate_spec is not None:
+                    _append_event(
+                        conn,
+                        review_gate_spec["source_task_id"],
+                        "review_gate_created",
+                        {
+                            "review_task_id": task_id,
+                            "candidate_sha": review_gate_spec["candidate_sha"],
+                            "candidate_tree": review_gate_spec["candidate_tree"],
+                            "status": "pending",
+                        },
+                    )
             return task_id
         except sqlite3.IntegrityError:
             if attempt == 1:
@@ -4100,6 +4287,200 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _review_receipt_decision(
+    gate: sqlite3.Row,
+    review_receipt: Optional[dict[str, Any]],
+) -> tuple[bool, str, Optional[str], Optional[str], Optional[str]]:
+    """Validate a typed receipt against one exact gate.
+
+    Returns ``(release, reason, verdict, receipt_sha, receipt_tree)``. Invalid
+    or incomplete receipts are reconciliation outcomes, not exceptions: the
+    review card may complete, but its source remains sticky-blocked and the
+    reason is persisted for audit.
+    """
+    if review_receipt is None:
+        return False, "missing_receipt", None, None, None
+    if not isinstance(review_receipt, dict):
+        return False, "invalid_receipt", None, None, None
+
+    raw_verdict = review_receipt.get("verdict")
+    verdict = raw_verdict.strip() if isinstance(raw_verdict, str) else None
+    raw_sha = review_receipt.get("candidate_sha")
+    receipt_sha = raw_sha.strip().lower() if isinstance(raw_sha, str) else None
+    raw_tree = review_receipt.get("candidate_tree")
+    receipt_tree = raw_tree.strip().lower() if isinstance(raw_tree, str) else None
+
+    if not verdict:
+        return False, "missing_verdict", None, receipt_sha, receipt_tree
+    if verdict not in VALID_REVIEW_VERDICTS:
+        return False, "invalid_verdict", verdict[:64], receipt_sha, receipt_tree
+    if not receipt_sha:
+        return False, "missing_candidate_sha", verdict, None, receipt_tree
+    if not receipt_tree:
+        return False, "missing_candidate_tree", verdict, receipt_sha, None
+    if not _GIT_OBJECT_ID_RE.fullmatch(receipt_sha):
+        return False, "invalid_candidate_sha", verdict, receipt_sha[:128], receipt_tree
+    if not _GIT_OBJECT_ID_RE.fullmatch(receipt_tree):
+        return False, "invalid_candidate_tree", verdict, receipt_sha, receipt_tree[:128]
+    if receipt_sha != gate["candidate_sha"]:
+        return False, "candidate_sha_mismatch", verdict, receipt_sha, receipt_tree
+    if receipt_tree != gate["candidate_tree"]:
+        return False, "candidate_tree_mismatch", verdict, receipt_sha, receipt_tree
+    if verdict != "approved":
+        return False, "changes_requested", verdict, receipt_sha, receipt_tree
+    return True, "approved_exact_match", verdict, receipt_sha, receipt_tree
+
+
+def _record_review_gate_reconciliation(
+    conn: sqlite3.Connection,
+    gate: sqlite3.Row,
+    *,
+    status: str,
+    reason: str,
+    verdict: Optional[str],
+    receipt_sha: Optional[str],
+    receipt_tree: Optional[str],
+    review_run_id: Optional[int],
+) -> None:
+    """Persist exactly one terminal reconciliation and its audit events.
+
+    Caller holds the write transaction. The ``status='active'`` CAS makes
+    repeated completion/failure handling idempotent.
+    """
+    now = int(time.time())
+    updated = conn.execute(
+        "UPDATE review_gates SET status = ?, verdict = ?, "
+        "receipt_candidate_sha = ?, receipt_candidate_tree = ?, "
+        "reconciliation_reason = ?, updated_at = ?, reconciled_at = ? "
+        "WHERE review_task_id = ? AND status = 'active'",
+        (
+            status,
+            verdict,
+            receipt_sha,
+            receipt_tree,
+            reason,
+            now,
+            now,
+            gate["review_task_id"],
+        ),
+    )
+    if updated.rowcount != 1:
+        return
+    payload = {
+        "source_task_id": gate["source_task_id"],
+        "review_task_id": gate["review_task_id"],
+        "status": status,
+        "reason": reason,
+        "verdict": verdict,
+        "candidate_sha": gate["candidate_sha"],
+        "candidate_tree": gate["candidate_tree"],
+        "receipt_candidate_sha": receipt_sha,
+        "receipt_candidate_tree": receipt_tree,
+    }
+    _append_event(
+        conn,
+        gate["source_task_id"],
+        "review_gate_released" if status == "released" else "review_gate_held",
+        payload,
+    )
+    _append_event(
+        conn,
+        gate["review_task_id"],
+        "review_gate_reconciled",
+        payload,
+        run_id=review_run_id,
+    )
+
+
+def _reconcile_review_completion(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    review_receipt: Optional[dict[str, Any]],
+    *,
+    review_run_id: Optional[int],
+) -> None:
+    """Reconcile an active gate as part of review completion's transaction."""
+    gate = conn.execute(
+        "SELECT * FROM review_gates WHERE review_task_id = ? AND status = 'active'",
+        (review_task_id,),
+    ).fetchone()
+    if gate is None:
+        return
+    release, reason, verdict, receipt_sha, receipt_tree = _review_receipt_decision(
+        gate, review_receipt,
+    )
+    status = "held"
+    if release:
+        source = conn.execute(
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
+            (gate["source_task_id"],),
+        ).fetchone()
+        if (
+            source is None
+            or source["status"] != "blocked"
+            or source["block_kind"] != "review_gate"
+        ):
+            release = False
+            reason = "source_not_typed_review_blocked"
+        else:
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
+                "WHERE l.child_id = ? "
+                "AND p.status NOT IN ('done', 'archived') LIMIT 1",
+                (gate["source_task_id"],),
+            ).fetchone()
+            source_status = "todo" if undone_parent else "ready"
+            source_update = conn.execute(
+                "UPDATE tasks SET status = ?, block_kind = NULL, "
+                "block_recurrences = 0, consecutive_failures = 0, "
+                "last_failure_error = NULL, claim_lock = NULL, "
+                "claim_expires = NULL, worker_pid = NULL, current_run_id = NULL "
+                "WHERE id = ? AND status = 'blocked' AND block_kind = 'review_gate'",
+                (source_status, gate["source_task_id"]),
+            )
+            if source_update.rowcount == 1:
+                status = "released"
+            else:
+                release = False
+                reason = "source_transition_raced"
+    _record_review_gate_reconciliation(
+        conn,
+        gate,
+        status=status,
+        reason=reason,
+        verdict=verdict,
+        receipt_sha=receipt_sha,
+        receipt_tree=receipt_tree,
+        review_run_id=review_run_id,
+    )
+
+
+def _hold_active_review_gate(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    reason: str,
+    review_run_id: Optional[int],
+) -> None:
+    """Terminally hold an active gate after a blocked/failed review run."""
+    gate = conn.execute(
+        "SELECT * FROM review_gates WHERE review_task_id = ? AND status = 'active'",
+        (review_task_id,),
+    ).fetchone()
+    if gate is None:
+        return
+    _record_review_gate_reconciliation(
+        conn,
+        gate,
+        status="held",
+        reason=reason,
+        verdict=None,
+        receipt_sha=None,
+        receipt_tree=None,
+        review_run_id=review_run_id,
+    )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4109,6 +4490,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    review_receipt: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -4176,6 +4558,11 @@ def complete_task(
     result = redact_for_persistence(result)
     summary = redact_for_persistence(summary)
     with write_txn(conn):
+        # A source with an unresolved typed review gate cannot bypass the gate
+        # through ordinary completion. Only exact positive reconciliation may
+        # release it back to the dependency-gated work pool.
+        if _has_unresolved_review_gate_for_source(conn, task_id):
+            return False
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -4273,6 +4660,12 @@ def complete_task(
             completed_payload,
             run_id=run_id,
         )
+        _reconcile_review_completion(
+            conn,
+            task_id,
+            review_receipt,
+            review_run_id=run_id,
+        )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
     # its own txn so the completion itself is already durable by the
@@ -4301,8 +4694,12 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     # Recompute ready status for dependents (separate txn so children see done).
     recompute_ready(conn)
-    # Clean up the scratch workspace and any stale tmux session for the worker.
-    _cleanup_workspace(conn, task_id)
+    # A detached review created by its source intentionally shares that
+    # source's workspace. The review card finishing must not delete the
+    # candidate before the released source gets its later dispatch; the source
+    # owns final cleanup when its lifecycle eventually completes.
+    if get_review_gate(conn, review_task_id=task_id) is None:
+        _cleanup_workspace(conn, task_id)
     _done_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_completed",
@@ -4890,6 +5287,108 @@ def edit_completed_task_result(
     return True
 
 
+def _block_task_for_review_gate(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Atomically block a source and make its detached exact review ready."""
+    with write_txn(conn):
+        gate = conn.execute(
+            "SELECT * FROM review_gates WHERE source_task_id = ? "
+            "AND status = 'pending'",
+            (task_id,),
+        ).fetchone()
+        if gate is None:
+            raise ValueError(
+                "review_gate block requires exactly one pending typed gate "
+                "created with kanban_create(review_gate=...)"
+            )
+        review = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id = ?",
+            (gate["review_task_id"],),
+        ).fetchone()
+        if (
+            review is None
+            or review["status"] != "todo"
+            or review["claim_lock"] is not None
+            or review["current_run_id"] is not None
+        ):
+            raise ValueError("pending review gate task is not safely dispatchable")
+        if conn.execute(
+            "SELECT 1 FROM task_links WHERE child_id = ? OR parent_id = ? LIMIT 1",
+            (gate["review_task_id"], gate["review_task_id"]),
+        ).fetchone():
+            raise ValueError("review gate task must remain detached from task_links")
+
+        suffix = "" if expected_run_id is None else " AND current_run_id = ?"
+        params: tuple[Any, ...] = (task_id,)
+        if expected_run_id is not None:
+            params = (task_id, int(expected_run_id))
+        source_update = conn.execute(
+            "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
+            "claim_expires = NULL, worker_pid = NULL, block_kind = 'review_gate', "
+            "block_recurrences = 1 WHERE id = ? "
+            "AND status IN ('running', 'ready')" + suffix,
+            params,
+        )
+        if source_update.rowcount != 1:
+            return False
+        review_update = conn.execute(
+            "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo' "
+            "AND claim_lock IS NULL AND current_run_id IS NULL",
+            (gate["review_task_id"],),
+        )
+        gate_update = conn.execute(
+            "UPDATE review_gates SET status = 'active', updated_at = ? "
+            "WHERE review_task_id = ? AND status = 'pending'",
+            (int(time.time()), gate["review_task_id"]),
+        )
+        if review_update.rowcount != 1 or gate_update.rowcount != 1:
+            raise RuntimeError("review gate activation invariant failed")
+        run_id = _end_run(
+            conn,
+            task_id,
+            outcome="blocked",
+            status="blocked",
+            summary=reason,
+        )
+        if run_id is None and reason:
+            run_id = _synthesize_ended_run(
+                conn, task_id, outcome="blocked", summary=reason,
+            )
+        payload = {
+            "reason": reason,
+            "kind": "review_gate",
+            "review_task_id": gate["review_task_id"],
+            "candidate_sha": gate["candidate_sha"],
+            "candidate_tree": gate["candidate_tree"],
+        }
+        _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+        _append_event(
+            conn,
+            gate["review_task_id"],
+            "review_gate_activated",
+            {
+                "source_task_id": task_id,
+                "candidate_sha": gate["candidate_sha"],
+                "candidate_tree": gate["candidate_tree"],
+            },
+        )
+        blocked_task = get_task(conn, task_id)
+    _fire_kanban_lifecycle_hook(
+        "kanban_task_blocked",
+        task_id,
+        board=get_current_board(),
+        assignee=blocked_task.assignee if blocked_task else None,
+        run_id=run_id,
+        reason=reason,
+    )
+    return True
+
+
 def block_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4929,6 +5428,13 @@ def block_task(
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
+        )
+    if kind == "review_gate":
+        return _block_task_for_review_gate(
+            conn,
+            task_id,
+            reason=reason,
+            expected_run_id=expected_run_id,
         )
     routed_to = "blocked"
     recurrences = 0
@@ -4980,6 +5486,12 @@ def block_task(
             _append_event(
                 conn, task_id, "dependency_wait",
                 {"reason": reason, "kind": kind}, run_id=run_id,
+            )
+            _hold_active_review_gate(
+                conn,
+                task_id,
+                reason="review_blocked",
+                review_run_id=run_id,
             )
             routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
@@ -5041,6 +5553,12 @@ def block_task(
                 },
                 run_id=run_id,
             )
+            _hold_active_review_gate(
+                conn,
+                task_id,
+                reason="review_blocked",
+                review_run_id=run_id,
+            )
             routed_to = "triage"
         else:
             if expected_run_id is None:
@@ -5094,6 +5612,12 @@ def block_task(
                 {"reason": reason, "kind": kind, "recurrences": recurrences},
                 run_id=run_id,
             )
+            _hold_active_review_gate(
+                conn,
+                task_id,
+                reason="review_blocked",
+                review_run_id=run_id,
+            )
         _blocked_task = get_task(conn, task_id)
     _fire_kanban_lifecycle_hook(
         "kanban_task_blocked",
@@ -5131,6 +5655,8 @@ def promote_task(
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _has_unresolved_review_gate_for_source(conn, task_id):
+        return False, "typed review gate is unresolved"
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -5160,6 +5686,8 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if _has_unresolved_review_gate_for_source(conn, task_id):
+            return False, "typed review gate is unresolved"
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -5189,6 +5717,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        # Active typed review gates are intentionally narrower than the broad
+        # orchestrator unblock capability. A held/reconciled gate may still be
+        # handled manually, but an active one can only release via its exact
+        # approved receipt.
+        if _has_unresolved_review_gate_for_source(conn, task_id):
+            return False
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -7166,6 +7700,12 @@ def _record_task_failure(
             _append_event(
                 conn, task_id, "gave_up", payload, run_id=run_id,
             )
+            _hold_active_review_gate(
+                conn,
+                task_id,
+                reason="review_failed",
+                review_run_id=run_id,
+            )
             blocked = True
         else:
             # Below threshold.
@@ -8571,6 +9111,38 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
+        lines.append("")
+
+    review_gate = get_review_gate(conn, review_task_id=task_id)
+    if review_gate is not None and review_gate["status"] in ("pending", "active"):
+        lines.append("## Typed review gate")
+        lines.append(f"Source task: `{review_gate['source_task_id']}`")
+        lines.append(f"Candidate commit: `{review_gate['candidate_sha']}`")
+        lines.append(f"Candidate tree: `{review_gate['candidate_tree']}`")
+        lines.append(
+            "Complete this review with `kanban_complete(review_receipt={verdict: "
+            "'approved'|'changes_requested', candidate_sha: <exact value above>, "
+            "candidate_tree: <exact value above>}, ...)`. Approval releases the "
+            "source only when both object ids match this gate exactly. Missing, "
+            "negative, or mismatched receipts hold the source."
+        )
+        lines.append("")
+    source_gate = get_review_gate(
+        conn, source_task_id=task_id, unresolved_only=True,
+    )
+    if source_gate is not None:
+        lines.append("## Source review state")
+        lines.append(
+            f"Typed review task `{source_gate['review_task_id']}` gates commit "
+            f"`{source_gate['candidate_sha']}` / tree "
+            f"`{source_gate['candidate_tree']}` ({source_gate['status']})."
+        )
+        if source_gate["status"] == "pending":
+            lines.append(
+                "When the candidate handoff is ready, call "
+                "`kanban_block(kind='review_gate', reason=...)`; this atomically "
+                "blocks this source and makes the detached review dispatchable."
+            )
         lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,

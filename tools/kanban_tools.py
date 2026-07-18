@@ -179,7 +179,9 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
-_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
+_GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset(
+    {"dependency", "needs_input", "review_gate"}
+)
 
 
 def _goal_judge_available() -> bool:
@@ -384,6 +386,11 @@ def _handle_show(args: dict, **kw) -> str:
             runs = kb.list_runs(conn, tid)
             parents = kb.parent_ids(conn, tid)
             children = kb.child_ids(conn, tid)
+            review_gate = kb.get_review_gate(conn, review_task_id=tid)
+            if review_gate is None:
+                review_gate = kb.get_review_gate(
+                    conn, source_task_id=tid, unresolved_only=True,
+                )
 
             def _task_dict(t):
                 return {
@@ -424,6 +431,7 @@ def _handle_show(args: dict, **kw) -> str:
                     for e in events[-50:]   # cap; full log via CLI
                 ],
                 "runs": [_run_dict(r) for r in runs],
+                "review_gate": review_gate,
                 # Also surface the worker's own context block so the
                 # agent can include it directly if it wants. This is
                 # the same string build_worker_context returns to the
@@ -527,6 +535,12 @@ def _handle_complete(args: dict, **kw) -> str:
             pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
+    review_receipt = args.get("review_receipt")
+    if review_receipt is not None and not isinstance(review_receipt, dict):
+        return tool_error(
+            f"review_receipt must be an object/dict, got "
+            f"{type(review_receipt).__name__}"
+        )
     if created_cards is not None:
         if isinstance(created_cards, str):
             # Accept a single id as a string for convenience.
@@ -629,6 +643,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     result=result, summary=summary, metadata=metadata,
                     created_cards=created_cards,
                     expected_run_id=_worker_run_id(tid),
+                    review_receipt=review_receipt,
                 )
             except kb.ArtifactPreservationError as artifact_err:
                 return tool_error(
@@ -662,7 +677,15 @@ def _handle_complete(args: dict, **kw) -> str:
                     f"could not complete {tid} (unknown id or already terminal)"
                 )
             run = kb.latest_run(conn, tid)
-            return _ok(task_id=tid, run_id=run.id if run else None)
+            gate = kb.get_review_gate(conn, review_task_id=tid)
+            return _ok(
+                task_id=tid,
+                run_id=run.id if run else None,
+                review_gate_status=gate.get("status") if gate else None,
+                review_gate_reason=(
+                    gate.get("reconciliation_reason") if gate else None
+                ),
+            )
         finally:
             conn.close()
     except ValueError as e:
@@ -1090,6 +1113,20 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
+    review_gate = args.get("review_gate")
+    if review_gate is not None and not isinstance(review_gate, dict):
+        return tool_error(
+            f"review_gate must be an object/dict, got "
+            f"{type(review_gate).__name__}"
+        )
+    worker_task_id = os.environ.get("HERMES_KANBAN_TASK")
+    if review_gate is not None and worker_task_id:
+        gate_source = review_gate.get("source_task_id")
+        if gate_source != worker_task_id:
+            return tool_error(
+                f"worker is scoped to task {worker_task_id}; review_gate."
+                "source_task_id must name that exact task"
+            )
     _inherit_workspace = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
@@ -1159,13 +1196,16 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                review_gate=review_gate,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
+            gate = kb.get_review_gate(conn, review_task_id=new_tid)
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                review_gate=gate,
             )
         finally:
             conn.close()
@@ -1438,7 +1478,9 @@ KANBAN_COMPLETE_SCHEMA = {
         "in ``artifacts`` — the gateway notifier will upload them as "
         "native attachments to the human who subscribed to the task, "
         "so the deliverable lands in their chat alongside the summary "
-        "instead of being a path they have to fetch by hand."
+        "instead of being a path they have to fetch by hand. A task shown "
+        "by kanban_show as a typed review gate must also pass review_receipt; "
+        "only an exact approved commit/tree receipt releases its source."
     ),
     "parameters": {
         "type": "object",
@@ -1510,6 +1552,37 @@ KANBAN_COMPLETE_SCHEMA = {
                     "task in-flight so you can fix the path and retry."
                 ),
             },
+            "review_receipt": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "verdict": {
+                        "type": "string",
+                        "enum": ["approved", "changes_requested"],
+                        "description": "The review's typed verdict.",
+                    },
+                    "candidate_sha": {
+                        "type": "string",
+                        "description": (
+                            "Full 40- or 64-hex candidate commit id, copied "
+                            "from kanban_show's typed review gate."
+                        ),
+                    },
+                    "candidate_tree": {
+                        "type": "string",
+                        "description": (
+                            "Full 40- or 64-hex candidate tree id, copied "
+                            "from kanban_show's typed review gate."
+                        ),
+                    },
+                },
+                "required": ["verdict", "candidate_sha", "candidate_tree"],
+                "description": (
+                    "Required only for an explicitly linked review task. "
+                    "Missing, negative, invalid, or mismatched receipts hold "
+                    "the source; only approved with both exact ids releases it."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": [],
@@ -1524,7 +1597,9 @@ KANBAN_BLOCK_SCHEMA = {
         "goes to todo and auto-resumes when that task finishes, no human "
         "needed), 'needs_input' (you need a human decision/answer), "
         "'capability' (a hard wall: no access, missing credentials, an action "
-        "no agent can do), or 'transient' (a flaky failure that may clear). "
+        "no agent can do), 'transient' (a flaky failure that may clear), or "
+        "'review_gate' (activate a pending exact review created by "
+        "kanban_create(review_gate=...)). "
         "``reason`` is shown to the human on the board. If a task keeps "
         "getting unblocked and re-blocked for the same reason, it is "
         "auto-escalated to triage. Use for genuine blockers only — don't "
@@ -1547,10 +1622,15 @@ KANBAN_BLOCK_SCHEMA = {
             },
             "kind": {
                 "type": "string",
-                "enum": ["dependency", "needs_input", "capability", "transient"],
+                "enum": [
+                    "dependency", "needs_input", "capability", "transient",
+                    "review_gate",
+                ],
                 "description": (
                     "Why you're blocked. 'dependency' waits in todo and "
-                    "resumes automatically; the others surface to a human. "
+                    "resumes automatically; 'review_gate' requires one pending "
+                    "typed gate for this source and makes its detached review "
+                    "dispatchable atomically; the others surface to a human. "
                     "Omit only if none apply."
                 ),
             },
@@ -1755,6 +1835,32 @@ KANBAN_CREATE_SCHEMA = {
                     "auto-promotes to 'ready'. Typical fan-in: list "
                     "all the researcher task ids when creating a "
                     "synthesizer task."
+                ),
+            },
+            "review_gate": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "source_task_id": {
+                        "type": "string",
+                        "description": "Exact source task this review gates.",
+                    },
+                    "candidate_sha": {
+                        "type": "string",
+                        "description": "Full 40- or 64-hex candidate commit id.",
+                    },
+                    "candidate_tree": {
+                        "type": "string",
+                        "description": "Full 40- or 64-hex candidate tree id.",
+                    },
+                },
+                "required": [
+                    "source_task_id", "candidate_sha", "candidate_tree",
+                ],
+                "description": (
+                    "Create this task as the detached exact reviewer for a "
+                    "source. Do not also pass parents. The task waits in todo "
+                    "until that source calls kanban_block(kind='review_gate')."
                 ),
             },
             "tenant": {

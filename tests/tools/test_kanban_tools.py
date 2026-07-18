@@ -1265,6 +1265,106 @@ def test_create_rejects_non_list_skills(worker_env):
     assert json.loads(out).get("error")
 
 
+def test_typed_review_gate_tool_flow_releases_exact_source(monkeypatch, worker_env):
+    """Create, activate, and reconcile through the real model-tool handlers."""
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    candidate_sha = "a" * 40
+    candidate_tree = "b" * 40
+    created = json.loads(kt._handle_create({
+        "title": "review exact candidate",
+        "assignee": "reviewer",
+        "review_gate": {
+            "source_task_id": worker_env,
+            "candidate_sha": candidate_sha,
+            "candidate_tree": candidate_tree,
+        },
+    }))
+    assert created["ok"] is True
+    review = created["task_id"]
+    assert created["status"] == "todo"
+    assert created["review_gate"]["source_task_id"] == worker_env
+
+    activated = json.loads(kt._handle_block({
+        "reason": "candidate ready",
+        "kind": "review_gate",
+    }))
+    assert activated["ok"] is True
+    assert activated["block_kind"] == "review_gate"
+
+    with kb.connect() as conn:
+        assert kb.parent_ids(conn, review) == []
+        claimed = kb.claim_task(conn, review)
+        assert claimed is not None
+        review_run_id = claimed.current_run_id
+    monkeypatch.setenv("HERMES_KANBAN_TASK", review)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(review_run_id))
+
+    completed = json.loads(kt._handle_complete({
+        "summary": "approved exact candidate",
+        "review_receipt": {
+            "verdict": "approved",
+            "candidate_sha": candidate_sha,
+            "candidate_tree": candidate_tree,
+        },
+    }))
+    assert completed["ok"] is True
+    assert completed["review_gate_status"] == "released"
+    assert completed["review_gate_reason"] == "approved_exact_match"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, worker_env).status == "ready"
+
+
+def test_worker_cannot_create_review_gate_for_foreign_source(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    with kb.connect() as conn:
+        foreign = kb.create_task(conn, title="foreign source", assignee="peer")
+    output = json.loads(kt._handle_create({
+        "title": "attempted foreign review",
+        "assignee": "reviewer",
+        "review_gate": {
+            "source_task_id": foreign,
+            "candidate_sha": "a" * 40,
+            "candidate_tree": "b" * 40,
+        },
+    }))
+    assert "error" in output
+    assert "must name that exact task" in output["error"]
+    with kb.connect() as conn:
+        assert kb.get_review_gate(
+            conn, source_task_id=foreign, unresolved_only=True,
+        ) is None
+
+
+def test_review_gate_tool_schema_and_prompt_contract(monkeypatch, tmp_path):
+    from agent.prompt_builder import KANBAN_GUIDANCE
+    from tools import kanban_tools as kt
+
+    create_gate = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"]["review_gate"]
+    assert create_gate["additionalProperties"] is False
+    assert set(create_gate["required"]) == {
+        "source_task_id", "candidate_sha", "candidate_tree",
+    }
+    receipt = kt.KANBAN_COMPLETE_SCHEMA["parameters"]["properties"]["review_receipt"]
+    assert receipt["additionalProperties"] is False
+    assert receipt["properties"]["verdict"]["enum"] == [
+        "approved", "changes_requested",
+    ]
+    assert set(receipt["required"]) == {
+        "verdict", "candidate_sha", "candidate_tree",
+    }
+    block_kinds = kt.KANBAN_BLOCK_SCHEMA["parameters"]["properties"]["kind"]["enum"]
+    assert "review_gate" in block_kinds
+
+    assert "review_gate={source_task_id" in KANBAN_GUIDANCE
+    assert 'kanban_block(kind="review_gate"' in KANBAN_GUIDANCE
+    assert "review_receipt={verdict" in KANBAN_GUIDANCE
+    assert "Prose, titles, comments" in KANBAN_GUIDANCE
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

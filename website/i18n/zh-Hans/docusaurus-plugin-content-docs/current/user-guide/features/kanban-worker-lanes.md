@@ -51,20 +51,21 @@ Hermes Kanban 拥有生命周期的真实状态——`ready` → `running` → `
 每次 claim 必须以以下之一结束：
 
 - `kanban_complete(summary=..., metadata=...)` — 任务成功，状态切换为 `done`。
-- `kanban_block(reason=...)` — 任务等待人工输入，状态切换为 `blocked`。调度器在 `kanban_unblock` 运行时重新生成。
+- `kanban_block(reason=..., kind=...)` — 任务按类型化阻塞原因等待。普通人工输入阻塞保持粘性，直到运行 `kanban_unblock`；活动的 `review_gate` 只能由精确匹配的批准审查回执自动释放。
 - worker 进程退出而未调用任何工具。内核回收该进程并发出 `crashed`（PID 已消亡）、`gave_up`（连续失败断路器触发）或 `timed_out`（超过 max_runtime）。这是失败路径；健康的 worker 不会在此结束。
 
 kanban 内核强制要求每次运行恰好由其中一项终止。既未调用任何终止工具又正常退出的 worker 将被视为崩溃。
 
-## 输出与 review-required 约定
+## 输出与精确审查门
 
-对于大多数涉及代码变更的任务，worker 完成的那一刻并不意味着真正*完成*——还需要人工审查。kanban 内核不强制执行这一区分（"涉及代码变更的任务"定义模糊，且在每个代码 worker 上强制 block 而非 complete 会破坏不需要审查的流程）。这是叠加在上层的约定：
+对于大多数涉及代码变更的任务，worker 完成的那一刻并不意味着真正*完成*——还需要审查。内核提供选择加入的机器可读链路，无需猜测卡片是否属于代码变更：
 
-- **使用 block 而非 complete**，`reason` 以 `review-required: ` 为前缀，使仪表板 / `hermes kanban show` 将该行显示为等待审查。
-- **先将结构化元数据写入 `kanban_comment`**，因为 `kanban_block` 只携带人类可读的 `reason`。Comment 是持久的注解通道——所有与审计相关的字段（changed_files、tests_run、diff_path 或 PR url、决策记录）都应放在这里。
-- **Reviewer 批准并解除阻塞**，这将重新生成 worker 并附带 comment 线程用于后续跟进；或通过另一条 comment 要求修改，下一次 worker 运行时将通过 `kanban_show` 的上下文看到这些内容。
+- **创建分离的审查卡片**：使用 `kanban_create(review_gate={source_task_id, candidate_sha, candidate_tree}, ...)`，并传入完整 Git commit 与 tree 对象 id。不要同时把 source 设置为 `parents` 依赖；被阻塞的 source 无法先完成。
+- **由 source 激活审查门**：调用 `kanban_block(kind="review_gate", reason=...)`。创建时 review 停在 `todo`；此类型化阻塞会原子地将 source 留在 `blocked`，并让精确关联的 review 进入 `ready`。
+- **以类型化回执完成审查**：调用 `kanban_complete(review_receipt={verdict: "approved" | "changes_requested", candidate_sha, candidate_tree}, ...)`。只有 `approved` 且两个 id 与已存门完全匹配时，source 才会回到 `ready`（若普通 parent 尚未完成则为 `todo`）。负面、缺失、格式错误或不匹配的回执都会保持阻塞并写入可审计的协调事件。
+- **旧版审查文本仍由人工处理。** 标题、comment、summary、metadata、result 以及 `review-required:` reason 前缀都不会被解析为门或 verdict。既有无类型阻塞仍保持粘性，需要显式人工处理。
 
-自动注入的 `KANBAN_GUIDANCE` 同时涵盖 `kanban_complete`（真正终态的任务——拼写修复、文档变更、研究报告）和 `review-required` block 模式。
+数据库边界保证门创建与激活的幂等性：每个 source 最多存在一个未解决门，review 卡片没有返回 source 的依赖边，重复完成不会再次发出释放事件或生成重复 source run。自动注入的 `KANBAN_GUIDANCE` 为实现 worker、reviewer 与 orchestrator 提供同一份工具契约。
 
 ## 日志与审计追踪
 
