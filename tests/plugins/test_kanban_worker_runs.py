@@ -373,7 +373,15 @@ def test_terminate_run_ok(client, monkeypatch):
     # Capture signal calls so we don't actually SIGTERM a random PID.
     sent = []
 
-    def _fake_terminate(pid, prev_lock, *, signal_fn=None):
+    def _fake_terminate(
+        pid,
+        prev_lock,
+        *,
+        conn=None,
+        task_id=None,
+        run_id=None,
+        signal_fn=None,
+    ):
         sent.append((pid, prev_lock))
         return {"signal": "SIGTERM", "delivered": True}
 
