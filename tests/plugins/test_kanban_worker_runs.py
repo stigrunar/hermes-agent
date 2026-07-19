@@ -327,8 +327,12 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
         "VALUES (?, 'running', ?, ?, ?, ?)",
         (task_id, lock, future, worker_pid, int(time.time())),
     )
+    run_id = cur.lastrowid
+    conn.execute(
+        "UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id),
+    )
     conn.commit()
-    return task_id, cur.lastrowid
+    return task_id, run_id
 
 
 def test_terminate_run_404_unknown_id(client):
@@ -370,6 +374,17 @@ def test_terminate_run_ok(client, monkeypatch):
     finally:
         conn.close()
 
+    plugin_module = sys.modules["hermes_dashboard_plugin_kanban_worker_runs_test"]
+    original_conn = plugin_module._conn
+    endpoint_connections = []
+
+    def _capture_endpoint_conn(board=None):
+        endpoint_conn = original_conn(board=board)
+        endpoint_connections.append(endpoint_conn)
+        return endpoint_conn
+
+    monkeypatch.setattr(plugin_module, "_conn", _capture_endpoint_conn)
+
     # Capture signal calls so we don't actually SIGTERM a random PID.
     sent = []
 
@@ -382,7 +397,7 @@ def test_terminate_run_ok(client, monkeypatch):
         run_id=None,
         signal_fn=None,
     ):
-        sent.append((pid, prev_lock))
+        sent.append((pid, prev_lock, conn, task_id, run_id))
         return {"signal": "SIGTERM", "delivered": True}
 
     monkeypatch.setattr(kb, "_terminate_reclaimed_worker", _fake_terminate)
@@ -394,8 +409,14 @@ def test_terminate_run_ok(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body == {"ok": True, "run_id": run_id, "task_id": task_id}
-    assert sent == [(33333, sent[0][1])]
-    assert sent[0][1] is not None  # claim_lock was non-null
+    assert len(endpoint_connections) == 1
+    assert len(sent) == 1
+    sent_pid, sent_lock, sent_conn, sent_task_id, sent_run_id = sent[0]
+    assert sent_pid == 33333
+    assert sent_lock is not None  # claim_lock was non-null
+    assert sent_conn is endpoint_connections[0]
+    assert sent_task_id == task_id
+    assert sent_run_id == run_id
 
     # Task is back to ready, claim cleared.
     conn = kb.connect()
