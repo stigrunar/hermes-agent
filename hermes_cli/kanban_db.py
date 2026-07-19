@@ -79,6 +79,7 @@ import random
 import secrets
 import shutil
 import sqlite3
+import stat
 import subprocess
 import sys
 import threading
@@ -1414,7 +1415,7 @@ def _cross_process_init_lock(path: Path):
 
 
 @contextlib.contextmanager
-def _dispatch_tick_lock(db_path: Path):
+def _dispatch_tick_lock(db_path: Path, *, fail_open: bool = True):
     """Non-blocking single-writer guard around one dispatcher tick.
 
     Yields ``True`` when this process holds the board's dispatch lock and
@@ -1444,7 +1445,13 @@ def _dispatch_tick_lock(db_path: Path):
     (yields ``True``) — single-writer enforcement is best-effort and the
     orphan-dispatcher scenario is specific to POSIX service managers.
     """
-    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    try:
+        canonical_db_path = db_path.expanduser().resolve(strict=False)
+    except OSError:
+        canonical_db_path = db_path
+    lock_path = canonical_db_path.with_name(
+        canonical_db_path.name + ".dispatch.lock"
+    )
     handle = None
     acquired = False
     try:
@@ -1472,8 +1479,10 @@ def _dispatch_tick_lock(db_path: Path):
                 acquired = False
     except OSError:
         # Could not even open the lock file (permissions, read-only FS).
-        # Degrade to a no-op so a probe failure never blocks dispatch.
-        acquired = True
+        # Dispatch preserves its historical fail-open behavior; destructive
+        # lifecycle callers pass fail_open=False because proceeding without
+        # serialization could release a just-launched worker pre-receipt.
+        acquired = bool(fail_open)
         handle = None
     try:
         yield acquired
@@ -3771,11 +3780,48 @@ def release_stale_claims(
             hb is not None
             and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
         )
+        scope_status = (
+            _worker_scope_state(conn, row["id"], row["current_run_id"])
+            if host_local and row["current_run_id"] is not None
+            else None
+        )
+        scope_state = None
+        scope_launch_mode = "untracked"
+        if scope_status is not None:
+            _, scope_state = scope_status
+            scope_launch_mode = getattr(scope_status, "launch_mode", "legacy")
+        if scope_state == "unknown":
+            termination = _terminate_reclaimed_worker(
+                row["worker_pid"],
+                row["claim_lock"],
+                conn=conn,
+                task_id=row["id"],
+                run_id=row["current_run_id"],
+                scope_status=scope_status,
+                signal_fn=signal_fn,
+            )
+            _defer_reclaim_for_live_worker(
+                conn,
+                row["id"],
+                row["claim_lock"],
+                now,
+                termination,
+                reason="ttl_expired_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_pid=row["worker_pid"],
+            )
+            continue
+        scoped_unit_needs_collection = bool(
+            scope_status is not None
+            and scope_launch_mode == "systemd-user-scope"
+            and scope_state in {"inactive", "not-found"}
+        )
         if (
             host_local
             and row["worker_pid"]
             and _pid_alive(row["worker_pid"])
             and not heartbeat_stale
+            and not scoped_unit_needs_collection
         ):
             new_expires = now + _resolve_claim_ttl_seconds()
             with write_txn(conn):
@@ -3784,8 +3830,16 @@ def release_stale_claims(
                     "WHERE id = ? AND status = 'running' "
                     "  AND claim_lock IS ? "
                     "  AND claim_expires IS NOT NULL "
-                    "  AND claim_expires < ?",
-                    (new_expires, row["id"], row["claim_lock"], now),
+                    "  AND claim_expires < ? "
+                    "  AND current_run_id IS ? AND worker_pid IS ?",
+                    (
+                        new_expires,
+                        row["id"],
+                        row["claim_lock"],
+                        now,
+                        row["current_run_id"],
+                        row["worker_pid"],
+                    ),
                 )
                 if cur.rowcount != 1:
                     continue
@@ -3819,6 +3873,7 @@ def release_stale_claims(
             conn=conn,
             task_id=row["id"],
             run_id=row["current_run_id"],
+            scope_status=scope_status,
             signal_fn=signal_fn,
         )
         # Never release a claim while our own worker is still alive: that would
@@ -3827,6 +3882,8 @@ def release_stale_claims(
             _defer_reclaim_for_live_worker(
                 conn, row["id"], row["claim_lock"], now, termination,
                 reason="ttl_expired_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_pid=row["worker_pid"],
             )
             continue
         with write_txn(conn):
@@ -3834,8 +3891,15 @@ def release_stale_claims(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
-                (row["id"], row["claim_lock"], now),
+                "AND claim_expires IS NOT NULL AND claim_expires < ? "
+                "AND current_run_id IS ? AND worker_pid IS ?",
+                (
+                    row["id"],
+                    row["claim_lock"],
+                    now,
+                    row["current_run_id"],
+                    row["worker_pid"],
+                ),
             )
             if cur.rowcount != 1:
                 continue
@@ -3889,6 +3953,70 @@ def reclaim_task(
     reclaimable or if its host-local worker/scope could not be proved gone;
     retaining the claim in that case prevents duplicate execution.
     """
+    db_path = _connection_main_db_path(conn)
+    if db_path is None:
+        return _reclaim_task_locked(
+            conn,
+            task_id,
+            reason=reason,
+            signal_fn=signal_fn,
+        )
+    # Dispatch holds this board-scoped cross-process lock continuously from
+    # claim through spawn acknowledgement and receipt persistence. Serializing
+    # manual reclaim on the same lock closes the only interval where a worker
+    # may already be running but neither its PID nor its launch handle is yet
+    # visible in SQLite.
+    with _dispatch_tick_lock(db_path, fail_open=False) as held:
+        if held:
+            return _reclaim_task_locked(
+                conn,
+                task_id,
+                reason=reason,
+                signal_fn=signal_fn,
+            )
+        row = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is not None and row["status"] == "running":
+            claim_lock = row["claim_lock"]
+            host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+            if claim_lock and str(claim_lock).startswith(host_prefix):
+                _defer_reclaim_for_live_worker(
+                    conn,
+                    task_id,
+                    claim_lock,
+                    int(time.time()),
+                    {
+                        "prev_pid": (
+                            int(row["worker_pid"])
+                            if row["worker_pid"] else None
+                        ),
+                        "host_local": True,
+                        "termination_attempted": False,
+                        "terminated": False,
+                        "sigkill": False,
+                        "scope_unit": None,
+                        "scope_state": "unknown",
+                        "scope_stop_attempted": False,
+                        "scope_unknown": True,
+                    },
+                    reason="manual_reclaim_dispatch_in_progress",
+                    expected_run_id=row["current_run_id"],
+                    expected_pid=row["worker_pid"],
+                )
+        return False
+
+
+def _reclaim_task_locked(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    signal_fn=None,
+) -> bool:
+    """Reclaim after the caller has excluded a concurrent dispatch tick."""
     row = conn.execute(
         "SELECT status, claim_lock, worker_pid, current_run_id "
         "FROM tasks WHERE id = ?",
@@ -3916,6 +4044,8 @@ def reclaim_task(
             int(time.time()),
             termination,
             reason="manual_reclaim_worker_alive",
+            expected_run_id=row["current_run_id"],
+            expected_pid=row["worker_pid"],
         )
         return False
     with write_txn(conn):
@@ -3923,8 +4053,8 @@ def reclaim_task(
             "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
-            "AND claim_lock IS ?",
-            (task_id, prev_lock),
+            "AND claim_lock IS ? AND current_run_id IS ? AND worker_pid IS ?",
+            (task_id, prev_lock, row["current_run_id"], row["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
@@ -6295,6 +6425,7 @@ def _terminate_reclaimed_worker(
     conn: Optional[sqlite3.Connection] = None,
     task_id: Optional[str] = None,
     run_id: Optional[int] = None,
+    scope_status: Optional[_WorkerScopeStatus] = None,
     pid_known_dead: bool = False,
     signal_fn=None,
 ) -> dict[str, Any]:
@@ -6325,19 +6456,55 @@ def _terminate_reclaimed_worker(
     # this dispatcher could have launched one, including the legacy name while
     # pre-upgrade workers drain.
     if conn is not None and task_id is not None and run_id is not None:
-        unit, scope_state = _worker_scope_state(conn, task_id, run_id)
+        resolved_scope = scope_status or _worker_scope_state(conn, task_id, run_id)
+        unit, scope_state = resolved_scope
+        manager_target = getattr(resolved_scope, "manager_target", None)
+        launch_mode = getattr(resolved_scope, "launch_mode", "legacy")
+        launch_acknowledged = getattr(
+            resolved_scope,
+            "launch_acknowledged",
+            None,
+        )
         info["scope_unit"] = unit
         info["scope_state"] = scope_state
         if scope_state == "unknown":
             info["scope_unknown"] = True
             return info
-        if scope_state == "active" and unit is not None:
+        if scope_state == "not-found" and launch_mode == "systemd-user-scope":
+            if launch_acknowledged is True:
+                # The acknowledged payload entered this exact authenticated
+                # unit and that unit is now collected. Its numeric leader PID
+                # may already have been reused, so never signal it.
+                info["terminated"] = True
+                return info
+            # Candidate-era receipts did not record acknowledgement, and a new
+            # explicitly uncertain receipt may still name a live systemd-run
+            # client that has not created its unit yet. ``not-found`` alone is
+            # therefore insufficient. A dead original PID closes that gap; a
+            # live (or possibly reused) PID must be retained without signaling.
+            if pid and pid > 0 and (
+                not pid_known_dead and _pid_alive(pid)
+            ):
+                info["scope_unknown"] = True
+                info["scope_state"] = "unknown"
+                return info
+            info["terminated"] = True
+            return info
+        if scope_state in {"active", "inactive"} and unit is not None:
             info["termination_attempted"] = True
             info["scope_stop_attempted"] = True
-            stopped = _stop_systemd_user_scope(unit)
+            if manager_target is None:
+                # Compatibility for narrow tests that monkeypatch the historical
+                # two-tuple result. Production resolutions always carry a target.
+                stopped = _stop_systemd_user_scope(unit)
+            else:
+                stopped = _stop_systemd_user_scope(
+                    unit,
+                    manager_target=manager_target,
+                )
             if stopped is True:
                 info["terminated"] = True
-                info["scope_state"] = "inactive"
+                info["scope_state"] = "not-found"
             elif stopped is None:
                 info["scope_unknown"] = True
                 info["scope_state"] = "unknown"
@@ -6414,6 +6581,8 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
+    expected_run_id: Optional[int],
+    expected_pid: Optional[int],
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -6427,8 +6596,9 @@ def _defer_reclaim_for_live_worker(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
-            (grace, task_id, claim_lock),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
+            "  AND current_run_id IS ? AND worker_pid IS ?",
+            (grace, task_id, claim_lock, expected_run_id, expected_pid),
         )
         if cur.rowcount != 1:
             return
@@ -6444,7 +6614,28 @@ def _defer_reclaim_for_live_worker(
             "claim_expires_now": grace,
         }
         payload.update(termination)
-        _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
+        # Max-runtime, stale, and crash checks can all run in one dispatcher
+        # tick and may supply different reasons for the same surviving unit.
+        # Keep one visible diagnostic per grace window regardless of reason;
+        # otherwise alternating checks defeat the bound and grow the event/WAL
+        # stream for as long as a user manager remains unavailable.
+        latest = conn.execute(
+            "SELECT payload, created_at FROM task_events "
+            "WHERE task_id = ? AND run_id IS ? AND kind = 'reclaim_deferred' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, run_id),
+        ).fetchone()
+        emit = latest is None or int(latest["created_at"]) < (
+            now - RECLAIM_DEFER_GRACE_SECONDS
+        )
+        if emit:
+            _append_event(
+                conn,
+                task_id,
+                "reclaim_deferred",
+                payload,
+                run_id=run_id,
+            )
 
 
 def heartbeat_worker(
@@ -6558,6 +6749,8 @@ def enforce_max_runtime(
                 now,
                 termination,
                 reason="max_runtime_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_pid=row["worker_pid"],
             )
             continue
         killed = bool(termination.get("sigkill"))
@@ -6568,8 +6761,9 @@ def enforce_max_runtime(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (tid, pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (tid, pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -6601,6 +6795,7 @@ def enforce_max_runtime(
                 outcome="timed_out",
                 release_claim=False,
                 end_run=False,
+                expected_run_id=row["current_run_id"],
                 event_payload_extra={
                     "pid": pid,
                     "sigkill": killed,
@@ -6696,6 +6891,8 @@ def detect_stale_running(
             _defer_reclaim_for_live_worker(
                 conn, tid, lock, now, termination,
                 reason="heartbeat_stale_worker_alive",
+                expected_run_id=row["current_run_id"],
+                expected_pid=pid,
             )
             continue
 
@@ -6705,8 +6902,9 @@ def detect_stale_running(
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND claim_lock IS ?",
-                (tid, row["claim_lock"]),
+                "  AND claim_lock IS ? AND current_run_id IS ? "
+                "  AND worker_pid IS ?",
+                (tid, row["claim_lock"], row["current_run_id"], pid),
             )
             if cur.rowcount != 1:
                 continue
@@ -6870,10 +7068,11 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     # clean-exit-but-still-running case, which is accounted against its
     # own bounded violation streak instead of the unified failure
     # counter (see the post-txn loop below).
-    crash_details: list[tuple[str, int, str, bool, str]] = []
-    # (task_id, pid, claimer, protocol_violation, error_text)
+    crash_details: list[tuple[str, int, str, bool, str, Optional[int]]] = []
+    # (task_id, pid, claimer, protocol_violation, error_text, ended_run_id)
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
-    deferred_scope_tasks: set[str] = set()
+    deferred_scope_runs: set[tuple[str, Optional[int]]] = set()
+    collected_scope_runs: set[tuple[str, Optional[int]]] = set()
     candidates = conn.execute(
         "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
         "FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
@@ -6887,7 +7086,21 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             grace = _resolve_crash_grace_seconds()
             if time.time() - started_at < grace:
                 continue
-        if _pid_alive(row["worker_pid"]):
+        scope_status = _worker_scope_state(
+            conn,
+            row["id"],
+            row["current_run_id"],
+        )
+        _, scope_state = scope_status
+        scope_launch_mode = getattr(scope_status, "launch_mode", "legacy")
+        pid_alive = _pid_alive(row["worker_pid"])
+        if pid_alive and not (
+            scope_state == "unknown"
+            or (
+                scope_launch_mode == "systemd-user-scope"
+                and scope_state in {"inactive", "not-found"}
+            )
+        ):
             continue
         termination = _terminate_reclaimed_worker(
             row["worker_pid"],
@@ -6895,7 +7108,8 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
             conn=conn,
             task_id=row["id"],
             run_id=row["current_run_id"],
-            pid_known_dead=True,
+            scope_status=scope_status,
+            pid_known_dead=not pid_alive,
         )
         if _worker_survived_termination(termination):
             _defer_reclaim_for_live_worker(
@@ -6905,16 +7119,25 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 int(time.time()),
                 termination,
                 reason="crashed_leader_scope_alive",
+                expected_run_id=row["current_run_id"],
+                expected_pid=row["worker_pid"],
             )
-            deferred_scope_tasks.add(row["id"])
+            deferred_scope_runs.add((row["id"], row["current_run_id"]))
+        elif (
+            scope_launch_mode == "systemd-user-scope"
+            and termination.get("terminated")
+        ):
+            collected_scope_runs.add((row["id"], row["current_run_id"]))
 
     with write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at FROM tasks "
+            "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
+            "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         for row in rows:
-            if row["id"] in deferred_scope_tasks:
+            run_key = (row["id"], row["current_run_id"])
+            if run_key in deferred_scope_runs:
                 continue
             # Only check liveness for claims owned by this host.
             lock = row["claim_lock"] or ""
@@ -6928,7 +7151,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 grace = _resolve_crash_grace_seconds()
                 if time.time() - started_at < grace:
                     continue
-            if _pid_alive(row["worker_pid"]):
+            if run_key not in collected_scope_runs and _pid_alive(row["worker_pid"]):
                 continue
 
             pid = int(row["worker_pid"])
@@ -6999,8 +7222,9 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ?",
-                (row["id"], pid, row["claim_lock"]),
+                "  AND worker_pid = ? AND claim_lock IS ? "
+                "  AND current_run_id IS ?",
+                (row["id"], pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -7045,7 +7269,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     crashed.append(row["id"])
                     crash_details.append(
                         (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text)
+                         protocol_violation, error_text, run_id)
                     )
     # Outside the main txn: account each crashed task and maybe trip the
     # breaker (the task transitions ready → blocked with a ``gave_up`` event
@@ -7067,10 +7291,17 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     if crash_details:
         # Fingerprint errors to detect systemic failures.
         _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text in crash_details:
+        for _, _, _, _, err_text, _ in crash_details:
             fp = _error_fingerprint(err_text)
             _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for tid, pid, claimer, protocol_violation, error_text in crash_details:
+        for (
+            tid,
+            pid,
+            claimer,
+            protocol_violation,
+            error_text,
+            ended_run_id,
+        ) in crash_details:
             if protocol_violation:
                 streak = _protocol_violation_streak(conn, tid)
                 trow = conn.execute(
@@ -7107,6 +7338,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                     force_trip=True,
                     release_claim=False,
                     end_run=False,
+                    expected_run_id=ended_run_id,
                     event_payload_extra={
                         "pid": pid,
                         "claimer": claimer,
@@ -7126,6 +7358,7 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
                 failure_limit=1 if is_systemic else None,
                 release_claim=False,
                 end_run=False,
+                expected_run_id=ended_run_id,
                 event_payload_extra={"pid": pid, "claimer": claimer},
             )
             if tripped:
@@ -7151,6 +7384,7 @@ def _record_task_failure(
     force_trip: bool = False,
     release_claim: bool = False,
     end_run: bool = False,
+    expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
@@ -7176,6 +7410,12 @@ def _record_task_failure(
       run with the appropriate outcome. This just increments the
       counter; if the breaker trips, the task is re-transitioned
       ``ready → blocked`` and a ``gave_up`` event is emitted.
+
+    ``expected_run_id`` protects timeout/crash accounting that happens after
+    the lifecycle transaction releases its lock. When supplied, accounting is
+    applied only while the task is still the unclaimed ``ready`` result of that
+    exact latest ended run; a newly created retry is never mutated by its
+    predecessor, even if the retry has already ended again.
 
     ``event_payload_extra`` merges into the ``gave_up`` event payload
     when the breaker trips, so callers can include outcome-specific
@@ -7203,11 +7443,28 @@ def _record_task_failure(
     blocked = False
     with write_txn(conn):
         row = conn.execute(
-            "SELECT consecutive_failures, status, max_retries "
+            "SELECT consecutive_failures, status, max_retries, "
+            "       current_run_id, claim_lock, worker_pid "
             "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if row is None:
             return False
+        if expected_run_id is not None:
+            expected_run_id = int(expected_run_id)
+            latest_ended_run = conn.execute(
+                "SELECT 1 FROM task_runs "
+                "WHERE id = ? AND task_id = ? AND ended_at IS NOT NULL "
+                "  AND id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?)",
+                (expected_run_id, task_id, task_id),
+            ).fetchone()
+            if not (
+                row["status"] == "ready"
+                and row["current_run_id"] is None
+                and row["claim_lock"] is None
+                and row["worker_pid"] is None
+                and latest_ended_run is not None
+            ):
+                return False
         failures = int(row["consecutive_failures"]) + 1
         cur_status = row["status"]
 
@@ -7372,13 +7629,75 @@ def _set_worker_pid(
                 "  AND claim_lock IS ?",
                 (int(pid), int(run_id), claim_lock),
             )
-        scope_unit = getattr(pid, "scope_unit", None)
+        # Only the exact private handle returned by ``_default_spawn`` may
+        # declare a scoped launch. A custom ``spawn_fn`` is allowed to return
+        # any int-like value, including an int subclass with arbitrary
+        # attributes; treating those attributes as receipt data would turn a
+        # plugin object into an unbounded persistence channel.
+        launch_handle = pid if type(pid) is _WorkerLaunchPid else None
+        declared_scope = (
+            launch_handle.scope_unit if launch_handle is not None else None
+        )
+        scoped_launch = launch_handle is not None and declared_scope is not None
         payload: dict[str, Any] = {
             "pid": int(pid),
-            "launch_mode": "systemd-user-scope" if scope_unit else "direct",
+            "launch_mode": "systemd-user-scope" if scoped_launch else "direct",
         }
-        if scope_unit:
-            payload["scope_unit"] = scope_unit
+        if scoped_launch:
+            db_path = _connection_main_db_path(conn)
+            expected_unit = None
+            if db_path is not None and run_id is not None:
+                try:
+                    expected_unit = _worker_scope_unit_name(
+                        task_id,
+                        int(run_id),
+                        db_path=db_path,
+                    )
+                except (OSError, TypeError, ValueError):
+                    pass
+            if (
+                isinstance(declared_scope, str)
+                and declared_scope == expected_unit
+                and _valid_worker_scope_unit(declared_scope)
+            ):
+                payload["scope_unit"] = expected_unit
+
+            manager_kind = launch_handle.manager_kind
+            manager_uid = launch_handle.manager_uid
+            getuid = getattr(os, "getuid", None)
+            geteuid = getattr(os, "geteuid", None)
+            manager_identity_valid = (
+                manager_kind == _SYSTEMD_USER_MANAGER_KIND
+                and isinstance(manager_uid, int)
+                and not isinstance(manager_uid, bool)
+                and manager_uid >= 0
+                and getuid is not None
+                and geteuid is not None
+                and manager_uid == int(getuid())
+                and manager_uid == int(geteuid())
+            )
+            if manager_identity_valid:
+                # Persist only the fixed kind and authenticated numeric kernel
+                # identity. Runtime paths and bus addresses are reconstructed
+                # locally and never enter the receipt.
+                payload["manager_kind"] = _SYSTEMD_USER_MANAGER_KIND
+                payload["manager_uid"] = manager_uid
+            elif manager_kind is not None or manager_uid is not None:
+                # A prior candidate legitimately supplied neither manager
+                # field, so the all-None shape remains backward compatible.
+                # A partially supplied or invalid identity is different: omit
+                # the unit too, producing a bounded receipt the reader treats
+                # as unknown instead of silently retargeting the current bus.
+                payload.pop("scope_unit", None)
+
+            launch_acknowledged = launch_handle.launch_acknowledged
+            if type(launch_acknowledged) is bool:
+                payload["launch_acknowledged"] = launch_acknowledged
+            elif launch_acknowledged is not None:
+                # As with an invalid manager identity, persist no arbitrary
+                # value and force the bounded receipt into the reader's
+                # fail-closed invalid-unit path.
+                payload.pop("scope_unit", None)
         _append_event(conn, task_id, "spawned", payload, run_id=run_id)
         return True
 
@@ -8363,6 +8682,8 @@ _SYSTEMD_WORKER_SCOPE_RE = re.compile(
 _SYSTEMD_WORKER_SCOPE_LEGACY_RE = re.compile(
     rf"^{re.escape(_SYSTEMD_WORKER_SCOPE_PREFIX)}[A-Za-z0-9_.-]+\.scope$"
 )
+_SYSTEMD_USER_MANAGER_KIND = "systemd-user"
+_SYSTEMD_USER_RUNTIME_ROOT = Path("/run/user")
 _SYSTEMD_SCOPE_MIN_VERSION = 236  # --collect was added in systemd 236.
 _SYSTEMD_PROBE_TIMEOUT_SECONDS = 2.0
 _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
@@ -8376,15 +8697,142 @@ class _WorkerLaunchUncertain(RuntimeError):
         self.pid = int(pid)
 
 
+@dataclass(frozen=True)
+class _SystemdUserManagerTarget:
+    """Locally validated address of one user manager.
+
+    Paths are derived from the numeric kernel identity and deliberately never
+    serialized into Kanban receipts or lifecycle diagnostics.
+    """
+
+    manager_kind: str
+    manager_uid: int
+    runtime_dir: Path = field(repr=False)
+    bus_path: Path = field(repr=False)
+
+
+@dataclass(frozen=True)
+class _WorkerScopeStatus:
+    """Resolved scope state plus the exact manager used to prove it."""
+
+    unit: Optional[str]
+    state: str
+    manager_target: Optional[_SystemdUserManagerTarget]
+    launch_mode: str
+    launch_acknowledged: Optional[bool] = None
+
+    def __iter__(self):
+        # Preserve the historical ``unit, state = _worker_scope_state(...)``
+        # shape for internal callers and third-party tests.
+        yield self.unit
+        yield self.state
+
+
 class _WorkerLaunchPid(int):
     """Integer-compatible worker PID carrying its durable launch handle."""
 
     scope_unit: Optional[str]
+    manager_kind: Optional[str]
+    manager_uid: Optional[int]
+    launch_acknowledged: Optional[bool]
 
-    def __new__(cls, pid: int, *, scope_unit: Optional[str] = None):
+    def __new__(
+        cls,
+        pid: int,
+        *,
+        scope_unit: Optional[str] = None,
+        manager_kind: Optional[str] = None,
+        manager_uid: Optional[int] = None,
+        launch_acknowledged: Optional[bool] = None,
+    ):
         value = int.__new__(cls, int(pid))
         value.scope_unit = scope_unit
+        value.manager_kind = manager_kind
+        value.manager_uid = manager_uid
+        value.launch_acknowledged = launch_acknowledged
         return value
+
+
+def _resolve_systemd_user_manager_target(
+    manager_kind: object,
+    manager_uid: object,
+    *,
+    platform: Optional[str] = None,
+    runtime_root: Optional[os.PathLike[str] | str] = None,
+    real_uid: Optional[int] = None,
+    effective_uid: Optional[int] = None,
+    lstat_fn=None,
+) -> Optional[_SystemdUserManagerTarget]:
+    """Validate and build the only supported local user-manager target.
+
+    Receipt data may select neither a username nor a bus path. The persisted
+    UID is accepted only when it exactly matches both kernel identities of the
+    replacement dispatcher. Official user-service -> system-service migration
+    keeps ``User=`` unchanged, so this crosses managers without granting a
+    privileged dispatcher authority over arbitrary users.
+    """
+    active_platform = platform if platform is not None else sys.platform
+    if not active_platform.startswith("linux"):
+        return None
+    if manager_kind != _SYSTEMD_USER_MANAGER_KIND:
+        return None
+    if isinstance(manager_uid, bool) or not isinstance(manager_uid, int):
+        return None
+    if manager_uid < 0:
+        return None
+    getuid = getattr(os, "getuid", None)
+    geteuid = getattr(os, "geteuid", None)
+    if getuid is None or geteuid is None:
+        return None
+    actual_real_uid = int(getuid()) if real_uid is None else int(real_uid)
+    actual_effective_uid = int(geteuid()) if effective_uid is None else int(effective_uid)
+    if manager_uid != actual_real_uid or manager_uid != actual_effective_uid:
+        return None
+
+    root = Path(runtime_root) if runtime_root is not None else _SYSTEMD_USER_RUNTIME_ROOT
+    runtime_dir = root / str(manager_uid)
+    bus_path = runtime_dir / "bus"
+    inspect = lstat_fn if lstat_fn is not None else os.lstat
+    try:
+        runtime_stat = inspect(runtime_dir)
+        bus_stat = inspect(bus_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if not stat.S_ISDIR(runtime_stat.st_mode) or runtime_stat.st_uid != manager_uid:
+        return None
+    # pam_systemd creates this directory 0700. A group/world-accessible runtime
+    # directory would let another local account replace the well-known bus.
+    if stat.S_IMODE(runtime_stat.st_mode) & 0o077:
+        return None
+    if not stat.S_ISSOCK(bus_stat.st_mode) or bus_stat.st_uid != manager_uid:
+        return None
+    return _SystemdUserManagerTarget(
+        manager_kind=_SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=manager_uid,
+        runtime_dir=runtime_dir,
+        bus_path=bus_path,
+    )
+
+
+def _current_systemd_user_manager_target() -> Optional[_SystemdUserManagerTarget]:
+    """Resolve the current process's manager without trusting ambient env."""
+    getuid = getattr(os, "getuid", None)
+    if getuid is None:
+        return None
+    return _resolve_systemd_user_manager_target(
+        _SYSTEMD_USER_MANAGER_KIND,
+        int(getuid()),
+    )
+
+
+def _systemd_user_manager_environment(
+    target: _SystemdUserManagerTarget,
+) -> dict[str, str]:
+    """Return a minimal, deterministic environment for one validated bus."""
+    return {
+        "XDG_RUNTIME_DIR": str(target.runtime_dir),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={target.bus_path}",
+    }
 
 
 def _systemd_service_manager(cgroup_path: Optional[str]) -> Optional[str]:
@@ -8406,6 +8854,25 @@ def _systemd_service_manager(cgroup_path: Optional[str]) -> Optional[str]:
     if path.startswith("/system.slice/"):
         return "system"
     return None
+
+
+def _systemd_user_manager_target_for_cgroup(
+    cgroup_path: Optional[str],
+) -> Optional[_SystemdUserManagerTarget]:
+    """Resolve the authenticated current user manager named by a cgroup."""
+    if _systemd_service_manager(cgroup_path) != "user" or not cgroup_path:
+        return None
+    match = re.search(r"/user@(\d+)\.service(?:/|$)", cgroup_path)
+    if match is None:
+        return None
+    try:
+        manager_uid = int(match.group(1))
+    except (TypeError, ValueError):
+        return None
+    return _resolve_systemd_user_manager_target(
+        _SYSTEMD_USER_MANAGER_KIND,
+        manager_uid,
+    )
 
 
 def _systemd_run_major_version(
@@ -8434,12 +8901,16 @@ def _systemd_run_major_version(
 
 def _systemd_user_manager_reachable(
     *,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
     systemctl: Optional[str] = None,
     run_fn=None,
 ) -> bool:
-    """Return whether this process can synchronously reach its user manager."""
+    """Return whether an explicitly targeted user manager is reachable."""
     controller = systemctl if systemctl is not None else shutil.which("systemctl")
     if not controller:
+        return False
+    target = manager_target or _current_systemd_user_manager_target()
+    if target is None:
         return False
     run = run_fn if run_fn is not None else subprocess.run
     try:
@@ -8450,6 +8921,7 @@ def _systemd_user_manager_reachable(
             text=True,
             timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS,
             check=False,
+            env=_systemd_user_manager_environment(target),
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
         return False
@@ -8459,6 +8931,7 @@ def _systemd_user_manager_reachable(
 def _systemd_user_scope_available(
     runner: str,
     *,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
     run_fn=None,
     systemctl: Optional[str] = None,
 ) -> bool:
@@ -8468,6 +8941,7 @@ def _systemd_user_scope_available(
         version is not None
         and version >= _SYSTEMD_SCOPE_MIN_VERSION
         and _systemd_user_manager_reachable(
+            manager_target=manager_target,
             systemctl=systemctl,
             run_fn=run_fn,
         )
@@ -8583,6 +9057,7 @@ def _systemd_worker_scope_argv(
     *,
     board: Optional[str] = None,
     cgroup_path: Optional[str] = None,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
     systemd_run: Optional[str] = None,
     platform: Optional[str] = None,
     user_manager_ready: Optional[bool] = None,
@@ -8607,11 +9082,14 @@ def _systemd_worker_scope_argv(
     current = cgroup_path if cgroup_path is not None else _current_cgroup_path()
     if _systemd_service_manager(current) != "user":
         return cmd
+    target = manager_target or _systemd_user_manager_target_for_cgroup(current)
+    if target is None:
+        return cmd
     runner = systemd_run if systemd_run is not None else shutil.which("systemd-run")
     if not runner:
         return cmd
     ready = (
-        _systemd_user_scope_available(runner)
+        _systemd_user_scope_available(runner, manager_target=target)
         if user_manager_ready is None
         else bool(user_manager_ready)
     )
@@ -8670,6 +9148,7 @@ def _valid_worker_scope_unit(unit: str) -> bool:
 def _systemd_user_scope_state(
     unit: str,
     *,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
     systemctl: Optional[str] = None,
     run_fn=None,
 ) -> str:
@@ -8678,6 +9157,9 @@ def _systemd_user_scope_state(
         return "unknown"
     controller = systemctl if systemctl is not None else shutil.which("systemctl")
     if not controller:
+        return "unknown"
+    target = manager_target or _current_systemd_user_manager_target()
+    if target is None:
         return "unknown"
     run = run_fn if run_fn is not None else subprocess.run
     try:
@@ -8696,8 +9178,11 @@ def _systemd_user_scope_state(
             text=True,
             timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS,
             check=False,
+            env=_systemd_user_manager_environment(target),
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
+        return "unknown"
+    if result.returncode != 0:
         return "unknown"
     properties = {}
     for line in (result.stdout or "").splitlines():
@@ -8717,6 +9202,7 @@ def _systemd_user_scope_state(
 def _stop_systemd_user_scope(
     unit: str,
     *,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
     systemctl: Optional[str] = None,
     run_fn=None,
 ) -> Optional[bool]:
@@ -8726,6 +9212,9 @@ def _stop_systemd_user_scope(
     controller = systemctl if systemctl is not None else shutil.which("systemctl")
     if not controller:
         return None
+    target = manager_target or _current_systemd_user_manager_target()
+    if target is None:
+        return None
     run = run_fn if run_fn is not None else subprocess.run
     try:
         run(
@@ -8734,6 +9223,7 @@ def _stop_systemd_user_scope(
             stderr=subprocess.DEVNULL,
             timeout=7.0,
             check=False,
+            env=_systemd_user_manager_environment(target),
         )
     except (OSError, subprocess.SubprocessError, TimeoutError):
         # State below remains authoritative: a stop can race collection and
@@ -8743,32 +9233,31 @@ def _stop_systemd_user_scope(
     for _ in range(10):
         state = _systemd_user_scope_state(
             unit,
+            manager_target=target,
             systemctl=controller,
             run_fn=run,
         )
-        if state in {"inactive", "not-found"}:
+        if state == "not-found":
             return True
         if state == "unknown":
             return None
         time.sleep(0.1)
-    return False if state == "active" else None
+    return False if state in {"active", "inactive"} else None
 
 
 def _worker_scope_state(
     conn: sqlite3.Connection,
     task_id: str,
     run_id: Optional[int],
-) -> tuple[Optional[str], str]:
-    """Locate an active current/legacy scope for an active task attempt."""
+) -> _WorkerScopeStatus:
+    """Resolve an attempt's scope only through its authenticated manager."""
     if run_id is None or not _systemd_user_scope_possible():
-        return None, "not-applicable"
+        return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
 
     # New runs persist the launch mode and exact opaque unit alongside the
     # real worker PID in the spawned event. This keeps direct/custom spawn_fn
     # runs on the PID fallback while allowing scope recovery after dispatcher
     # manager migration or loss of the systemd-run launcher binary.
-    launch_mode: Optional[str] = None
-    persisted_unit: Optional[str] = None
     try:
         event = conn.execute(
             "SELECT payload FROM task_events "
@@ -8780,45 +9269,117 @@ def _worker_scope_state(
             # A claimed run can be inspected before PID persistence, and test
             # or third-party callers may set a PID directly. Without a spawned
             # receipt there is no evidence that this run used a scope.
-            return None, "not-applicable"
-        if event["payload"]:
-            payload = json.loads(event["payload"])
-            launch_mode = payload.get("launch_mode")
-            persisted_unit = payload.get("scope_unit")
+            return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
+        payload = json.loads(event["payload"]) if event["payload"] else None
     except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
-        return None, "unknown"
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+    if not isinstance(payload, dict):
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+
+    has_launch_mode = "launch_mode" in payload
+    launch_mode = payload.get("launch_mode") if has_launch_mode else "legacy"
+    launch_ack_present = "launch_acknowledged" in payload
+    launch_acknowledged = (
+        payload.get("launch_acknowledged") if launch_ack_present else None
+    )
+    if launch_ack_present and type(launch_acknowledged) is not bool:
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
     if launch_mode == "direct":
-        return None, "not-applicable"
-    if launch_mode == "systemd-user-scope":
-        if not isinstance(persisted_unit, str) or not _valid_worker_scope_unit(
-            persisted_unit
+        if any(
+            key in payload
+            for key in (
+                "scope_unit",
+                "manager_kind",
+                "manager_uid",
+                "launch_acknowledged",
+            )
         ):
-            return None, "unknown"
-        candidates = (persisted_unit,)
+            return _WorkerScopeStatus(None, "unknown", None, "invalid")
+        return _WorkerScopeStatus(None, "not-applicable", None, "direct")
+    if has_launch_mode and launch_mode != "systemd-user-scope":
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+    if launch_mode == "legacy" and any(
+        key in payload
+        for key in (
+            "scope_unit",
+            "manager_kind",
+            "manager_uid",
+            "launch_acknowledged",
+        )
+    ):
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+
+    db_path = _connection_main_db_path(conn)
+    if db_path is None:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+    try:
+        current_unit = _worker_scope_unit_name(
+            task_id,
+            int(run_id),
+            db_path=db_path,
+        )
+        legacy_unit = _legacy_worker_scope_unit_name(task_id, int(run_id))
+    except (OSError, TypeError, ValueError):
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+
+    manager_kind_present = "manager_kind" in payload
+    manager_uid_present = "manager_uid" in payload
+    if manager_kind_present != manager_uid_present:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+    if manager_kind_present:
+        target = _resolve_systemd_user_manager_target(
+            payload.get("manager_kind"),
+            payload.get("manager_uid"),
+        )
     else:
+        # Compatibility with pre-manager receipts is safe because this derives
+        # only the replacement process's own UID and fixed /run/user path.
+        target = _current_systemd_user_manager_target()
+    if target is None:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+
+    if launch_mode == "systemd-user-scope":
+        persisted_unit = payload.get("scope_unit")
+        if (
+            not isinstance(persisted_unit, str)
+            or persisted_unit != current_unit
+            or not _valid_worker_scope_unit(persisted_unit)
+        ):
+            return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+        state = _systemd_user_scope_state(
+            persisted_unit,
+            manager_target=target,
+        )
+        return _WorkerScopeStatus(
+            persisted_unit,
+            state,
+            target,
+            launch_mode,
+            launch_acknowledged,
+        )
+
+    if not has_launch_mode:
         # Pre-handle runs may still own either deterministic unit name. Treat
         # them as potentially scoped regardless of the current dispatcher's
         # manager so an upgrade/restart cannot release a surviving descendant.
-        db_path = _connection_main_db_path(conn)
-        if db_path is None:
-            return None, "unknown"
-        try:
-            candidates = (
-                _worker_scope_unit_name(task_id, int(run_id), db_path=db_path),
-                _legacy_worker_scope_unit_name(task_id, int(run_id)),
-            )
-        except (OSError, ValueError):
-            return None, "unknown"
+        candidates = (current_unit, legacy_unit)
+    else:  # pragma: no cover - guarded by launch_mode validation above
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
     unknown_unit: Optional[str] = None
+    inactive_unit: Optional[str] = None
     for unit in candidates:
-        state = _systemd_user_scope_state(unit)
+        state = _systemd_user_scope_state(unit, manager_target=target)
         if state == "active":
-            return unit, state
+            return _WorkerScopeStatus(unit, state, target, launch_mode)
+        if state == "inactive" and inactive_unit is None:
+            inactive_unit = unit
         if state == "unknown" and unknown_unit is None:
             unknown_unit = unit
     if unknown_unit is not None:
-        return unknown_unit, "unknown"
-    return None, "inactive"
+        return _WorkerScopeStatus(unknown_unit, "unknown", target, launch_mode)
+    if inactive_unit is not None:
+        return _WorkerScopeStatus(inactive_unit, "inactive", target, launch_mode)
+    return _WorkerScopeStatus(None, "not-found", target, launch_mode)
 
 
 def _default_spawn(
@@ -8974,10 +9535,21 @@ def _default_spawn(
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
     worker_cmd = cmd
-    cmd = _systemd_worker_scope_argv(worker_cmd, task, board=board)
+    scope_cgroup_path = _current_cgroup_path()
+    scope_manager_target = _systemd_user_manager_target_for_cgroup(
+        scope_cgroup_path,
+    )
+    cmd = _systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        board=board,
+        cgroup_path=scope_cgroup_path,
+        manager_target=scope_manager_target,
+    )
     scope_unit: Optional[str] = None
     scope_ready_read: Optional[int] = None
     scope_ready_write: Optional[int] = None
+    scope_launch_acknowledged: Optional[bool] = None
     if cmd is not worker_cmd:
         # A synchronous scope keeps systemd-run's PID by execing the payload in
         # place. Put a one-byte acknowledgement immediately before that exec so
@@ -8985,6 +9557,19 @@ def _default_spawn(
         # successfully started. The pipe is inherited only by this child.
         delimiter = cmd.index("--")
         scope_unit = cmd[5].removeprefix("--unit=")
+        if scope_manager_target is None:  # pragma: no cover - defensive
+            raise RuntimeError("scoped worker launch lost its validated user manager")
+        # Do not let inherited ambient variables redirect systemd-run. The same
+        # process execs the worker, so keep its normal environment and replace
+        # only the user-bus selectors with the locally derived target.
+        for key in (
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DBUS_STARTER_ADDRESS",
+            "DBUS_STARTER_BUS_TYPE",
+        ):
+            env.pop(key, None)
+        env.update(_systemd_user_manager_environment(scope_manager_target))
         scope_ready_read, scope_ready_write = os.pipe()
         cmd = [
             *cmd[: delimiter + 1],
@@ -9041,10 +9626,12 @@ def _default_spawn(
         try:
             try:
                 _await_scope_exec_ack(proc, scope_ready_read)
+                scope_launch_acknowledged = True
             except _WorkerLaunchUncertain as exc:
                 # Safety-first: retain the claim and PID when we cannot prove
                 # either exec success or launcher death. Crash/TTL handling can
                 # recover it later without spawning a duplicate.
+                scope_launch_acknowledged = False
                 _log.warning("kanban worker launch state uncertain: %s", exc)
         finally:
             os.close(scope_ready_read)
@@ -9053,7 +9640,21 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return _WorkerLaunchPid(proc.pid, scope_unit=scope_unit)
+    return _WorkerLaunchPid(
+        proc.pid,
+        scope_unit=scope_unit,
+        manager_kind=(
+            scope_manager_target.manager_kind
+            if scope_unit is not None and scope_manager_target is not None
+            else None
+        ),
+        manager_uid=(
+            scope_manager_target.manager_uid
+            if scope_unit is not None and scope_manager_target is not None
+            else None
+        ),
+        launch_acknowledged=scope_launch_acknowledged,
+    )
 
 
 # ---------------------------------------------------------------------------

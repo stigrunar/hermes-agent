@@ -720,7 +720,468 @@ def test_scope_termination_stops_unit_instead_of_only_leader(
         assert stopped == [unit]
         assert info["scope_stop_attempted"] is True
         assert info["terminated"] is True
-        assert info["scope_state"] == "inactive"
+        assert info["scope_state"] == "not-found"
+
+
+def test_scoped_spawn_receipt_persists_only_manager_kind_and_uid(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="scoped receipt", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        pid = kb._WorkerLaunchPid(
+            12345,
+            scope_unit=unit,
+            manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+            manager_uid=os.getuid(),
+        )
+        assert kb._set_worker_pid(conn, t, pid) is True
+
+        event = next(e for e in kb.list_events(conn, t) if e.kind == "spawned")
+        assert event.payload == {
+            "pid": 12345,
+            "launch_mode": "systemd-user-scope",
+            "scope_unit": unit,
+            "manager_kind": kb._SYSTEMD_USER_MANAGER_KIND,
+            "manager_uid": os.getuid(),
+        }
+        persisted = json.dumps(event.payload)
+        for forbidden in (
+            "XDG_RUNTIME_DIR",
+            "DBUS_SESSION_BUS_ADDRESS",
+            str(Path.home()),
+        ):
+            assert forbidden not in persisted
+
+
+def test_custom_int_subclass_cannot_inject_scoped_receipt_data(kanban_home):
+    class CustomSpawnPid(int):
+        pass
+
+    secret = "alice:/home/alice?token=not-receipt-data"
+    pid = CustomSpawnPid(12345)
+    pid.scope_unit = secret
+    pid.manager_kind = secret
+    pid.manager_uid = secret
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="custom pid", assignee="worker")
+        kb.claim_task(conn, t)
+        assert kb._set_worker_pid(conn, t, pid) is True
+
+        event = next(e for e in kb.list_events(conn, t) if e.kind == "spawned")
+        assert event.payload == {"pid": 12345, "launch_mode": "direct"}
+        assert secret not in json.dumps(event.payload)
+
+
+def test_candidate_scoped_receipt_without_manager_identity_is_compatible(
+    kanban_home, monkeypatch,
+):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="candidate receipt", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        assert kb._set_worker_pid(
+            conn,
+            t,
+            kb._WorkerLaunchPid(12345, scope_unit=unit),
+        ) is True
+        event = next(e for e in kb.list_events(conn, t) if e.kind == "spawned")
+        assert event.payload == {
+            "pid": 12345,
+            "launch_mode": "systemd-user-scope",
+            "scope_unit": unit,
+        }
+
+        monkeypatch.setattr(
+            kb,
+            "_current_systemd_user_manager_target",
+            lambda: target,
+        )
+        queries = []
+
+        def state(candidate, *, manager_target, **_kwargs):
+            queries.append((candidate, manager_target))
+            return "active"
+
+        monkeypatch.setattr(kb, "_systemd_user_scope_state", state)
+        status = kb._worker_scope_state(conn, t, claimed.current_run_id)
+
+        assert tuple(status) == (unit, "active")
+        assert status.manager_target is target
+        assert queries == [(unit, target)]
+
+
+def test_legacy_pid_receipt_reconstructs_legacy_unit(kanban_home, monkeypatch):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="legacy receipt", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        current_unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        legacy_unit = kb._legacy_worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+        )
+        kb._set_worker_pid(conn, t, 12345)
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned'",
+            (json.dumps({"pid": 12345}), t, claimed.current_run_id),
+        )
+        monkeypatch.setattr(
+            kb,
+            "_current_systemd_user_manager_target",
+            lambda: target,
+        )
+        queries = []
+
+        def state(candidate, *, manager_target, **_kwargs):
+            assert manager_target is target
+            queries.append(candidate)
+            return "active" if candidate == legacy_unit else "not-found"
+
+        monkeypatch.setattr(kb, "_systemd_user_scope_state", state)
+        status = kb._worker_scope_state(conn, t, claimed.current_run_id)
+
+        assert tuple(status) == (legacy_unit, "active")
+        assert queries == [current_unit, legacy_unit]
+
+
+def test_worker_scope_state_threads_exact_receipt_target(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="targeted receipt", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        kb._set_worker_pid(
+            conn,
+            t,
+            kb._WorkerLaunchPid(
+                12345,
+                scope_unit=unit,
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid(),
+            ),
+        )
+        target = kb._SystemdUserManagerTarget(
+            manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+            manager_uid=os.getuid(),
+            runtime_dir=Path(f"/run/user/{os.getuid()}"),
+            bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+        )
+        resolved = []
+        queried = []
+
+        def resolve(kind, uid, **_kwargs):
+            resolved.append((kind, uid))
+            return target
+
+        def state(candidate, *, manager_target, **_kwargs):
+            queried.append((candidate, manager_target))
+            return "active"
+
+        monkeypatch.setattr(kb, "_resolve_systemd_user_manager_target", resolve)
+        monkeypatch.setattr(kb, "_systemd_user_scope_state", state)
+
+        status = kb._worker_scope_state(conn, t, claimed.current_run_id)
+        assert tuple(status) == (unit, "active")
+        assert status.manager_target is target
+        assert status.launch_mode == "systemd-user-scope"
+        assert resolved == [(kb._SYSTEMD_USER_MANAGER_KIND, os.getuid())]
+        assert queried == [(unit, target)]
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"pid": 12345, "launch_mode": None},
+        {"pid": 12345, "launch_mode": "unknown"},
+        {
+            "pid": 12345,
+            "launch_mode": "direct",
+            "launch_acknowledged": False,
+        },
+        {
+            "pid": 12345,
+            "launch_mode": "systemd-user-scope",
+            "scope_unit": "hermes-kanban-worker-ffffffffffffffffffffffffffffffff.scope",
+            "manager_kind": "systemd-user",
+            "manager_uid": 1000,
+        },
+        {
+            "pid": 12345,
+            "launch_mode": "systemd-user-scope",
+            "scope_unit": "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope",
+            "manager_kind": "systemd-user",
+        },
+        {
+            "pid": 12345,
+            "launch_mode": "systemd-user-scope",
+            "scope_unit": "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope",
+            "launch_acknowledged": "yes",
+        },
+    ],
+)
+def test_worker_scope_state_rejects_malformed_or_tampered_receipts(
+    kanban_home, monkeypatch, payload,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="tampered receipt", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        kb._set_worker_pid(conn, t, 12345)
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned'",
+            (json.dumps(payload), t, claimed.current_run_id),
+        )
+        monkeypatch.setattr(
+            kb,
+            "_systemd_user_scope_state",
+            lambda *_args, **_kwargs: pytest.fail(
+                "untrusted receipt must not select a user manager or unit"
+            ),
+        )
+
+        status = kb._worker_scope_state(conn, t, claimed.current_run_id)
+        assert tuple(status) == (None, "unknown")
+
+
+def test_scoped_uid_mismatch_defers_crash_reclaim(kanban_home, monkeypatch):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="uid mismatch", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        kb._set_worker_pid(
+            conn,
+            t,
+            kb._WorkerLaunchPid(
+                12345,
+                scope_unit=unit,
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid() + 1,
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 12345
+        assert any(
+            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
+        )
+
+
+def test_scoped_manager_unavailable_defers_without_pid_fallback(
+    kanban_home, monkeypatch,
+):
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manager unavailable", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        kb._set_worker_pid(
+            conn,
+            t,
+            kb._WorkerLaunchPid(
+                12345,
+                scope_unit=unit,
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid(),
+            ),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_systemd_user_manager_target",
+            lambda *_args, **_kwargs: None,
+        )
+        monkeypatch.setattr(
+            kb,
+            "_systemd_user_scope_state",
+            lambda *_args, **_kwargs: pytest.fail(
+                "an unavailable manager cannot be queried"
+            ),
+        )
+        monkeypatch.setattr(
+            kb.os,
+            "kill",
+            lambda *_args: pytest.fail(
+                "a scoped receipt with unknown manager must not fall back to PID"
+            ),
+        )
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == claimed.claim_lock
+        assert task.worker_pid == 12345
+        deferred = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload["scope_unknown"] is True
+
+
+def test_uncertain_scoped_launch_not_found_retains_live_pid(
+    kanban_home, monkeypatch,
+):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="uncertain launch", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        kb._set_worker_pid(
+            conn,
+            t,
+            kb._WorkerLaunchPid(
+                12345,
+                scope_unit=unit,
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid(),
+                launch_acknowledged=False,
+            ),
+        )
+        event = next(e for e in kb.list_events(conn, t) if e.kind == "spawned")
+        assert event.payload["launch_acknowledged"] is False
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
+        monkeypatch.setattr(
+            kb,
+            "_resolve_systemd_user_manager_target",
+            lambda *_args, **_kwargs: target,
+        )
+        monkeypatch.setattr(
+            kb,
+            "_systemd_user_scope_state",
+            lambda candidate, **_kwargs: (
+                "not-found"
+                if candidate == unit
+                else pytest.fail("only the exact persisted unit may be queried")
+            ),
+        )
+        monkeypatch.setattr(
+            kb.os,
+            "kill",
+            lambda *_args: pytest.fail(
+                "an uncertain scoped launcher must not use PID fallback"
+            ),
+        )
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == claimed.claim_lock
+        assert task.worker_pid == 12345
+        deferred = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload["scope_unknown"] is True
+
+
+def test_collected_scoped_receipt_never_signals_reused_pid(
+    kanban_home, monkeypatch,
+):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    status = kb._WorkerScopeStatus(
+        unit="hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope",
+        state="not-found",
+        manager_target=target,
+        launch_mode="systemd-user-scope",
+        launch_acknowledged=True,
+    )
+    monkeypatch.setattr(kb, "_worker_scope_state", lambda *_args: status)
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="reused pid", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        info = kb._terminate_reclaimed_worker(
+            12345,
+            claimed.claim_lock,
+            conn=conn,
+            task_id=t,
+            run_id=claimed.current_run_id,
+            signal_fn=lambda *_args: pytest.fail("collected scope must not signal PID"),
+        )
+
+    assert info["terminated"] is True
+    assert info["termination_attempted"] is False
+    assert info["scope_state"] == "not-found"
 
 
 def test_ttl_reclaim_defers_when_scope_state_is_unknown(kanban_home, monkeypatch):
@@ -775,13 +1236,61 @@ def test_max_runtime_defers_when_scope_stop_does_not_finish(
         monkeypatch.setattr(
             kb, "_worker_scope_state", lambda *_args: (unit, "active"),
         )
-        monkeypatch.setattr(kb, "_stop_systemd_user_scope", lambda _unit: False)
+        monkeypatch.setattr(
+            kb,
+            "_stop_systemd_user_scope",
+            lambda _unit, **_kwargs: False,
+        )
 
         assert kb.enforce_max_runtime(conn) == []
+        assert kb.enforce_max_runtime(conn) == []
         assert kb.get_task(conn, t).status == "running"
-        assert any(
-            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
+        deferred = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload["reason"] == "max_runtime_worker_alive"
+
+
+def test_reclaim_deferred_is_bounded_across_alternating_reasons(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="bounded deferral", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None
+        kb._set_worker_pid(conn, task_id, 12345)
+        now = int(time.time())
+        termination = {"scope_unknown": True, "terminated": False}
+
+        kb._defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            claimed.claim_lock,
+            now,
+            termination,
+            reason="max_runtime_worker_alive",
+            expected_run_id=claimed.current_run_id,
+            expected_pid=12345,
         )
+        kb._defer_reclaim_for_live_worker(
+            conn,
+            task_id,
+            claimed.claim_lock,
+            now,
+            termination,
+            reason="crashed_worker_scope_unknown",
+            expected_run_id=claimed.current_run_id,
+            expected_pid=12345,
+        )
+
+        deferred = [
+            event
+            for event in kb.list_events(conn, task_id)
+            if event.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert deferred[0].payload["reason"] == "max_runtime_worker_alive"
 
 
 def test_crash_reclaim_defers_while_scope_descendants_remain(
@@ -797,7 +1306,11 @@ def test_crash_reclaim_defers_while_scope_descendants_remain(
         monkeypatch.setattr(
             kb, "_worker_scope_state", lambda *_args: (unit, "active"),
         )
-        monkeypatch.setattr(kb, "_stop_systemd_user_scope", lambda _unit: False)
+        monkeypatch.setattr(
+            kb,
+            "_stop_systemd_user_scope",
+            lambda _unit, **_kwargs: False,
+        )
 
         assert kb.detect_crashed_workers(conn) == []
         assert kb.get_task(conn, t).status == "running"
@@ -841,14 +1354,30 @@ def test_crash_reclaim_recovers_user_scope_after_dispatcher_manager_migration(
             "which",
             lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
         )
+        target = kb._SystemdUserManagerTarget(
+            manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+            manager_uid=os.getuid(),
+            runtime_dir=Path(f"/run/user/{os.getuid()}"),
+            bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+        )
+        monkeypatch.setattr(
+            kb,
+            "_current_systemd_user_manager_target",
+            lambda: target,
+        )
         queried = []
 
-        def scope_state(candidate, **_kwargs):
+        def scope_state(candidate, *, manager_target, **_kwargs):
+            assert manager_target is target
             queried.append(candidate)
             return "active" if candidate == unit else "not-found"
 
         monkeypatch.setattr(kb, "_systemd_user_scope_state", scope_state)
-        monkeypatch.setattr(kb, "_stop_systemd_user_scope", lambda _unit: False)
+        monkeypatch.setattr(
+            kb,
+            "_stop_systemd_user_scope",
+            lambda _unit, **_kwargs: False,
+        )
 
         assert kb.detect_crashed_workers(conn) == []
         task = kb.get_task(conn, t)
@@ -891,6 +1420,55 @@ def test_manual_reclaim_defers_when_scope_state_is_unknown(
         ).fetchone()
         assert event is not None
         assert json.loads(event["payload"])["reason"] == "manual_reclaim_worker_alive"
+
+
+def test_manual_reclaim_cannot_cross_launch_receipt_window(
+    kanban_home, monkeypatch,
+):
+    class DispatchInProgress:
+        def __enter__(self):
+            return False
+
+        def __exit__(self, *_args):
+            return False
+
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="launch window", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert kb.get_task(conn, t).worker_pid is None
+        monkeypatch.setattr(
+            kb,
+            "_dispatch_tick_lock",
+            lambda _db_path, **_kwargs: DispatchInProgress(),
+        )
+
+        for _ in range(2):
+            assert kb.reclaim_task(
+                conn,
+                t,
+                reason="operator requested stop",
+                signal_fn=lambda *_args: pytest.fail(
+                    "a pre-receipt worker cannot be safely signaled"
+                ),
+            ) is False
+
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.claim_lock == claimed.claim_lock
+        assert task.current_run_id == claimed.current_run_id
+        assert task.worker_pid is None
+        deferred = [
+            event
+            for event in kb.list_events(conn, t)
+            if event.kind == "reclaim_deferred"
+        ]
+        assert len(deferred) == 1
+        assert (
+            deferred[0].payload["reason"]
+            == "manual_reclaim_dispatch_in_progress"
+        )
 
 
 def test_set_worker_pid_cas_ignores_fast_completed_run(kanban_home):
@@ -1339,6 +1917,117 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == []
         assert kb.get_task(conn, t).status == "running"
+
+
+def test_max_runtime_failure_accounting_cannot_mutate_new_retry(
+    kanban_home, monkeypatch,
+):
+    """An old timeout must not block or charge a newly claimed run."""
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn,
+            title="timeout accounting race",
+            assignee="a",
+            max_runtime_seconds=1,
+        )
+        first = kb.claim_task(conn, t)
+        assert first is not None
+        kb._set_worker_pid(conn, t, 12345)
+        old = int(time.time()) - 30
+        conn.execute(
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (old, t),
+        )
+        conn.execute(
+            "UPDATE task_runs SET started_at = ? WHERE id = ?",
+            (old, first.current_run_id),
+        )
+        monkeypatch.setattr(
+            kb,
+            "_terminate_reclaimed_worker",
+            lambda *_args, **_kwargs: {
+                "host_local": True,
+                "termination_attempted": True,
+                "terminated": True,
+                "sigkill": False,
+            },
+        )
+        record_failure = kb._record_task_failure
+        retry = {}
+
+        def race_then_record(conn_arg, task_id, error, **kwargs):
+            claimed = kb.claim_task(conn_arg, task_id, claimer="retry:worker")
+            assert claimed is not None
+            retry["run_id"] = claimed.current_run_id
+            retry["claim_lock"] = claimed.claim_lock
+            assert kb._set_worker_pid(
+                conn_arg,
+                task_id,
+                54321,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+            ) is True
+            kwargs["failure_limit"] = 1
+            return record_failure(conn_arg, task_id, error, **kwargs)
+
+        monkeypatch.setattr(kb, "_record_task_failure", race_then_record)
+
+        assert kb.enforce_max_runtime(conn) == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.current_run_id == retry["run_id"]
+        assert task.claim_lock == retry["claim_lock"]
+        assert task.worker_pid == 54321
+        assert task.consecutive_failures == 0
+
+
+def test_crash_failure_accounting_cannot_mutate_new_retry(
+    kanban_home, monkeypatch,
+):
+    """An old crash must not block or charge a newly claimed run."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="crash accounting race", assignee="a")
+        first = kb.claim_task(conn, t)
+        assert first is not None
+        kb._set_worker_pid(conn, t, 12345)
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_terminate_reclaimed_worker",
+            lambda *_args, **_kwargs: {
+                "host_local": True,
+                "termination_attempted": False,
+                "terminated": True,
+                "sigkill": False,
+            },
+        )
+        record_failure = kb._record_task_failure
+        retry = {}
+
+        def race_then_record(conn_arg, task_id, error, **kwargs):
+            claimed = kb.claim_task(conn_arg, task_id, claimer="retry:worker")
+            assert claimed is not None
+            retry["run_id"] = claimed.current_run_id
+            retry["claim_lock"] = claimed.claim_lock
+            assert kb._set_worker_pid(
+                conn_arg,
+                task_id,
+                54321,
+                expected_run_id=claimed.current_run_id,
+                expected_claim_lock=claimed.claim_lock,
+            ) is True
+            return record_failure(conn_arg, task_id, error, **kwargs)
+
+        monkeypatch.setattr(kb, "_record_task_failure", race_then_record)
+
+        assert kb.detect_crashed_workers(conn) == [t]
+        task = kb.get_task(conn, t)
+        assert task.status == "running"
+        assert task.current_run_id == retry["run_id"]
+        assert task.claim_lock == retry["claim_lock"]
+        assert task.worker_pid == 54321
+        assert task.consecutive_failures == 0
 
 
 def test_heartbeat_extends_claim(kanban_home):

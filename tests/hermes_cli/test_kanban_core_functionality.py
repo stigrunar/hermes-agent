@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
 import sys
 import threading
@@ -2832,13 +2833,21 @@ def test_systemd_worker_scope_argv_isolates_service_hosted_worker(kanban_home):
     task = SimpleNamespace(id=tid, current_run_id=17)
 
     worker_cmd = ["/opt/hermes/bin/hermes", "chat", "-q", f"work kanban task {tid}"]
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
     wrapped = kb._systemd_worker_scope_argv(
         worker_cmd,
         task,
         cgroup_path=(
-            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            f"/user.slice/user-{os.getuid()}.slice/"
+            f"user@{os.getuid()}.service/app.slice/"
             "hermes-kanban-safe-dispatcher.service"
         ),
+        manager_target=target,
         systemd_run="/usr/bin/systemd-run",
         platform="linux",
         user_manager_ready=True,
@@ -2872,6 +2881,159 @@ def test_systemd_service_manager_classifies_manager_not_suffix(
     cgroup_path, expected,
 ):
     assert kb._systemd_service_manager(cgroup_path) == expected
+
+
+def test_systemd_user_manager_target_validates_local_uid_and_bus(tmp_path):
+    uid = os.getuid()
+    runtime_root = tmp_path / "run-user"
+    runtime_dir = runtime_root / str(uid)
+    bus_path = runtime_dir / "bus"
+    modes = {
+        runtime_dir: stat.S_IFDIR | 0o700,
+        bus_path: stat.S_IFSOCK | 0o666,
+    }
+
+    def lstat(path):
+        return SimpleNamespace(st_mode=modes[Path(path)], st_uid=uid)
+
+    target = kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    )
+    assert target is not None
+    assert target.manager_kind == kb._SYSTEMD_USER_MANAGER_KIND
+    assert target.manager_uid == uid
+
+    modes[runtime_dir] = stat.S_IFDIR | 0o755
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[runtime_dir] = stat.S_IFDIR | 0o700
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid + 1,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        True,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+
+    modes[runtime_dir] = stat.S_IFREG | 0o600
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[runtime_dir] = stat.S_IFDIR | 0o700
+
+    def wrong_runtime_owner(path):
+        result = lstat(path)
+        if Path(path) == runtime_dir:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=uid + 1)
+        return result
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=wrong_runtime_owner,
+    ) is None
+
+    modes[bus_path] = stat.S_IFREG | 0o600
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[bus_path] = stat.S_IFSOCK | 0o666
+
+    def wrong_bus_owner(path):
+        result = lstat(path)
+        if Path(path) == bus_path:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=uid + 1)
+        return result
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=wrong_bus_owner,
+    ) is None
+
+
+def test_systemd_scope_state_uses_only_explicit_manager_bus(monkeypatch):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/ambient-wrong-runtime")
+    monkeypatch.setenv(
+        "DBUS_SESSION_BUS_ADDRESS",
+        "unix:path=/tmp/ambient-wrong-bus",
+    )
+    captured = {}
+
+    def run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout="LoadState=loaded\nActiveState=active\n",
+        )
+
+    unit = "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope"
+    assert kb._systemd_user_scope_state(
+        unit,
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=run,
+    ) == "active"
+    assert captured["cmd"][0:3] == [
+        "/usr/bin/systemctl", "--user", "show",
+    ]
+    assert captured["env"] == {
+        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+        "DBUS_SESSION_BUS_ADDRESS": (
+            f"unix:path=/run/user/{os.getuid()}/bus"
+        ),
+    }
+
+
+def test_systemd_scope_state_rejects_nonzero_result_with_plausible_output():
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+
+    def run(_cmd, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout="LoadState=loaded\nActiveState=active\n",
+        )
+
+    unit = "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope"
+    assert kb._systemd_user_scope_state(
+        unit,
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=run,
+    ) == "unknown"
 
 
 def test_worker_scope_unit_name_is_opaque_deterministic_and_board_scoped(tmp_path):
@@ -2922,6 +3084,13 @@ def test_system_service_and_unreachable_user_manager_use_direct_spawn():
 
 
 def test_systemd_user_scope_availability_requires_version_and_user_bus():
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+
     def reachable(cmd, **_kwargs):
         if cmd[-1] == "--version":
             return SimpleNamespace(returncode=0, stdout="systemd 255\n")
@@ -2929,6 +3098,7 @@ def test_systemd_user_scope_availability_requires_version_and_user_bus():
 
     assert kb._systemd_user_scope_available(
         "/usr/bin/systemd-run",
+        manager_target=target,
         systemctl="/usr/bin/systemctl",
         run_fn=reachable,
     ) is True
@@ -2938,6 +3108,7 @@ def test_systemd_user_scope_availability_requires_version_and_user_bus():
 
     assert kb._systemd_user_scope_available(
         "/usr/bin/systemd-run",
+        manager_target=target,
         systemctl="/usr/bin/systemctl",
         run_fn=too_old,
     ) is False
@@ -2949,6 +3120,7 @@ def test_systemd_user_scope_availability_requires_version_and_user_bus():
 
     assert kb._systemd_user_scope_available(
         "/usr/bin/systemd-run",
+        manager_target=target,
         systemctl="/usr/bin/systemctl",
         run_fn=no_bus,
     ) is False
@@ -3022,8 +3194,15 @@ def test_systemd_worker_scope_argv_preserves_non_linux_fallback():
     ) is worker_cmd
 
 
+@pytest.mark.parametrize(
+    ("uncertain", "expected_acknowledged"),
+    [(False, True), (True, False)],
+)
 def test_default_spawn_wraps_scope_and_returns_popen_pid(
-    kanban_home, monkeypatch,
+    kanban_home,
+    monkeypatch,
+    uncertain,
+    expected_acknowledged,
 ):
     """The mock proves wrapper selection and Popen PID passthrough only."""
     captured = {}
@@ -3041,12 +3220,21 @@ def test_default_spawn_wraps_scope_and_returns_popen_pid(
         kb,
         "_current_cgroup_path",
         lambda: (
-            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            f"/user.slice/user-{os.getuid()}.slice/"
+            f"user@{os.getuid()}.service/app.slice/"
             "dispatcher.service"
         ),
     )
-    monkeypatch.setattr(kb, "_systemd_user_scope_available", lambda _runner: True)
-    monkeypatch.setattr(kb, "_await_scope_exec_ack", lambda _proc, _fd: None)
+    monkeypatch.setattr(
+        kb,
+        "_systemd_user_scope_available",
+        lambda _runner, **_kwargs: True,
+    )
+    def await_ack(proc, _fd):
+        if uncertain:
+            raise kb._WorkerLaunchUncertain(proc.pid, "synthetic uncertainty")
+
+    monkeypatch.setattr(kb, "_await_scope_exec_ack", await_ack)
     monkeypatch.setattr(
         kb.shutil,
         "which",
@@ -3065,12 +3253,21 @@ def test_default_spawn_wraps_scope_and_returns_popen_pid(
 
     assert pid == 424242
     assert getattr(pid, "scope_unit") == captured["cmd"][5].removeprefix("--unit=")
+    assert getattr(pid, "manager_kind") == kb._SYSTEMD_USER_MANAGER_KIND
+    assert getattr(pid, "manager_uid") == os.getuid()
+    assert getattr(pid, "launch_acknowledged") is expected_acknowledged
     assert captured["cmd"][0:3] == [
         "/usr/bin/systemd-run", "--user", "--scope",
     ]
     assert captured["kwargs"]["start_new_session"] is True
     assert captured["kwargs"]["pass_fds"]
     assert captured["kwargs"]["env"]["HERMES_KANBAN_TASK"] == tid
+    assert captured["kwargs"]["env"]["XDG_RUNTIME_DIR"] == (
+        f"/run/user/{os.getuid()}"
+    )
+    assert captured["kwargs"]["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
+        f"unix:path=/run/user/{os.getuid()}/bus"
+    )
 
 
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):
