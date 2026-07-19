@@ -23,6 +23,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
+from agent.secret_scope import UnscopedSecretError
 from agent.thread_scoped_output import thread_scoped_silence
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
+    except UnscopedSecretError:
+        raise
     except Exception:
         return parent
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
@@ -105,6 +108,8 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
             "args": list(rp.get("args") or []),
             "routed": True,
         }
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         logger.debug("background-review aux routing failed (%s); using main model", e)
         return parent

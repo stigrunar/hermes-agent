@@ -31,6 +31,7 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
+from agent.secret_scope import UnscopedSecretError
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -3132,6 +3133,8 @@ def _resolve_child_credential_pool(
             pool = load_pool(child_key)
             if pool is not None and pool.has_credentials():
                 return pool
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug(
                 "Could not resolve custom credential pool for child endpoint '%s': %s",
@@ -3149,6 +3152,8 @@ def _resolve_child_credential_pool(
         pool = load_pool(effective_provider)
         if pool is not None and pool.has_credentials():
             return pool
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         logger.debug(
             "Could not load credential pool for child provider '%s': %s",
@@ -3258,6 +3263,8 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "

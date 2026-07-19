@@ -10,6 +10,7 @@ Usage:
 """
 
 from contextlib import asynccontextmanager, contextmanager
+from contextvars import copy_context
 
 import asyncio
 import atexit
@@ -47,6 +48,8 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
+
+from agent.secret_scope import UnscopedSecretError
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
@@ -6163,6 +6166,8 @@ def get_recommended_default_model(provider: str = ""):
             try:
                 state = get_provider_auth_state("nous") or {}
                 portal_url = state.get("portal_base_url", "") or ""
+            except UnscopedSecretError:
+                raise
             except Exception:
                 portal_url = ""
 
@@ -6180,6 +6185,8 @@ def get_recommended_default_model(provider: str = ""):
 
             model = pick_silent_default_model(model_ids, provider="nous")
             return {"provider": "nous", "model": model, "free_tier": bool(free_tier)}
+        except UnscopedSecretError:
+            raise
         except Exception:
             _log.exception("GET /api/model/recommended-default (nous) failed")
             return {"provider": "nous", "model": "", "free_tier": None}
@@ -9127,6 +9134,8 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     if read_hermes_oauth_credentials:
         try:
             hermes_creds = read_hermes_oauth_credentials()
+        except UnscopedSecretError:
+            raise
         except Exception:
             hermes_creds = None
     if hermes_creds and hermes_creds.get("accessToken"):
@@ -9139,8 +9148,9 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
             "has_refresh_token": bool(hermes_creds.get("refreshToken")),
         }
 
-    # Env-var / secret-source path. ``get_env_value`` checks the process
-    # environment first (where Bitwarden-sourced secrets land) then .env.
+    # Env-var / secret-source path. The config helper is profile-scope aware:
+    # a multiplexed status request must never fall through to process ambient
+    # credentials when its owning profile has no value.
     env_var_order: tuple = ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -9157,7 +9167,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
         format_secret_source_suffix = None  # type: ignore
 
     for var in env_var_order:
-        value = (get_env_value(var) if get_env_value else None) or os.getenv(var)
+        value = get_env_value(var) if get_env_value else None
         if not value:
             continue
         suffix = format_secret_source_suffix(var) if format_secret_source_suffix else ""
@@ -9182,6 +9192,8 @@ def _claude_code_only_status() -> Dict[str, Any]:
     try:
         from agent.anthropic_adapter import read_claude_code_credentials
         creds = read_claude_code_credentials()
+    except UnscopedSecretError:
+        raise
     except Exception:
         creds = None
     if creds and creds.get("accessToken"):
@@ -9310,6 +9322,8 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
     if status_fn is not None:
         try:
             return status_fn()
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             return {"logged_in": False, "error": str(e)}
     try:
@@ -9394,6 +9408,8 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": raw.get("expires_at") or raw.get("access_expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
             }
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
     return {"logged_in": False}
@@ -9511,7 +9527,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
     sync with the `hermes model` picker; _OAUTH_OVERRIDES supplies per-provider
     flow/status/cli metadata.
     """
-    with _profile_scope(profile):
+    with _auth_profile_scope(profile):
         providers = []
         for p in _build_oauth_catalog():
             status = _resolve_provider_status(p["id"], p.get("status_fn"))
@@ -9539,7 +9555,7 @@ async def disconnect_oauth_provider(
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
     _require_token(request)
 
-    with _profile_scope(profile):
+    with _auth_profile_scope(profile):
         catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
         provider = catalog_by_id.get(provider_id)
         if provider is None:
@@ -9575,12 +9591,16 @@ async def disconnect_oauth_provider(
                 if oauth_file.exists():
                     oauth_file.unlink()
                     cleared = True
+            except UnscopedSecretError:
+                raise
             except Exception:
                 pass
             # Also clear the credential pool entry if present.
             try:
                 from hermes_cli.auth import clear_provider_auth
                 cleared = clear_provider_auth("anthropic") or cleared
+            except UnscopedSecretError:
+                raise
             except Exception:
                 pass
             _log.info("oauth/disconnect: %s", provider_id)
@@ -9593,6 +9613,8 @@ async def disconnect_oauth_provider(
                 invalidate_nous_auth_status_cache()
             _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
             return {"ok": bool(cleared), "provider": provider_id}
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             _log.exception("disconnect %s failed", provider_id)
             raise HTTPException(status_code=500, detail=str(e))
@@ -9704,11 +9726,24 @@ def _oauth_session_profile(
     session_id: str,
     fallback: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the profile that owns an OAuth session, if one was provided."""
+    """Return the immutable owner bound when the OAuth session was created.
+
+    ``None`` is an unambiguous owner: the dashboard's current/default profile.
+    It must not be treated as missing state and replaced by a submit-time named
+    profile.
+    """
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
-        profile = sess.get("profile") if sess else None
-    return profile or _oauth_profile_name(fallback)
+        if not sess:
+            return _oauth_profile_name(fallback)
+        profile = sess.get("profile")
+    requested = _oauth_profile_name(fallback)
+    if requested is not None and requested != profile:
+        raise HTTPException(
+            status_code=409,
+            detail="OAuth session belongs to a different profile",
+        )
+    return profile
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -9750,6 +9785,8 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
         for e in existing:
             try:
                 pool.remove_entry(getattr(e, "id", ""))
+            except UnscopedSecretError:
+                raise
             except Exception:
                 pass
         entry = PooledCredential(
@@ -9764,6 +9801,8 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
             expires_at_ms=expires_at_ms,
         )
         pool.add_entry(entry)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
 
@@ -9862,8 +9901,10 @@ def _submit_anthropic_pkce(
 
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
     try:
-        with _profile_scope(_oauth_session_profile(session_id, profile)):
+        with _auth_profile_scope(_oauth_session_profile(session_id, profile)):
             _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         with _oauth_sessions_lock:
             sess["status"] = "error"
@@ -9888,13 +9929,13 @@ async def _start_device_code_flow(
     if provider_id == "nous":
         from hermes_cli.auth import (
             _request_device_code,
+            _nous_portal_env_override,
             PROVIDER_REGISTRY,
         )
         import httpx
         pconfig = PROVIDER_REGISTRY["nous"]
         portal_base_url = (
-            os.getenv("HERMES_PORTAL_BASE_URL")
-            or os.getenv("NOUS_PORTAL_BASE_URL")
+            _nous_portal_env_override()
             or pconfig.portal_base_url
         ).rstrip("/")
         client_id = pconfig.client_id
@@ -9915,8 +9956,8 @@ async def _start_device_code_flow(
                     scope,
                 )
 
-        device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
-            None, _do_nous_device_request
+        device_data, effective_scope = await _run_auth_in_executor(
+            _do_nous_device_request
         )
         sid, sess = _new_oauth_session("nous", "device_code", profile=profile)
         sess["device_code"] = str(device_data["device_code"])
@@ -9925,9 +9966,9 @@ async def _start_device_code_flow(
         sess["portal_base_url"] = portal_base_url
         sess["client_id"] = client_id
         sess["scope"] = effective_scope
-        threading.Thread(
-            target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
-        ).start()
+        _start_auth_thread(
+            _nous_poller, sid, name=f"oauth-poll-{sid[:6]}"
+        )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -9945,10 +9986,9 @@ async def _start_device_code_flow(
         # so we run the full helper in a worker and proxy the user_code +
         # verification_url back via the session dict. The helper prints
         # to stdout — we capture nothing here, just status.
-        threading.Thread(
-            target=_codex_full_login_worker, args=(sid,), daemon=True,
-            name=f"oauth-codex-{sid[:6]}",
-        ).start()
+        _start_auth_thread(
+            _codex_full_login_worker, sid, name=f"oauth-codex-{sid[:6]}"
+        )
         # Block briefly until the worker has populated the user_code, OR error.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -9987,8 +10027,11 @@ async def _start_device_code_flow(
         )
         import httpx
         verifier, challenge, state = _minimax_pkce_pair()
+        from hermes_cli.config import get_env_value_prefer_dotenv
+
         portal_base_url = (
-            os.getenv("MINIMAX_PORTAL_BASE_URL") or MINIMAX_OAUTH_GLOBAL_BASE
+            get_env_value_prefer_dotenv("MINIMAX_PORTAL_BASE_URL")
+            or MINIMAX_OAUTH_GLOBAL_BASE
         ).rstrip("/")
         def _do_minimax_request():
             with httpx.Client(
@@ -10003,9 +10046,7 @@ async def _start_device_code_flow(
                     code_challenge=challenge,
                     state=state,
                 )
-        device_data = await asyncio.get_event_loop().run_in_executor(
-            None, _do_minimax_request
-        )
+        device_data = await _run_auth_in_executor(_do_minimax_request)
         sid, sess = _new_oauth_session("minimax-oauth", "device_code", profile=profile)
         # The CLI flow names this `interval_ms` because MiniMax's
         # `interval` field is in milliseconds (defensive default 2000ms
@@ -10033,12 +10074,9 @@ async def _start_device_code_flow(
             expires_at_ts = time.time() + expired_in_raw
             expires_in_seconds = expired_in_raw
         sess["expires_at"] = expires_at_ts
-        threading.Thread(
-            target=_minimax_poller,
-            args=(sid,),
-            daemon=True,
-            name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        _start_auth_thread(
+            _minimax_poller, sid, name=f"oauth-poll-{sid[:6]}"
+        )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10059,19 +10097,14 @@ async def _start_device_code_flow(
             ) as client:
                 return _xai_oauth_request_device_code(client)
 
-        device_data = await asyncio.get_running_loop().run_in_executor(
-            None, _do_xai_device_request
-        )
+        device_data = await _run_auth_in_executor(_do_xai_device_request)
         sid, sess = _new_oauth_session("xai-oauth", "device_code", profile=profile)
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
-        threading.Thread(
-            target=_xai_device_poller,
-            args=(sid,),
-            daemon=True,
-            name=f"oauth-poll-{sid[:6]}",
-        ).start()
+        _start_auth_thread(
+            _xai_device_poller, sid, name=f"oauth-poll-{sid[:6]}"
+        )
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10133,7 +10166,7 @@ def _nous_poller(session_id: str) -> None:
             ),
             "expires_in": token_ttl,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _auth_profile_scope(_oauth_session_profile(session_id)):
             full_state = refresh_nous_oauth_from_state(
                 auth_state,
                 timeout_seconds=15.0,
@@ -10144,6 +10177,8 @@ def _nous_poller(session_id: str) -> None:
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: nous login completed (session=%s)", session_id)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         _log.warning("nous device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10223,11 +10258,13 @@ def _minimax_poller(session_id: str) -> None:
             ).isoformat(),
             "expires_in": expires_in_s,
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _auth_profile_scope(_oauth_session_profile(session_id)):
             _minimax_save_auth_state(auth_state)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: minimax login completed (session=%s)", session_id)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         _log.warning("minimax device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10272,12 +10309,13 @@ def _xai_device_poller(session_id: str) -> None:
             "expires_in": token_data.get("expires_in"),
             "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
         }
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _auth_profile_scope(_oauth_session_profile(session_id)):
             _save_xai_oauth_tokens(
                 tokens,
                 discovery=discovery,
                 last_refresh=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 auth_mode="oauth_device_code",
+                to_active_profile=True,
             )
             # The singleton write above is the single source of truth: the
             # credential-pool load seeds it as the canonical ``device_code``
@@ -10292,6 +10330,8 @@ def _xai_device_poller(session_id: str) -> None:
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: xai login completed (session=%s)", session_id)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         _log.warning("xai device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10449,14 +10489,16 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         from hermes_cli.auth import _save_codex_tokens
 
-        with _profile_scope(_oauth_session_profile(session_id)):
+        with _auth_profile_scope(_oauth_session_profile(session_id)):
             _save_codex_tokens({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
-            })
+            }, to_active_profile=True)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10492,11 +10534,14 @@ async def start_oauth_login(
         # silently launch the Anthropic OAuth flow (the bug fixed in this
         # change for MiniMax). New PKCE providers must add their own
         # start function and an explicit branch here.
-        if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
-            return _start_anthropic_pkce(profile=profile)
-        if catalog_entry["flow"] == "device_code":
-            return await _start_device_code_flow(provider_id, profile=profile)
+        with _auth_profile_scope(profile):
+            if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
+                return _start_anthropic_pkce(profile=profile)
+            if catalog_entry["flow"] == "device_code":
+                return await _start_device_code_flow(provider_id, profile=profile)
     except HTTPException:
+        raise
+    except UnscopedSecretError:
         raise
     except Exception as e:
         _log.exception("oauth/start %s failed", provider_id)
@@ -10519,9 +10564,14 @@ async def submit_oauth_code(
     """Submit the auth code for PKCE flows. Token-protected."""
     _require_token(request)
     if provider_id == "anthropic":
-        return await asyncio.get_running_loop().run_in_executor(
-            None, _submit_anthropic_pkce, body.session_id, body.code, profile,
-        )
+        effective_profile = _oauth_session_profile(body.session_id, profile)
+        with _auth_profile_scope(effective_profile):
+            return await _run_auth_in_executor(
+                _submit_anthropic_pkce,
+                body.session_id,
+                body.code,
+                profile,
+            )
     raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
 
 
@@ -12897,34 +12947,40 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 
 @app.get("/api/credentials/pool")
-async def list_credential_pool():
+async def list_credential_pool(profile: Optional[str] = None):
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
-    providers = []
-    # read_credential_pool(None) lists every provider that has pooled entries;
-    # load_pool() then gives us the rich PooledCredential objects per provider.
-    raw_pool = read_credential_pool()
-    for provider_id in sorted(raw_pool.keys()):
-        try:
-            pool = load_pool(provider_id)
-        except Exception:
-            _log.exception("load_pool(%s) failed", provider_id)
-            continue
-        entries = pool.entries()
-        if not entries:
-            continue
-        providers.append({
-            "provider": provider_id,
-            "entries": [
-                _pool_entry_summary(e, i) for i, e in enumerate(entries, start=1)
-            ],
-        })
-    return {"providers": providers}
+    with _auth_profile_scope(profile):
+        providers = []
+        # read_credential_pool(None) lists every provider that has pooled entries;
+        # load_pool() then gives us the rich PooledCredential objects per provider.
+        raw_pool = read_credential_pool()
+        for provider_id in sorted(raw_pool.keys()):
+            try:
+                pool = load_pool(provider_id)
+            except UnscopedSecretError:
+                raise
+            except Exception:
+                _log.exception("load_pool(%s) failed", provider_id)
+                continue
+            entries = pool.entries()
+            if not entries:
+                continue
+            providers.append({
+                "provider": provider_id,
+                "entries": [
+                    _pool_entry_summary(e, i)
+                    for i, e in enumerate(entries, start=1)
+                ],
+            })
+        return {"providers": providers}
 
 
 @app.post("/api/credentials/pool")
-async def add_credential_pool_entry(body: CredentialPoolAdd):
+async def add_credential_pool_entry(
+    body: CredentialPoolAdd, profile: Optional[str] = None
+):
     import uuid as _uuid
     from agent.credential_pool import (
         load_pool,
@@ -12939,98 +12995,101 @@ async def add_credential_pool_entry(body: CredentialPoolAdd):
     if not provider or not api_key:
         raise HTTPException(status_code=400, detail="provider and api_key are required")
 
-    try:
-        pool = load_pool(provider)
-        label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
-        entry = PooledCredential(
-            provider=provider,
-            id=_uuid.uuid4().hex[:6],
-            label=label,
-            auth_type=AUTH_TYPE_API_KEY,
-            priority=0,
-            source=SOURCE_MANUAL,
-            access_token=api_key,
-        )
-        pool.add_entry(entry)
-        # Re-adding a credential is an explicit re-engagement signal: lift
-        # every suppression for this provider so a source deleted earlier
-        # (via DELETE below or `hermes auth remove`) can seed again.
-        # Mirrors the `hermes auth add` behaviour in auth_commands.py.
-        if not provider.startswith(CUSTOM_POOL_PREFIX):
-            try:
-                from hermes_cli.auth import (
-                    _load_auth_store,
-                    unsuppress_credential_source,
-                )
-                suppressed = _load_auth_store().get("suppressed_sources", {})
-                for src in list(suppressed.get(provider, []) or []):
-                    unsuppress_credential_source(provider, src)
-            except Exception:
-                _log.exception("unsuppress after pool add failed (non-fatal)")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        _log.exception("POST /api/credentials/pool failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return {"ok": True, "provider": provider, "count": len(pool.entries())}
+    with _auth_profile_scope(profile):
+        try:
+            pool = load_pool(provider)
+            label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
+            entry = PooledCredential(
+                provider=provider,
+                id=_uuid.uuid4().hex[:6],
+                label=label,
+                auth_type=AUTH_TYPE_API_KEY,
+                priority=0,
+                source=SOURCE_MANUAL,
+                access_token=api_key,
+            )
+            pool.add_entry(entry)
+            # Re-adding a credential is an explicit re-engagement signal: lift
+            # every suppression for this provider so a source deleted earlier
+            # (via DELETE below or `hermes auth remove`) can seed again.
+            if not provider.startswith(CUSTOM_POOL_PREFIX):
+                try:
+                    from hermes_cli.auth import (
+                        _load_auth_store,
+                        unsuppress_credential_source,
+                    )
+
+                    suppressed = _load_auth_store().get("suppressed_sources", {})
+                    for src in list(suppressed.get(provider, []) or []):
+                        unsuppress_credential_source(provider, src)
+                except UnscopedSecretError:
+                    raise
+                except Exception:
+                    _log.exception("unsuppress after pool add failed (non-fatal)")
+        except UnscopedSecretError:
+            raise
+        except HTTPException:
+            raise
+        except Exception as exc:
+            _log.exception("POST /api/credentials/pool failed")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return {"ok": True, "provider": provider, "count": len(pool.entries())}
 
 
 @app.delete("/api/credentials/pool/{provider}/{index}")
-async def remove_credential_pool_entry(provider: str, index: int):
-    """Remove a pool entry.  ``index`` is 1-based (matches the list response).
-
-    Removal must be sticky (#55217): ``load_pool()`` re-seeds entries from
-    their backing source (.env var, OAuth singleton file, custom-provider
-    config) on every call, so deleting only the pool row silently reverts on
-    the next dashboard refresh.  We dispatch through the same RemovalStep
-    registry the CLI ``hermes auth remove`` uses: each source cleans up its
-    external state and suppresses ``(provider, source)`` so the seeders skip
-    it.  Manual entries have no registered step — nothing external to clean,
-    no suppression needed (they aren't re-seeded).
-    """
+async def remove_credential_pool_entry(
+    provider: str, index: int, profile: Optional[str] = None
+):
+    """Remove one pool entry and suppress any source that could reseed it."""
     from agent.credential_pool import load_pool
     from agent.credential_sources import find_removal_step
     from hermes_cli.auth import suppress_credential_source
 
     provider = (provider or "").strip().lower()
-    try:
-        pool = load_pool(provider)
-        removed = pool.remove_index(index)
-    except Exception as exc:
-        _log.exception("DELETE /api/credentials/pool failed")
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    if removed is None:
-        raise HTTPException(status_code=404, detail="No pool entry at that index")
-
-    cleaned: List[str] = []
-    hints: List[str] = []
-    step = find_removal_step(provider, removed.source or "")
-    if step is not None:
+    with _auth_profile_scope(profile):
         try:
-            result = step.remove_fn(provider, removed)
-            cleaned = list(result.cleaned)
-            hints = list(result.hints)
-            if result.suppress:
-                suppress_credential_source(provider, removed.source)
-        except Exception:
-            # Cleanup is best-effort, but suppression is the actual bug fix —
-            # without it the entry resurrects on the next load_pool().  Apply
-            # it even when source-specific cleanup blew up.
-            _log.exception(
-                "credential source cleanup failed for %s/%s; suppressing anyway",
-                provider, removed.source,
-            )
+            pool = load_pool(provider)
+            removed = pool.remove_index(index)
+        except UnscopedSecretError:
+            raise
+        except Exception as exc:
+            _log.exception("DELETE /api/credentials/pool failed")
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if removed is None:
+            raise HTTPException(status_code=404, detail="No pool entry at that index")
+
+        cleaned: List[str] = []
+        hints: List[str] = []
+        step = find_removal_step(provider, removed.source or "")
+        if step is not None:
             try:
-                suppress_credential_source(provider, removed.source)
+                result = step.remove_fn(provider, removed)
+                cleaned = list(result.cleaned)
+                hints = list(result.hints)
+                if result.suppress:
+                    suppress_credential_source(provider, removed.source)
+            except UnscopedSecretError:
+                raise
             except Exception:
-                _log.exception("suppress_credential_source failed")
-    return {
-        "ok": True,
-        "provider": provider,
-        "count": len(pool.entries()),
-        "cleaned": cleaned,
-        "hints": hints,
-    }
+                # Cleanup is best-effort, but suppression prevents reseeding.
+                _log.exception(
+                    "credential source cleanup failed for %s/%s; suppressing anyway",
+                    provider,
+                    removed.source,
+                )
+                try:
+                    suppress_credential_source(provider, removed.source)
+                except UnscopedSecretError:
+                    raise
+                except Exception:
+                    _log.exception("suppress_credential_source failed")
+        return {
+            "ok": True,
+            "provider": provider,
+            "count": len(pool.entries()),
+            "cleaned": cleaned,
+            "hints": hints,
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -14701,6 +14760,66 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
+
+
+@contextmanager
+def _auth_profile_scope(profile: Optional[str]):
+    """Await-safe profile home + secret scope for auth/status operations."""
+    from agent.secret_scope import (
+        build_profile_secret_scope,
+        is_multiplex_active,
+        reset_secret_scope,
+        set_secret_scope,
+    )
+
+    with _config_profile_scope(profile) as profile_dir:
+        owner_home = profile_dir or get_hermes_home()
+        requested = (profile or "").strip().lower()
+        if not is_multiplex_active() and requested in {"", "current"}:
+            # Preserve the classic dashboard contract: exported credentials
+            # remain valid for its one process-owned profile. Named-profile
+            # requests and multiplex deployments always install an owner scope.
+            yield owner_home
+            return
+        secret_token = set_secret_scope(build_profile_secret_scope(owner_home))
+        try:
+            yield owner_home
+        finally:
+            reset_secret_scope(secret_token)
+
+
+async def _run_auth_in_executor(func, *args):
+    """Run blocking auth work with the current profile ContextVars intact."""
+    context = copy_context()
+    call = functools.partial(func, *args)
+    executor = concurrent.futures.ThreadPoolExecutor(
+        max_workers=1,
+        thread_name_prefix="hermes-auth",
+    )
+    try:
+        return await asyncio.get_running_loop().run_in_executor(
+            executor, context.run, call
+        )
+    finally:
+        # Do not attach auth work to asyncio's process-wide default executor:
+        # its lifecycle is shared with unrelated dashboard tasks. The bounded
+        # provider call has already completed on the normal path; wait=False
+        # also keeps cancellation from blocking the event loop during teardown.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def _start_auth_thread(func, *args, name: str) -> threading.Thread:
+    """Start an OAuth worker carrying the initiating profile's context."""
+    context = copy_context()
+    call = functools.partial(func, *args)
+    thread = threading.Thread(
+        target=context.run,
+        args=(call,),
+        daemon=True,
+        name=name,
+    )
+    thread.start()
+    return thread
 
 
 class SkillToggle(BaseModel):

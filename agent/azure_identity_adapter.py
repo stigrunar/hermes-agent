@@ -33,12 +33,16 @@ from __future__ import annotations
 
 import functools
 import logging
-import os
 import threading
-from dataclasses import dataclass
+from contextvars import copy_context
+from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
+
+
+class AzureCredentialScopeError(RuntimeError):
+    """Azure identity selection would require an ambient SDK chain."""
 
 # Microsoft-documented scope for Foundry inference auth. Both the new
 # Foundry portal and the legacy Azure OpenAI managed-identity docs use
@@ -123,19 +127,16 @@ def reset_credential_cache() -> None:
 class EntraIdentityConfig:
     """Serializable Entra ID config.
 
-    Captures the Hermes-managed Entra knobs we need outside Azure SDK
-    environment configuration. Everything else
-    (tenant ID, service principal secret, federated token file, sovereign
-    cloud authority, etc.) flows through azure-identity's standard
-    ``AZURE_*`` env vars — see the Bedrock pattern in
-    ``hermes_cli/runtime_provider.py:1310-1377`` for the analogous
-    "let the SDK read env" approach.
+    In multiplex mode, ``credential_spec`` captures the active profile's
+    explicit service-principal or workload-identity settings so the SDK never
+    reads another owner's ambient/default chain. Single-profile mode keeps the
+    legacy SDK chain.
 
     ``scope`` is Microsoft's documented Foundry inference audience. Almost
     everyone uses the default; sovereign-cloud / non-standard tenants can
-    override via ``model.entra.scope``. Identity selection (user-assigned
-    managed identity, workload identity, service principal, tenant, authority)
-    stays in the standard Azure SDK env vars such as ``AZURE_CLIENT_ID``.
+    override via ``model.entra.scope``. Identity selection is still configured
+    with standard ``AZURE_*`` names; :meth:`from_active_scope` resolves them
+    through the profile scope.
 
     ``exclude_interactive_browser`` is kept as an internal constructor knob
     so probes stay non-interactive by default. It is not written by the setup
@@ -148,6 +149,9 @@ class EntraIdentityConfig:
 
     scope: str = SCOPE_AI_AZURE_DEFAULT
     exclude_interactive_browser: bool = True
+    credential_spec: tuple[str, str, str, str, str] = field(
+        default=(), repr=False
+    )
 
     def __post_init__(self) -> None:
         scope = str(self.scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
@@ -158,6 +162,46 @@ class EntraIdentityConfig:
             "scope": self.scope,
             "exclude_interactive_browser": self.exclude_interactive_browser,
         }
+
+    @classmethod
+    def from_active_scope(
+        cls,
+        *,
+        scope: str = SCOPE_AI_AZURE_DEFAULT,
+        exclude_interactive_browser: bool = True,
+    ) -> "EntraIdentityConfig":
+        """Bind an explicit profile identity when multiplexing is active."""
+        from agent.secret_scope import get_secret, is_multiplex_active
+
+        if not is_multiplex_active():
+            return cls(
+                scope=scope,
+                exclude_interactive_browser=exclude_interactive_browser,
+            )
+
+        tenant_id = (get_secret("AZURE_TENANT_ID", "") or "").strip()
+        client_id = (get_secret("AZURE_CLIENT_ID", "") or "").strip()
+        client_secret = (get_secret("AZURE_CLIENT_SECRET", "") or "").strip()
+        token_file = (get_secret("AZURE_FEDERATED_TOKEN_FILE", "") or "").strip()
+        authority = (get_secret("AZURE_AUTHORITY_HOST", "") or "").strip()
+        if not (tenant_id and client_id and (client_secret or token_file)):
+            raise AzureCredentialScopeError(
+                "Azure Entra ID in multiplex mode requires profile-owned "
+                "AZURE_TENANT_ID + AZURE_CLIENT_ID and either "
+                "AZURE_CLIENT_SECRET or AZURE_FEDERATED_TOKEN_FILE; the "
+                "DefaultAzureCredential ambient chain is disabled"
+            )
+        return cls(
+            scope=scope,
+            exclude_interactive_browser=exclude_interactive_browser,
+            credential_spec=(
+                tenant_id,
+                client_id,
+                client_secret,
+                token_file,
+                authority,
+            ),
+        )
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]],
@@ -172,16 +216,40 @@ class EntraIdentityConfig:
 
 
 def _build_default_credential(config: EntraIdentityConfig) -> Any:
-    """Construct a ``DefaultAzureCredential`` for ``config``.
-
-    Only Hermes-selected knobs are passed as kwargs. Everything else
-    (tenant, service principal secret, federated token file, sovereign
-    cloud authority, etc.) is read by ``azure-identity`` from the
-    standard ``AZURE_*`` environment variables — see Microsoft's
-    documented credential resolution chain. Users configure those in
-    ``~/.hermes/.env`` or the deployment environment.
-    """
+    """Construct the explicit profile credential, or the legacy default."""
     ai = _require_azure_identity()
+    if config.credential_spec:
+        tenant_id, client_id, client_secret, token_file, authority = (
+            config.credential_spec
+        )
+    else:
+        tenant_id = client_id = client_secret = token_file = authority = ""
+    if client_secret:
+        kwargs: Dict[str, Any] = {}
+        if authority:
+            kwargs["authority"] = authority
+        return ai.ClientSecretCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            client_secret=client_secret,
+            **kwargs,
+        )
+    if token_file:
+        kwargs = {}
+        if authority:
+            kwargs["authority"] = authority
+        return ai.WorkloadIdentityCredential(
+            tenant_id=tenant_id,
+            client_id=client_id,
+            token_file_path=token_file,
+            **kwargs,
+        )
+    from agent.secret_scope import is_multiplex_active
+
+    if is_multiplex_active():
+        raise AzureCredentialScopeError(
+            "DefaultAzureCredential is disabled in multiplex mode"
+        )
     kwargs: Dict[str, Any] = {}
     # SDK default is True (browser excluded); only pass when the user
     # explicitly opts in to interactive browser auth.
@@ -190,26 +258,42 @@ def _build_default_credential(config: EntraIdentityConfig) -> Any:
     return ai.DefaultAzureCredential(**kwargs)
 
 
-@functools.lru_cache(maxsize=1)
+@functools.lru_cache(maxsize=8)
+def _build_cached_credential(
+    config: EntraIdentityConfig,
+    multiplexed: bool,
+) -> Any:
+    # ``multiplexed`` is intentionally part of the cache key. Without it, a
+    # legacy DefaultAzureCredential created before multiplex activation could
+    # be returned without re-entering the fail-closed constructor.
+    return _build_default_credential(config)
+
+
 def build_credential(config: EntraIdentityConfig) -> Any:
     """Return the cached ``DefaultAzureCredential`` for ``config``.
 
-    Hermes processes use exactly one Entra config at a time (the
-    ``model.entra.*`` block in config.yaml drives every aux task,
-    subagent, and credential probe in the session). ``maxsize=1`` is
-    intentional: it reflects the actual usage pattern and keeps the
-    cache trivially small.
+    The bounded cache retains separate entries for concurrently active profile
+    identities. ``credential_spec`` is immutable and excluded from repr so the
+    cache key is owner-safe without making credential material loggable.
 
     ``EntraIdentityConfig`` is a frozen dataclass, so it's hashable and
     safe as an LRU-cache key. ``functools.lru_cache`` is thread-safe in
     CPython.
 
-    If two distinct configs are ever passed (tests do this; production
-    rarely), the LRU eviction handles it correctly — each call still
-    returns a credential matching its config; only one is cached at a
-    time. Use :func:`reset_credential_cache` to clear (e.g. in tests).
+    Use :func:`reset_credential_cache` to clear it (e.g. in tests).
     """
-    return _build_default_credential(config)
+    from agent.secret_scope import is_multiplex_active
+
+    multiplexed = is_multiplex_active()
+    if multiplexed and not config.credential_spec:
+        raise AzureCredentialScopeError(
+            "DefaultAzureCredential is disabled in multiplex mode"
+        )
+    return _build_cached_credential(config, multiplexed)
+
+
+# Keep the existing test/reset hook on the public constructor.
+build_credential.cache_clear = _build_cached_credential.cache_clear  # type: ignore[attr-defined]
 
 
 def build_token_provider(scope: Optional[str] = None,
@@ -245,7 +329,7 @@ def build_token_provider(scope: Optional[str] = None,
     """
     ai = _require_azure_identity()
     if config is None:
-        config = EntraIdentityConfig(
+        config = EntraIdentityConfig.from_active_scope(
             scope=scope or SCOPE_AI_AZURE_DEFAULT,
             exclude_interactive_browser=exclude_interactive_browser,
         )
@@ -290,7 +374,20 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
             return False
     if config is None:
         effective_scope = (scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
-        config = EntraIdentityConfig(scope=effective_scope, **overrides)
+        exclude_browser = bool(overrides.pop("exclude_interactive_browser", True))
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            config = EntraIdentityConfig.from_active_scope(
+                scope=effective_scope,
+                exclude_interactive_browser=exclude_browser,
+            )
+        else:
+            config = EntraIdentityConfig(
+                scope=effective_scope,
+                exclude_interactive_browser=exclude_browser,
+                **overrides,
+            )
 
     result = {"ok": False}
 
@@ -302,13 +399,20 @@ def has_azure_identity_credentials(scope: Optional[str] = None,
         except Exception as exc:
             logger.debug("Entra credential probe failed: %s", exc)
             result["ok"] = False
+            result["error"] = exc
 
-    thread = threading.Thread(target=_probe, daemon=True)
+    context = copy_context()
+    thread = threading.Thread(target=context.run, args=(_probe,), daemon=True)
     thread.start()
     thread.join(timeout=max(0.01, timeout_seconds))
     if thread.is_alive():
         logger.debug("Entra token service probe timed out after %ss", timeout_seconds)
         return False
+    error = result.get("error")
+    from agent.secret_scope import UnscopedSecretError
+
+    if isinstance(error, UnscopedSecretError):
+        raise error
     return bool(result.get("ok"))
 
 
@@ -358,23 +462,60 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
 
     if config is None:
         effective_scope = (scope or "").strip() or SCOPE_AI_AZURE_DEFAULT
-        config = EntraIdentityConfig(scope=effective_scope, **overrides)
+        exclude_browser = bool(overrides.pop("exclude_interactive_browser", True))
+        from agent.secret_scope import is_multiplex_active
+
+        if is_multiplex_active():
+            config = EntraIdentityConfig.from_active_scope(
+                scope=effective_scope,
+                exclude_interactive_browser=exclude_browser,
+            )
+        else:
+            config = EntraIdentityConfig(
+                scope=effective_scope,
+                exclude_interactive_browser=exclude_browser,
+                **overrides,
+            )
 
     info["scope"] = config.scope
-    # Tenant / authority / service-principal config flow through the
-    # standard ``AZURE_*`` env vars; surface them below.
-    if os.environ.get("AZURE_TENANT_ID", "").strip():
-        info["tenant_id_env"] = os.environ["AZURE_TENANT_ID"].strip()
+    from agent.secret_scope import get_secret, is_multiplex_active
+
+    multiplexed = is_multiplex_active()
+
+    def _identity_value(name: str, configured: str = "") -> str:
+        if configured:
+            return configured.strip()
+        if multiplexed:
+            # A multiplexed diagnostic is allowed to inspect only the active
+            # owner's secret mapping. ``get_secret`` also supplies the
+            # fail-closed unscoped boundary.
+            return (get_secret(name, "") or "").strip()
+        # Single-profile compatibility: the SDK's legacy ambient chain is
+        # still deliberate, and get_secret preserves that behavior.
+        return (get_secret(name, "") or "").strip()
+
+    if config.credential_spec:
+        tenant_cfg, client_cfg, secret_cfg, token_cfg, _authority_owner = (
+            config.credential_spec
+        )
+    else:
+        tenant_cfg = client_cfg = secret_cfg = token_cfg = ""
+    tenant_id = _identity_value("AZURE_TENANT_ID", tenant_cfg)
+    client_id = _identity_value("AZURE_CLIENT_ID", client_cfg)
+    client_secret = _identity_value("AZURE_CLIENT_SECRET", secret_cfg)
+    token_file = _identity_value("AZURE_FEDERATED_TOKEN_FILE", token_cfg)
+    if tenant_id:
+        info["tenant_id_env"] = tenant_id
 
     # Surface which env-var sources are present without minting yet.
     env_sources = []
-    if os.environ.get("AZURE_FEDERATED_TOKEN_FILE", "").strip():
+    if token_file:
         env_sources.append("WorkloadIdentityCredential (AZURE_FEDERATED_TOKEN_FILE)")
-    if (os.environ.get("AZURE_CLIENT_ID", "").strip()
-            and os.environ.get("AZURE_CLIENT_SECRET", "").strip()
-            and os.environ.get("AZURE_TENANT_ID", "").strip()):
+    if client_id and client_secret and tenant_id:
         env_sources.append("EnvironmentCredential (client secret)")
-    if os.environ.get("IDENTITY_ENDPOINT", "").strip() or os.environ.get("MSI_ENDPOINT", "").strip():
+    if not multiplexed and (
+        _identity_value("IDENTITY_ENDPOINT") or _identity_value("MSI_ENDPOINT")
+    ):
         env_sources.append("ManagedIdentityCredential (IDENTITY_ENDPOINT)")
     info["env_sources"] = env_sources
 
@@ -387,9 +528,10 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
             tok = credential.get_token(config.scope)
             result["token"] = tok
         except Exception as exc:
-            result["error"] = str(exc)
+            result["error"] = exc
 
-    thread = threading.Thread(target=_probe, daemon=True)
+    context = copy_context()
+    thread = threading.Thread(target=context.run, args=(_probe,), daemon=True)
     thread.start()
     thread.join(timeout=max(0.01, timeout_seconds))
     if thread.is_alive():
@@ -401,8 +543,13 @@ def describe_active_credential(config: Optional[EntraIdentityConfig] = None,
         )
         return info
 
-    if "error" in result:
-        info["error"] = result["error"]
+    error = result.get("error")
+    from agent.secret_scope import UnscopedSecretError
+
+    if isinstance(error, UnscopedSecretError):
+        raise error
+    if error is not None:
+        info["error"] = str(error)
         return info
 
     token = result.get("token")

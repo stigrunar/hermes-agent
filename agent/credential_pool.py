@@ -18,8 +18,10 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
 from agent.secret_scope import (
+    UnscopedSecretError,
     current_secret_scope as _current_secret_scope,
     get_secret as _get_secret,
+    is_multiplex_active as _is_multiplex_active,
 )
 from agent.credential_persistence import (
     is_borrowed_credential_source,
@@ -59,6 +61,8 @@ def _load_config_safe() -> Optional[dict]:
         from hermes_cli.config import load_config_readonly
 
         return load_config_readonly()
+    except UnscopedSecretError:
+        raise
     except Exception:
         return None
 
@@ -721,6 +725,8 @@ class CredentialPool:
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Failed to sync from credentials file: %s", redact_for_persistence(str(exc)))
         return entry
@@ -1051,6 +1057,8 @@ class CredentialPool:
                     source_path,
                     set_active=False,
                 )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug(
                 "Failed to sync %s pool entry back to auth store: %s",
@@ -1224,6 +1232,8 @@ class CredentialPool:
                 updated = self._sync_nous_entry_from_auth_store(entry)
             else:
                 return entry
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug(
                 "Credential refresh failed for %s/%s: %s",
@@ -1268,6 +1278,8 @@ class CredentialPool:
                                 redact_for_persistence(str(wexc)),
                             )
                         return updated
+                    except UnscopedSecretError:
+                        raise
                     except Exception as retry_exc:
                         logger.debug(
                             "Retry refresh also failed: %s",
@@ -2059,9 +2071,15 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # that masquerade.  Prefer ~/.hermes/.env over os.environ for the
         # same reason `_seed_from_env` does — that's the authoritative file
         # that `hermes setup` writes.
-        _env_file = load_env()
+        _env_file = (
+            {}
+            if _current_secret_scope() is not None or _is_multiplex_active()
+            else load_env()
+        )
 
         def _env_val(key: str) -> str:
+            if _current_secret_scope() is not None or _is_multiplex_active():
+                return (_get_secret(key, "") or "").strip()
             return (_env_file.get(key) or _get_secret(key, "") or "").strip()
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
@@ -2200,6 +2218,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             "label": source,
                         },
                     )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Copilot token seed failed: %s", redact_for_persistence(str(exc)))
 
@@ -2230,6 +2250,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             "label": creds.get("auth_file", source_name),
                         },
                     )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Qwen OAuth token seed failed: %s", redact_for_persistence(str(exc)))
 
@@ -2272,6 +2294,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             ),
                         },
                     )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("MiniMax OAuth token seed failed: %s", redact_for_persistence(str(exc)))
 
@@ -2357,8 +2381,8 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # An installed profile scope is authoritative. It already contains
         # .env plus any external source overrides resolved for this profile.
         scope = _current_secret_scope()
-        if scope is not None:
-            return str(scope.get(key, "") or "").strip()
+        if scope is not None or _is_multiplex_active():
+            return str(_get_secret(key, "") or "").strip()
 
         env_file = load_env()
         raw = env_file.get(key, "").strip()

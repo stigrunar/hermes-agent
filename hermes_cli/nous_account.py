@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
 
+from agent.secret_scope import UnscopedSecretError
+
 
 NousAccountInfoSource = Literal["jwt", "account_api", "inference_key", "none", "error"]
 
@@ -335,6 +337,8 @@ def get_nous_portal_account_info(
         from hermes_cli.auth import get_provider_auth_state
 
         state = get_provider_auth_state("nous") or {}
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         return _error_info(error=exc, logged_in=False)
 
@@ -420,6 +424,8 @@ def _fresh_account_info(
         with _ACCOUNT_INFO_CACHE_LOCK:
             _account_info_cache = (cache_key, time.monotonic(), info)
         return info
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         return _error_info(
             error=exc,
@@ -457,6 +463,8 @@ def _info_from_inference_key_pool(
             credential_source=f"pool:{getattr(entry, 'label', 'unknown')}",
             error="portal_oauth_missing",
         )
+    except UnscopedSecretError:
+        raise
     except Exception:
         return None
 
@@ -469,6 +477,8 @@ def _info_from_oauth_pool(
 ) -> Optional[NousPortalAccountInfo]:
     try:
         entry = _select_nous_pool_entry()
+    except UnscopedSecretError:
+        raise
     except Exception:
         return None
     if entry is None or not _pool_entry_is_portal_oauth(entry):

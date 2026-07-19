@@ -916,6 +916,7 @@ def _relative_time(ts) -> str:
 
 def _has_any_provider_configured() -> bool:
     """Check if at least one inference provider is usable."""
+    from agent.secret_scope import UnscopedSecretError, get_secret
     from hermes_cli.config import get_env_path, get_hermes_home, load_config
     from hermes_cli.auth import get_auth_status
 
@@ -952,7 +953,7 @@ def _has_any_provider_configured() -> bool:
     for pconfig in PROVIDER_REGISTRY.values():
         if pconfig.auth_type == "api_key":
             provider_env_vars.update(pconfig.api_key_env_vars)
-    if any(os.getenv(v) for v in provider_env_vars):
+    if any(get_secret(v) for v in provider_env_vars):
         return True
 
     # Check .env file for keys
@@ -980,6 +981,8 @@ def _has_any_provider_configured() -> bool:
             status = get_auth_status(provider_id)
             if status.get("logged_in"):
                 return True
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -995,6 +998,8 @@ def _has_any_provider_configured() -> bool:
                 status = get_auth_status(active)
                 if status.get("logged_in"):
                     return True
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
 
@@ -2982,7 +2987,9 @@ def select_provider_and_model(args=None):
         config_provider = model_cfg.get("provider")
 
     effective_provider = (
-        config_provider or os.getenv("HERMES_INFERENCE_PROVIDER") or "auto"
+        config_provider
+        or get_env_value("HERMES_INFERENCE_PROVIDER")
+        or "auto"
     )
     compatible_custom_providers = get_compatible_custom_providers(config)
     def _named_custom_provider_map(cfg) -> dict[str, dict[str, str]]:

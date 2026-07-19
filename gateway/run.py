@@ -1456,6 +1456,8 @@ def _reload_runtime_env_preserving_config_authority() -> None:
 
 def _bridge_max_turns_from_config(home: "Path") -> None:
     """Bridge config.yaml agent.max_turns into HERMES_MAX_ITERATIONS (a global)."""
+    from agent.secret_scope import UnscopedSecretError
+
     config_path = home / 'config.yaml'
     if not config_path.exists():
         return
@@ -1474,6 +1476,8 @@ def _bridge_max_turns_from_config(home: "Path") -> None:
             cfg = managed_scope.apply_managed_overlay(cfg)
         except Exception:
             pass
+    except UnscopedSecretError:
+        raise
     except Exception:
         return
 
@@ -1572,6 +1576,8 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     Single-profile gateways never set ``multiplex_profiles``, so they keep the
     unscoped load and are unaffected.
     """
+    from agent.secret_scope import UnscopedSecretError
+
     cfg = load_gateway_config()
     if not getattr(cfg, "multiplex_profiles", False):
         return cfg
@@ -1582,6 +1588,8 @@ def load_gateway_config_for_runner() -> "GatewayConfig":
     try:
         with _profile_runtime_scope(Path(home)):
             return load_gateway_config()
+    except UnscopedSecretError:
+        raise
     except Exception:
         logger.debug(
             "multiplex default-scope config reload failed; using unscoped load",
@@ -1676,7 +1684,22 @@ if _config_path.exists():
                 "sandbox_dir": "TERMINAL_SANDBOX_DIR",
                 "persistent_shell": "TERMINAL_PERSISTENT_SHELL",
             }
+            _multiplex_terminal_credentials = bool(
+                isinstance(_cfg.get("gateway"), dict)
+                and _cfg["gateway"].get("multiplex_profiles")
+            )
+            _profile_owned_terminal_env = {
+                "TERMINAL_SSH_HOST",
+                "TERMINAL_SSH_USER",
+                "TERMINAL_SSH_PORT",
+                "TERMINAL_SSH_KEY",
+            }
             for _cfg_key, _env_var in _terminal_env_map.items():
+                if (
+                    _multiplex_terminal_credentials
+                    and _env_var in _profile_owned_terminal_env
+                ):
+                    continue
                 if _cfg_key in _terminal_cfg:
                     _val = _terminal_cfg[_cfg_key]
                     # Skip cwd placeholder values (".", "auto", "cwd") — the
@@ -1968,6 +1991,26 @@ _OWN_POLICY_OPEN_ENV = {
 }
 
 
+def _gateway_auth_env(name: Optional[str], default: str = "") -> str:
+    """Read a profile-owned gateway authorization value."""
+    if not name:
+        return default
+    from agent.secret_scope import get_secret
+
+    value = get_secret(name, default)
+    return str(value).strip() if value is not None else default
+
+
+@_contextmanager
+def _gateway_startup_auth_scope(config):
+    """Install the default profile owner while multiplex startup reads auth."""
+    if getattr(config, "multiplex_profiles", False):
+        with _profile_runtime_scope(_hermes_home):
+            yield
+        return
+    yield
+
+
 def _own_policy_open_startup_violation(config) -> Optional[str]:
     """Return a startup-abort reason when open policy lacks allow-all opt-in."""
     for platform, platform_config in getattr(config, "platforms", {}).items():
@@ -1980,20 +2023,20 @@ def _own_policy_open_startup_violation(config) -> Optional[str]:
         extra = getattr(platform_config, "extra", None) or {}
         dm_policy = str(
             extra.get("dm_policy")
-            or (os.getenv(dm_env, "pairing") if dm_env else "pairing")
+            or _gateway_auth_env(dm_env, "pairing")
         ).strip().lower()
         group_policy = str(
             extra.get("group_policy")
-            or (os.getenv(group_env, "pairing") if group_env else "pairing")
+            or _gateway_auth_env(group_env, "pairing")
         ).strip().lower()
         if dm_policy != "open" and group_policy != "open":
             continue
-        gateway_allow_all = os.getenv(
-            "GATEWAY_ALLOW_ALL_USERS", ""
+        gateway_allow_all = _gateway_auth_env(
+            "GATEWAY_ALLOW_ALL_USERS"
         ).lower() in {"true", "1", "yes"}
         platform_opted_in = gateway_allow_all or (
             allow_all_env
-            and os.getenv(allow_all_env, "").lower() in {"true", "1", "yes"}
+            and _gateway_auth_env(allow_all_env).lower() in {"true", "1", "yes"}
         )
         if platform_opted_in:
             continue
@@ -2064,6 +2107,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         _get_model_config,
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from agent.secret_scope import UnscopedSecretError
 
     try:
         runtime = resolve_runtime_provider()
@@ -2080,6 +2124,8 @@ def _resolve_runtime_agent_kwargs() -> dict:
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
@@ -2121,8 +2167,12 @@ def _resolve_runtime_agent_kwargs_for_provider(provider: str) -> dict:
         resolve_runtime_provider,
         format_runtime_provider_error,
     )
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         runtime = resolve_runtime_provider(requested=provider)
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
     return {
@@ -2140,10 +2190,14 @@ def _credential_pool_for_provider(provider: Optional[str]):
     """Return the live credential pool for a provider id (e.g. ``custom:hyper``)."""
     if not provider or not str(provider).strip():
         return None
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         return _resolve_runtime_agent_kwargs_for_provider(str(provider).strip()).get(
             "credential_pool"
         )
+    except UnscopedSecretError:
+        raise
     except Exception:
         logger.debug(
             "Failed to resolve credential pool for provider=%s",
@@ -2155,6 +2209,7 @@ def _credential_pool_for_provider(provider: Optional[str]):
 
 def _try_resolve_fallback_provider() -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
+    from agent.secret_scope import UnscopedSecretError
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
         import yaml as _y
@@ -2194,9 +2249,13 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
                 }
+            except UnscopedSecretError:
+                raise
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
                 continue
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
     return None
@@ -7443,13 +7502,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
-        _any_allowlist = any(
-            os.getenv(v) for v in _builtin_allowed_vars + _plugin_allowed_vars
-        )
-        _allow_all = os.getenv("GATEWAY_ALLOW_ALL_USERS", "").lower() in {"true", "1", "yes"} or any(
-            os.getenv(v, "").lower() in {"true", "1", "yes"}
-            for v in _builtin_allow_all_vars + _plugin_allow_all_vars
-        )
+        with _gateway_startup_auth_scope(self.config):
+            _any_allowlist = any(
+                _gateway_auth_env(v)
+                for v in _builtin_allowed_vars + _plugin_allowed_vars
+            )
+            _allow_all = _gateway_auth_env(
+                "GATEWAY_ALLOW_ALL_USERS"
+            ).lower() in {"true", "1", "yes"} or any(
+                _gateway_auth_env(v).lower() in {"true", "1", "yes"}
+                for v in _builtin_allow_all_vars + _plugin_allow_all_vars
+            )
+            reason = _own_policy_open_startup_violation(self.config)
         if not _any_allowlist and not _allow_all:
             logger.warning(
                 "No env user allowlists configured. Messaging platforms default to "
@@ -7459,7 +7523,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "dm_policy/group_policy: open on the platform."
             )
 
-        reason = _own_policy_open_startup_violation(self.config)
         if reason:
             platform_value = reason.split(":", 1)[0]
             allow_all_env = None
@@ -10862,7 +10925,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_whoami_command(event)
 
         if canonical == "status":
-            return await self._handle_status_command(event)
+            return await self._run_profile_scoped_slash_command(
+                event, self._handle_status_command
+            )
 
         if canonical == "agents":
             return await self._handle_agents_command(event)
@@ -10926,10 +10991,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_yolo_command(event)
 
         if canonical == "model":
-            return await self._handle_model_command(event)
+            return await self._run_profile_scoped_slash_command(
+                event, self._handle_model_command
+            )
 
         if canonical == "codex-runtime":
-            return await self._handle_codex_runtime_command(event)
+            return await self._run_profile_scoped_slash_command(
+                event, self._handle_codex_runtime_command
+            )
 
         if canonical == "personality":
             return await self._handle_personality_command(event)
@@ -11001,10 +11070,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return await self._handle_compress_command(event)
 
         if canonical == "usage":
-            return await self._handle_usage_command(event)
+            return await self._run_profile_scoped_slash_command(
+                event, self._handle_usage_command
+            )
 
         if canonical == "topup":
-            return await self._handle_topup_command(event)
+            return await self._run_profile_scoped_slash_command(
+                event, self._handle_topup_command
+            )
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
@@ -12758,15 +12831,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             env_key = _home_target_env_var(platform_name)
             # Multiplex: home channel may live only in the profile secret
             # scope / PlatformConfig, not process os.environ.
-            home_env = ""
-            try:
-                from agent.secret_scope import get_secret
+            from agent.secret_scope import get_secret
 
-                home_env = (get_secret(env_key) or "").strip() if env_key else ""
-            except Exception:
-                home_env = ""
-            if not home_env:
-                home_env = (os.getenv(env_key) or "").strip() if env_key else ""
+            home_env = (get_secret(env_key) or "").strip() if env_key else ""
             # Also honor in-memory / yaml home_channel on this platform.
             try:
                 if not home_env and self.config.get_home_channel(source.platform):

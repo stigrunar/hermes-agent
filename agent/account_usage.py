@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Optional
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Optional
 import httpx
 
 from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
+from agent.secret_scope import UnscopedSecretError
 from hermes_cli.auth import AuthError, _read_codex_tokens, resolve_codex_runtime_credentials
 from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -260,6 +262,8 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
         tok = (get_provider_auth_state("nous") or {}).get("access_token")
         if not (isinstance(tok, str) and tok.strip()):
             return []
+    except UnscopedSecretError:
+        raise
     except Exception:
         return []
     try:
@@ -268,11 +272,14 @@ def nous_credits_lines(*, markdown: bool = False, timeout: float = 10.0) -> list
         from hermes_cli.nous_account import get_nous_portal_account_info
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            context = copy_context()
             account = pool.submit(
-                get_nous_portal_account_info, force_fresh=True
+                context.run, get_nous_portal_account_info, force_fresh=True
             ).result(timeout=timeout)
         snapshot = build_nous_credits_snapshot(account)
         return render_account_usage_lines(snapshot, markdown=markdown)
+    except UnscopedSecretError:
+        raise
     except Exception:
         # Fail-open (caller shows nothing), but leave a breadcrumb so a dead
         # /usage credits block is diagnosable in agent.log without a dev flag.
@@ -370,6 +377,8 @@ def build_credits_view(*, markdown: bool = False, timeout: float = 10.0) -> Cred
         tok = (get_provider_auth_state("nous") or {}).get("access_token")
         if not (isinstance(tok, str) and tok.strip()):
             return not_logged_in
+    except UnscopedSecretError:
+        raise
     except Exception:
         return not_logged_in
 
@@ -382,9 +391,12 @@ def build_credits_view(*, markdown: bool = False, timeout: float = 10.0) -> Cred
         )
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            account = pool.submit(get_nous_portal_account_info, force_fresh=True).result(
-                timeout=timeout
-            )
+            context = copy_context()
+            account = pool.submit(
+                context.run, get_nous_portal_account_info, force_fresh=True
+            ).result(timeout=timeout)
+    except UnscopedSecretError:
+        raise
     except Exception:
         logger.debug("credits ▸ /topup portal fetch failed (fail-open)", exc_info=True)
         return not_logged_in
@@ -613,6 +625,8 @@ def redeem_codex_reset_credit(
 
     try:
         token, resolved_base_url, account_id = _resolve_codex_usage_credentials(base_url, api_key)
+    except UnscopedSecretError:
+        raise
     except Exception:
         return CodexResetRedeemResult(
             status="unavailable",
@@ -885,6 +899,8 @@ def fetch_account_usage(
             return _fetch_anthropic_account_usage()
         if normalized == "openrouter":
             return _fetch_openrouter_account_usage(base_url, api_key)
+    except UnscopedSecretError:
+        raise
     except Exception:
         return None
     return None

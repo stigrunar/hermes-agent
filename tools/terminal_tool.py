@@ -45,6 +45,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+from agent.secret_scope import get_secret
 from utils import env_var_enabled
 
 logger = logging.getLogger(__name__)
@@ -366,7 +367,7 @@ def _invalidate_cached_sudo_on_auth_failure(
     Env-configured ``SUDO_PASSWORD`` is left alone — that is an explicit
     operator choice, not an interactive cache entry.
     """
-    if "SUDO_PASSWORD" in os.environ:
+    if get_secret("SUDO_PASSWORD") is not None:
         return False
     if not _sudo_wrong_password_failure(output):
         return False
@@ -909,12 +910,9 @@ def _transform_sudo_command(command: str | None) -> tuple[str | None, str | None
     if sudo_count == 0:
         return command, None
 
-    has_configured_password = "SUDO_PASSWORD" in os.environ
-    sudo_password = (
-        os.environ.get("SUDO_PASSWORD", "")
-        if has_configured_password
-        else _get_cached_sudo_password()
-    )
+    configured_password = get_secret("SUDO_PASSWORD")
+    has_configured_password = configured_password is not None
+    sudo_password = configured_password if has_configured_password else _get_cached_sudo_password()
 
     # Local hosts with sudoers NOPASSWD should not be forced through the
     # interactive Hermes password prompt or the sudo -S password-pipe path.
@@ -1245,6 +1243,23 @@ def _parse_env_var(name: str, default: str, converter: Any = int, type_label: st
         )
 
 
+def _parse_profile_env_var(
+    name: str,
+    default: str,
+    converter: Any = int,
+    type_label: str = "integer",
+):
+    """Parse a profile-owned terminal credential/endpoint member."""
+    raw = get_secret(name, default)
+    try:
+        return converter(raw)
+    except (ValueError, json.JSONDecodeError):
+        raise ValueError(
+            f"Invalid value for {name}: {raw!r} (expected {type_label}). "
+            "Check the active profile's terminal configuration."
+        )
+
+
 def _safe_getcwd() -> str:
     """Return the current working directory, tolerating a deleted CWD.
 
@@ -1430,10 +1445,10 @@ def _get_env_config() -> Dict[str, Any]:
         "timeout": _parse_env_var("TERMINAL_TIMEOUT", "180"),
         "lifetime_seconds": _parse_env_var("TERMINAL_LIFETIME_SECONDS", "300"),
         # SSH-specific config
-        "ssh_host": os.getenv("TERMINAL_SSH_HOST", ""),
-        "ssh_user": os.getenv("TERMINAL_SSH_USER", ""),
-        "ssh_port": _parse_env_var("TERMINAL_SSH_PORT", "22"),
-        "ssh_key": os.getenv("TERMINAL_SSH_KEY", ""),
+        "ssh_host": get_secret("TERMINAL_SSH_HOST", "") or "",
+        "ssh_user": get_secret("TERMINAL_SSH_USER", "") or "",
+        "ssh_port": _parse_profile_env_var("TERMINAL_SSH_PORT", "22"),
+        "ssh_key": get_secret("TERMINAL_SSH_KEY", "") or "",
         # Persistent shell: SSH defaults to the config-level persistent_shell
         # setting (true by default for non-local backends); local is always opt-in.
         # Per-backend env vars override if explicitly set.

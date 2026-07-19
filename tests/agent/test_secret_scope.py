@@ -71,6 +71,43 @@ class TestMultiplexActiveFailClosed:
         ss.set_multiplex_active(True)
         assert ss.get_secret("HERMES_KANBAN_DB") == "/x/kanban.db"
 
+    def test_unknown_legacy_prefix_name_is_not_implicitly_global(self, monkeypatch):
+        monkeypatch.setenv(
+            "HERMES_TELEGRAM_FUTURE_TOKEN", "synthetic-hostile-future-token"
+        )
+        ss.set_multiplex_active(True)
+
+        with pytest.raises(ss.UnscopedSecretError):
+            ss.get_secret("HERMES_TELEGRAM_FUTURE_TOKEN")
+
+    @pytest.mark.parametrize(
+        ("name", "value"),
+        (
+            ("HTTPS_PROXY", "https://synthetic-proxy.invalid:8443"),
+            ("NO_PROXY", "synthetic-internal.invalid"),
+            ("HERMES_CA_BUNDLE", "/synthetic/ca-bundle.pem"),
+            ("REQUESTS_CA_BUNDLE", "/synthetic/requests-ca.pem"),
+            ("CURL_CA_BUNDLE", "/synthetic/curl-ca.pem"),
+            ("HERMES_PORTAL_BASE_URL", "https://synthetic-deployment-portal.invalid"),
+        ),
+    )
+    def test_explicit_deployment_globals_remain_available(
+        self, monkeypatch, name, value
+    ):
+        monkeypatch.setenv(name, value)
+        ss.set_multiplex_active(True)
+
+        assert ss.get_deployment_env(name) == value
+        assert ss.get_secret(name) == value
+
+    def test_deployment_accessor_rejects_profile_values(self, monkeypatch):
+        monkeypatch.setenv(
+            "OPENAI_API_KEY", "synthetic-hostile-global-accessor-key"
+        )
+
+        with pytest.raises(ValueError, match="profile-scoped"):
+            ss.get_deployment_env("OPENAI_API_KEY")
+
 
 class TestScopeIsolation:
     """Two scopes never see each other's secrets."""

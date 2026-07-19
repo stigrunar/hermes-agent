@@ -92,32 +92,95 @@ def current_secret_scope() -> Optional[Mapping[str, str]]:
 # multiplex mode — routing them through the fail-closed path would wrongly
 # crash. Anything matching is read from os.environ regardless of scope.
 #
-# Membership test is by exact name OR prefix (see _is_global_env). Keep this
-# list tight: when in doubt a value is a profile secret, not a global.
+# Membership is exact-name only. Keep this list tight: when in doubt a value
+# is profile-scoped, not global; broad prefixes can silently exempt future
+# credentials from the multiplex boundary.
 _GLOBAL_ENV_EXACT = frozenset({
     # Hermes runtime / deployment
     "HERMES_HOME", "HERMES_PROFILE", "HERMES_GATEWAY_LOCK_DIR",
     "HERMES_MAX_ITERATIONS", "HERMES_MAX_TOKENS", "HERMES_API_TIMEOUT",
     "HERMES_REDACT_SECRETS", "HERMES_NOUS_TIMEOUT_SECONDS",
+    "HERMES_NOUS_MIN_KEY_TTL_SECONDS",
+    "HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "HERMES_XAI_REFRESH_TIMEOUT_SECONDS",
+    "HERMES_OAUTH_TRACE", "HERMES_SHARED_AUTH_DIR",
+    # Trusted hosted-deployment routing. Unlike NOUS_PORTAL_BASE_URL, this is
+    # stamped by the container deployment and intentionally wins across
+    # profiles (see the staging-token routing contract in hermes_cli.auth).
+    "HERMES_PORTAL_BASE_URL",
+    "HERMES_COPILOT_ACP_COMMAND", "HERMES_COPILOT_ACP_ARGS",
     "_HERMES_GATEWAY",
     # OS / interpreter
     "PATH", "HOME", "USER", "LANG", "LC_ALL", "TZ", "PWD", "SHELL", "TMPDIR",
-    "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE",
-    # Kanban paths (per-board, not per-profile-secret)
-    "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACES_ROOT", "HERMES_KANBAN_BOARD",
+    "VIRTUAL_ENV", "PYTHONPATH", "SSL_CERT_FILE", "HERMES_CA_BUNDLE",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "CODEX_HOME", "COPILOT_CLI_PATH",
+    "SSH_CLIENT", "SSH_TTY", "BROWSER", "DISPLAY", "WAYLAND_DISPLAY", "LOGNAME",
+    "CODESPACES", "CODESPACE_NAME", "GITPOD_WORKSPACE_ID", "CLOUD_SHELL",
+    "CLOUD_SHELL_ENVIRONMENT", "REPL_ID", "STACKBLITZ",
+    # Process-wide network policy. HTTP clients also consume these directly.
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+    # Terminal backend mechanics. Credential-bearing SSH members and
+    # SUDO_PASSWORD are deliberately absent: those belong to the active
+    # profile and must resolve through get_secret().
+    "TERMINAL_ENV", "TERMINAL_CWD", "TERMINAL_TIMEOUT",
+    "TERMINAL_HOME_MODE", "TERMINAL_LIFETIME_SECONDS",
+    "TERMINAL_MAX_FOREGROUND_TIMEOUT", "TERMINAL_DISK_WARNING_GB",
+    "TERMINAL_MODAL_MODE", "TERMINAL_DOCKER_IMAGE",
+    "TERMINAL_DOCKER_FORWARD_ENV", "TERMINAL_SINGULARITY_IMAGE",
+    "TERMINAL_MODAL_IMAGE", "TERMINAL_DAYTONA_IMAGE",
+    "TERMINAL_CONTAINER_CPU", "TERMINAL_CONTAINER_MEMORY",
+    "TERMINAL_CONTAINER_DISK", "TERMINAL_CONTAINER_PERSISTENT",
+    "TERMINAL_DOCKER_VOLUMES", "TERMINAL_DOCKER_ENV",
+    "TERMINAL_DOCKER_EXTRA_ARGS", "TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE",
+    "TERMINAL_DOCKER_NETWORK", "TERMINAL_DOCKER_RUN_AS_HOST_USER",
+    "TERMINAL_DOCKER_PERSIST_ACROSS_PROCESSES",
+    "TERMINAL_DOCKER_ORPHAN_REAPER", "TERMINAL_SANDBOX_DIR",
+    "TERMINAL_PERSISTENT_SHELL", "TERMINAL_SSH_PERSISTENT",
+    "TERMINAL_LOCAL_PERSISTENT", "TERMINAL_SECURITY_MODE",
+    "TERMINAL_TIMEOUT_GRACE_SECONDS", "TERMINAL_SCRATCH_DIR",
+    "TERMINAL_MANAGED_MODAL_CONNECT_TIMEOUT_SECONDS",
+    "TERMINAL_MANAGED_MODAL_POLL_READ_TIMEOUT_SECONDS",
+    "TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS",
+    # Kanban worker identity, paths, and process tuning (not profile secrets).
+    "HERMES_KANBAN_ATTACHMENTS_ROOT", "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_BRANCH", "HERMES_KANBAN_BUSY_TIMEOUT_MS",
+    "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_CLAIM_TTL_SECONDS",
+    "HERMES_KANBAN_CRASH_GRACE_SECONDS", "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_DISPATCH_IN_GATEWAY", "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_HOME",
+    "HERMES_KANBAN_LOGS_ROOT", "HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS",
+    "HERMES_KANBAN_ROOT", "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_SPECIFY_MAX_TOKENS", "HERMES_KANBAN_STOP_NUDGE",
+    "HERMES_KANBAN_TASK", "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    # Telegram transport tuning. Bot tokens/allowlists are deliberately absent.
+    "HERMES_TELEGRAM_DISABLE_FALLBACK_IPS",
+    "HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS",
+    "HERMES_TELEGRAM_HTTP_CONNECT_TIMEOUT", "HERMES_TELEGRAM_HTTP_POOL_SIZE",
+    "HERMES_TELEGRAM_HTTP_POOL_TIMEOUT", "HERMES_TELEGRAM_HTTP_READ_TIMEOUT",
+    "HERMES_TELEGRAM_HTTP_WRITE_TIMEOUT", "HERMES_TELEGRAM_INIT_TIMEOUT",
+    "HERMES_TELEGRAM_MEDIA_BATCH_DELAY_SECONDS",
+    "HERMES_TELEGRAM_NOTIFICATIONS", "HERMES_TELEGRAM_TEXT_BATCH_DELAY_SECONDS",
+    "HERMES_TELEGRAM_TEXT_BATCH_SPLIT_DELAY_SECONDS",
 })
-_GLOBAL_ENV_PREFIXES = (
-    "HERMES_KANBAN_",
-    "HERMES_TELEGRAM_",   # tuning knobs (batch delays, fallback toggles) — NOT the token
-    "TERMINAL_",          # terminal/sandbox backend settings
-)
 
+def get_deployment_env(
+    name: str, default: Optional[str] = None
+) -> Optional[str]:
+    """Read an explicitly classified process/deployment-level value.
 
-def _is_global_env(name: str) -> bool:
-    """Return True for genuinely process-global (non-profile-secret) env vars."""
-    if name in _GLOBAL_ENV_EXACT:
-        return True
-    return any(name.startswith(p) for p in _GLOBAL_ENV_PREFIXES)
+    This accessor is intentionally exact-name allowlisted. Provider keys,
+    provider-selection signals, and provider endpoint overrides must use
+    :func:`get_secret` instead; accepting an arbitrary name here would recreate
+    the ambient multiplex bypass this module exists to prevent.
+    """
+    if name not in _GLOBAL_ENV_EXACT:
+        raise ValueError(
+            f"{name!r} is profile-scoped and cannot be read through the "
+            "deployment-global environment accessor"
+        )
+    value = os.environ.get(name)
+    return value if value is not None else default
 
 
 def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
@@ -125,7 +188,7 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 
     Resolution order:
 
-    1. Genuinely-global vars (``_is_global_env``) always read ``os.environ`` —
+    1. Exact-allowlisted global vars always read ``os.environ`` —
        they are deployment settings, not profile secrets.
     2. When a secret scope is installed (multiplexed turn), read from it; an
        absent key returns ``default``. The scope is authoritative — we do NOT
@@ -137,10 +200,8 @@ def get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
        - multiplex ACTIVE: FAIL CLOSED. Raise ``UnscopedSecretError`` so the
          missing scope is caught loudly instead of leaking a cross-profile value.
     """
-    if _is_global_env(name):
-        val = os.environ.get(name)
-        return val if val is not None else default
-
+    if name in _GLOBAL_ENV_EXACT:
+        return get_deployment_env(name, default)
     scope = _SECRET_SCOPE.get()
     if scope is not None:
         val = scope.get(name)
@@ -208,6 +269,28 @@ def build_profile_secret_scope(hermes_home: Path) -> Dict[str, str]:
     secrets = load_env_file(home / ".env")
     for key, value in load_env_file(home / ".op.env").items():
         secrets.setdefault(key, value)
+
+    # SSH connection identity and sudo authentication are profile-owned even
+    # though the terminal backend's mechanical settings are deployment-wide.
+    # Config.yaml historically stores these fields, so project them into the
+    # same isolated transport as .env without mutating os.environ.
+    try:
+        import yaml
+
+        raw_config = yaml.safe_load((home / "config.yaml").read_text(encoding="utf-8")) or {}
+        terminal = raw_config.get("terminal") if isinstance(raw_config, dict) else None
+        if isinstance(terminal, dict):
+            for config_key, env_name in (
+                ("ssh_host", "TERMINAL_SSH_HOST"),
+                ("ssh_user", "TERMINAL_SSH_USER"),
+                ("ssh_port", "TERMINAL_SSH_PORT"),
+                ("ssh_key", "TERMINAL_SSH_KEY"),
+                ("sudo_password", "SUDO_PASSWORD"),
+            ):
+                if config_key in terminal and terminal[config_key] is not None:
+                    secrets[env_name] = str(terminal[config_key])
+    except (FileNotFoundError, OSError, UnicodeDecodeError, yaml.YAMLError):
+        pass
 
     try:
         from hermes_cli.env_loader import _load_secrets_config

@@ -20,10 +20,21 @@ from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.urllib_security import open_credentialed_url
+from agent.secret_scope import (
+    UnscopedSecretError,
+    current_secret_scope,
+    get_secret,
+    is_multiplex_active,
+)
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
+
+
+def _profile_env(name: str, default: str = "") -> str:
+    value = get_secret(name, default)
+    return value if value is not None else default
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
@@ -793,8 +804,15 @@ def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
     states return False so this compatibility wrapper does not block users.
     """
     global _free_tier_cache
+    multiplex = is_multiplex_active()
+    if multiplex and current_secret_scope() is None:
+        raise UnscopedSecretError(
+            "Nous account-tier resolution requires an owner profile scope "
+            "while multiplexing is active"
+        )
+
     now = time.monotonic()
-    if not force_fresh and _free_tier_cache is not None:
+    if not multiplex and not force_fresh and _free_tier_cache is not None:
         cached_result, cached_at = _free_tier_cache
         if now - cached_at < _FREE_TIER_CACHE_TTL:
             return cached_result
@@ -804,10 +822,14 @@ def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
 
         account_info = get_nous_portal_account_info(force_fresh=force_fresh)
         result = account_info.is_free_tier
-        _free_tier_cache = (result, now)
+        if not multiplex:
+            _free_tier_cache = (result, now)
         return result
+    except UnscopedSecretError:
+        raise
     except Exception:
-        _free_tier_cache = (False, now)
+        if not multiplex:
+            _free_tier_cache = (False, now)
         return False  # default to paid on error — don't block users
 
 
@@ -969,6 +991,8 @@ def _resolve_nous_portal_url() -> str:
         if portal:
             return portal.rstrip("/")
         return str(DEFAULT_NOUS_PORTAL_URL).rstrip("/")
+    except UnscopedSecretError:
+        raise
     except Exception:
         return "https://portal.nousresearch.com"
 
@@ -1019,6 +1043,8 @@ def get_nous_recommended_aux_model(
     if free_tier is None:
         try:
             free_tier = check_nous_free_tier()
+        except UnscopedSecretError:
+            raise
         except Exception:
             # On any detection error, assume paid — paid users see both fields
             # anyway so this is a safe default that maximises model quality.
@@ -1620,7 +1646,7 @@ def fetch_models_with_pricing(
 
 def _resolve_openrouter_api_key() -> str:
     """Best-effort OpenRouter API key for pricing fetch."""
-    return os.getenv("OPENROUTER_API_KEY", "").strip()
+    return _profile_env("OPENROUTER_API_KEY").strip()
 
 
 _DEFAULT_NOUS_INFERENCE_BASE = "https://inference-api.nousresearch.com"
@@ -1643,6 +1669,8 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
         creds = resolve_nous_runtime_credentials()
         if creds:
             return (creds.get("api_key", ""), creds.get("base_url", ""))
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
     return ("", _DEFAULT_NOUS_INFERENCE_BASE)
@@ -1742,11 +1770,14 @@ def _fetch_novita_pricing(
     Results are cached in ``_pricing_cache`` keyed on the resolved base URL —
     without this, every menu render or pricing lookup re-hits the network.
     """
-    api_key = os.getenv("NOVITA_API_KEY", "").strip()
+    api_key = _profile_env("NOVITA_API_KEY").strip()
     if not api_key:
         return {}
 
-    base_url = os.getenv("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
+    base_url = (
+        _profile_env("NOVITA_BASE_URL").strip()
+        or "https://api.novita.ai/openai/v1"
+    )
     cache_key = base_url.rstrip("/")
     if not force_refresh and cache_key in _pricing_cache:
         return _pricing_cache[cache_key]
@@ -1823,10 +1854,12 @@ def list_available_providers() -> list[dict[str, str]]:
                 custom_base_url = _get_custom_base_url() or ""
                 has_creds = bool(custom_base_url.strip())
             elif pid == "openrouter":
-                has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
+                has_creds = has_usable_secret(_profile_env("OPENROUTER_API_KEY"))
             else:
                 status = get_auth_status(pid)
                 has_creds = bool(status.get("logged_in") or status.get("configured"))
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
         result.append({
@@ -2315,6 +2348,8 @@ def _resolve_copilot_catalog_api_key() -> str:
         api_key = str(creds.get("api_key") or "").strip()
         if api_key:
             return api_key
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -2336,10 +2371,14 @@ def _resolve_copilot_catalog_api_key() -> str:
                 continue
             try:
                 api_token, _expires_at = exchange_copilot_token(raw)
+            except UnscopedSecretError:
+                raise
             except Exception:
                 continue
             if api_token:
                 return api_token
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -2441,6 +2480,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
             creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
             access_token = creds.get("api_key")
+        except UnscopedSecretError:
+            raise
         except Exception:
             access_token = None
         return get_codex_model_ids(access_token=access_token)
@@ -2451,6 +2492,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
                 return live
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
         if normalized == "copilot-acp":
@@ -2464,6 +2507,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_nous_models(api_key=creds.get("api_key", ""), inference_base_url=creds.get("base_url", ""))
                 if live:
                     return live
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
         # Live failed (or no creds). Fall back to the docs-hosted manifest
@@ -2483,6 +2528,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_api_models(api_key, base_url)
                 if live:
                     return live
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
     if normalized == "anthropic":
@@ -2525,9 +2572,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = os.getenv("OPENAI_API_KEY", "").strip()
+        api_key = _profile_env("OPENAI_API_KEY").strip()
         if api_key:
-            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
+            base_raw = _profile_env("OPENAI_BASE_URL").strip().rstrip("/")
             base = base_raw or "https://api.openai.com/v1"
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
@@ -2569,6 +2616,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_api_models(api_key, base_url)
                 if live:
                     return live
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
     if normalized == "custom":
@@ -2578,9 +2627,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # Try common API key env vars for custom endpoints
             api_key = (
                 str(model_cfg.get("api_key", "") or "").strip()
-                or os.getenv("CUSTOM_API_KEY", "")
-                or os.getenv("OPENAI_API_KEY", "")
-                or os.getenv("OPENROUTER_API_KEY", "")
+                or _profile_env("CUSTOM_API_KEY")
+                or _profile_env("OPENAI_API_KEY")
+                or _profile_env("OPENROUTER_API_KEY")
             )
             api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(base_url) else None
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
@@ -2596,6 +2645,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             ids = bedrock_model_ids_or_none()
             if ids is not None:
                 return ids
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
 
@@ -2612,6 +2663,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 creds = resolve_api_key_provider_credentials(normalized)
                 api_key = str(creds.get("api_key") or "").strip()
                 base_url = str(creds.get("base_url") or "").strip()
+            except UnscopedSecretError:
+                raise
             except Exception:
                 api_key, base_url = "", _p.base_url
             if not base_url:
@@ -2654,6 +2707,8 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # Use profile's fallback_models if defined
             if _p.fallback_models:
                 return list(_p.fallback_models)
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -2706,8 +2761,6 @@ def _credential_fingerprint(provider: str) -> str:
     after re-auth bust the cache.
     """
     import hashlib
-    import os as _os
-
     parts: list[str] = []
 
     # Env vars from PROVIDER_REGISTRY for this slug
@@ -2716,10 +2769,12 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_os.environ.get(ev, '')}")
+                parts.append(f"{ev}={_profile_env(ev)}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_os.environ.get(bev, '')}")
+                parts.append(f"{bev}={_profile_env(bev)}")
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
 
@@ -2737,20 +2792,25 @@ def _credential_fingerprint(provider: str) -> str:
     except Exception:
         pass
 
-    # External well-known credential file locations
-    for path in (
-        _os.path.expanduser("~/.codex/auth.json"),
-        _os.path.expanduser("~/.claude/.credentials.json"),
-        _os.path.expanduser("~/.config/github-copilot/hosts.json"),
-        _os.path.expanduser("~/.minimax/credentials.json"),
-    ):
-        try:
-            mt = _os.stat(path).st_mtime_ns
-            parts.append(f"{path}@{mt}")
-        except FileNotFoundError:
-            parts.append(f"{path}@missing")
-        except Exception:
-            pass
+    # Ambient CLI credential caches are part of the legacy single-profile
+    # resolver only. In multiplex mode they must not select another profile's
+    # disk-cache identity.
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    if current_secret_scope() is None and not is_multiplex_active():
+        for path in (
+            os.path.expanduser("~/.codex/auth.json"),
+            os.path.expanduser("~/.claude/.credentials.json"),
+            os.path.expanduser("~/.config/github-copilot/hosts.json"),
+            os.path.expanduser("~/.minimax/credentials.json"),
+        ):
+            try:
+                mt = os.stat(path).st_mtime_ns
+                parts.append(f"{path}@{mt}")
+            except FileNotFoundError:
+                parts.append(f"{path}@missing")
+            except Exception:
+                pass
 
     blob = "|".join(parts).encode("utf-8", errors="replace")
     # blake2b for cache-key fingerprinting only — not for credential storage.
@@ -3852,7 +3912,7 @@ _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 def _deepinfra_catalog_url() -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
-    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    base = _profile_env("DEEPINFRA_BASE_URL").strip() or _DEEPINFRA_DEFAULT_BASE_URL
     cache_key = base.rstrip("/")
     return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
 
@@ -3877,7 +3937,7 @@ def _fetch_deepinfra_catalog(
             return None
 
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
+    api_key = _profile_env("DEEPINFRA_API_KEY").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -3990,7 +4050,7 @@ def deepinfra_base_url(section: Optional[dict] = None) -> str:
     to re-code (with subtly divergent normalization).
     """
     candidate = section.get("base_url") if isinstance(section, dict) else None
-    value = candidate or os.getenv("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    value = candidate or _profile_env("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
     return str(value).strip().rstrip("/")
 
 
@@ -4146,9 +4206,9 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = os.getenv("OLLAMA_API_KEY", "")
+        api_key = _profile_env("OLLAMA_API_KEY")
     if not base_url:
-        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
+        base_url = _profile_env("OLLAMA_BASE_URL") or "https://ollama.com/v1"
 
     live_models: list[str] = []
     if api_key:
@@ -4663,6 +4723,8 @@ def validate_requested_model(
                     f"{suggestion_text}"
                 ),
             }
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass  # Fall through to generic warning
 
@@ -4677,6 +4739,8 @@ def validate_requested_model(
     provider_label = _PROVIDER_LABELS.get(normalized, normalized)
     try:
         catalog_models = provider_model_ids(normalized)
+    except UnscopedSecretError:
+        raise
     except Exception:
         catalog_models = []
 

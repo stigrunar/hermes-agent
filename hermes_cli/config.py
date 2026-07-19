@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, Any, Optional, List, Tuple, Set
 
+from agent.secret_scope import UnscopedSecretError
 from hermes_cli.secret_prompt import masked_secret_prompt
 
 logger = logging.getLogger(__name__)
@@ -5883,6 +5884,8 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                 save_env_value("ANTHROPIC_TOKEN", "")
                 if not quiet:
                     print("  ✓ Cleared ANTHROPIC_TOKEN from .env (no longer used)")
+        except UnscopedSecretError:
+            raise
         except Exception:
             pass
 
@@ -5962,6 +5965,8 @@ def migrate_config(interactive: bool = True, quiet: bool = False) -> Dict[str, A
                     save_env_value(dead_var, "")
                     if not quiet:
                         print(f"  ✓ Cleared {dead_var} from .env (no longer used — config.yaml is source of truth)")
+            except UnscopedSecretError:
+                raise
             except Exception:
                 pass
 
@@ -6651,6 +6656,26 @@ def _strip_dotted_keys(cfg: dict, dotted_keys: set) -> Tuple[dict, set]:
     return cfg, stripped
 
 
+def _scope_aware_process_env(name: str) -> Optional[str]:
+    """Resolve config interpolation without crossing a profile boundary.
+
+    Config ``${VAR}`` references can contain provider keys and endpoints. An
+    installed profile scope is authoritative; when multiplexing is active but
+    a scope was lost, ``get_secret`` raises instead of consulting ambient
+    process state. Classic single-profile interpolation remains environment
+    based, matching the historical contract.
+    """
+    from agent.secret_scope import (
+        current_secret_scope,
+        get_secret,
+        is_multiplex_active,
+    )
+
+    if current_secret_scope() is not None or is_multiplex_active():
+        return get_secret(name)
+    return os.environ.get(name)
+
+
 def _expand_env_vars(obj):
     """Recursively expand ``${VAR}`` references in config values.
 
@@ -6659,9 +6684,13 @@ def _expand_env_vars(obj):
     ``os.environ``) are kept verbatim so callers can detect them.
     """
     if isinstance(obj, str):
+        def _replacement(match: re.Match) -> str:
+            value = _scope_aware_process_env(match.group(1))
+            return value if value is not None else match.group(0)
+
         return re.sub(
             r"\${([^}]+)}",
-            lambda m: os.environ.get(m.group(1), m.group(0)),
+            _replacement,
             obj,
         )
     if isinstance(obj, dict):
@@ -6686,7 +6715,7 @@ def _env_ref_snapshot(obj, snapshot=None):
         snapshot = {}
     if isinstance(obj, str):
         for name in re.findall(r"\${([^}]+)}", obj):
-            snapshot[name] = os.environ.get(name)
+            snapshot[name] = _scope_aware_process_env(name)
     elif isinstance(obj, dict):
         for value in obj.values():
             _env_ref_snapshot(value, snapshot)
@@ -7265,7 +7294,18 @@ def apply_terminal_config_to_env(
     if not isinstance(terminal_cfg, dict):
         return target
 
+    from agent.secret_scope import is_multiplex_active
+
+    profile_owned = {
+        "TERMINAL_SSH_HOST",
+        "TERMINAL_SSH_USER",
+        "TERMINAL_SSH_PORT",
+        "TERMINAL_SSH_KEY",
+    }
+
     for cfg_key, env_var in TERMINAL_CONFIG_ENV_MAP.items():
+        if is_multiplex_active() and env_var in profile_owned:
+            continue
         if cfg_key not in terminal_cfg:
             continue
         value = terminal_cfg[cfg_key]
@@ -7327,7 +7367,10 @@ def _load_config_impl(*, want_deepcopy: bool) -> Dict[str, Any]:
             # pins unexpanded literals (e.g. auxiliary.<task>.api_key) for the
             # life of the process (#58514).
             env_snapshot = cached[5] if len(cached) > 5 else {}
-            if all(os.environ.get(k) == v for k, v in env_snapshot.items()):
+            if all(
+                _scope_aware_process_env(k) == v
+                for k, v in env_snapshot.items()
+            ):
                 return copy.deepcopy(cached[4]) if want_deepcopy else cached[4]
 
         config = copy.deepcopy(DEFAULT_CONFIG)
@@ -8165,6 +8208,11 @@ def reload_env() -> int:
 
 def get_env_value(key: str) -> Optional[str]:
     """Get a value from ~/.hermes/.env or environment."""
+    from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+    if current_secret_scope() is not None or is_multiplex_active():
+        return _scope_aware_process_env(key)
+
     # Check environment first
     if key in os.environ:
         return os.environ[key]
@@ -8188,16 +8236,19 @@ def get_env_value_prefer_dotenv(key: str) -> Optional[str]:
     is scope-checked rather than leaking another profile's raw ``os.environ``
     value — matching the credential-pool seeding path's behaviour.
     """
+    from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
+
+    # A built profile scope already contains its owning .env plus external
+    # source overlays. It is authoritative. Checking load_env() first would
+    # read the default/other profile before the boundary guard runs.
+    if current_secret_scope() is not None or is_multiplex_active():
+        return get_secret(key)
+
     env_vars = load_env()
     val = env_vars.get(key)
     if val:
         return val
-    try:
-        from agent.secret_scope import get_secret as _get_secret
-
-        return _get_secret(key)
-    except Exception:
-        return os.environ.get(key)
+    return get_secret(key)
 
 
 # =============================================================================

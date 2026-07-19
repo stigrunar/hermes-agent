@@ -268,6 +268,16 @@ _JWT_RE = re.compile(
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
+# Local identity paths are diagnostic metadata, not functional payloads.  The
+# strict persistence pass masks the username-bearing prefix while retaining
+# any useful project-relative suffix.  URL paths are excluded by the negative
+# lookbehind (their preceding character is another slash or a hostname char).
+_LOCAL_HOME_PATH_RE = re.compile(
+    r"(?<![A-Za-z0-9_./-])(?:/(?:home|Users)/[^/\s]+|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)",
+    re.IGNORECASE,
+)
+_USER_RUNTIME_PATH_RE = re.compile(r"/run/user/\d+(?:/bus)?")
+
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
 # Ported from nearai/ironclaw#2529.
@@ -754,18 +764,24 @@ def redact_sensitive_text(
 
 
 def redact_for_persistence(value):
-    """Force-redact text before it crosses a durable receipt boundary.
+    """Force-redact an explicitly classified durable diagnostic value.
 
-    Active browser/tool workflows intentionally preserve web query credentials
-    and ``user:password@`` URLs because masking them can destroy a callback or
-    signed URL the user asked the agent to follow. Durable logs, scheduler
-    receipts, and coordination records have no such need. This stricter pass
-    therefore forces the normal redactor on and additionally masks URL query
-    credentials, URL userinfo, and HTTP request-target query strings.
+    Active browser/tool workflows and functional persistence fields preserve
+    web query credentials and ``user:password@`` URLs because masking them can
+    destroy a callback, signed URL, handoff, or archived result. Callers use
+    this stricter pass only for schema fields whose producer classifies them as
+    machine-generated diagnostics, such as authentication, delivery, or fixed
+    execution failures. It forces the normal redactor on and additionally
+    masks URL query credentials, URL userinfo, and HTTP request-target query
+    strings.
 
     Dictionaries and sequences are handled recursively so structured event
     payloads and diagnostic metadata cannot bypass the text boundary.
     Non-text scalar values pass through unchanged.
+
+    This targets recognized secret, URL-auth, and phone-number patterns. It is
+    not a comprehensive arbitrary-PII sanitizer and must not be applied to
+    opaque functional content merely because that content is persisted.
     """
     if isinstance(value, str):
         text = redact_sensitive_text(value, force=True, full_mask=True)
@@ -774,6 +790,8 @@ def redact_for_persistence(value):
         text = _redact_url_query_params(text)
         text = _redact_url_userinfo(text)
         text = _redact_http_request_target_query_params(text)
+        text = _LOCAL_HOME_PATH_RE.sub("<home>", text)
+        text = _USER_RUNTIME_PATH_RE.sub("<user-runtime>", text)
         return text
     if isinstance(value, dict):
         return {key: redact_for_persistence(item) for key, item in value.items()}

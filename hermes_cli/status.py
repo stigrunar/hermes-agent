@@ -9,6 +9,8 @@ import sys
 import subprocess  # noqa: F401 — re-exported for tests that monkeypatch status.subprocess to guard against regressions
 from pathlib import Path
 
+from agent.secret_scope import UnscopedSecretError, get_secret
+
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 
 from hermes_cli.auth import AuthError, resolve_provider
@@ -203,6 +205,8 @@ def show_status(args):
         codex_status = get_codex_auth_status()
         qwen_status = get_qwen_auth_status()
         minimax_status = get_minimax_oauth_auth_status()
+    except UnscopedSecretError:
+        raise
     except Exception:
         nous_status = {}
         codex_status = {}
@@ -219,6 +223,8 @@ def show_status(args):
     ):
         try:
             nous_account_info = get_nous_portal_account_info()
+        except UnscopedSecretError:
+            raise
         except Exception:
             nous_account_info = None
 
@@ -417,8 +423,8 @@ def show_status(args):
     print(f"  Backend:      {terminal_env}")
 
     if terminal_env == "ssh":
-        ssh_host = os.getenv("TERMINAL_SSH_HOST", "")
-        ssh_user = os.getenv("TERMINAL_SSH_USER", "")
+        ssh_host = get_secret("TERMINAL_SSH_HOST", "") or ""
+        ssh_user = get_secret("TERMINAL_SSH_USER", "") or ""
         print(f"  SSH Host:     {ssh_host or '(not set)'}")
         print(f"  SSH User:     {ssh_user or '(not set)'}")
     elif terminal_env == "docker":
@@ -428,7 +434,7 @@ def show_status(args):
         daytona_image = os.getenv("TERMINAL_DAYTONA_IMAGE", "nikolaik/python-nodejs:python3.11-nodejs20")
         print(f"  Daytona Image: {daytona_image}")
 
-    sudo_password = os.getenv("SUDO_PASSWORD", "")
+    sudo_password = get_secret("SUDO_PASSWORD", "") or ""
     print(f"  Sudo:         {check_mark(bool(sudo_password))} {'enabled' if sudo_password else 'disabled'}")
 
     # =========================================================================
@@ -456,15 +462,15 @@ def show_status(args):
     }
 
     for name, (token_var, home_var) in platforms.items():
-        token = os.getenv(token_var, "")
+        token = get_env_value(token_var) or ""
         has_token = bool(token)
         
         home_channel = ""
         if home_var:
-            home_channel = os.getenv(home_var, "")
+            home_channel = get_env_value(home_var) or ""
         # Back-compat: QQBot home channel was renamed from QQ_HOME_CHANNEL to QQBOT_HOME_CHANNEL
         if not home_channel and home_var == "QQBOT_HOME_CHANNEL":
-            home_channel = os.getenv("QQ_HOME_CHANNEL", "")
+            home_channel = get_env_value("QQ_HOME_CHANNEL") or ""
         
         status = "configured" if has_token else "not configured"
         if home_channel:
@@ -589,7 +595,7 @@ def show_status(args):
         print(color("◆ Deep Checks", Colors.CYAN, Colors.BOLD))
         
         # Check OpenRouter connectivity
-        openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
+        openrouter_key = get_env_value("OPENROUTER_API_KEY") or ""
         if openrouter_key:
             try:
                 import httpx

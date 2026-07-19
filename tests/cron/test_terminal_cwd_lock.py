@@ -159,7 +159,10 @@ def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):
 
     def _raise_on_workdir_log(msg, *args, **kwargs):
         if isinstance(msg, str) and "using workdir" in msg:
-            raise RuntimeError("boom")
+            raise RuntimeError(
+                "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz012345 "
+                "from /home/alice/.hermes/config.yaml"
+            )
         return real_info(msg, *args, **kwargs)
 
     with patch("cron.scheduler._hermes_home", tmp_path), \
@@ -170,9 +173,13 @@ def test_run_job_releases_cwd_lock_when_body_raises(tmp_path):
          patch("hermes_state.SessionDB", return_value=MagicMock()):
         # run_job catches its own body exceptions and returns (False, ...);
         # it must not propagate, and it must release the lock either way.
-        success, _out, _final, _err = sched.run_job(job)
+        success, output, _final, error = sched.run_job(job)
 
     assert success is False
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz012345" not in output
+    assert "sk-proj-abcdefghijklmnopqrstuvwxyz012345" not in (error or "")
+    assert "/home/alice" not in output
+    assert "/home/alice" not in (error or "")
 
     # If the writer lock leaked, this acquire would block forever. Prove it's
     # free by acquiring as a writer from another thread under a short timeout.

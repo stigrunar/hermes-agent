@@ -114,6 +114,7 @@ from agent.process_bootstrap import (
     _get_proxy_for_base_url,
 )
 from agent.iteration_budget import IterationBudget
+from agent.secret_scope import UnscopedSecretError
 
 
 from hermes_cli.env_loader import load_hermes_dotenv
@@ -4449,6 +4450,8 @@ class AIAgent:
                 singleton_now = resolve_xai_oauth_runtime_credentials(
                     refresh_if_expiring=False,
                 )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("%s singleton read failed: %s", self.provider, exc)
             return False
@@ -4473,6 +4476,8 @@ class AIAgent:
                 from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
 
                 creds = resolve_xai_oauth_runtime_credentials(force_refresh=force)
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("%s credential refresh failed: %s", self.provider, exc)
             return False
@@ -4509,6 +4514,8 @@ class AIAgent:
                 timeout_seconds=env_float("HERMES_NOUS_TIMEOUT_SECONDS", 15),
                 force_refresh=force,
             )
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Nous credential refresh failed: %s", exc)
             return False
@@ -4549,6 +4556,8 @@ class AIAgent:
             from agent.vertex_adapter import get_vertex_config
 
             token, base_url = get_vertex_config()
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Vertex credential refresh failed: %s", exc)
             return False
@@ -4584,6 +4593,8 @@ class AIAgent:
             from hermes_cli.copilot_auth import resolve_copilot_token
 
             new_token, token_source = resolve_copilot_token()
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Copilot credential refresh failed: %s", exc)
             return False
@@ -4621,6 +4632,8 @@ class AIAgent:
             from agent.anthropic_adapter import resolve_anthropic_token, build_anthropic_client
 
             new_token = resolve_anthropic_token()
+        except UnscopedSecretError:
+            raise
         except Exception as exc:
             logger.debug("Anthropic credential refresh failed: %s", exc)
             return False

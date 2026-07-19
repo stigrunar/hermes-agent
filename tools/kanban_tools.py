@@ -33,7 +33,6 @@ import logging
 import os
 from typing import Any, Optional
 
-from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
 from tools.registry import registry, tool_error
 from hermes_cli.config import cfg_get, load_config
@@ -353,6 +352,12 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "superseded_by": getattr(task, "superseded_by", None),
+        "live_path_task_id": getattr(task, "live_path_task_id", None),
+        "canonical_live_path": getattr(task, "canonical_live_path", None),
+        "required_capabilities": list(getattr(task, "required_capabilities", None) or []),
+        "failure_classification": getattr(task, "failure_classification", None),
+        "failure_fingerprint": getattr(task, "failure_fingerprint", None),
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -514,17 +519,6 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
-    if summary:
-        summary = redact_sensitive_text(str(summary), force=True)
-    if result:
-        result = redact_sensitive_text(str(result), force=True)
-    if metadata is not None and isinstance(metadata, dict):
-        meta_json = json.dumps(metadata)
-        meta_json = redact_sensitive_text(meta_json, force=True)
-        try:
-            metadata = json.loads(meta_json)
-        except json.JSONDecodeError:
-            pass
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -690,8 +684,9 @@ def _handle_block(args: dict, **kw) -> str:
     reason = args.get("reason")
     if not reason or not str(reason).strip():
         return tool_error("reason is required — explain what input you need")
-    reason = redact_sensitive_text(str(reason), force=True)
+    reason = str(reason)
     kind = args.get("kind")
+    dependency_task_id = args.get("dependency_task_id")
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -729,6 +724,7 @@ def _handle_block(args: dict, **kw) -> str:
                 conn, tid,
                 reason=reason,
                 kind=kind,
+                dependency_task_id=dependency_task_id,
                 expected_run_id=_worker_run_id(tid),
             )
             if not ok:
@@ -817,7 +813,7 @@ def _handle_comment(args: dict, **kw) -> str:
     body = args.get("body")
     if not body or not str(body).strip():
         return tool_error("body is required")
-    body = redact_sensitive_text(str(body), force=True)
+    body = str(body)
     # Author is intentionally derived from the worker's own runtime
     # identity, NOT from caller-supplied args. Comments are injected
     # into the next worker's system prompt by ``build_worker_context``
@@ -1112,6 +1108,14 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
+    required_capabilities = args.get("required_capabilities")
+    if isinstance(required_capabilities, str):
+        required_capabilities = [required_capabilities]
+    if required_capabilities is not None and not isinstance(required_capabilities, (list, tuple)):
+        return tool_error(
+            "required_capabilities must be a list of capability names, "
+            f"got {type(required_capabilities).__name__}"
+        )
     goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
@@ -1164,6 +1168,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                required_capabilities=required_capabilities,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1559,6 +1564,14 @@ KANBAN_BLOCK_SCHEMA = {
                     "Omit only if none apply."
                 ),
             },
+            "dependency_task_id": {
+                "type": "string",
+                "description": (
+                    "Stable task id being waited on. Supply this with kind "
+                    "'dependency'; the task resumes only after that task's "
+                    "relevant state or verdict changes."
+                ),
+            },
             "board": _board_schema_prop(),
         },
         "required": ["reason"],
@@ -1869,6 +1882,15 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "required_capabilities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Runtime capabilities required before dispatch. Use "
+                    "terminal, file, file_patch, process, browser, network, "
+                    "or private:<toolset> for explicit private toolsets."
                 ),
             },
             "board": _board_schema_prop(),

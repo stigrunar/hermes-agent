@@ -8,8 +8,10 @@ import os
 import sys
 import subprocess
 import shutil
+from contextvars import copy_context
 from pathlib import Path
 
+from agent.secret_scope import UnscopedSecretError, get_secret
 from hermes_cli.config import get_project_root, get_hermes_home, get_env_path
 from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_constants import display_hermes_home
@@ -846,6 +848,8 @@ def run_doctor(args):
                     resolve_provider as _resolve_auth_provider,
                 )
                 known_providers = set(PROVIDER_REGISTRY.keys()) | {"openrouter", "custom", "auto"}
+            except UnscopedSecretError:
+                raise
             except Exception:
                 _resolve_auth_provider = None
                 pass
@@ -900,6 +904,8 @@ def run_doctor(args):
                 try:
                     runtime_provider = _resolve_auth_provider(provider)
                     provider_ids_to_accept.add(runtime_provider)
+                except UnscopedSecretError:
+                    raise
                 except Exception:
                     runtime_provider = provider
 
@@ -1013,9 +1019,13 @@ def run_doctor(args):
                             ),
                             issues,
                         )
+                except UnscopedSecretError:
+                    raise
                 except Exception:
                     pass
 
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             check_warn("Could not validate model/provider config", f"({e})")
     else:
@@ -1628,11 +1638,11 @@ def run_doctor(args):
     
     # SSH (if using ssh backend)
     if terminal_env == "ssh":
-        ssh_host = os.getenv("TERMINAL_SSH_HOST")
+        ssh_host = get_secret("TERMINAL_SSH_HOST")
         if ssh_host:
-            ssh_user = os.getenv("TERMINAL_SSH_USER")
-            ssh_port = os.getenv("TERMINAL_SSH_PORT")
-            ssh_key = os.getenv("TERMINAL_SSH_KEY")
+            ssh_user = get_secret("TERMINAL_SSH_USER")
+            ssh_port = get_secret("TERMINAL_SSH_PORT")
+            ssh_key = get_secret("TERMINAL_SSH_KEY")
             target = f"{ssh_user}@{ssh_host}" if ssh_user else ssh_host
             cmd = ["ssh", "-o", "ConnectTimeout=5", "-o", "BatchMode=yes"]
             if ssh_port:
@@ -1898,7 +1908,7 @@ def run_doctor(args):
     _probes: list = []  # list of (label, callable) submitted in display order
 
     def _probe_openrouter() -> _ConnectivityResult:
-        key = os.getenv("OPENROUTER_API_KEY")
+        key = get_secret("OPENROUTER_API_KEY")
         if not key:
             return _ConnectivityResult(
                 "OpenRouter API",
@@ -1950,6 +1960,8 @@ def run_doctor(args):
                   color(f"(HTTP {r.status_code})", Colors.DIM))],
                 [],
             )
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             return _ConnectivityResult(
                 "OpenRouter API",
@@ -2019,6 +2031,8 @@ def run_doctor(args):
                   color("(couldn't verify)", Colors.DIM))],
                 [],
             )
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             return _ConnectivityResult(
                 "Anthropic API",
@@ -2031,7 +2045,7 @@ def run_doctor(args):
                                supports_health_check) -> _ConnectivityResult:
         key = ""
         for ev in env_vars:
-            key = os.getenv(ev, "")
+            key = get_secret(ev, "") or ""
             if key:
                 break
         if not key:
@@ -2046,7 +2060,7 @@ def run_doctor(args):
             )
         try:
             import httpx
-            base = os.getenv(base_env, "") if base_env else ""
+            base = (get_secret(base_env, "") or "") if base_env else ""
             # Auto-detect Kimi Code keys (sk-kimi-) → api.kimi.com/coding/v1
             # (OpenAI-compat surface, which exposes /models for health check).
             if not base and key.startswith("sk-kimi-"):
@@ -2104,6 +2118,8 @@ def run_doctor(args):
                   color(f"(HTTP {r.status_code})", Colors.DIM))],
                 [],
             )
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             return _ConnectivityResult(
                 pname,
@@ -2153,6 +2169,8 @@ def run_doctor(args):
                         Colors.DIM))],
                 [f"Install boto3 for Bedrock: {sys.executable} -m pip install boto3"],
             )
+        except UnscopedSecretError:
+            raise
         except Exception as e:
             err_name = type(e).__name__
             return _ConnectivityResult(
@@ -2185,6 +2203,8 @@ def run_doctor(args):
             auth_mode = str(model_cfg.get("auth_mode") or "").strip().lower()
             if cfg_provider != "azure-foundry" or auth_mode != "entra_id":
                 return _ConnectivityResult("Azure Foundry (Entra ID)", [], [])
+        except UnscopedSecretError:
+            raise
         except Exception:
             return _ConnectivityResult("Azure Foundry (Entra ID)", [], [])
 
@@ -2285,7 +2305,9 @@ def run_doctor(args):
         # noisy output if anything ever printed from inside a worker.
         with _futures.ThreadPoolExecutor(max_workers=8,
                                          thread_name_prefix="doctor-probe") as _ex:
-            _futures_in_order = [_ex.submit(_fn) for _, _fn in _probes]
+            _futures_in_order = [
+                _ex.submit(copy_context().run, _fn) for _, _fn in _probes
+            ]
             _results = [_f.result() for _f in _futures_in_order]
     finally:
         if _imds_prev is None:

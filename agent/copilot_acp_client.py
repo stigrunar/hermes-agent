@@ -28,6 +28,7 @@ from openai.types.chat.chat_completion_message_tool_call import (
 
 from agent.file_safety import get_read_block_error, get_write_denied_error
 from agent.redact import redact_sensitive_text
+from agent.secret_scope import get_deployment_env
 from tools.environments.local import hermes_subprocess_env
 
 ACP_MARKER_BASE_URL = "acp://copilot"
@@ -61,14 +62,14 @@ def _is_gh_copilot_deprecation_message(stderr_text: str) -> bool:
 
 def _resolve_command() -> str:
     return (
-        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
-        or os.getenv("COPILOT_CLI_PATH", "").strip()
+        (get_deployment_env("HERMES_COPILOT_ACP_COMMAND", "") or "").strip()
+        or (get_deployment_env("COPILOT_CLI_PATH", "") or "").strip()
         or "copilot"
     )
 
 
 def _resolve_args() -> list[str]:
-    raw = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
+    raw = (get_deployment_env("HERMES_COPILOT_ACP_ARGS", "") or "").strip()
     if not raw:
         return ["--acp", "--stdio"]
     return shlex.split(raw)
@@ -76,7 +77,7 @@ def _resolve_args() -> list[str]:
 
 def _resolve_home_dir() -> str:
     """Return a stable HOME for child ACP processes."""
-    home = os.environ.get("HOME", "").strip()
+    home = (get_deployment_env("HOME", "") or "").strip()
     if home:
         return home
 
