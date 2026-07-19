@@ -47,42 +47,6 @@ export function buildPluginApiPath(manifestId: string, pluginPath: string): stri
   return `/api/plugins/${manifestId}${normalizePluginRelativePath(pluginPath)}`
 }
 
-export function normalizeDashboardPluginAssetPath(path: string): string {
-  if (typeof path !== 'string' || !path.trim() || path.includes('?') || path.includes('#')) {
-    throw new TypeError('Invalid dashboard plugin asset path')
-  }
-
-  const trimmed = path.trim()
-
-  if (URI_SCHEME.test(trimmed) || trimmed.startsWith('/') || trimmed.startsWith('//')) {
-    throw new TypeError('Unsafe dashboard plugin asset path')
-  }
-
-  let decoded = trimmed
-
-  for (let pass = 0; pass < 2; pass += 1) {
-    assertSafeAssetPath(decoded)
-
-    try {
-      decoded = decodeURIComponent(decoded)
-    } catch {
-      throw new TypeError('Invalid percent-encoding in dashboard plugin asset path')
-    }
-  }
-
-  assertSafeAssetPath(decoded)
-
-  return trimmed
-}
-
-export function buildDashboardPluginAssetPath(manifestId: string, assetPath: string): string {
-  if (typeof manifestId !== 'string' || !isValidPluginManifestId(manifestId)) {
-    throw new TypeError('Invalid plugin manifest id')
-  }
-
-  return `/dashboard-plugins/${manifestId}/${normalizeDashboardPluginAssetPath(assetPath)}`
-}
-
 function assertSafePathname(pathname: string): void {
   if (
     URI_SCHEME.test(pathname) ||
@@ -90,17 +54,5 @@ function assertSafePathname(pathname: string): void {
     pathname.split('/').some(segment => segment === '.' || segment === '..')
   ) {
     throw new TypeError('Unsafe plugin-relative API path')
-  }
-}
-
-function assertSafeAssetPath(pathname: string): void {
-  if (
-    URI_SCHEME.test(pathname) ||
-    pathname.includes('\\') ||
-    pathname
-      .split('/')
-      .some(segment => !segment || segment === '.' || segment === '..')
-  ) {
-    throw new TypeError('Unsafe dashboard plugin asset path')
   }
 }

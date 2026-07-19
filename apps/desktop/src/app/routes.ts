@@ -1,12 +1,6 @@
 import { atom } from 'nanostores'
 import type { ReactNode } from 'react'
 
-import {
-  $dashboardPluginDiscovery,
-  dashboardPluginPendingPath,
-  isDashboardPluginPathCandidate,
-  isDashboardPluginPathReserved
-} from '@/contrib/dashboard-discovery-state'
 import { registry } from '@/contrib/registry'
 
 export const SESSION_ROUTE_PREFIX = '/'
@@ -72,10 +66,6 @@ export const APP_ROUTES = [
 const APP_VIEW_BY_PATH = new Map<string, AppView>(APP_ROUTES.map(route => [route.path, route.view]))
 const RESERVED_PATHS: ReadonlySet<string> = new Set(APP_ROUTES.map(route => route.path))
 
-export function isReservedAppPath(pathname: string): boolean {
-  return RESERVED_PATHS.has(pathname)
-}
-
 // ── Contributed routes — the `routes` registry area ─────────────────────────
 // A contribution mounts a FULL PAGE in the workspace pane at `data.path`
 // (`render` on the contribution itself, like every other area). Contributed
@@ -88,13 +78,10 @@ export const ROUTES_AREA = 'routes'
 export interface RouteContribution {
   /** Absolute path, e.g. `/kanban`. One segment; no params. */
   path: string
-  /** True only for manifest-declared replacement of a reserved built-in route. */
-  override?: boolean
 }
 
 export function contributedRoutes(): Array<{
   key: string
-  override?: boolean
   path: string
   title?: string
   render: () => ReactNode
@@ -103,12 +90,11 @@ export function contributedRoutes(): Array<{
     .getArea(ROUTES_AREA)
     .map(c => ({
       key: `${c.source ?? 'core'}:${c.id}`,
-      override: (c.data as RouteContribution | undefined)?.override === true,
       path: (c.data as RouteContribution | undefined)?.path ?? '',
       title: c.title,
       render: c.render!
     }))
-    .filter(route => Boolean(route.path.startsWith('/') && route.render) && (!RESERVED_PATHS.has(route.path) || route.override))
+    .filter(route => Boolean(route.path.startsWith('/') && route.render) && !RESERVED_PATHS.has(route.path))
 }
 
 export function routeTileCandidateForPath(pathname: string): null | { path: string; title: string } {
@@ -181,21 +167,10 @@ export function isNewChatRoute(pathname: string): boolean {
 }
 
 export function routeSessionId(pathname: string): string | null {
-  const discovery = $dashboardPluginDiscovery.get()
-
-  if (dashboardPluginPendingPath() === pathname) {
-    return null
-  }
-
-  if (discovery.phase !== 'resolved' && isDashboardPluginPathCandidate(pathname)) {
-    return null
-  }
-
   if (
     !pathname.startsWith(SESSION_ROUTE_PREFIX) ||
     RESERVED_PATHS.has(pathname) ||
-    isContributedPath(pathname) ||
-    isDashboardPluginPathReserved(pathname)
+    isContributedPath(pathname)
   ) {
     return null
   }
@@ -210,12 +185,7 @@ export function sessionRoute(sessionId: string): string {
 }
 
 export function appViewForPath(pathname: string): AppView {
-  const discovery = $dashboardPluginDiscovery.get()
-
-  if (
-    isContributedPath(pathname) ||
-    (discovery.phase !== 'resolved' && isDashboardPluginPathCandidate(pathname))
-  ) {
+  if (isContributedPath(pathname)) {
     return 'extension'
   }
 

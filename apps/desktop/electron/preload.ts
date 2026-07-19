@@ -6,8 +6,6 @@ contextBridge.exposeInMainWorld('hermesDesktop', {
   touchBackend: profile => ipcRenderer.invoke('hermes:backend:touch', profile),
   getGatewayWsUrl: profile => ipcRenderer.invoke('hermes:gateway:ws-url', profile),
   getPluginWsUrl: (pluginId, path, profile) => ipcRenderer.invoke('hermes:plugin:ws-url', pluginId, path, profile),
-  pluginRaw: request => ipcRenderer.invoke('hermes:plugin:raw', request),
-  dashboardPluginAsset: request => ipcRenderer.invoke('hermes:dashboard-plugin:asset', request),
   openSessionWindow: (sessionId, opts) => ipcRenderer.invoke('hermes:window:openSession', sessionId, opts),
   openNewSessionWindow: () => ipcRenderer.invoke('hermes:window:openNewSession'),
   petOverlay: {

@@ -21,12 +21,6 @@ import { NotificationStack } from '@/components/notifications'
 import { DesktopOnboardingOverlay } from '@/components/onboarding'
 import { FloatingPet } from '@/components/pet/floating-pet'
 import { RemoteDisplayBanner } from '@/components/remote-display-banner'
-import {
-  $dashboardPluginDiscovery,
-  dashboardPluginPendingPath,
-  isDashboardPluginPathCandidate,
-  setDashboardPluginPendingPath
-} from '@/contrib/dashboard-discovery-state'
 import { emitGatewayEvent } from '@/contrib/events'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
@@ -143,7 +137,6 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   const actionsRef = useRef<WiringActions | null>(null)
 
   const gatewayState = useStore($gatewayState)
-  const dashboardPluginDiscovery = useStore($dashboardPluginDiscovery)
   const activeSessionId = useStore($activeSessionId)
   const currentCwd = useStore($currentCwd)
   const freshDraftReady = useStore($freshDraftReady)
@@ -173,23 +166,7 @@ export function ContribWiring({ children }: { children: ReactNode }) {
   // zone's tab bar stands down on pages (and returns with the chat).
   useEffect(() => {
     syncWorkspaceIsPage(location.pathname)
-
-    if (dashboardPluginDiscovery.phase === 'pending' && isDashboardPluginPathCandidate(location.pathname)) {
-      setDashboardPluginPendingPath(location.pathname)
-    } else if (
-      dashboardPluginDiscovery.phase === 'resolved' &&
-      dashboardPluginDiscovery.reservedPaths.includes(location.pathname)
-    ) {
-      // Remember the active manifest route so a reconnect/profile refresh can
-      // reserve it synchronously while the old contributions are replaced.
-      setDashboardPluginPendingPath(location.pathname)
-    } else if (
-      dashboardPluginDiscovery.phase === 'resolved' ||
-      (dashboardPluginDiscovery.phase === 'failed' && dashboardPluginPendingPath() !== location.pathname)
-    ) {
-      setDashboardPluginPendingPath(null)
-    }
-  }, [dashboardPluginDiscovery.phase, dashboardPluginDiscovery.reservedPaths, location.pathname])
+  }, [location.pathname])
 
   const {
     agentsOpen,

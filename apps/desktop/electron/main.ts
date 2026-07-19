@@ -55,7 +55,6 @@ import {
   resolveTestWsUrl,
   tokenPreview
 } from './connection-config'
-import { dashboardPluginAssetBackendPath } from './dashboard-plugin-assets'
 import { adoptServedDashboardToken } from './dashboard-token'
 import {
   buildPosixCleanupScript,
@@ -3820,19 +3819,6 @@ function unsafePluginWsPath(pathname) {
   )
 }
 
-function validatePluginRawPath(path) {
-  const raw = String(path || '')
-  const match = raw.match(/^\/api\/plugins\/([^/?#]+)(\/.*)?$/)
-
-  if (!match || !PLUGIN_MANIFEST_ID_RE.test(match[1])) {
-    throw new Error('Invalid plugin raw API path')
-  }
-
-  pluginWsEndpoint(match[1], match[2] || '/')
-
-  return raw
-}
-
 function fetchJson(url, token, options: any = {}) {
   return new Promise((resolve, reject) => {
     const { body, contentType } = options.upload
@@ -3904,64 +3890,6 @@ function fetchJson(url, token, options: any = {}) {
           } catch {
             reject(new Error(`Invalid JSON from ${url} (status ${res.statusCode}): ${text.slice(0, 200)}`))
           }
-        })
-      }
-    )
-
-    req.on('error', reject)
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    })
-
-    if (body) {
-      req.write(body)
-    }
-
-    req.end()
-  })
-}
-
-function fetchRaw(url, token, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const { body, contentType } = options.upload
-      ? multipartBody(options.upload)
-      : {
-          body: options.body === undefined ? undefined : Buffer.from(JSON.stringify(options.body)),
-          contentType: 'application/json'
-        }
-
-    const parsed = new URL(url)
-    const client = parsed.protocol === 'https:' ? https : http
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-
-      return
-    }
-
-    const req = client.request(
-      parsed,
-      {
-        method: options.method || 'GET',
-        headers: {
-          'Content-Type': contentType,
-          'X-Hermes-Session-Token': token,
-          ...(body ? { 'Content-Length': String(body.length) } : {})
-        }
-      },
-      res => {
-        const chunks = []
-        res.on('error', reject)
-        res.on('data', chunk => chunks.push(Buffer.from(chunk)))
-        res.on('end', () => {
-          const headers = {}
-
-          for (const [key, value] of Object.entries(res.headers)) {
-            headers[key] = Array.isArray(value) ? value.join(', ') : String(value ?? '')
-          }
-
-          resolve({ body: Buffer.concat(chunks), headers, status: res.statusCode || 500 })
         })
       }
     )
@@ -5663,77 +5591,6 @@ function fetchJsonViaOauthSession(url, options: any = {}) {
 
       clearTimeout(timer)
       reject(error)
-    })
-
-    if (body) {
-      request.write(body)
-    }
-
-    request.end()
-  })
-}
-
-function fetchRawViaOauthSession(url, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const sess = getOauthSession()
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    const multipart = options.upload ? multipartBody(options.upload) : null
-    const body = multipart ? multipart.body : serializeJsonBody(options.body)
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    const request = electronNet.request({
-      method: options.method || 'GET',
-      url,
-      session: sess,
-      useSessionCookies: true,
-      redirect: 'follow'
-    } as any)
-
-    setRequestContentType(request, multipart ? multipart.contentType : 'application/json')
-
-    let timedOut = false
-
-    const timer = setTimeout(() => {
-      timedOut = true
-
-      try {
-        request.abort()
-      } catch {
-        // already finished
-      }
-
-      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    }, timeoutMs)
-
-    request.on('response', res => {
-      const chunks = []
-      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
-      res.on('end', () => {
-        if (timedOut) {
-          return
-        }
-
-        clearTimeout(timer)
-        const headers = {}
-
-        for (const [key, value] of Object.entries(res.headers)) {
-          headers[key] = Array.isArray(value) ? value.join(', ') : String(value ?? '')
-        }
-
-        resolve({ body: Buffer.concat(chunks), headers, status: res.statusCode || 500 })
-      })
-    })
-    request.on('error', error => {
-      if (!timedOut) {
-        clearTimeout(timer)
-        reject(error)
-      }
     })
 
     if (body) {
@@ -7929,23 +7786,6 @@ ipcMain.handle('hermes:gateway:ws-url', async (_event, profile) => freshGatewayW
 ipcMain.handle('hermes:plugin:ws-url', async (_event, pluginId, path, profile) =>
   freshPluginWsUrl(pluginId, path, profile)
 )
-ipcMain.handle('hermes:plugin:raw', async (_event, request) => {
-  const profile = request?.profile
-  const connection = await ensureBackend(profile)
-  const url = `${connection.baseUrl}${validatePluginRawPath(request?.path)}`
-  const opts = { body: request?.body, method: request?.method, timeoutMs: request?.timeoutMs, upload: request?.upload }
-
-  return connection.authMode === 'oauth' ? fetchRawViaOauthSession(url, opts) : fetchRaw(url, connection.token, opts)
-})
-ipcMain.handle('hermes:dashboard-plugin:asset', async (_event, request) => {
-  const profile = request?.profile
-  const connection = await ensureBackend(profile)
-  const url = `${connection.baseUrl}${dashboardPluginAssetBackendPath(request?.manifestId, request?.assetPath)}`
-
-  return connection.authMode === 'oauth'
-    ? fetchRawViaOauthSession(url, { method: 'GET', timeoutMs: request?.timeoutMs })
-    : fetchRaw(url, connection.token, { method: 'GET', timeoutMs: request?.timeoutMs })
-})
 ipcMain.handle('hermes:window:openSession', async (_event, sessionId, opts) => {
   if (typeof sessionId !== 'string' || !sessionId.trim()) {
     return { ok: false, error: 'invalid-session-id' }

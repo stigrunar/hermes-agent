@@ -1,8 +1,6 @@
 import {
-  buildDashboardPluginAssetPath,
   buildPluginApiPath,
   JsonRpcGatewayClient,
-  normalizeDashboardPluginAssetPath,
   normalizePluginRelativePath
 } from '@hermes/shared'
 
@@ -215,32 +213,6 @@ export interface PluginRestOptions {
   timeoutMs?: number
 }
 
-export async function getDashboardPluginManifests<T = unknown[]>(): Promise<T> {
-  if (!window.hermesDesktop?.api) {
-    throw new Error('Hermes desktop bridge unavailable')
-  }
-
-  return window.hermesDesktop.api<T>({ path: '/api/dashboard/plugins', ...profileScoped() })
-}
-
-export async function getDashboardPluginAsset(manifestId: string, assetPath: string): Promise<Response> {
-  if (!window.hermesDesktop?.dashboardPluginAsset) {
-    throw new Error('Hermes desktop dashboard plugin asset bridge unavailable')
-  }
-
-  buildDashboardPluginAssetPath(manifestId, assetPath)
-
-  const result = await window.hermesDesktop.dashboardPluginAsset({
-    assetPath: normalizeDashboardPluginAssetPath(assetPath),
-    manifestId,
-    ...profileScoped()
-  })
-
-  const body = result.body instanceof ArrayBuffer ? result.body : new Uint8Array(result.body).buffer
-
-  return new Response(body, { headers: result.headers, status: result.status })
-}
-
 /** The plugin REST door. Every call is scoped BY CONSTRUCTION to the plugin's
  *  own backend namespace — `path` is relative to `/api/plugins/<pluginId>`
  *  ('/board' → `/api/plugins/kanban/board`), so a plugin can't address another
@@ -260,42 +232,6 @@ export async function pluginRest<T>(pluginId: string, path: string, opts: Plugin
     timeoutMs: opts.timeoutMs,
     ...profileScoped()
   })
-}
-
-export async function pluginFetchJSON<T>(url: string, init: RequestInit = {}, ownerId?: string): Promise<T> {
-  const { pluginId, suffix } = pluginEndpointParts(url)
-  assertPluginOwner(pluginId, ownerId)
-  const body = typeof init.body === 'string' ? parseJsonBody(init.body) : init.body
-
-  return pluginRest<T>(pluginId, suffix, { body, method: init.method })
-}
-
-export async function pluginRawFetch(url: string, init: RequestInit = {}, ownerId?: string): Promise<Response> {
-  const { pluginId, suffix } = pluginEndpointParts(url)
-  assertPluginOwner(pluginId, ownerId)
-  const upload = init.body instanceof FormData ? await uploadFromFormData(init.body) : undefined
-
-  if (!window.hermesDesktop?.pluginRaw) {
-    throw new Error('Hermes desktop plugin raw bridge unavailable')
-  }
-
-  const result = await window.hermesDesktop.pluginRaw({
-    path: buildPluginApiPath(pluginId, suffix),
-    method: init.method,
-    upload,
-    body: upload ? undefined : typeof init.body === 'string' ? parseJsonBody(init.body) : init.body,
-    ...profileScoped()
-  })
-
-  const body = result.body instanceof ArrayBuffer ? result.body : new Uint8Array(result.body).buffer
-
-  return new Response(body, { headers: result.headers, status: result.status })
-}
-
-function assertPluginOwner(pluginId: string, ownerId: string | undefined): void {
-  if (ownerId && pluginId !== ownerId) {
-    throw new Error(`Plugin ${ownerId} cannot access plugin namespace ${pluginId}`)
-  }
 }
 
 /** The plugin WebSocket door — the live twin of `pluginRest`, scoped the same
@@ -343,43 +279,6 @@ export function pluginSocket(pluginId: string, path: string, onMessage: (data: u
   return () => {
     disposed = true
     socket?.close()
-  }
-}
-
-function pluginEndpointParts(url: string): { pluginId: string; suffix: string } {
-  const normalized = url.startsWith('/') ? url : `/${url}`
-  const match = normalized.match(/^\/api\/plugins\/([^/?#]+)(\/.*)?$/)
-
-  if (!match) {
-    throw new Error(`Plugin API path must target /api/plugins/<id>: ${url}`)
-  }
-
-  return { pluginId: decodeURIComponent(match[1]), suffix: match[2] || '/' }
-}
-
-function parseJsonBody(body: string): unknown {
-  if (!body) {
-    return undefined
-  }
-
-  try {
-    return JSON.parse(body)
-  } catch {
-    return body
-  }
-}
-
-async function uploadFromFormData(form: FormData): Promise<PluginRestOptions['upload']> {
-  const file = form.get('file')
-
-  if (!(file instanceof File)) {
-    throw new Error('Plugin upload FormData must include a file field')
-  }
-
-  return {
-    bytes: await file.arrayBuffer(),
-    contentType: file.type || 'application/octet-stream',
-    filename: file.name || 'file'
   }
 }
 
