@@ -1445,10 +1445,13 @@ def _dispatch_tick_lock(db_path: Path, *, fail_open: bool = True):
     (yields ``True``) — single-writer enforcement is best-effort and the
     orphan-dispatcher scenario is specific to POSIX service managers.
     """
-    try:
-        canonical_db_path = db_path.expanduser().resolve(strict=False)
-    except OSError:
-        canonical_db_path = db_path
+    canonical_db_path = _canonical_db_path(db_path)
+    if canonical_db_path is None:
+        # Never manufacture a lock path from an unresolved identity. The
+        # ``fail_open`` flag only governs an open/permission failure for a
+        # valid path; identity resolution itself is always fail-closed.
+        yield False
+        return
     lock_path = canonical_db_path.with_name(
         canonical_db_path.name + ".dispatch.lock"
     )
@@ -7941,30 +7944,32 @@ def dispatch_once(
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
     the holder is already making progress on the same board.
 
-    The lock is keyed off the board's resolved DB path, so unrelated
-    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
-    cross-process / cross-platform mechanics.
+    The lock is keyed off the active SQLite connection's canonical DB path,
+    so explicit DB callers and board-less ticks cannot drift onto a different
+    lock file. Unrelated boards still tick in parallel. See
+    :func:`_dispatch_tick_lock` for the cross-process / cross-platform
+    mechanics.
     """
-    try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        return _dispatch_once_locked(
-            conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
-            failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
-            default_assignee=default_assignee,
-            max_in_progress_per_profile=max_in_progress_per_profile,
+    db_path = _connection_main_db_path(conn)
+    if db_path is None:
+        _log.error(
+            "kanban dispatch skipped: active SQLite connection has no "
+            "canonical on-disk database identity"
         )
-    with _dispatch_tick_lock(db_path) as held:
+        return DispatchResult(skipped_locked=True)
+    try:
+        # Snapshot the board once. A board switch while a tick is blocked in
+        # spawn must not redirect workspace/log resolution on the same tick.
+        pinned_board = _normalize_board_slug(board) or get_current_board()
+    except Exception:
+        _log.error(
+            "kanban dispatch skipped: could not resolve a stable board "
+            "identity for database %s",
+            db_path,
+            exc_info=True,
+        )
+        return DispatchResult(skipped_locked=True)
+    with _dispatch_tick_lock(db_path, fail_open=False) as held:
         if not held:
             return DispatchResult(skipped_locked=True)
         return _dispatch_once_locked(
@@ -7976,9 +7981,10 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            board=pinned_board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            db_path=db_path,
         )
 
 
@@ -7993,6 +7999,7 @@ def _dispatch_once_locked(
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
+    db_path: Optional[Path] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
 ) -> DispatchResult:
@@ -8021,9 +8028,15 @@ def _dispatch_once_locked(
     busy board and accumulate without bound.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
-    ``board`` pins workspace/log/db resolution for this tick to a specific
-    board. When omitted, the current-board resolution chain is used.
+    ``board`` pins workspace/log resolution for this tick to a specific
+    board. ``db_path`` is the canonical identity of the active SQLite
+    connection and is required for the lock/worker/scope/receipt handoff.
     """
+    if db_path is None:
+        raise RuntimeError(
+            "_dispatch_once_locked requires the canonical connection DB path"
+        )
+
     # Reap zombie children from previously spawned workers. See
     # reap_worker_zombies() for the full rationale.
     reap_worker_zombies()
@@ -8269,10 +8282,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "db_path" in sig.parameters:
+                    spawn_kwargs["db_path"] = db_path
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -8370,10 +8385,12 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
+                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    pid = _spawn(claimed, str(workspace), board=board)
-                else:
-                    pid = _spawn(claimed, str(workspace))
+                    spawn_kwargs["board"] = board
+                if "db_path" in sig.parameters:
+                    spawn_kwargs["db_path"] = db_path
+                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -8963,10 +8980,31 @@ def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
     try:
         for row in conn.execute("PRAGMA database_list").fetchall():
             if row[1] == "main" and row[2]:
-                return Path(row[2])
+                return _canonical_db_path(row[2])
     except (sqlite3.Error, IndexError, TypeError):
         return None
     return None
+
+
+def _canonical_db_path(
+    db_path: Optional[os.PathLike[str] | str],
+) -> Optional[Path]:
+    """Resolve one on-disk SQLite identity without consulting board state.
+
+    Dispatch/reclaim synchronization must use the path owned by the active
+    SQLite connection. Returning ``None`` for an in-memory/invalid identity is
+    intentional: callers that protect lifecycle writes must fail closed rather
+    than silently selecting a board-derived lock file.
+    """
+    if db_path is None:
+        return None
+    try:
+        raw = str(db_path).strip()
+        if not raw or raw == ":memory:":
+            return None
+        return Path(raw).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError):
+        return None
 
 
 def _worker_scope_unit_name(
@@ -9056,6 +9094,7 @@ def _systemd_worker_scope_argv(
     task: Task,
     *,
     board: Optional[str] = None,
+    db_path: Optional[os.PathLike[str] | str] = None,
     cgroup_path: Optional[str] = None,
     manager_target: Optional[_SystemdUserManagerTarget] = None,
     systemd_run: Optional[str] = None,
@@ -9100,6 +9139,7 @@ def _systemd_worker_scope_argv(
             task.id,
             int(task.current_run_id),
             board=board,
+            db_path=db_path,
         )
     except (OSError, ValueError):
         return cmd
@@ -9387,6 +9427,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    db_path: Optional[os.PathLike[str] | str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -9403,6 +9444,14 @@ def _default_spawn(
     import subprocess
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
+
+    canonical_db_path = _canonical_db_path(
+        db_path if db_path is not None else kanban_db_path(board=board)
+    )
+    if canonical_db_path is None:
+        raise RuntimeError(
+            "kanban worker spawn requires a canonical on-disk database identity"
+        )
 
     from hermes_cli.profiles import normalize_profile_name
 
@@ -9478,7 +9527,7 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
+    env["HERMES_KANBAN_DB"] = str(canonical_db_path)
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
@@ -9543,6 +9592,7 @@ def _default_spawn(
         worker_cmd,
         task,
         board=board,
+        db_path=canonical_db_path,
         cgroup_path=scope_cgroup_path,
         manager_target=scope_manager_target,
     )

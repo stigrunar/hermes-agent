@@ -8,6 +8,7 @@ import os
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 import types
 import unittest.mock
@@ -2726,6 +2727,190 @@ def test_dispatch_promotes_ready_and_spawns(kanban_home, all_assignees_spawnable
     # c is now running
     with kb.connect() as conn:
         assert kb.get_task(conn, c).status == "running"
+
+
+def test_dispatch_reclaim_share_explicit_connection_lock_during_blocked_spawn(
+    tmp_path, monkeypatch,
+):
+    """A blocked spawn keeps a second connection from releasing the claim.
+
+    This uses two real SQLite connections to an explicit path. The reclaim
+    attempt must lose the same canonical dispatch lock, then the original
+    dispatch must still CAS its PID and receipt after the spawn unblocks.
+    """
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    db_path = tmp_path / "explicit-board" / "kanban.db"
+    kb.init_db(db_path)
+    setup_conn = kb.connect(db_path=db_path)
+    reclaim_conn = kb.connect(db_path=db_path)
+    started = threading.Event()
+    release = threading.Event()
+    dispatch_done = threading.Event()
+    dispatch_results = []
+    dispatch_errors = []
+
+    def blocked_spawn(_task, _workspace):
+        started.set()
+        if not release.wait(timeout=5):
+            raise AssertionError("blocked spawn was not released")
+        return 44001
+
+    try:
+        task_id = kb.create_task(
+            setup_conn, title="blocked explicit spawn", assignee="worker"
+        )
+        setup_conn.close()
+
+        def run_dispatch():
+            dispatch_conn = kb.connect(db_path=db_path)
+            try:
+                dispatch_results.append(
+                    kb.dispatch_once(dispatch_conn, spawn_fn=blocked_spawn)
+                )
+            except BaseException as exc:  # surface thread failures in the test
+                dispatch_errors.append(exc)
+            finally:
+                dispatch_conn.close()
+                dispatch_done.set()
+
+        worker = threading.Thread(target=run_dispatch)
+        worker.start()
+        assert started.wait(timeout=5)
+
+        # The second connection reaches the real lock file, not a mocked
+        # acquisition seam. It must retain the pre-receipt claim.
+        assert kb.reclaim_task(
+            reclaim_conn, task_id, reason="operator raced spawn"
+        ) is False
+        during = kb.get_task(reclaim_conn, task_id)
+        assert during is not None
+        assert during.status == "running"
+        assert during.claim_lock is not None
+        assert during.worker_pid is None
+
+        release.set()
+        assert dispatch_done.wait(timeout=5)
+        worker.join(timeout=1)
+        assert not dispatch_errors
+        assert len(dispatch_results) == 1
+        assert len(dispatch_results[0].spawned) == 1
+        assert dispatch_results[0].spawned[0][0:2] == (task_id, "worker")
+
+        final = kb.get_task(reclaim_conn, task_id)
+        assert final is not None
+        assert final.status == "running"
+        assert final.worker_pid == 44001
+        spawned = reclaim_conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'spawned'",
+            (task_id,),
+        ).fetchall()
+        assert len(spawned) == 1
+        assert json.loads(spawned[0]["payload"])["pid"] == 44001
+
+        duplicate_calls = []
+
+        def duplicate_spawn(task, _workspace):
+            duplicate_calls.append(task.id)
+            return 44002
+
+        kb.dispatch_once(reclaim_conn, spawn_fn=duplicate_spawn)
+        assert duplicate_calls == []
+    finally:
+        release.set()
+        dispatch_done.wait(timeout=5)
+        try:
+            setup_conn.close()
+        except Exception:
+            pass
+        reclaim_conn.close()
+
+
+def test_dispatch_default_spawn_pins_connection_db_through_receipt(
+    tmp_path, monkeypatch,
+):
+    """Default spawn, scope naming, and receipt validation share one DB path."""
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _name: True)
+    db_path = (tmp_path / "explicit" / "kanban.db").resolve()
+    kb.init_db(db_path)
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=tmp_path / "run-user",
+        bus_path=tmp_path / "run-user" / "bus",
+    )
+    captured = {}
+
+    class FakeProc:
+        pid = 44003
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kb,
+        "_current_cgroup_path",
+        lambda: "/user.slice/user-1000.slice/user@1000.service/app.slice/dispatcher.service",
+    )
+    monkeypatch.setattr(kb, "_systemd_user_manager_target_for_cgroup", lambda _path: target)
+    monkeypatch.setattr(kb, "_systemd_user_scope_available", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(kb, "_await_scope_exec_ack", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        kb.shutil,
+        "which",
+        lambda name: "/usr/bin/systemd-run" if name == "systemd-run" else None,
+    )
+
+    def fake_popen(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["kwargs"] = kwargs
+        return FakeProc()
+
+    monkeypatch.setattr("subprocess.Popen", fake_popen)
+    # The board snapshot must remain stable even if current-board resolution
+    # changes after dispatch entry.
+    board_reads = iter(("default", "drifted-board"))
+    monkeypatch.setattr(kb, "get_current_board", lambda: next(board_reads, "drifted-board"))
+
+    with kb.connect(db_path=db_path) as conn:
+        task_id = kb.create_task(conn, title="identity agreement", assignee="worker")
+        result = kb.dispatch_once(conn)
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert result.spawned
+        expected_unit = kb._worker_scope_unit_name(
+            task_id, task.current_run_id, db_path=db_path,
+        )
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'spawned' ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+
+    assert event is not None
+    payload = json.loads(event["payload"])
+    assert payload["scope_unit"] == expected_unit
+    assert captured["cmd"][5] == f"--unit={expected_unit}"
+    assert captured["kwargs"]["env"]["HERMES_KANBAN_DB"] == str(db_path)
+    assert captured["kwargs"]["env"]["HERMES_KANBAN_BOARD"] == "default"
+
+
+def test_dispatch_fails_closed_without_connection_db_identity(monkeypatch):
+    conn = sqlite3.connect(":memory:")
+    called = []
+    monkeypatch.setattr(
+        kb,
+        "_dispatch_once_locked",
+        lambda *_args, **_kwargs: called.append(True),
+    )
+    try:
+        result = kb.dispatch_once(conn, spawn_fn=lambda *_args: 44004)
+    finally:
+        conn.close()
+    assert result.skipped_locked is True
+    assert called == []
 
 
 def test_dispatch_spawn_failure_releases_claim(kanban_home, all_assignees_spawnable):
