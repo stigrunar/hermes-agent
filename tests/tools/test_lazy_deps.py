@@ -326,6 +326,47 @@ class TestActiveFeatures:
         )
         assert "platform.slack" in ld.active_features()
 
+    def test_shared_package_alone_does_not_activate_unrelated_features(self, monkeypatch):
+        monkeypatch.setitem(
+            ld.LAZY_DEPS,
+            "test.alpha",
+            ("alpha-sdk==1.0", "shared-transport==2.0"),
+        )
+        monkeypatch.setitem(
+            ld.LAZY_DEPS,
+            "test.beta",
+            ("beta-sdk==1.0", "shared-transport==2.0"),
+        )
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "shared-transport",
+        )
+
+        active = ld.active_features()
+
+        assert "test.alpha" not in active
+        assert "test.beta" not in active
+
+    def test_feature_distinctive_secondary_package_can_activate(self, monkeypatch):
+        monkeypatch.setitem(
+            ld.LAZY_DEPS,
+            "test.alpha",
+            ("alpha-sdk==1.0", "alpha-helper==1.0", "shared-transport==2.0"),
+        )
+        monkeypatch.setitem(
+            ld.LAZY_DEPS,
+            "test.beta",
+            ("beta-sdk==1.0", "shared-transport==2.0"),
+        )
+        monkeypatch.setattr(
+            ld,
+            "_is_present",
+            lambda spec: ld._pkg_name_from_spec(spec) == "alpha-helper",
+        )
+
+        assert "test.alpha" in ld.active_features()
+
 
 class TestRefreshActiveFeatures:
     def test_no_active_features_returns_empty(self, monkeypatch):

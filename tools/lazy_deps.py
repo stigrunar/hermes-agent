@@ -858,16 +858,34 @@ def feature_install_command(feature: str) -> Optional[str]:
 def active_features() -> list[str]:
     """Return the list of features the user has ever lazy-installed.
 
-    A feature counts as "active" if at least one of its declared packages
-    is currently installed in the venv (presence check, ignoring version).
-    Features the user has never enabled stay quiet.
+    A feature counts as "active" if at least one of its feature-distinctive
+    declared packages is currently installed in the venv (presence check,
+    ignoring version). Packages declared by more than one feature are ignored
+    for activation detection when a distinctive package exists. This prevents
+    shared transport/security pins such as ``aiohttp`` or ``starlette`` from
+    making every platform that declares them look previously activated.
+
+    If a feature has no distinctive package (for example two features that are
+    intentionally thin aliases over the same SDK), its first declared package
+    remains the activation sentinel.
 
     Used by ``hermes update`` to figure out which lazy backends need a
     refresh pass when pins move in :data:`LAZY_DEPS`.
     """
+    package_owners: dict[str, set[str]] = {}
+    for feature, specs in LAZY_DEPS.items():
+        for spec in specs:
+            package_owners.setdefault(_pkg_name_from_spec(spec).lower(), set()).add(feature)
+
     active = []
     for feature, specs in LAZY_DEPS.items():
-        if any(_is_present(s) for s in specs):
+        distinctive = tuple(
+            spec
+            for spec in specs
+            if len(package_owners[_pkg_name_from_spec(spec).lower()]) == 1
+        )
+        activation_specs = distinctive or specs[:1]
+        if any(_is_present(spec) for spec in activation_specs):
             active.append(feature)
     return active
 
