@@ -1,6 +1,6 @@
 import type { useSensors } from '@dnd-kit/core'
 import type * as React from 'react'
-import { useMemo, useState } from 'react'
+import { useId, useMemo, useState } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
 import { Button } from '@/components/ui/button'
@@ -477,10 +477,13 @@ function MessagingConversationTree({
   renderRows: (sessions: SessionInfo[]) => React.ReactNode
 }) {
   const [open, setOpen] = useState(true)
+  const contentId = useId()
 
   return (
     <div className="grid gap-px">
       <button
+        aria-controls={contentId}
+        aria-expanded={open}
         className="group/conversation flex min-h-[1.625rem] min-w-0 items-center gap-1.5 rounded-md bg-transparent pl-2 pr-1 text-left"
         onClick={() => setOpen(value => !value)}
         type="button"
@@ -495,7 +498,7 @@ function MessagingConversationTree({
         />
       </button>
       {open && (
-        <div className="grid gap-px pl-3">
+        <div className="grid gap-px pl-3" id={contentId}>
           {conversation.topics.map(topic => (
             <MessagingTopicTree key={topic.id} projects={projects} renderRows={renderRows} topic={topic} />
           ))}
@@ -517,6 +520,7 @@ function MessagingTopicTree({
   const { t } = useI18n()
   const s = t.sidebar.projects
   const [open, setOpen] = useState(true)
+  const contentId = useId()
   const [dialogOpen, setDialogOpen] = useState(false)
 
   const [projectId, setProjectId] = useState(
@@ -576,6 +580,8 @@ function MessagingTopicTree({
     <div className="grid gap-px">
       <div className="group/topic grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md">
         <button
+          aria-controls={contentId}
+          aria-expanded={open}
           className="flex h-full min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
           onClick={() => setOpen(value => !value)}
           type="button"
@@ -608,7 +614,11 @@ function MessagingTopicTree({
           </Tip>
         ) : null}
       </div>
-      {open && <div className="grid gap-px pl-3">{renderRows(topic.sessions)}</div>}
+      {open && (
+        <div className="grid gap-px pl-3" id={contentId}>
+          {renderRows(topic.sessions)}
+        </div>
+      )}
       <Dialog onOpenChange={setDialogOpen} open={topic.canManageBinding && dialogOpen}>
         <DialogContent>
           <DialogHeader>
