@@ -806,6 +806,61 @@ def test_crash_reclaim_defers_while_scope_descendants_remain(
         )
 
 
+def test_crash_reclaim_recovers_user_scope_after_dispatcher_manager_migration(
+    kanban_home, monkeypatch,
+):
+    """A replacement system-service dispatcher must honor the prior user scope."""
+    with kb.connect() as conn:
+        t = kb.create_task(conn, title="manager migration", assignee="worker")
+        claimed = kb.claim_task(conn, t)
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+        unit = kb._worker_scope_unit_name(
+            t,
+            claimed.current_run_id,
+            db_path=kanban_home / "kanban.db",
+        )
+        kb._set_worker_pid(conn, t, kb._WorkerLaunchPid(12345, scope_unit=unit))
+        # Simulate an in-flight run launched by the prior candidate, whose
+        # spawned receipt predates explicit launch handles. Recovery must still
+        # reconstruct its unit after the dispatcher changes manager.
+        conn.execute(
+            "UPDATE task_events SET payload = ? "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned'",
+            (json.dumps({"pid": 12345}), t, claimed.current_run_id),
+        )
+        monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+        monkeypatch.setattr(
+            kb,
+            "_current_cgroup_path",
+            lambda: "/system.slice/hermes-kanban-dispatcher.service",
+        )
+        monkeypatch.setattr(
+            kb.shutil,
+            "which",
+            lambda name: "/usr/bin/systemctl" if name == "systemctl" else None,
+        )
+        queried = []
+
+        def scope_state(candidate, **_kwargs):
+            queried.append(candidate)
+            return "active" if candidate == unit else "not-found"
+
+        monkeypatch.setattr(kb, "_systemd_user_scope_state", scope_state)
+        monkeypatch.setattr(kb, "_stop_systemd_user_scope", lambda _unit: False)
+
+        assert kb.detect_crashed_workers(conn) == []
+        task = kb.get_task(conn, t)
+        assert task is not None
+        assert task.status == "running"
+        assert task.worker_pid == 12345
+        assert queried == [unit]
+        assert any(
+            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
+        )
+
+
 def test_manual_reclaim_defers_when_scope_state_is_unknown(
     kanban_home, monkeypatch,
 ):

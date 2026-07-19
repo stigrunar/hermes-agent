@@ -1231,7 +1231,7 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        assert spawned[0].payload == {"pid": 98765, "launch_mode": "direct"}
     finally:
         conn.close()
 
@@ -3064,6 +3064,7 @@ def test_default_spawn_wraps_scope_and_returns_popen_pid(
         conn.close()
 
     assert pid == 424242
+    assert getattr(pid, "scope_unit") == captured["cmd"][5].removeprefix("--unit=")
     assert captured["cmd"][0:3] == [
         "/usr/bin/systemd-run", "--user", "--scope",
     ]

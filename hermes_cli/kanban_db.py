@@ -7335,11 +7335,10 @@ def _set_worker_pid(
 ) -> bool:
     """CAS-record the spawned child's pid and emit a ``spawned`` event.
 
-    The event's payload carries the pid so a human reading ``hermes kanban
-    tail`` can correlate log lines with OS-level traces without opening
-    the drawer. Returns ``False`` when the worker completed or lost its claim
-    before the dispatcher could persist the PID; in that race no stale PID is
-    written onto the terminal/newer run.
+    The event's payload carries the PID plus a separate launch handle. Custom
+    ``spawn_fn -> int`` results are explicitly direct; the built-in scoped
+    launcher returns an int-compatible value carrying its opaque unit. Returns
+    ``False`` when the worker completed or lost its claim before persistence.
     """
     with write_txn(conn):
         row = conn.execute(
@@ -7373,7 +7372,14 @@ def _set_worker_pid(
                 "  AND claim_lock IS ?",
                 (int(pid), int(run_id), claim_lock),
             )
-        _append_event(conn, task_id, "spawned", {"pid": int(pid)}, run_id=run_id)
+        scope_unit = getattr(pid, "scope_unit", None)
+        payload: dict[str, Any] = {
+            "pid": int(pid),
+            "launch_mode": "systemd-user-scope" if scope_unit else "direct",
+        }
+        if scope_unit:
+            payload["scope_unit"] = scope_unit
+        _append_event(conn, task_id, "spawned", payload, run_id=run_id)
         return True
 
 
@@ -7954,7 +7960,7 @@ def _dispatch_once_locked(
                 _set_worker_pid(
                     conn,
                     claimed.id,
-                    int(pid),
+                    pid,
                     expected_run_id=claimed.current_run_id,
                     expected_claim_lock=claimed.claim_lock,
                 )
@@ -8055,7 +8061,7 @@ def _dispatch_once_locked(
                 _set_worker_pid(
                     conn,
                     claimed.id,
-                    int(pid),
+                    pid,
                     expected_run_id=claimed.current_run_id,
                     expected_claim_lock=claimed.claim_lock,
                 )
@@ -8370,6 +8376,17 @@ class _WorkerLaunchUncertain(RuntimeError):
         self.pid = int(pid)
 
 
+class _WorkerLaunchPid(int):
+    """Integer-compatible worker PID carrying its durable launch handle."""
+
+    scope_unit: Optional[str]
+
+    def __new__(cls, pid: int, *, scope_unit: Optional[str] = None):
+        value = int.__new__(cls, int(pid))
+        value.scope_unit = scope_unit
+        return value
+
+
 def _systemd_service_manager(cgroup_path: Optional[str]) -> Optional[str]:
     """Classify a service-hosted cgroup as ``user`` or ``system``.
 
@@ -8628,34 +8645,16 @@ def _systemd_user_scope_possible(
     platform: Optional[str] = None,
     run_fn=None,
 ) -> bool:
-    """Return whether this process could have launched managed user scopes.
+    """Return whether this host may contain managed user worker scopes.
 
-    Unlike the launch preflight, this intentionally does not require the user
-    bus to be reachable *right now*. A temporary bus failure while recovering
-    an earlier scope is an unknown lifecycle state and must defer automatic
-    requeue rather than silently orphan descendants.
+    Recovery is deliberately independent of the replacement dispatcher's
+    manager, launcher availability, and current user-bus health. A worker may
+    have been launched by an earlier user-service dispatcher and survived a
+    restart into a system service. The actual unit query below distinguishes
+    active, absent, and unknown state; unknown fails closed.
     """
     active_platform = platform if platform is not None else sys.platform
-    if not active_platform.startswith("linux"):
-        return False
-    current = cgroup_path if cgroup_path is not None else _current_cgroup_path()
-    manager = _systemd_service_manager(current)
-    if manager == "system":
-        return False
-    runner = systemd_run if systemd_run is not None else shutil.which("systemd-run")
-    controller = systemctl if systemctl is not None else shutil.which("systemctl")
-    if not runner or not controller:
-        return False
-    version = _systemd_run_major_version(runner, run_fn=run_fn)
-    if version is None or version < _SYSTEMD_SCOPE_MIN_VERSION:
-        return False
-    return bool(
-        manager == "user"
-        or _systemd_user_manager_reachable(
-            systemctl=controller,
-            run_fn=run_fn,
-        )
-    )
+    return active_platform.startswith("linux")
 
 
 def _valid_worker_scope_unit(unit: str) -> bool:
@@ -8763,16 +8762,53 @@ def _worker_scope_state(
     """Locate an active current/legacy scope for an active task attempt."""
     if run_id is None or not _systemd_user_scope_possible():
         return None, "not-applicable"
-    db_path = _connection_main_db_path(conn)
-    if db_path is None:
-        return None, "not-applicable"
+
+    # New runs persist the launch mode and exact opaque unit alongside the
+    # real worker PID in the spawned event. This keeps direct/custom spawn_fn
+    # runs on the PID fallback while allowing scope recovery after dispatcher
+    # manager migration or loss of the systemd-run launcher binary.
+    launch_mode: Optional[str] = None
+    persisted_unit: Optional[str] = None
     try:
-        candidates = (
-            _worker_scope_unit_name(task_id, int(run_id), db_path=db_path),
-            _legacy_worker_scope_unit_name(task_id, int(run_id)),
-        )
-    except (OSError, ValueError):
+        event = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        if event is None:
+            # A claimed run can be inspected before PID persistence, and test
+            # or third-party callers may set a PID directly. Without a spawned
+            # receipt there is no evidence that this run used a scope.
+            return None, "not-applicable"
+        if event["payload"]:
+            payload = json.loads(event["payload"])
+            launch_mode = payload.get("launch_mode")
+            persisted_unit = payload.get("scope_unit")
+    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
         return None, "unknown"
+    if launch_mode == "direct":
+        return None, "not-applicable"
+    if launch_mode == "systemd-user-scope":
+        if not isinstance(persisted_unit, str) or not _valid_worker_scope_unit(
+            persisted_unit
+        ):
+            return None, "unknown"
+        candidates = (persisted_unit,)
+    else:
+        # Pre-handle runs may still own either deterministic unit name. Treat
+        # them as potentially scoped regardless of the current dispatcher's
+        # manager so an upgrade/restart cannot release a surviving descendant.
+        db_path = _connection_main_db_path(conn)
+        if db_path is None:
+            return None, "unknown"
+        try:
+            candidates = (
+                _worker_scope_unit_name(task_id, int(run_id), db_path=db_path),
+                _legacy_worker_scope_unit_name(task_id, int(run_id)),
+            )
+        except (OSError, ValueError):
+            return None, "unknown"
     unknown_unit: Optional[str] = None
     for unit in candidates:
         state = _systemd_user_scope_state(unit)
@@ -8939,6 +8975,7 @@ def _default_spawn(
         cmd.append("-Q")
     worker_cmd = cmd
     cmd = _systemd_worker_scope_argv(worker_cmd, task, board=board)
+    scope_unit: Optional[str] = None
     scope_ready_read: Optional[int] = None
     scope_ready_write: Optional[int] = None
     if cmd is not worker_cmd:
@@ -8947,6 +8984,7 @@ def _default_spawn(
         # a D-Bus/polkit/unit-name failure cannot be mistaken for a worker that
         # successfully started. The pipe is inherited only by this child.
         delimiter = cmd.index("--")
+        scope_unit = cmd[5].removeprefix("--unit=")
         scope_ready_read, scope_ready_write = os.pipe()
         cmd = [
             *cmd[: delimiter + 1],
@@ -9015,7 +9053,7 @@ def _default_spawn(
     # handle is kept alive by the child's inheritance.  The parent's
     # reference goes out of scope and is GC'd, but the OS-level FD stays
     # open in the child until the child exits.
-    return proc.pid
+    return _WorkerLaunchPid(proc.pid, scope_unit=scope_unit)
 
 
 # ---------------------------------------------------------------------------
