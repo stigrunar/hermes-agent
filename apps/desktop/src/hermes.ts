@@ -144,6 +144,7 @@ export type {
   ConfigFieldSchema,
   ConfigSchemaResponse,
   CronDeliveryTarget,
+  ConversationBindingInfo,
   CronJob,
   CronJobCreatePayload,
   CronJobSchedule,
