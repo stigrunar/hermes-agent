@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import stat
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -332,8 +334,7 @@ def test_max_retries_none_falls_through_to_dispatcher_limit(kanban_home, all_ass
 
 
 def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spawnable):
-    """`dir:` workspace with no path should fail workspace resolution AND
-    count against the failure budget — not just crash the tick."""
+    """A deterministic workspace failure parks on its first fingerprint."""
     conn = kb.connect()
     try:
         # Manually insert a broken task: dir workspace but workspace_path is NULL
@@ -349,15 +350,12 @@ def test_workspace_resolution_failure_also_counts(kanban_home, all_assignees_spa
             )
         res = kb.dispatch_once(conn, failure_limit=3)
         task = kb.get_task(conn, tid)
-        assert task.consecutive_failures == 1
-        assert task.status == "ready"
-        assert task.last_failure_error and "workspace" in task.last_failure_error
-        # Run twice more → auto-blocked.
-        kb.dispatch_once(conn, failure_limit=3)
-        res = kb.dispatch_once(conn, failure_limit=3)
-        assert tid in res.auto_blocked
-        task = kb.get_task(conn, tid)
+        assert res.auto_blocked == [tid]
+        assert task.consecutive_failures == 0
         assert task.status == "blocked"
+        assert task.failure_classification == "workspace_config"
+        assert task.failure_fingerprint
+        assert task.last_failure_error and "workspace" in task.last_failure_error
     finally:
         conn.close()
 
@@ -455,12 +453,14 @@ def test_daemon_runs_and_stops(kanban_home):
 def test_daemon_keeps_going_after_tick_exception(kanban_home, monkeypatch):
     """A tick that raises shouldn't kill the loop."""
     calls = [0]
+    second_tick = threading.Event()
     orig_dispatch = kb.dispatch_once
 
     def _boom(conn, **kw):
         calls[0] += 1
         if calls[0] == 1:
             raise RuntimeError("simulated tick failure")
+        second_tick.set()
         return orig_dispatch(conn, **kw)
 
     monkeypatch.setattr(kb, "dispatch_once", _boom)
@@ -471,10 +471,12 @@ def test_daemon_keeps_going_after_tick_exception(kanban_home, monkeypatch):
 
     t = threading.Thread(target=_runner, daemon=True)
     t.start()
-    time.sleep(0.3)
-    stop.set()
-    t.join(timeout=2.0)
-    # At minimum, second-tick+ should have run.
+    try:
+        assert second_tick.wait(timeout=2.0), "daemon did not survive the first tick"
+    finally:
+        stop.set()
+        t.join(timeout=2.0)
+    assert not t.is_alive(), "daemon should exit on stop_event"
     assert calls[0] >= 2
 
 
@@ -1230,7 +1232,7 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765}
+        assert spawned[0].payload == {"pid": 98765, "launch_mode": "direct"}
     finally:
         conn.close()
 
@@ -2502,7 +2504,7 @@ def test_build_worker_context_role_history_bounded_to_5(kanban_home):
 
 @pytest.mark.skipif("linux" not in __import__("sys").platform,
                     reason="zombie detection is Linux-specific")
-def test_pid_alive_detects_zombie(kanban_home):
+def test_pid_alive_detects_zombie(kanban_home, monkeypatch):
     """_pid_alive must return False for a zombie process.
 
     Without the /proc check, kill(pid, 0) succeeds against zombies
@@ -2510,30 +2512,19 @@ def test_pid_alive_detects_zombie(kanban_home):
     would treat a dead-but-unreaped worker as alive. This catches a
     worker that exited normally but whose parent hasn't called wait().
     """
-    import subprocess as _sp
-    proc = _sp.Popen(
-        ["sleep", "3600"],
-        stdin=_sp.DEVNULL, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
-    )
-    pid = proc.pid
-    try:
-        assert kb._pid_alive(pid) is True  # live non-zombie
-        os.kill(pid, 9)
-        time.sleep(0.3)
-        # Verify /proc reports zombie state so the test is actually
-        # exercising the zombie path and not some other liveness failure
-        with open(f"/proc/{pid}/status") as f:
-            state_line = next(
-                (l for l in f if l.startswith("State:")), ""
-            )
-        assert "Z" in state_line, f"expected zombie, got {state_line!r}"
-        # And _pid_alive must see through it.
-        assert kb._pid_alive(pid) is False
-    finally:
-        try:
-            proc.wait(timeout=1)
-        except Exception:
-            pass
+    import io
+
+    probes = []
+    monkeypatch.setattr(kb.os, "kill", lambda pid, sig: probes.append((pid, sig)))
+
+    def fake_open(path, *args, **kwargs):
+        assert path == "/proc/4321/status"
+        return io.StringIO("Name:\tworker\nState:\tZ (zombie)\n")
+
+    monkeypatch.setattr("builtins.open", fake_open)
+
+    assert kb._pid_alive(4321) is False
+    assert probes == [(4321, 0)]
 
 
 def test_task_ids_dont_collide_at_scale(kanban_home):
@@ -2605,17 +2596,13 @@ def test_resolve_workspace_rejects_relative_dir_path(kanban_home):
     CWD — a confused-deputy escape vector."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="path-trav", assignee="worker",
-            workspace_kind="dir",
-            workspace_path="../../../tmp/attacker",
-        )
-        task = kb.get_task(conn, tid)
-        # Storage is verbatim — that's fine.
-        assert task.workspace_path == "../../../tmp/attacker"
-        # But resolution must refuse.
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(task)
+        with pytest.raises(ValueError, match=r"absolute"):
+            kb.create_task(
+                conn, title="path-trav", assignee="worker",
+                workspace_kind="dir",
+                workspace_path="../../../tmp/attacker",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -2642,13 +2629,13 @@ def test_resolve_workspace_rejects_relative_worktree_path(kanban_home):
     """Worktree paths also must be absolute when explicitly set."""
     conn = kb.connect()
     try:
-        tid = kb.create_task(
-            conn, title="wt", assignee="worker",
-            workspace_kind="worktree",
-            workspace_path="../escape",
-        )
-        with pytest.raises(ValueError, match=r"non-absolute"):
-            kb.resolve_workspace(kb.get_task(conn, tid))
+        with pytest.raises(ValueError, match=r"absolute"):
+            kb.create_task(
+                conn, title="wt", assignee="worker",
+                workspace_kind="worktree",
+                workspace_path="../escape",
+            )
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -2820,7 +2807,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     assert env.get("HERMES_PROFILE") == "some-profile"
 
 
-def test_systemd_worker_scope_argv_isolates_service_hosted_worker():
+def test_systemd_worker_scope_argv_isolates_service_hosted_worker(kanban_home):
     """Service workers launch in sibling scopes, outside the dispatcher unit.
 
     Stopping/restarting a systemd service applies its kill policy to members of
@@ -2831,24 +2818,331 @@ def test_systemd_worker_scope_argv_isolates_service_hosted_worker():
     task = SimpleNamespace(id=tid, current_run_id=17)
 
     worker_cmd = ["/opt/hermes/bin/hermes", "chat", "-q", f"work kanban task {tid}"]
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
     wrapped = kb._systemd_worker_scope_argv(
         worker_cmd,
         task,
         cgroup_path=(
-            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            f"/user.slice/user-{os.getuid()}.slice/"
+            f"user@{os.getuid()}.service/app.slice/"
             "hermes-kanban-safe-dispatcher.service"
         ),
+        manager_target=target,
         systemd_run="/usr/bin/systemd-run",
         platform="linux",
+        user_manager_ready=True,
     )
 
     assert wrapped[:5] == [
         "/usr/bin/systemd-run", "--user", "--scope", "--quiet", "--collect",
     ]
-    assert wrapped[5] == f"--unit=hermes-kanban-worker-{tid}-17.scope"
+    unit = wrapped[5].removeprefix("--unit=")
+    assert kb._SYSTEMD_WORKER_SCOPE_RE.fullmatch(unit)
+    assert tid not in unit
     assert wrapped[6] == "--"
     assert wrapped[7:] == worker_cmd
     assert "hermes-kanban-safe-dispatcher.service" not in wrapped[5]
+
+
+@pytest.mark.parametrize(
+    ("cgroup_path", "expected"),
+    [
+        (
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway.service",
+            "user",
+        ),
+        ("/system.slice/hermes-gateway.service", "system"),
+        ("/user.slice/user-1000.slice/example.service", None),
+        ("/user.slice/user-1000.slice/session-4.scope", None),
+    ],
+)
+def test_systemd_service_manager_classifies_manager_not_suffix(
+    cgroup_path, expected,
+):
+    assert kb._systemd_service_manager(cgroup_path) == expected
+
+
+def test_systemd_user_manager_target_validates_local_uid_and_bus(tmp_path):
+    uid = os.getuid()
+    runtime_root = tmp_path / "run-user"
+    runtime_dir = runtime_root / str(uid)
+    bus_path = runtime_dir / "bus"
+    modes = {
+        runtime_dir: stat.S_IFDIR | 0o700,
+        bus_path: stat.S_IFSOCK | 0o666,
+    }
+
+    def lstat(path):
+        return SimpleNamespace(st_mode=modes[Path(path)], st_uid=uid)
+
+    target = kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    )
+    assert target is not None
+    assert target.manager_kind == kb._SYSTEMD_USER_MANAGER_KIND
+    assert target.manager_uid == uid
+
+    modes[runtime_dir] = stat.S_IFDIR | 0o755
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[runtime_dir] = stat.S_IFDIR | 0o700
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid + 1,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        True,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+
+    modes[runtime_dir] = stat.S_IFREG | 0o600
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[runtime_dir] = stat.S_IFDIR | 0o700
+
+    def wrong_runtime_owner(path):
+        result = lstat(path)
+        if Path(path) == runtime_dir:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=uid + 1)
+        return result
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=wrong_runtime_owner,
+    ) is None
+
+    modes[bus_path] = stat.S_IFREG | 0o600
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=lstat,
+    ) is None
+    modes[bus_path] = stat.S_IFSOCK | 0o666
+
+    def wrong_bus_owner(path):
+        result = lstat(path)
+        if Path(path) == bus_path:
+            return SimpleNamespace(st_mode=result.st_mode, st_uid=uid + 1)
+        return result
+
+    assert kb._resolve_systemd_user_manager_target(
+        kb._SYSTEMD_USER_MANAGER_KIND,
+        uid,
+        runtime_root=runtime_root,
+        lstat_fn=wrong_bus_owner,
+    ) is None
+
+
+def test_systemd_scope_state_uses_only_explicit_manager_bus(monkeypatch):
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+    monkeypatch.setenv("XDG_RUNTIME_DIR", "/tmp/ambient-wrong-runtime")
+    monkeypatch.setenv(
+        "DBUS_SESSION_BUS_ADDRESS",
+        "unix:path=/tmp/ambient-wrong-bus",
+    )
+    captured = {}
+
+    def run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["env"] = kwargs["env"]
+        return SimpleNamespace(
+            returncode=0,
+            stdout="LoadState=loaded\nActiveState=active\n",
+        )
+
+    unit = "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope"
+    assert kb._systemd_user_scope_state(
+        unit,
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=run,
+    ) == "active"
+    assert captured["cmd"][0:3] == [
+        "/usr/bin/systemctl", "--user", "show",
+    ]
+    assert captured["env"] == {
+        "XDG_RUNTIME_DIR": f"/run/user/{os.getuid()}",
+        "DBUS_SESSION_BUS_ADDRESS": (
+            f"unix:path=/run/user/{os.getuid()}/bus"
+        ),
+    }
+
+
+def test_systemd_scope_state_rejects_nonzero_result_with_plausible_output():
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+
+    def run(_cmd, **_kwargs):
+        return SimpleNamespace(
+            returncode=1,
+            stdout="LoadState=loaded\nActiveState=active\n",
+        )
+
+    unit = "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope"
+    assert kb._systemd_user_scope_state(
+        unit,
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=run,
+    ) == "unknown"
+
+
+def test_worker_scope_unit_name_is_opaque_deterministic_and_board_scoped(tmp_path):
+    first = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+    repeated = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+    other_board = kb._worker_scope_unit_name(
+        "t_shared", 7, db_path=tmp_path / "other-secret" / "kanban.db",
+    )
+    other_run = kb._worker_scope_unit_name(
+        "t_shared", 8, db_path=tmp_path / "secret-board" / "kanban.db",
+    )
+
+    assert first == repeated
+    assert first != other_board
+    assert first != other_run
+    assert "secret-board" not in first
+    assert "t_shared" not in first
+    assert kb._SYSTEMD_WORKER_SCOPE_RE.fullmatch(first)
+
+
+def test_system_service_and_unreachable_user_manager_use_direct_spawn():
+    task = SimpleNamespace(id="t_direct", current_run_id=3)
+    worker_cmd = ["hermes", "chat"]
+
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path="/system.slice/hermes-gateway.service",
+        systemd_run="/usr/bin/systemd-run",
+        platform="linux",
+        user_manager_ready=True,
+    ) is worker_cmd
+    assert kb._systemd_worker_scope_argv(
+        worker_cmd,
+        task,
+        cgroup_path=(
+            "/user.slice/user-1000.slice/user@1000.service/app.slice/"
+            "hermes-gateway.service"
+        ),
+        systemd_run="/usr/bin/systemd-run",
+        platform="linux",
+        user_manager_ready=False,
+    ) is worker_cmd
+
+
+def test_systemd_user_scope_availability_requires_version_and_user_bus():
+    target = kb._SystemdUserManagerTarget(
+        manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=os.getuid(),
+        runtime_dir=Path(f"/run/user/{os.getuid()}"),
+        bus_path=Path(f"/run/user/{os.getuid()}/bus"),
+    )
+
+    def reachable(cmd, **_kwargs):
+        if cmd[-1] == "--version":
+            return SimpleNamespace(returncode=0, stdout="systemd 255\n")
+        return SimpleNamespace(returncode=0, stdout="255\n")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=reachable,
+    ) is True
+
+    def too_old(cmd, **_kwargs):
+        return SimpleNamespace(returncode=0, stdout="systemd 235\n")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=too_old,
+    ) is False
+
+    def no_bus(cmd, **_kwargs):
+        if cmd[-1] == "--version":
+            return SimpleNamespace(returncode=0, stdout="systemd 255\n")
+        return SimpleNamespace(returncode=1, stdout="")
+
+    assert kb._systemd_user_scope_available(
+        "/usr/bin/systemd-run",
+        manager_target=target,
+        systemctl="/usr/bin/systemctl",
+        run_fn=no_bus,
+    ) is False
+
+
+def test_scope_exec_ack_accepts_pre_exec_byte():
+    ready_read, ready_write = os.pipe()
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-c",
+            "import os,sys; os.write(int(sys.argv[1]), b'1')",
+            str(ready_write),
+        ],
+        pass_fds=(ready_write,),
+    )
+    os.close(ready_write)
+    try:
+        kb._await_scope_exec_ack(proc, ready_read, timeout=1.0)
+    finally:
+        os.close(ready_read)
+        proc.wait(timeout=1.0)
+
+
+def test_scope_exec_ack_rejects_pre_exec_exit():
+    ready_read, ready_write = os.pipe()
+    proc = subprocess.Popen(
+        [sys.executable, "-c", "pass"],
+        pass_fds=(ready_write,),
+    )
+    os.close(ready_write)
+    try:
+        with pytest.raises(RuntimeError, match="exited before"):
+            kb._await_scope_exec_ack(proc, ready_read, timeout=1.0)
+    finally:
+        os.close(ready_read)
+        proc.wait(timeout=1.0)
 
 
 @pytest.mark.parametrize(
@@ -2885,10 +3179,17 @@ def test_systemd_worker_scope_argv_preserves_non_linux_fallback():
     ) is worker_cmd
 
 
-def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
-    kanban_home, monkeypatch,
+@pytest.mark.parametrize(
+    ("uncertain", "expected_acknowledged"),
+    [(False, True), (True, False)],
+)
+def test_default_spawn_wraps_scope_and_returns_popen_pid(
+    kanban_home,
+    monkeypatch,
+    uncertain,
+    expected_acknowledged,
 ):
-    """The scope launcher execs in-place, so Popen's PID remains canonical."""
+    """The mock proves wrapper selection and Popen PID passthrough only."""
     captured = {}
 
     class FakeProc:
@@ -2903,8 +3204,22 @@ def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
     monkeypatch.setattr(
         kb,
         "_current_cgroup_path",
-        lambda: "/user.slice/user-1000.slice/dispatcher.service",
+        lambda: (
+            f"/user.slice/user-{os.getuid()}.slice/"
+            f"user@{os.getuid()}.service/app.slice/"
+            "dispatcher.service"
+        ),
     )
+    monkeypatch.setattr(
+        kb,
+        "_systemd_user_scope_available",
+        lambda _runner, **_kwargs: True,
+    )
+    def await_ack(proc, _fd):
+        if uncertain:
+            raise kb._WorkerLaunchUncertain(proc.pid, "synthetic uncertainty")
+
+    monkeypatch.setattr(kb, "_await_scope_exec_ack", await_ack)
     monkeypatch.setattr(
         kb.shutil,
         "which",
@@ -2914,18 +3229,30 @@ def test_default_spawn_keeps_worker_pid_tracking_through_systemd_scope(
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="tracked scope worker", assignee="ops")
-        task = kb.get_task(conn, tid)
+        task = kb.claim_task(conn, tid)
+        assert task is not None
         workspace = kb.resolve_workspace(task)
         pid = kb._default_spawn(task, str(workspace))
     finally:
         conn.close()
 
     assert pid == 424242
+    assert getattr(pid, "scope_unit") == captured["cmd"][5].removeprefix("--unit=")
+    assert getattr(pid, "manager_kind") == kb._SYSTEMD_USER_MANAGER_KIND
+    assert getattr(pid, "manager_uid") == os.getuid()
+    assert getattr(pid, "launch_acknowledged") is expected_acknowledged
     assert captured["cmd"][0:3] == [
         "/usr/bin/systemd-run", "--user", "--scope",
     ]
     assert captured["kwargs"]["start_new_session"] is True
+    assert captured["kwargs"]["pass_fds"]
     assert captured["kwargs"]["env"]["HERMES_KANBAN_TASK"] == tid
+    assert captured["kwargs"]["env"]["XDG_RUNTIME_DIR"] == (
+        f"/run/user/{os.getuid()}"
+    )
+    assert captured["kwargs"]["env"]["DBUS_SESSION_BUS_ADDRESS"] == (
+        f"unix:path=/run/user/{os.getuid()}/bus"
+    )
 
 
 def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monkeypatch):

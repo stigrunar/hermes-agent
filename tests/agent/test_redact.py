@@ -1053,7 +1053,7 @@ class TestRedactCdpUrl:
         assert redact_cdp_url(None) == ""
 
 
-class TestPersistenceRedaction:
+class TestDiagnosticPersistenceRedaction:
     def test_forces_secret_and_url_credential_redaction(self, monkeypatch):
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         opaque = "persistence-only-opaque-value"
@@ -1078,7 +1078,7 @@ class TestPersistenceRedaction:
         assert marker not in str(redacted)
         assert redacted["count"] == 2
 
-    def test_persistence_masks_all_random_secret_and_pii_bytes(self):
+    def test_persistence_fully_masks_recognized_secret_and_phone_bytes(self):
         secret = "sk-syntheticfullmaskvalue123456789"
         phone = "+4798765432"
 

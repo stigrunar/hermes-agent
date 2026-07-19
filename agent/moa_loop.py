@@ -15,6 +15,7 @@ from typing import Any
 
 from agent.auxiliary_client import call_llm
 from agent.message_content import flatten_message_text
+from agent.secret_scope import UnscopedSecretError
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -212,6 +213,8 @@ def _slot_runtime(slot: dict[str, Any]) -> dict[str, Any]:
             out["api_key"] = rt["api_key"]
         if rt.get("api_mode"):
             out["api_mode"] = rt["api_mode"]
+    except UnscopedSecretError:
+        raise
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("MoA slot runtime resolution failed for %s: %s", _slot_label(slot), exc)
     return out

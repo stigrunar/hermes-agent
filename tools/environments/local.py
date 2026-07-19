@@ -342,6 +342,37 @@ _HERMES_PROVIDER_ENV_BLOCKLIST = _build_provider_env_blocklist()
 # Hermes venv stays reachable via PATH (its bin dir is first), so stripping
 # these markers is safe and only prevents the cross-project clobber (#23473).
 _ACTIVE_VENV_MARKER_VARS = ("VIRTUAL_ENV", "CONDA_PREFIX")
+_KANBAN_WORKER_CONTEXT_VARS = (
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_WORKSPACE",
+    "HERMES_KANBAN_WORKSPACE_KIND",
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_BRANCH",
+    "HERMES_KANBAN_WORKSPACES_ROOT",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
+)
+_KANBAN_CONTEXT_PROPAGATE_FLAG = "HERMES_KANBAN_PROPAGATE_CONTEXT"
+
+
+def _strip_kanban_worker_context_env(env: dict) -> None:
+    """Strip task ownership env from nested subprocesses launched by workers.
+
+    A dispatcher-spawned worker has ``HERMES_KANBAN_TASK`` set so its own
+    lifecycle tools can mutate exactly one task. Terminal/background child
+    processes launched from that worker must not inherit that ownership by
+    default. Set ``HERMES_KANBAN_PROPAGATE_CONTEXT=1`` in the explicit child
+    environment only for deliberate nested worker propagation.
+    """
+    if not env.get("HERMES_KANBAN_TASK"):
+        return
+    if str(env.get(_KANBAN_CONTEXT_PROPAGATE_FLAG, "")).strip().lower() in {"1", "true", "yes"}:
+        return
+    for key in _KANBAN_WORKER_CONTEXT_VARS:
+        env.pop(key, None)
 
 
 def _is_hermes_internal_secret(key: str) -> bool:
@@ -484,6 +515,7 @@ def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = Non
     # Same cross-session leak guard as _make_run_env, for the background/PTY
     # spawn path (process_registry.spawn_local builds env via this function).
     _inject_session_context_env(sanitized)
+    _strip_kanban_worker_context_env(sanitized)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         sanitized.pop(_marker, None)
@@ -611,6 +643,7 @@ def hermes_subprocess_env(*, inherit_credentials: bool = False) -> dict[str, str
     # session's identity. Strip _UNSET session vars when engaged so that can't
     # happen; single uniform policy across every spawn surface.
     _inject_session_context_env(env)
+    _strip_kanban_worker_context_env(env)
 
     return env
 
@@ -1168,6 +1201,7 @@ def _make_run_env(env: dict) -> dict:
     # cross-session leak guard — strips _UNSET vars when a concurrent host is
     # engaged so a sibling session's os.environ mirror can't leak in).
     _inject_session_context_env(run_env)
+    _strip_kanban_worker_context_env(run_env)
 
     for _marker in _ACTIVE_VENV_MARKER_VARS:
         run_env.pop(_marker, None)

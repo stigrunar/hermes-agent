@@ -17,6 +17,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple, Optional
 
+from agent.secret_scope import UnscopedSecretError
 from hermes_constants import (
     get_hermes_home,
     get_hermes_home_override,
@@ -2386,9 +2387,11 @@ def resolve_skin() -> dict:
 
 
 def _resolve_model() -> str:
+    from agent.secret_scope import get_secret
+
     env = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        get_secret("HERMES_MODEL", "")
+        or get_secret("HERMES_INFERENCE_MODEL", "")
     ).strip()
     if env:
         return env
@@ -2484,14 +2487,16 @@ def _config_model_target() -> tuple[str, str]:
 
 
 def _resolve_startup_runtime() -> tuple[str, str | None]:
+    from agent.secret_scope import UnscopedSecretError, get_secret
+
     model = _resolve_model()
-    explicit_provider = os.environ.get("HERMES_TUI_PROVIDER", "").strip()
+    explicit_provider = (get_secret("HERMES_TUI_PROVIDER", "") or "").strip()
     if explicit_provider:
         return model, explicit_provider
 
     explicit_model = (
-        os.environ.get("HERMES_MODEL", "")
-        or os.environ.get("HERMES_INFERENCE_MODEL", "")
+        get_secret("HERMES_MODEL", "")
+        or get_secret("HERMES_INFERENCE_MODEL", "")
     ).strip()
     if not explicit_model:
         return model, None
@@ -2506,13 +2511,15 @@ def _resolve_startup_runtime() -> tuple[str, str | None]:
                 if isinstance(cfg, dict)
                 else ""
             )
-            or os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip().lower()
+            or (get_secret("HERMES_INFERENCE_PROVIDER", "") or "").strip().lower()
             or "auto"
         )
         detected = detect_static_provider_for_model(explicit_model, current_provider)
         if detected:
             provider, detected_model = detected
             return detected_model, provider
+    except UnscopedSecretError:
+        raise
     except Exception:
         pass
     return model, None
@@ -4875,6 +4882,7 @@ def _resolve_runtime_with_fallback(
     into a different runtime. ``used_fallback`` remains explicit rather than
     overloading a nullable model as control flow.
     """
+    from agent.secret_scope import UnscopedSecretError
     from hermes_cli.auth import AuthError
     from hermes_cli.runtime_provider import resolve_runtime_provider
 
@@ -4916,6 +4924,8 @@ def _resolve_runtime_with_fallback(
                     fb_model,
                 )
                 return _RuntimeFallbackResolution(runtime, fb_model, True)
+            except UnscopedSecretError:
+                raise
             except Exception:
                 continue
         raise
@@ -7862,6 +7872,8 @@ def _(rid, params: dict) -> dict:
             logger.debug("pet provider list failed: %s", exc)
             providers = []
         return _ok(rid, {"available": available, "providers": providers})
+    except UnscopedSecretError:
+        raise
     except Exception as exc:  # noqa: BLE001 - never break the surface
         logger.debug("pet.generate.status failed: %s", exc)
         return _ok(rid, {"available": False, "providers": []})
@@ -7975,6 +7987,8 @@ def _(rid, params: dict) -> dict:
             return _err(rid, 5031, "generation produced no usable drafts")
         out.sort(key=lambda d: d["index"])
         return _ok(rid, {"ok": True, "token": token, "drafts": out})
+    except UnscopedSecretError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.debug("pet.generate failed: %s", exc)
         return _err(rid, 5031, f"pet.generate failed: {exc}")
@@ -8074,6 +8088,8 @@ def _(rid, params: dict) -> dict:
                 "pet": payload,
             },
         )
+    except UnscopedSecretError:
+        raise
     except Exception as exc:  # noqa: BLE001
         logger.debug("pet.hatch failed: %s", exc)
         return _err(rid, 5031, f"pet.hatch failed: {exc}")
@@ -12426,10 +12442,14 @@ def _(rid, params: dict) -> dict:
 
 @method("setup.status")
 def _(rid, params: dict) -> dict:
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         from hermes_cli.main import _has_any_provider_configured
 
         return _ok(rid, {"provider_configured": bool(_has_any_provider_configured())})
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         return _err(rid, 5016, str(e))
 
@@ -12445,6 +12465,8 @@ def _(rid, params: dict) -> dict:
     when the user's configured model cannot actually be served, so UIs can
     surface onboarding before the user submits a doomed prompt.
     """
+    from agent.secret_scope import UnscopedSecretError
+
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
         from hermes_cli.auth import has_usable_secret
@@ -12500,6 +12522,8 @@ def _(rid, params: dict) -> dict:
                 "source": runtime.get("source"),
             },
         )
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         return _ok(rid, {"ok": False, "error": str(e)})
 
@@ -15329,11 +15353,17 @@ def _(rid, params: dict) -> dict:
 @method("config.show")
 def _(rid, params: dict) -> dict:
     try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+
         cfg = _load_cfg()
         model = _resolve_model()
-        api_key = os.environ.get("HERMES_API_KEY", "") or cfg.get("api_key", "")
+        api_key = (get_secret("HERMES_API_KEY", "") or "") or cfg.get(
+            "api_key", ""
+        )
         masked = f"****{api_key[-4:]}" if len(api_key) > 4 else "(not set)"
-        base_url = os.environ.get("HERMES_BASE_URL", "") or cfg.get("base_url", "")
+        base_url = (get_secret("HERMES_BASE_URL", "") or "") or cfg.get(
+            "base_url", ""
+        )
 
         sections = [
             {
@@ -15361,6 +15391,8 @@ def _(rid, params: dict) -> dict:
             },
         ]
         return _ok(rid, {"sections": sections})
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         return _err(rid, 5030, str(e))
 

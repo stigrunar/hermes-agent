@@ -38,8 +38,10 @@ from agent.message_sanitization import (
     _sanitize_surrogates,
     _repair_tool_call_arguments,
 )
+from agent.secret_scope import UnscopedSecretError, get_secret
 from agent.stream_single_writer import claim_stream_writer, stream_writer_is_current
 from tools.terminal_tool import is_persistent_env
+from tools.thread_context import propagate_context_to_thread
 from utils import base_url_host_matches, base_url_hostname, env_float, env_int
 
 logger = logging.getLogger(__name__)
@@ -752,7 +754,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(target=propagate_context_to_thread(_call), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -1519,6 +1521,8 @@ def _fallback_entry_unavailable_without_network(agent, fb: dict) -> Optional[str
         from hermes_cli.auth import get_provider_auth_state
 
         state = get_provider_auth_state("nous") or {}
+    except UnscopedSecretError:
+        raise
     except Exception as exc:
         return f"nous_auth_unreadable:{type(exc).__name__}"
     access_value = state.get("access_token")
@@ -1636,12 +1640,12 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             # _normalize_custom_provider_entry in hermes_cli/config.py).
             fb_key_env = (fb.get("key_env") or fb.get("api_key_env") or "").strip()
             if fb_key_env:
-                fb_api_key_hint = os.getenv(fb_key_env, "").strip() or None
+                fb_api_key_hint = (get_secret(fb_key_env, "") or "").strip() or None
         # For Ollama Cloud endpoints, pull OLLAMA_API_KEY from env
         # when no explicit key is in the fallback config. Host match
         # (not substring) — see GHSA-76xc-57q6-vm5m.
         if fb_base_url_hint and base_url_host_matches(fb_base_url_hint, "ollama.com") and not fb_api_key_hint:
-            fb_api_key_hint = os.getenv("OLLAMA_API_KEY") or None
+            fb_api_key_hint = get_secret("OLLAMA_API_KEY") or None
         fb_client, _resolved_fb_model = resolve_provider_client(
             fb_provider, model=fb_model, raw_codex=True,
             explicit_base_url=fb_base_url_hint,
@@ -1746,6 +1750,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                         "Fallback to %s/%s: attached fallback credential pool",
                         fb_provider, fb_model,
                     )
+            except UnscopedSecretError:
+                raise
             except Exception as exc:
                 logger.debug(
                     "Fallback to %s/%s: could not attach credential pool: %s",
@@ -1854,6 +1860,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
                 "Fallback %s: reasoning_config resolved: %s",
                 agent.model, agent.reasoning_config,
             )
+        except UnscopedSecretError:
+            raise
         except Exception as _reasoning_err:
             logger.debug(
                 "Failed to resolve reasoning_config for fallback %s; keeping current: %s",
@@ -1889,6 +1897,8 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # single stream attempt.
         _reset_stale_streak(agent)
         return True
+    except UnscopedSecretError:
+        raise
     except Exception as e:
         if fb_provider == "nous":
             unavailable.add(fb_key)
@@ -2344,7 +2354,9 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        t = threading.Thread(
+            target=propagate_context_to_thread(_bedrock_call), daemon=True
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -3571,7 +3583,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(target=propagate_context_to_thread(_call), daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches

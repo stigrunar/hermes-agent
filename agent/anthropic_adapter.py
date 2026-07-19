@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
+from agent.secret_scope import UnscopedSecretError, get_secret
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
@@ -856,7 +857,8 @@ def build_anthropic_bedrock_client(region: str):
     it, Bedrock caps these models at 200K even though the Anthropic API
     serves them with 1M natively.
 
-    Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
+    Multiplex profiles pass an explicit owner-scoped AWS identity. Classic
+    single-profile callers retain the boto3 default credential chain.
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
@@ -871,8 +873,23 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
+    from agent.bedrock_adapter import resolve_bedrock_credentials
+
+    credentials = resolve_bedrock_credentials()
+    auth_kwargs = {}
+    if credentials.access_key_id and credentials.secret_access_key:
+        auth_kwargs.update(
+            aws_access_key=credentials.access_key_id,
+            aws_secret_key=credentials.secret_access_key,
+        )
+        if credentials.session_token:
+            auth_kwargs["aws_session_token"] = credentials.session_token
+    elif credentials.profile_name:
+        auth_kwargs["aws_profile"] = credentials.profile_name
+
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
+        **auth_kwargs,
         timeout=Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
@@ -1265,6 +1282,8 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
         # which would violate this read-only contract.
         entries = pool._available_entries(clear_expired=False, refresh=False)
+    except UnscopedSecretError:
+        raise
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
         return None
@@ -1300,7 +1319,7 @@ def resolve_anthropic_token() -> Optional[str]:
     creds = read_claude_code_credentials()
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    token = (get_secret("ANTHROPIC_TOKEN", "") or "").strip()
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
@@ -1308,7 +1327,7 @@ def resolve_anthropic_token() -> Optional[str]:
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    cc_token = (get_secret("CLAUDE_CODE_OAUTH_TOKEN", "") or "").strip()
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
@@ -1327,7 +1346,7 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = (get_secret("ANTHROPIC_API_KEY", "") or "").strip()
     if api_key:
         return api_key
 
@@ -1370,7 +1389,7 @@ def run_oauth_setup_token() -> Optional[str]:
 
     # Check env vars that may have been set
     for env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
-        val = os.getenv(env_var, "").strip()
+        val = (get_secret(env_var, "") or "").strip()
         if val:
             return val
 

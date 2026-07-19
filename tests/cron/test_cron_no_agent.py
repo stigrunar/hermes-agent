@@ -306,7 +306,7 @@ def test_run_job_script_bash_extension_also_runs_via_bash(hermes_env):
 
     ok, output = _run_job_script("thing.bash")
     assert ok is True
-    assert output == "via bash"
+    assert output == "via bash\n"
 
 
 def test_run_job_script_python_still_runs_via_python(hermes_env):
@@ -319,6 +319,38 @@ def test_run_job_script_python_still_runs_via_python(hermes_env):
     ok, output = _run_job_script("py.py")
     assert ok is True
     assert output.startswith("python ")
+
+
+def test_no_agent_script_preserves_functional_stdout_end_to_end(hermes_env):
+    from cron.jobs import create_job, save_job_output
+    from cron.scheduler import run_job
+
+    payload = (
+        "  sk-syntheticfunctionalvalue123456789 "
+        "https://demo-user:demo-pass@example.invalid/report?token=resume-code\n"
+        "résumé 日本語 🔐 trailing spaces  \n"
+    )
+    script_path = hermes_env / "scripts" / "functional.py"
+    script_path.write_text(
+        f"import sys\nsys.stdout.write({payload!r})\n",
+        encoding="utf-8",
+    )
+    job = create_job(
+        prompt=None,
+        schedule="every 5m",
+        script="functional.py",
+        no_agent=True,
+        deliver="local",
+    )
+
+    success, doc, final_response, error = run_job(job)
+
+    assert success is True
+    assert error is None
+    assert final_response == payload
+    assert payload in doc
+    output_file = save_job_output(job["id"], doc)
+    assert payload.encode("utf-8") in output_file.read_bytes()
 
 
 def test_run_job_script_path_traversal_still_blocked(hermes_env):

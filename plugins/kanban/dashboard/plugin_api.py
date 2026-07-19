@@ -139,8 +139,9 @@ def _conn(board: Optional[str] = None):
 # Serialization helpers
 # ---------------------------------------------------------------------------
 
-# Columns shown by the dashboard, in left-to-right order. "archived" is
-# available via a filter toggle rather than a visible column.
+# Columns shown by the dashboard, in left-to-right order. Non-actionable
+# history statuses are available via a filter toggle rather than visible
+# columns.
 #
 # Keep this in sync with kanban_db.VALID_STATUSES.  In particular,
 # ``scheduled`` is a first-class waiting column used for time-based follow-ups;
@@ -263,7 +264,8 @@ def _compute_task_diagnostics(
 
     # Build the candidate task list. We need each task's row + its
     # events + its runs. Doing N separate queries works but scales
-    # poorly; do three aggregate queries instead.
+    # poorly; do three aggregate queries instead. A task subset still
+    # needs linked neighbors for cross-task chain diagnostics.
     if task_ids is not None:
         if not task_ids:
             return {}
@@ -274,17 +276,22 @@ def _compute_task_diagnostics(
         ).fetchall()
     else:
         rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
+            "SELECT * FROM tasks WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only')",
         ).fetchall()
 
     if not rows:
         return {}
 
+    # Archived parents can still release children under the kernel's
+    # done-or-archived dependency semantics, so retain them as graph context
+    # even though archived cards remain omitted from normal dashboard output.
+    graph_rows = conn.execute("SELECT * FROM tasks").fetchall()
+
     # Index events + runs by task id. For very large boards this will
     # slurp a lot — acceptable on the dashboard's typical working set
     # (hundreds of tasks), but we can add pagination / filtering later
     # if profiling shows it's a hotspot.
-    row_ids = [r["id"] for r in rows]
+    row_ids = [r["id"] for r in graph_rows]
     placeholders = ",".join(["?"] * len(row_ids))
     events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
     for ev_row in conn.execute(
@@ -299,6 +306,28 @@ def _compute_task_diagnostics(
     ).fetchall():
         runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
 
+    links = conn.execute(
+        f"SELECT parent_id, child_id FROM task_links "
+        f"WHERE parent_id IN ({placeholders}) AND child_id IN ({placeholders})",
+        tuple(row_ids) + tuple(row_ids),
+    ).fetchall()
+    chain_by_task = kd.compute_chain_diagnostics(
+        graph_rows, links, events_by_task, runs_by_task,
+    )
+    reconciliation_context = {
+        str(row["id"]): {
+            "task": row,
+            "_runs": runs_by_task.get(str(row["id"]), []),
+        }
+        for row in graph_rows
+    }
+    git_probe = kd.GitProbeSession()
+    try:
+        from hermes_cli.profiles import profile_exists
+        profile_roster = profile_exists
+    except Exception:
+        profile_roster = None
+
     out: dict[str, list[dict]] = {}
     for r in rows:
         tid = r["id"]
@@ -307,7 +336,10 @@ def _compute_task_diagnostics(
             events_by_task.get(tid, []),
             runs_by_task.get(tid, []),
             config=diag_config,
-        )
+            tasks=reconciliation_context,
+            git_probe=git_probe,
+            profile_roster=profile_roster,
+        ) + chain_by_task.get(tid, [])
         if diags:
             out[tid] = [d.to_dict() for d in diags]
     return out
@@ -402,10 +434,23 @@ def get_board(
         tasks = kanban_db.list_tasks(
             conn,
             tenant=tenant,
-            include_archived=include_archived,
+            include_archived=False,
             workflow_template_id=workflow_template_id,
             current_step_key=current_step_key,
         )
+        historical_tasks: list[kanban_db.Task] = []
+        for historical_status in sorted(kanban_db.NON_ACTIONABLE_STATUSES):
+            historical_tasks.extend(
+                kanban_db.list_tasks(
+                    conn,
+                    tenant=tenant,
+                    status=historical_status,
+                    include_archived=True,
+                    workflow_template_id=workflow_template_id,
+                    current_step_key=current_step_key,
+                )
+            )
+        rendered_tasks = [*tasks, *historical_tasks]
         # Pre-fetch link counts per task (cheap: one query).
         link_counts: dict[str, dict[str, int]] = {}
         for row in conn.execute(
@@ -450,16 +495,17 @@ def get_board(
         ).fetchone()["m"]
 
         columns: dict[str, list[dict]] = {c: [] for c in BOARD_COLUMNS}
-        if include_archived:
-            columns["archived"] = []
+        suppressed: list[dict] = []
 
         # Batch-fetch the latest non-null run summary per task in one
         # window-function query (avoids N+1 ``latest_summary`` calls
         # for boards with hundreds of tasks). Truncated to a card-size
         # preview here — the full text is available via /tasks/:id.
-        summary_map = kanban_db.latest_summaries(conn, [t.id for t in tasks])
+        summary_map = kanban_db.latest_summaries(
+            conn, [t.id for t in rendered_tasks]
+        )
 
-        for t in tasks:
+        for t in rendered_tasks:
             full = summary_map.get(t.id)
             preview = (
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
@@ -475,6 +521,23 @@ def get_board(
                 # needs the summary.
                 d["diagnostics"] = diags
                 d["warnings"] = _warnings_summary_from_diagnostics(diags)
+            if t.status in kanban_db.NON_ACTIONABLE_STATUSES:
+                # History remains discoverable with canonical replacement
+                # metadata from the task row, but never enters an actionable
+                # board column or attention computation.
+                d["non_authorizing"] = True
+                suppressed.append(d)
+                continue
+            if any(
+                diag.get("kind") == "replacement_suppressed"
+                and diag.get("data", {}).get("suppressed") is True
+                for diag in (diags or [])
+            ):
+                # Keep a first-class audit surface and the normal detail/event
+                # endpoint, but never leave a proven superseded source in an
+                # ordinary actionable board column.
+                suppressed.append(d)
+                continue
             col = t.status if t.status in columns else "todo"
             columns[col].append(d)
 
@@ -493,7 +556,7 @@ def get_board(
             r["assignee"]
             for r in conn.execute(
                 "SELECT DISTINCT assignee FROM tasks WHERE assignee IS NOT NULL "
-                "AND status != 'archived' ORDER BY assignee"
+                "AND status NOT IN ('archived', 'superseded', 'stale_continuity_only') ORDER BY assignee"
             )
         ]
 
@@ -501,6 +564,7 @@ def get_board(
             "columns": [
                 {"name": name, "tasks": columns[name]} for name in columns.keys()
             ],
+            "suppressed": suppressed,
             "tenants": tenants,
             "assignees": assignees,
             "latest_event_id": int(latest_event_id),
@@ -608,6 +672,7 @@ class CreateTaskBody(BaseModel):
     skills: Optional[list[str]] = None
     goal_mode: bool = False
     goal_max_turns: Optional[int] = None
+    required_capabilities: Optional[list[str]] = None
 
 
 @router.post("/tasks")
@@ -632,6 +697,7 @@ def create_task(payload: CreateTaskBody, board: Optional[str] = Query(None)):
             skills=payload.skills,
             goal_mode=payload.goal_mode,
             goal_max_turns=payload.goal_max_turns,
+            required_capabilities=payload.required_capabilities,
         )
         task = kanban_db.get_task(conn, task_id)
         body: dict[str, Any] = {"task": _task_dict(task) if task else None}
@@ -956,18 +1022,19 @@ def delete_task(task_id: str, board: Optional[str] = Query(None)):
 def _parents_blocking_ready(
     conn: sqlite3.Connection, task_id: str,
 ) -> list:
-    """Return parent rows (``id``, ``title``, ``status``) that aren't ``done``
+    """Return parent rows (``id``, ``title``, ``status``) that are non-terminal
     and therefore prevent ``task_id`` from being promoted to ``ready``.
 
     Used to enrich the 409 response from :func:`update_task` so the
     dashboard can show an actionable toast (#26744) instead of a silent
     no-op.  Returns ``[]`` when nothing blocks the transition (e.g. no
-    parents, or all parents already done).
+    parents, or all parents already terminal).
     """
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ? AND t.status != 'done'",
+        "WHERE l.child_id = ? "
+        "AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only')",
         (task_id,),
     ).fetchall()
     return [
@@ -980,22 +1047,51 @@ def _set_status_direct(
     conn: sqlite3.Connection, task_id: str, new_status: str,
 ) -> bool:
     """Direct status write for drag-drop moves that aren't covered by the
-    structured complete/block/unblock/archive verbs (e.g. todo<->ready,
-    running<->ready). Appends a ``status`` event row for the live feed.
-
-    When this transitions OFF ``running`` to anything other than the
-    terminal verbs above (which own their own run closing), we close the
-    active run with outcome='reclaimed' so attempt history isn't
-    orphaned. ``running -> ready`` via drag-drop is the common case
-    (user yanking a stuck worker back to the queue).
+    structured complete/block/unblock/archive verbs (e.g. todo<->ready).
+    Appends a ``status`` event row for the live feed. Active running→ready
+    requests route through the scope-aware reclaim path; every other direct
+    transition refuses an active claim.
     """
+    observed = conn.execute(
+        "SELECT status, claim_lock, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if observed is None:
+        return False
+    observed_active = (
+        observed["status"] == "running"
+        or observed["claim_lock"] is not None
+        or observed["worker_pid"] is not None
+        or observed["current_run_id"] is not None
+    )
+    if observed_active:
+        if new_status != "ready":
+            return False
+        if _parents_blocking_ready(conn, task_id):
+            return False
+        return kanban_db.reclaim_task(
+            conn,
+            task_id,
+            reason="dashboard status changed to ready",
+        )
+
     with kanban_db.write_txn(conn):
-        # Snapshot current state so we know whether to close a run.
+        # Re-check under the write lock: dispatch may have claimed the task
+        # after the observation above. Direct writes never clear that claim.
         prev = conn.execute(
-            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if (
+            prev["status"] == "running"
+            or prev["claim_lock"] is not None
+            or prev["worker_pid"] is not None
+            or prev["current_run_id"] is not None
+        ):
             return False
 
         # Guard: don't allow promoting to 'ready' unless all parents are done.
@@ -1013,33 +1109,24 @@ def _set_status_direct(
             ):
                 return False
 
-        was_running = prev["status"] == "running"
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
             and new_status not in {"done", "archived"}
         )
 
         cur = conn.execute(
-            "UPDATE tasks SET status = ?, "
-            "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
-            "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (new_status, new_status, new_status, new_status, task_id),
+            "UPDATE tasks SET status = ? "
+            "WHERE id = ? AND status = ? "
+            "AND claim_lock IS NULL AND worker_pid IS NULL "
+            "AND current_run_id IS NULL",
+            (new_status, task_id, prev["status"]),
         )
         if cur.rowcount != 1:
             return False
-        run_id = None
-        if was_running and new_status != "running" and prev["current_run_id"]:
-            run_id = kanban_db._end_run(
-                conn, task_id,
-                outcome="reclaimed", status="reclaimed",
-                summary=f"status changed to {new_status} (dashboard/direct)",
-            )
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
-            (task_id, run_id, json.dumps({"status": new_status}), int(time.time())),
+            (task_id, None, json.dumps({"status": new_status}), int(time.time())),
         )
         if reopening_satisfied_parent:
             # A parent leaving done/archived invalidates any direct child that

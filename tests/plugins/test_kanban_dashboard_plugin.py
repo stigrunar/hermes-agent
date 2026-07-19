@@ -8,7 +8,9 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -71,10 +73,11 @@ def test_board_empty(client):
     data = r.json()
     # All canonical columns present (triage + the rest), each empty.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    assert set(names) == kb.VALID_STATUSES - kb.NON_ACTIONABLE_STATUSES
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
+    assert data["suppressed"] == []
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
@@ -113,6 +116,281 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
+
+
+@pytest.mark.parametrize("workspace_path", [None, "relative/path"])
+def test_create_dir_requires_absolute_anchor_before_insert(
+    client,
+    workspace_path,
+):
+    response = client.post(
+        "/api/plugins/kanban/tasks",
+        json={
+            "title": "bad dir",
+            "workspace_kind": "dir",
+            "workspace_path": workspace_path,
+        },
+    )
+    assert response.status_code == 400
+    with kb.connect_closing() as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
+
+
+def test_proven_replacement_leaves_columns_but_remains_auditable(client):
+    source = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "superseded source", "assignee": "alice"},
+    ).json()["task"]
+    target = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "canonical replacement", "assignee": "alice"},
+    ).json()["task"]
+    head = "c" * 40
+    with kb.connect() as conn:
+        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (target["id"],))
+        conn.execute(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'done', 'completed', 1, 2, ?)",
+            (
+                target["id"],
+                json.dumps({"reconciliation": {
+                    "supersedes_task_id": source["id"],
+                    "canonical_live_task": target["id"],
+                    "candidate_head": head,
+                    "terminal_receipt": {
+                        "state": "merged",
+                        "task_id": target["id"],
+                        "head": head,
+                    },
+                }}),
+            ),
+        )
+
+    board = client.get("/api/plugins/kanban/board").json()
+    ordinary_ids = {
+        task["id"]
+        for column in board["columns"]
+        for task in column["tasks"]
+    }
+    assert source["id"] not in ordinary_ids
+    assert source["id"] in {task["id"] for task in board["suppressed"]}
+
+    detail = client.get(f"/api/plugins/kanban/tasks/{source['id']}")
+    assert detail.status_code == 200
+    assert detail.json()["task"]["id"] == source["id"]
+    assert any(
+        diagnostic["kind"] == "replacement_suppressed"
+        for diagnostic in detail.json()["task"]["diagnostics"]
+    )
+
+
+def test_non_actionable_rows_live_only_in_suppressed_audit(client):
+    with kb.connect_closing() as conn:
+        replacement = kb.create_task(conn, title="canonical", assignee="alice")
+        superseded = kb.create_task(conn, title="old", assignee="alice")
+        stale = kb.create_task(conn, title="stale", assignee="alice")
+        archived = kb.create_task(conn, title="archive", assignee="alice")
+        assert kb.mark_task_non_actionable(
+            conn,
+            superseded,
+            status="superseded",
+            actor="controller",
+            superseded_by=replacement,
+            live_path_task_id=replacement,
+            canonical_live_path="refs/heads/main",
+        )
+        assert kb.mark_task_non_actionable(
+            conn,
+            stale,
+            status="stale_continuity_only",
+            actor="controller",
+            live_path_task_id=replacement,
+            canonical_live_path="refs/heads/main",
+        )
+        assert kb.archive_task(conn, archived)
+
+    board = client.get("/api/plugins/kanban/board").json()
+    ordinary_ids = {
+        task["id"]
+        for column in board["columns"]
+        for task in column["tasks"]
+    }
+    suppressed_rows = {task["id"]: task for task in board["suppressed"]}
+    assert {superseded, stale, archived}.isdisjoint(ordinary_ids)
+    assert {superseded, stale, archived} <= set(suppressed_rows)
+    assert suppressed_rows[superseded]["non_authorizing"] is True
+    assert suppressed_rows[superseded]["superseded_by"] == replacement
+    assert suppressed_rows[superseded]["live_path_task_id"] == replacement
+    assert suppressed_rows[superseded]["canonical_live_path"] == "refs/heads/main"
+
+
+def test_suppressed_audit_client_is_discoverable_and_opens_existing_drawer():
+    """Execute the shipped IIFE and exercise the audit-to-drawer path.
+
+    The plugin has no separate source/build package: ``dist/index.js`` is the
+    tracked plain-IIFE browser surface. A bounded Node VM supplies only the
+    host SDK/React primitives the bundle expects, captures its registered
+    ``KanbanPage``, and renders its actual virtual-element tree. The harness
+    then clicks the real audit Open handler and rerenders the root to observe
+    the existing ``TaskDrawer`` props.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.fail("node is required for the dashboard IIFE runtime contract")
+
+    bundle = (
+        Path(__file__).resolve().parents[2]
+        / "plugins"
+        / "kanban"
+        / "dashboard"
+        / "dist"
+        / "index.js"
+    )
+    harness = r'''
+const assert = require("node:assert/strict");
+const fs = require("node:fs");
+const vm = require("node:vm");
+
+const bundlePath = process.argv[1];
+const ordinaryId = "t_live";
+const suppressedId = "t_superseded";
+const boardFixture = {
+  columns: [{ name: "ready", tasks: [{
+    id: ordinaryId, title: "Live task", status: "ready", assignee: "alice",
+    tenant: null, body: "", result: "", latest_summary: "",
+  }] }],
+  suppressed: [{
+    id: suppressedId, title: "Superseded source", status: "done", assignee: "alice",
+    tenant: null, body: "", result: "", latest_summary: "",
+  }],
+  tenants: [], assignees: ["alice"], latest_event_id: 0,
+};
+
+let hookIndex = 0;
+const stateValues = [];
+function useState(initial) {
+  const index = hookIndex++;
+  if (!(index in stateValues)) {
+    const value = typeof initial === "function" ? initial() : initial;
+    // KanbanPage's fifth state slot is its loaded board; the seventh is its
+    // loading flag. Seed those real component states for this render.
+    stateValues[index] = index === 4 ? boardFixture : index === 6 ? false : value;
+  }
+  return [stateValues[index], function (next) {
+    stateValues[index] = typeof next === "function" ? next(stateValues[index]) : next;
+  }];
+}
+function useEffect() { hookIndex += 1; }
+function useMemo(factory) { hookIndex += 1; return factory(); }
+function useCallback(callback) { hookIndex += 1; return callback; }
+function useRef(value) { hookIndex += 1; return { current: value }; }
+
+function createElement(type, props, ...children) {
+  const nextProps = Object.assign({}, props || {});
+  if (children.length === 1) nextProps.children = children[0];
+  else if (children.length > 1) nextProps.children = children;
+  return { type, props: nextProps };
+}
+const React = { createElement, Component: class {} };
+const componentNames = [
+  "Card", "CardContent", "Badge", "Button", "Input", "Label",
+  "Select", "SelectOption", "Checkbox",
+];
+const components = Object.fromEntries(componentNames.map(name => [name, name]));
+let KanbanPage;
+const context = {
+  console,
+  URLSearchParams,
+  setTimeout,
+  clearTimeout,
+  window: {
+    __HERMES_PLUGIN_SDK__: {
+      React,
+      components,
+      hooks: { useState, useEffect, useCallback, useMemo, useRef },
+      utils: { cn: (...values) => values.filter(Boolean).join(" "), timeAgo: () => "" },
+      useI18n: () => ({ t: { kanban: null }, locale: "en" }),
+      fetchJSON: () => Promise.resolve({ boards: [], current: "default" }),
+      buildWsUrl: () => Promise.resolve("ws://127.0.0.1/events"),
+    },
+    __HERMES_PLUGINS__: { register: (name, component) => {
+      assert.equal(name, "kanban");
+      KanbanPage = component;
+    } },
+    localStorage: { getItem: () => null, setItem: () => {} },
+    prompt: () => null,
+    alert: () => {},
+  },
+};
+context.window.window = context.window;
+vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
+assert.equal(typeof KanbanPage, "function", "bundle must register KanbanPage");
+
+function renderRoot() {
+  hookIndex = 0;
+  return KanbanPage({});
+}
+function childrenOf(node) {
+  if (!node || typeof node !== "object") return [];
+  const children = node.props && node.props.children;
+  return children == null ? [] : Array.isArray(children) ? children : [children];
+}
+function findComponent(node, name) {
+  if (!node || typeof node !== "object") return null;
+  if (typeof node.type === "function" && node.type.name === name) return node;
+  for (const child of childrenOf(node)) {
+    const found = findComponent(child, name);
+    if (found) return found;
+  }
+  return null;
+}
+function findElement(node, predicate) {
+  if (!node || typeof node !== "object") return null;
+  if (predicate(node)) return node;
+  for (const child of childrenOf(node)) {
+    const found = findElement(child, predicate);
+    if (found) return found;
+  }
+  return null;
+}
+function textContent(node) {
+  if (node == null || typeof node === "boolean") return "";
+  if (typeof node === "string" || typeof node === "number") return String(node);
+  return childrenOf(node).map(textContent).join("");
+}
+
+let root = renderRoot();
+const columns = findComponent(root, "BoardColumns");
+assert.ok(columns, "KanbanPage must render ordinary board columns");
+const ordinaryTasks = columns.props.board.columns.flatMap(column => column.tasks || []);
+assert.deepEqual(ordinaryTasks.map(task => task.id), [ordinaryId]);
+assert.ok(!ordinaryTasks.some(task => task.id === suppressedId));
+
+const audit = findComponent(root, "SuppressedAuditSection");
+assert.ok(audit, "suppressed task must be discoverable in the audit section");
+const auditTree = audit.type(audit.props);
+assert.match(textContent(auditTree), /Superseded source/);
+const open = findElement(auditTree, node =>
+  node.type === "button" && node.props.className === "hermes-kanban-suppressed-audit-open"
+);
+assert.ok(open, "audit row must expose an Open action");
+open.props.onClick();
+
+root = renderRoot();
+const drawer = findComponent(root, "TaskDrawer");
+assert.ok(drawer, "Open must enter the existing task drawer path");
+assert.equal(drawer.props.taskId, suppressedId);
+console.log("suppressed audit runtime contract passed");
+'''
+    result = subprocess.run(
+        [node, "-e", harness, str(bundle)],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert "suppressed audit runtime contract passed" in result.stdout
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
@@ -1488,6 +1766,40 @@ def test_patch_status_archive_closes_running_run(client):
         conn.close()
 
 
+def test_patch_running_to_ready_retains_claim_when_scope_stop_is_unproven(
+    client,
+    monkeypatch,
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active", "assignee": "worker"},
+    ).json()["task"]
+    with kb.connect_closing() as conn:
+        claimed = kb.claim_task(conn, task["id"])
+        assert claimed is not None
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *_a, **_k: {
+            "host_local": True,
+            "termination_attempted": False,
+            "terminated": False,
+            "scope_unknown": True,
+        },
+    )
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "ready"},
+    )
+    assert response.status_code == 409
+    with kb.connect_closing() as conn:
+        retained = kb.get_task(conn, task["id"])
+    assert retained.status == "running"
+    assert retained.claim_lock == claimed.claim_lock
+    assert retained.current_run_id == claimed.current_run_id
+
+
 def test_event_dict_includes_run_id(client):
     """GET /tasks/:id returns events with run_id populated."""
     r = client.post("/api/plugins/kanban/tasks", json={"title": "e", "assignee": "worker"})
@@ -2200,6 +2512,35 @@ def test_diagnostics_endpoint_severity_filter(client):
     data = r.json()
     assert data["count"] == 1
     assert data["diagnostics"][0]["task_id"] == p2
+
+
+def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="source", assignee="worker")
+        child = kb.create_task(
+            conn, title="child", assignee="worker", parents=[parent],
+        )
+        kb.claim_task(conn, parent, claimer="worker")
+        assert kb.block_task(
+            conn, parent,
+            reason="review-required: inspect the source handoff",
+        )
+    finally:
+        conn.close()
+
+    response = client.get("/api/plugins/kanban/diagnostics")
+    assert response.status_code == 200
+    rows = response.json()["diagnostics"]
+    child_row = next(row for row in rows if row["task_id"] == child)
+    kinds = {diag["kind"] for diag in child_row["diagnostics"]}
+    assert "review_parent_gates_child" in kinds
+    finding = next(
+        diag for diag in child_row["diagnostics"]
+        if diag["kind"] == "review_parent_gates_child"
+    )
+    assert finding["data"]["parent_id"] == parent
+    assert finding["data"]["child_status"] == "todo"
 
 
 def test_board_exposes_diagnostics_list_and_summary(client):

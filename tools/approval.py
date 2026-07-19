@@ -23,6 +23,7 @@ import time
 import unicodedata
 from typing import Optional
 from hermes_cli.config import cfg_get
+from agent.secret_scope import get_secret
 
 from tools.interrupt import is_interrupted
 from utils import env_var_enabled, is_truthy_value
@@ -492,7 +493,7 @@ def _check_sudo_stdin_guard(command: str) -> tuple:
     Returns:
         (is_blocked: bool, description: str | None)
     """
-    if "SUDO_PASSWORD" in os.environ:
+    if get_secret("SUDO_PASSWORD"):
         return (False, None)
     normalized = _normalize_command_for_detection(command).lower()
     if _SUDO_STDIN_RE.search(normalized):

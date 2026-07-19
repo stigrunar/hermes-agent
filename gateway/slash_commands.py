@@ -90,6 +90,22 @@ class GatewaySlashCommandsMixin:
 
     async_session_store: AsyncSessionStore
 
+    async def _run_profile_scoped_slash_command(self, event, handler):
+        """Run a credential/config-sensitive slash handler as its owner.
+
+        ``asyncio.to_thread`` copies the active ContextVars, so worker calls
+        made by model/status/usage handlers retain this profile's home and
+        secret scope. Single-profile gateways deliberately keep the legacy
+        process-environment behavior.
+        """
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            from gateway.run import _profile_runtime_scope
+
+            profile_home = self._resolve_profile_home_for_source(event.source)
+            with _profile_runtime_scope(profile_home):
+                return await handler(event)
+        return await handler(event)
+
     def _typed_command_prefix_for(self, platform) -> str:
         """Return the prefix users can always type to reach Hermes commands.
 
