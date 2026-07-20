@@ -313,6 +313,7 @@ def _compute_task_diagnostics(
     ).fetchall()
     chain_by_task = kd.compute_chain_diagnostics(
         graph_rows, links, events_by_task, runs_by_task,
+        review_handoffs=kanban_db.list_review_handoffs(conn),
     )
     reconciliation_context = {
         str(row["id"]): {
@@ -883,6 +884,21 @@ class UpdateTaskBody(BaseModel):
     metadata: Optional[dict] = None
 
 
+def _review_handoff_status_error(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[str]:
+    handoff = kanban_db._protected_review_handoff_for_task(
+        conn, task_id, role="next",
+    )
+    if handoff is None:
+        return None
+    return (
+        "explicit review successor gate is protected while the review handoff "
+        f"is {handoff['state']}; status changes are released by an approved "
+        "review verdict"
+    )
+
+
 @router.patch("/tasks/{task_id}")
 def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
@@ -891,6 +907,19 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
+        if payload.status is not None:
+            status_error = _review_handoff_status_error(conn, task_id)
+            if status_error is not None:
+                raise HTTPException(status_code=409, detail=status_error)
+            active_handoff = kanban_db._active_review_handoff_for_task(conn, task_id)
+            if active_handoff is not None:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "active review lifecycle can only close through "
+                        "/review-verdict (approved or changes_requested)"
+                    ),
+                )
 
         # --- assignee ----------------------------------------------------
         if payload.assignee is not None:
@@ -998,6 +1027,8 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
 
         updated = kanban_db.get_task(conn, task_id)
         return {"task": _task_dict(updated) if updated else None}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
@@ -1085,6 +1116,8 @@ def _set_status_direct(
             (task_id,),
         ).fetchone()
         if prev is None:
+            return False
+        if _review_handoff_status_error(conn, task_id) is not None:
             return False
         if (
             prev["status"] == "running"
@@ -1198,6 +1231,8 @@ def add_comment(task_id: str, payload: CommentBody, board: Optional[str] = Query
 class LinkBody(BaseModel):
     parent_id: str
     child_id: str
+    relationship: str = "dependency"
+    next_task_id: Optional[str] = None
 
 
 @router.post("/links")
@@ -1205,8 +1240,40 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        kanban_db.link_tasks(conn, payload.parent_id, payload.child_id)
-        return {"ok": True}
+        kanban_db.link_tasks(
+            conn,
+            payload.parent_id,
+            payload.child_id,
+            relationship=payload.relationship,
+            next_task_id=payload.next_task_id,
+        )
+        return {"ok": True, "relationship": payload.relationship}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    finally:
+        conn.close()
+
+
+class ReviewVerdictBody(BaseModel):
+    verdict: str
+    summary: Optional[str] = None
+
+
+@router.post("/tasks/{task_id}/review-verdict")
+def submit_review_verdict(
+    task_id: str,
+    payload: ReviewVerdictBody,
+    board: Optional[str] = Query(None),
+):
+    board = _resolve_board(board)
+    conn = _conn(board=board)
+    try:
+        ok = kanban_db.submit_review_verdict(
+            conn, task_id, verdict=payload.verdict, summary=payload.summary,
+        )
+        if not ok:
+            raise HTTPException(status_code=409, detail="review run ownership changed")
+        return {"ok": True, "verdict": payload.verdict}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1224,6 +1291,8 @@ def delete_link(
     try:
         ok = kanban_db.unlink_tasks(conn, parent_id, child_id)
         return {"ok": bool(ok)}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     finally:
         conn.close()
 
@@ -1266,6 +1335,12 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
+                if payload.status is not None and not payload.archive:
+                    status_error = _review_handoff_status_error(conn, tid)
+                    if status_error is not None:
+                        entry.update(ok=False, error=status_error)
+                        results.append(entry)
+                        continue
                 if payload.archive:
                     if not kanban_db.archive_task(conn, tid):
                         entry.update(ok=False, error="archive refused")

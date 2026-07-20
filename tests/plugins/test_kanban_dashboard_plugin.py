@@ -17,7 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
@@ -1023,6 +1023,130 @@ def test_add_link_cycle_rejected(client):
         json={"parent_id": b["id"], "child_id": a["id"]},
     )
     assert r.status_code == 400
+
+
+def test_explicit_review_handoff_api_direct(tmp_path, monkeypatch):
+    """Exercise the endpoint functions without the sandbox-blocked TestClient."""
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
+    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
+
+    source = pa.create_task(pa.CreateTaskBody(title="source"), board="test")["task"]
+    review = pa.create_task(
+        pa.CreateTaskBody(title="review", parents=[source["id"]]), board="test",
+    )["task"]
+    nxt = pa.create_task(pa.CreateTaskBody(title="next"), board="test")["task"]
+    linked = pa.add_link(pa.LinkBody(
+        parent_id=source["id"],
+        child_id=review["id"],
+        relationship="review_gate",
+        next_task_id=nxt["id"],
+    ), board="test")
+    assert linked == {"ok": True, "relationship": "review_gate"}
+
+    handed_off = pa.update_task(
+        source["id"],
+        pa.UpdateTaskBody(
+            status="blocked", block_reason="review-required: inspect",
+        ),
+        board="test",
+    )
+    assert handed_off["task"]["status"] == "blocked"
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, review["id"]).status == "review"
+
+    verdict = pa.submit_review_verdict(
+        review["id"],
+        pa.ReviewVerdictBody(verdict="approved", summary="verified"),
+        board="test",
+    )
+    assert verdict == {"ok": True, "verdict": "approved"}
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, nxt["id"]).status == "ready"
+
+
+@pytest.mark.parametrize("state", ["active", "changes_requested"])
+def test_dashboard_protects_review_successor_status_mutations(
+    tmp_path, monkeypatch, state,
+):
+    import plugins.kanban.dashboard.plugin_api as pa
+
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path)
+    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
+    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
+
+    source = pa.create_task(
+        pa.CreateTaskBody(title="source", assignee="builder"), board="test",
+    )["task"]
+    review = pa.create_task(
+        pa.CreateTaskBody(
+            title="review", assignee="reviewer", parents=[source["id"]],
+        ),
+        board="test",
+    )["task"]
+    nxt = pa.create_task(
+        pa.CreateTaskBody(title="next"), board="test",
+    )["task"]
+    assert pa.add_link(pa.LinkBody(
+        parent_id=source["id"],
+        child_id=review["id"],
+        relationship="review_gate",
+        next_task_id=nxt["id"],
+    ), board="test") == {"ok": True, "relationship": "review_gate"}
+    handed_off = pa.update_task(
+        source["id"],
+        pa.UpdateTaskBody(
+            status="blocked", block_reason="review-required: inspect",
+        ),
+        board="test",
+    )
+    assert handed_off["task"]["status"] == "blocked"
+
+    if state == "changes_requested":
+        verdict = pa.submit_review_verdict(
+            review["id"],
+            pa.ReviewVerdictBody(
+                verdict="changes_requested", summary="please recut",
+            ),
+            board="test",
+        )
+        assert verdict == {"ok": True, "verdict": "changes_requested"}
+
+    with pytest.raises(HTTPException) as single:
+        pa.update_task(
+            nxt["id"], pa.UpdateTaskBody(status="ready"), board="test",
+        )
+    assert single.value.status_code == 409
+    assert "successor gate" in single.value.detail
+
+    bulk = pa.bulk_update(
+        pa.BulkTaskBody(ids=[nxt["id"]], status="ready"), board="test",
+    )
+    bulk_result = bulk["results"]
+    assert len(bulk_result) == 1
+    assert bulk_result[0]["id"] == nxt["id"]
+    assert bulk_result[0]["ok"] is False
+    assert "successor gate" in bulk_result[0]["error"]
+
+    ordinary = pa.create_task(
+        pa.CreateTaskBody(title="ordinary"), board="test",
+    )["task"]
+    ordinary_patch = pa.update_task(
+        ordinary["id"],
+        pa.UpdateTaskBody(status="blocked", block_reason="wait"),
+        board="test",
+    )
+    assert ordinary_patch["task"]["status"] == "blocked"
+    ordinary_bulk = pa.bulk_update(
+        pa.BulkTaskBody(ids=[ordinary["id"]], status="ready"), board="test",
+    )
+    assert ordinary_bulk["results"][0]["ok"] is True
+    with kb.connect(db_path) as conn:
+        assert kb.get_task(conn, nxt["id"]).status == "todo"
 
 
 # ---------------------------------------------------------------------------
@@ -2521,11 +2645,22 @@ def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
         child = kb.create_task(
             conn, title="child", assignee="worker", parents=[parent],
         )
-        kb.claim_task(conn, parent, claimer="worker")
-        assert kb.block_task(
-            conn, parent,
-            reason="review-required: inspect the source handoff",
+        # Reproduce the pre-review-handoff persisted shape directly.  The live
+        # transition now rejects this unsafe graph before mutating either task.
+        conn.execute(
+            "UPDATE tasks SET status='blocked' WHERE id=?",
+            (parent,),
         )
+        conn.execute(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'blocked', ?, ?)",
+            (
+                parent,
+                '{"reason":"review-required: inspect the source handoff"}',
+                int(time.time()),
+            ),
+        )
+        conn.commit()
     finally:
         conn.close()
 
@@ -2534,10 +2669,10 @@ def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
     rows = response.json()["diagnostics"]
     child_row = next(row for row in rows if row["task_id"] == child)
     kinds = {diag["kind"] for diag in child_row["diagnostics"]}
-    assert "review_parent_gates_child" in kinds
+    assert "legacy_review_parent_gates_child" in kinds
     finding = next(
         diag for diag in child_row["diagnostics"]
-        if diag["kind"] == "review_parent_gates_child"
+        if diag["kind"] == "legacy_review_parent_gates_child"
     )
     assert finding["data"]["parent_id"] == parent
     assert finding["data"]["child_status"] == "todo"

@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
-from agent.secret_scope import get_secret
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 
 logger = logging.getLogger(__name__)
 
@@ -91,7 +91,13 @@ def resolve_copilot_token() -> tuple[str, str]:
                 continue
             return val, env_var
 
-    # 2. Fall back to gh auth token
+    # 2. Host ``gh`` credentials are not profile-scoped. An active profile
+    # scope (including an intentionally empty one) is authoritative and must
+    # fail closed instead of borrowing the host account.
+    if current_secret_scope() is not None or is_multiplex_active():
+        return "", ""
+
+    # 2. Fall back to gh auth token for unprofiled legacy callers only.
     token = _try_gh_cli_token()
     if token:
         valid, msg = validate_copilot_token(token)

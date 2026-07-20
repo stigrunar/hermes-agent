@@ -96,6 +96,11 @@ from agent.redact import redact_for_persistence as _redact_diagnostic
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
+# Unit tests replace ``subprocess.Popen`` to capture worker launches. Keep
+# systemd capability probes within that injected boundary instead of allowing
+# ``subprocess.run`` to invoke a real manager while the fake is installed.
+_REAL_SUBPROCESS_POPEN = subprocess.Popen
+
 _log = logging.getLogger(__name__)
 
 
@@ -227,6 +232,8 @@ DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+REVIEW_REQUIRED_PREFIX = "review-required:"
+VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
 AUTONOMOUS_CONTINUATION_BLOCK_KINDS = frozenset({"capability", "transient"})
 DEFAULT_BLOCKER_CONTINUATION_SLA_SECONDS = 15 * 60
 _AUTONOMOUS_CONTINUATION_HUMAN_REASON_TOKENS = (
@@ -1339,6 +1346,21 @@ CREATE TABLE IF NOT EXISTS task_links (
     PRIMARY KEY (parent_id, child_id)
 );
 
+-- Explicit review control-plane relationship.  The ordinary task_links edge
+-- source -> review keeps a pre-created gate parked until the source hands off.
+-- Activation removes that edge and moves only the named review task into the
+-- parent-agnostic ``review`` lane.  A completed review run is not a verdict:
+-- only submit_review_verdict advances this row and releases source/next_gate.
+CREATE TABLE IF NOT EXISTS review_handoffs (
+    source_task_id TEXT PRIMARY KEY,
+    review_task_id TEXT NOT NULL UNIQUE,
+    next_task_id   TEXT UNIQUE,
+    state          TEXT NOT NULL,
+    verdict        TEXT,
+    created_at     INTEGER NOT NULL,
+    updated_at     INTEGER NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS task_comments (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id    TEXT NOT NULL,
@@ -1442,6 +1464,7 @@ CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
+CREATE INDEX IF NOT EXISTS idx_review_handoffs_state ON review_handoffs(state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
@@ -3357,7 +3380,242 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
 # Links
 # ---------------------------------------------------------------------------
 
-def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
+def _review_handoff_row(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: Optional[str] = None,
+    review_task_id: Optional[str] = None,
+) -> Optional[sqlite3.Row]:
+    if source_task_id is not None:
+        return conn.execute(
+            "SELECT * FROM review_handoffs WHERE source_task_id = ?",
+            (source_task_id,),
+        ).fetchone()
+    if review_task_id is not None:
+        return conn.execute(
+            "SELECT * FROM review_handoffs WHERE review_task_id = ?",
+            (review_task_id,),
+        ).fetchone()
+    return None
+
+
+def list_review_handoffs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return the explicit review relationships for diagnostics/UI callers."""
+    return [dict(row) for row in conn.execute(
+        "SELECT * FROM review_handoffs ORDER BY created_at, source_task_id"
+    ).fetchall()]
+
+
+def _validate_review_handoff_graph(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    review_task_id: str,
+    next_task_id: Optional[str],
+) -> None:
+    ids = [source_task_id, review_task_id]
+    if next_task_id:
+        ids.append(next_task_id)
+    if len(set(ids)) != len(ids):
+        raise ValueError("review handoff source, review gate, and next gate must be distinct")
+    missing = _find_missing_parents(conn, ids)
+    if missing:
+        raise ValueError(f"unknown review handoff task(s): {', '.join(missing)}")
+
+    tasks = {
+        row["id"]: row for row in conn.execute(
+            "SELECT id, status FROM tasks WHERE id IN ("
+            + ",".join("?" * len(ids)) + ")",
+            tuple(ids),
+        ).fetchall()
+    }
+    if tasks[source_task_id]["status"] in ("done", "archived"):
+        raise ValueError("review handoff source is already terminal")
+    if tasks[review_task_id]["status"] not in ("todo", "ready", "blocked"):
+        raise ValueError(
+            "review gate must be pre-created and unclaimed (todo/ready/blocked)"
+        )
+
+    review_parents = {
+        row["parent_id"] for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id = ?", (review_task_id,)
+        )
+    }
+    if review_parents - {source_task_id}:
+        raise ValueError(
+            "review gate has additional parents; detach them before registering "
+            "the one-to-one review handoff"
+        )
+    source_children = {
+        row["child_id"] for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (source_task_id,)
+        )
+    }
+    allowed_source_children = {review_task_id}
+    if next_task_id:
+        allowed_source_children.add(next_task_id)
+    if source_children - allowed_source_children:
+        raise ValueError(
+            "review source has ordinary downstream children; register a single "
+            "review gate before adding an explicitly approved next gate"
+        )
+    review_children = {
+        row["child_id"] for row in conn.execute(
+            "SELECT child_id FROM task_links WHERE parent_id = ?", (review_task_id,)
+        )
+    }
+    allowed_review_children = {next_task_id} if next_task_id else set()
+    if review_children - allowed_review_children:
+        raise ValueError(
+            "review gate has ordinary downstream children; only the explicit "
+            "next review gate may follow approval"
+        )
+
+
+def register_review_handoff(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    review_task_id: str,
+    *,
+    next_task_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Register one explicit source -> review -> optional-next lifecycle.
+
+    Registration is retry-safe.  It creates the ordinary parking links, but
+    only :func:`block_task` with ``review-required:`` may detach/release the
+    review gate.  Conflicting registrations and ambiguous graphs are rejected
+    before any mutation.
+    """
+    with write_txn(conn):
+        existing = _review_handoff_row(conn, source_task_id=source_task_id)
+        if existing is not None:
+            if (
+                existing["review_task_id"] == review_task_id
+                and existing["next_task_id"] == next_task_id
+            ):
+                return dict(existing)
+            raise ValueError(
+                f"source {source_task_id} already has review gate "
+                f"{existing['review_task_id']}"
+            )
+        review_owner = _review_handoff_row(conn, review_task_id=review_task_id)
+        if review_owner is not None:
+            raise ValueError(
+                f"review gate {review_task_id} already belongs to source "
+                f"{review_owner['source_task_id']}"
+            )
+        if next_task_id:
+            next_owner = conn.execute(
+                "SELECT source_task_id FROM review_handoffs WHERE next_task_id = ?",
+                (next_task_id,),
+            ).fetchone()
+            if next_owner:
+                raise ValueError(
+                    f"next gate {next_task_id} already belongs to review handoff "
+                    f"{next_owner['source_task_id']}"
+                )
+        _validate_review_handoff_graph(
+            conn, source_task_id, review_task_id, next_task_id,
+        )
+        source_status = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (source_task_id,),
+        ).fetchone()["status"]
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO review_handoffs "
+            "(source_task_id, review_task_id, next_task_id, state, verdict, created_at, updated_at) "
+            "VALUES (?, ?, ?, 'waiting', NULL, ?, ?)",
+            (source_task_id, review_task_id, next_task_id, now, now),
+        )
+        conn.execute(
+            "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+            (source_task_id, review_task_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+            (review_task_id,),
+        )
+        if next_task_id:
+            # Bounded migration for a legacy linear source -> review -> next
+            # chain: the explicit lifecycle parks the successor under the
+            # source so only an approved verdict can release it.
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                (review_task_id, next_task_id),
+            )
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (source_task_id, next_task_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
+                (next_task_id,),
+            )
+        payload = {
+            "source_task_id": source_task_id,
+            "review_task_id": review_task_id,
+            "next_task_id": next_task_id,
+        }
+        _append_event(conn, source_task_id, "review_handoff_registered", payload)
+        _append_event(conn, review_task_id, "review_gate_registered", payload)
+        # Bounded legacy reconciliation: an operator may explicitly register
+        # exactly the historical source/child pair already stranded in the
+        # blocked->todo shape.  Registration itself supplies the missing
+        # identity; release that one named gate atomically without scanning or
+        # bulk-promoting any other historical cards.
+        if source_status == "blocked":
+            blocked_event = conn.execute(
+                "SELECT payload FROM task_events WHERE task_id=? AND kind='blocked' "
+                "ORDER BY id DESC LIMIT 1",
+                (source_task_id,),
+            ).fetchone()
+            try:
+                blocked_payload = (
+                    json.loads(blocked_event["payload"])
+                    if blocked_event and blocked_event["payload"] else {}
+                )
+            except (TypeError, ValueError):
+                blocked_payload = {}
+            blocked_reason = str(blocked_payload.get("reason") or "")
+            if blocked_reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX):
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                    (source_task_id, review_task_id),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='review', completed_at=NULL, result=NULL, "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "current_run_id=NULL WHERE id=?",
+                    (review_task_id,),
+                )
+                conn.execute(
+                    "UPDATE review_handoffs SET state='active', updated_at=? "
+                    "WHERE source_task_id=? AND state='waiting'",
+                    (now, source_task_id),
+                )
+                _append_event(
+                    conn,
+                    review_task_id,
+                    "review_handoff_reconciled",
+                    {**payload, "reason": blocked_reason, "bounded": True},
+                )
+        return dict(_review_handoff_row(conn, source_task_id=source_task_id))
+
+
+def link_tasks(
+    conn: sqlite3.Connection,
+    parent_id: str,
+    child_id: str,
+    *,
+    relationship: str = "dependency",
+    next_task_id: Optional[str] = None,
+) -> None:
+    if relationship == "review_gate":
+        register_review_handoff(
+            conn, parent_id, child_id, next_task_id=next_task_id,
+        )
+        return
+    if relationship != "dependency":
+        raise ValueError("relationship must be 'dependency' or 'review_gate'")
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -3367,6 +3625,27 @@ def link_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> None:
         if _would_cycle(conn, parent_id, child_id):
             raise ValueError(
                 f"linking {parent_id} -> {child_id} would create a cycle"
+            )
+        source_handoff = _review_handoff_row(conn, source_task_id=parent_id)
+        if source_handoff:
+            if (
+                child_id == source_handoff["review_task_id"]
+                and source_handoff["state"] != "waiting"
+            ):
+                raise ValueError("cannot reattach a released review gate to its source")
+            if child_id not in {
+                source_handoff["review_task_id"], source_handoff["next_task_id"],
+            }:
+                raise ValueError(
+                    f"source {parent_id} is review-gated; only its registered review "
+                    f"gate {source_handoff['review_task_id']} and explicit next gate "
+                    "may be linked directly"
+                )
+        review_handoff = _review_handoff_row(conn, review_task_id=parent_id)
+        if review_handoff:
+            raise ValueError(
+                f"review gate {parent_id} may release only its explicitly "
+                "registered next gate; successor parking is owned by the source"
             )
         conn.execute(
             "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
@@ -3412,6 +3691,17 @@ def _would_cycle(conn: sqlite3.Connection, parent_id: str, child_id: str) -> boo
 
 def unlink_tasks(conn: sqlite3.Connection, parent_id: str, child_id: str) -> bool:
     with write_txn(conn):
+        protected = conn.execute(
+            "SELECT 1 FROM review_handoffs "
+            "WHERE (source_task_id=? AND review_task_id=? AND state='waiting') "
+            "OR (source_task_id=? AND next_task_id=? AND state!='approved')",
+            (parent_id, child_id, parent_id, child_id),
+        ).fetchone()
+        if protected:
+            raise ValueError(
+                "cannot unlink an active review lifecycle edge; close or replace "
+                "the explicit review handoff first"
+            )
         cur = conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
             (parent_id, child_id),
@@ -4077,6 +4367,8 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if _protected_review_handoff_for_task(conn, task_id, role="next"):
+                continue
             block_kind = conn.execute(
                 "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
             ).fetchone()["block_kind"]
@@ -4088,6 +4380,24 @@ def recompute_ready(
                 # silently auto-recover.  ``unblock_task`` is the only
                 # legitimate exit (it emits ``"unblocked"`` which flips
                 # this predicate back).
+                continue
+            active_review = conn.execute(
+                "SELECT 1 FROM review_handoffs "
+                "WHERE review_task_id=? AND state='active'",
+                (task_id,),
+            ).fetchone()
+            if active_review:
+                # An active review gate has a parent-agnostic lane. Never let
+                # a stale/manual todo or blocked value turn it into an
+                # ordinary ready worker; an explicit unblock or review retry
+                # must restore ``review`` instead.
+                if cur_status in ("todo", "blocked"):
+                    conn.execute(
+                        "UPDATE tasks SET status='review', block_kind=NULL "
+                        "WHERE id=? AND status IN ('todo','blocked')",
+                        (task_id,),
+                    )
+                    _append_event(conn, task_id, "review_lane_restored", None)
                 continue
             parents = conn.execute(
                 "SELECT t.status FROM tasks t "
@@ -4350,6 +4660,17 @@ def claim_task(
         wait = conn.execute(
             "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
         ).fetchone()
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            if wait and wait["status"] == "ready":
+                conn.execute(
+                    "UPDATE tasks SET status='todo', block_kind=NULL "
+                    "WHERE id=? AND status='ready'", (task_id,),
+                )
+                _append_event(
+                    conn, task_id, "claim_rejected",
+                    {"reason": "review_successor_protected"},
+                )
+            return None
         if (wait and wait["status"] == "ready" and wait["block_kind"] == "dependency"
                 and not _dependency_wait_changed(conn, task_id)):
             conn.execute(
@@ -4414,6 +4735,22 @@ def claim_task(
                     "conflicting_run_id": duplicate["current_run_id"],
                 },
             )
+            return None
+        active_review = conn.execute(
+            "SELECT 1 FROM review_handoffs "
+            "WHERE review_task_id=? AND state='active'",
+            (task_id,),
+        ).fetchone()
+        if active_review:
+            # A review gate is claimed through claim_review_task and must not
+            # enter the ordinary ready -> running worker lane if stale state
+            # or a manual writer left it marked ready.
+            conn.execute(
+                "UPDATE tasks SET status='review', block_kind=NULL "
+                "WHERE id=? AND status='ready'",
+                (task_id,),
+            )
+            _append_event(conn, task_id, "review_lane_restored", None)
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -4588,6 +4925,17 @@ def claim_review_task(
             run_id=run_id,
         )
         return get_task(conn, task_id)
+
+
+def _claim_retry_status(conn: sqlite3.Connection, task_id: str) -> str:
+    """Return the lane an interrupted claim must re-enter."""
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        return "todo"
+    active_review = conn.execute(
+        "SELECT 1 FROM review_handoffs WHERE review_task_id=? AND state='active'",
+        (task_id,),
+    ).fetchone()
+    return "review" if active_review else "ready"
 
 
 def heartbeat_claim(
@@ -4817,13 +5165,15 @@ def release_stale_claims(
             )
             continue
         with write_txn(conn):
+            retry_status = _claim_retry_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
                 "AND claim_expires IS NOT NULL AND claim_expires < ? "
                 "AND current_run_id IS ? AND worker_pid IS ?",
                 (
+                    retry_status,
                     row["id"],
                     row["claim_lock"],
                     now,
@@ -4975,12 +5325,13 @@ def _reclaim_task_locked(
         )
         return False
     with write_txn(conn):
+        retry_status = _claim_retry_status(conn, task_id)
         cur = conn.execute(
-            "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+            "UPDATE tasks SET status = ?, claim_lock = NULL, "
             "claim_expires = NULL, worker_pid = NULL "
             "WHERE id = ? AND status IN ('running', 'ready', 'blocked') "
             "AND claim_lock IS ? AND current_run_id IS ? AND worker_pid IS ?",
-            (task_id, prev_lock, row["current_run_id"], row["worker_pid"]),
+            (retry_status, task_id, prev_lock, row["current_run_id"], row["worker_pid"]),
         )
         if cur.rowcount != 1:
             return False
@@ -5179,6 +5530,46 @@ class ArtifactPreservationError(RuntimeError):
     """Raised when a declared scratch deliverable cannot be preserved."""
 
 
+def _active_review_handoff_for_task(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[sqlite3.Row]:
+    return conn.execute(
+        "SELECT * FROM review_handoffs "
+        "WHERE state = 'active' AND (source_task_id = ? OR review_task_id = ?)",
+        (task_id, task_id),
+    ).fetchone()
+
+
+def _assert_task_completion_allowed(
+    conn: sqlite3.Connection, task_id: str,
+) -> None:
+    """Reject ordinary completion while an explicit review lifecycle is open."""
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        raise ValueError(
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
+    active_handoff = _active_review_handoff_for_task(conn, task_id)
+    if active_handoff is not None:
+        if active_handoff["review_task_id"] == task_id:
+            raise ValueError(
+                "active review gate requires an explicit approved or "
+                "changes_requested verdict; task completion is not approval"
+            )
+        raise ValueError(
+            "review-gated source remains blocked until its explicit review verdict"
+        )
+
+    waiting_handoff = _review_handoff_row(conn, source_task_id=task_id)
+    if waiting_handoff is not None and waiting_handoff["state"] in (
+        "waiting", "changes_requested",
+    ):
+        raise ValueError(
+            "source has a registered review gate; hand off with "
+            "kanban_block(reason='review-required: ...') instead of completing"
+        )
+
+
 def complete_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5218,6 +5609,8 @@ def complete_task(
     and never blocks.
     """
     now = int(time.time())
+
+    _assert_task_completion_allowed(conn, task_id)
 
     # A controller must not mark a dispatcher-owned running task terminal
     # while its worker process can still mutate the workspace.  The active
@@ -5266,6 +5659,10 @@ def complete_task(
         conn, task_id, metadata, summary=summary, result=result,
     )
     with write_txn(conn):
+        # Keep the early check above for actionable errors, but repeat it
+        # under the write lock immediately before the task CAS. A handoff can
+        # be registered after the precheck and must win over completion.
+        _assert_task_completion_allowed(conn, task_id)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6017,9 +6414,17 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    review_required = bool(
+        reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
+    )
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?",
             (task_id,),
@@ -6033,6 +6438,91 @@ def block_task(
             and cur_row["block_recurrences"] is not None
             else 0
         )
+
+        if review_required:
+            handoff = _review_handoff_row(conn, source_task_id=task_id)
+            if handoff is not None:
+                if handoff["state"] == "active":
+                    # Retried terminal calls and dispatcher-delivery retries are
+                    # harmless: the one gate is already released.
+                    return cur_row["status"] == "blocked"
+                if handoff["state"] == "approved":
+                    raise ValueError("approved review handoff cannot be activated again")
+                review = conn.execute(
+                    "SELECT status FROM tasks WHERE id = ?",
+                    (handoff["review_task_id"],),
+                ).fetchone()
+                if review is None:
+                    raise ValueError("registered review gate no longer exists")
+                if review["status"] not in ("todo", "ready", "blocked", "done"):
+                    raise ValueError(
+                        f"review gate {handoff['review_task_id']} is "
+                        f"{review['status']}; reclaim it before handoff"
+                    )
+                params: tuple[Any, ...] = (task_id,)
+                run_guard = ""
+                if expected_run_id is not None:
+                    run_guard = " AND current_run_id = ?"
+                    params = (task_id, int(expected_run_id))
+                cur = conn.execute(
+                    "UPDATE tasks SET status='blocked', claim_lock=NULL, "
+                    "claim_expires=NULL, worker_pid=NULL, block_kind=NULL "
+                    "WHERE id=? AND status IN ('running','ready')" + run_guard,
+                    params,
+                )
+                if cur.rowcount != 1:
+                    return False
+                run_id = _end_run(
+                    conn, task_id, outcome="blocked", status="blocked", summary=reason,
+                )
+                if run_id is None and reason:
+                    run_id = _synthesize_ended_run(
+                        conn, task_id, outcome="blocked", summary=reason,
+                    )
+                now = int(time.time())
+                conn.execute(
+                    "DELETE FROM task_links WHERE parent_id = ? AND child_id = ?",
+                    (task_id, handoff["review_task_id"]),
+                )
+                conn.execute(
+                    "UPDATE tasks SET status='review', completed_at=NULL, result=NULL, "
+                    "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+                    "current_run_id=NULL, consecutive_failures=0, last_failure_error=NULL "
+                    "WHERE id = ?",
+                    (handoff["review_task_id"],),
+                )
+                conn.execute(
+                    "UPDATE review_handoffs SET state='active', verdict=NULL, updated_at=? "
+                    "WHERE source_task_id=? AND state IN ('waiting','changes_requested')",
+                    (now, task_id),
+                )
+                payload = {
+                    "reason": reason,
+                    "review_task_id": handoff["review_task_id"],
+                    "next_task_id": handoff["next_task_id"],
+                }
+                _append_event(conn, task_id, "blocked", payload, run_id=run_id)
+                _append_event(
+                    conn, handoff["review_task_id"], "review_handoff_released",
+                    {**payload, "source_task_id": task_id},
+                )
+                return True
+
+            unsafe_children = conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
+                (task_id,),
+            ).fetchall()
+            if unsafe_children:
+                child_ids = ", ".join(row["child_id"] for row in unsafe_children[:5])
+                detail = f"parent-gated child task(s): {child_ids}"
+            else:
+                detail = "no registered review_handoff"
+            raise ValueError(
+                "review-required handoff cannot activate: no explicit review "
+                f"relationship ({detail}). Register exactly one with "
+                "kanban_link relationship='review_gate' before blocking; no task "
+                "state was changed"
+            )
 
         # Dependency blocks never enter the human ``blocked`` bucket — they
         # wait in ``todo`` and let ``recompute_ready`` gate on parents. Routing
@@ -6211,6 +6701,163 @@ def block_task(
     return True
 
 
+def submit_review_verdict(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    verdict: str,
+    summary: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Close an active explicit review gate with an auditable verdict.
+
+    ``changes_requested`` returns the source to its normal dependency-gated
+    work lane for a recut. ``approved`` closes the source and review cards and
+    releases only the successor named when the handoff was registered. Merely
+    completing the review task cannot call this transition implicitly.
+    """
+    if verdict not in VALID_REVIEW_VERDICTS:
+        raise ValueError(
+            f"review verdict must be one of {sorted(VALID_REVIEW_VERDICTS)}"
+        )
+    with write_txn(conn):
+        handoff = _review_handoff_row(conn, review_task_id=review_task_id)
+        if handoff is None:
+            raise ValueError(
+                f"task {review_task_id} is not an explicitly registered review gate"
+            )
+        if handoff["state"] == verdict and handoff["verdict"] == verdict:
+            return True
+        if handoff["state"] != "active":
+            raise ValueError(
+                f"review handoff is {handoff['state']}, not active; verdict rejected"
+            )
+        review = conn.execute(
+            "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
+            (review_task_id,),
+        ).fetchone()
+        if review is None or review["status"] not in ("running", "review"):
+            raise ValueError("review gate is not running or awaiting a reviewer")
+        if (
+            expected_run_id is not None
+            and int(review["current_run_id"] or 0) != int(expected_run_id)
+        ):
+            return False
+        if (
+            review["status"] == "running"
+            and review["worker_pid"] is not None
+            and expected_run_id is None
+        ):
+            raise ValueError("active_run_requires_stop")
+
+        now = int(time.time())
+        run_id = _end_run(
+            conn,
+            review_task_id,
+            outcome="completed",
+            status="done",
+            summary=summary or verdict,
+            metadata={"review_verdict": verdict},
+        )
+        if run_id is None:
+            run_id = _synthesize_ended_run(
+                conn,
+                review_task_id,
+                outcome="completed",
+                summary=summary or verdict,
+                metadata={"review_verdict": verdict},
+            )
+        conn.execute(
+            "UPDATE tasks SET status='done', result=?, completed_at=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "block_kind=NULL, block_recurrences=0 WHERE id=?",
+            (summary or verdict, now, review_task_id),
+        )
+        conn.execute(
+            "UPDATE review_handoffs SET state=?, verdict=?, updated_at=? "
+            "WHERE source_task_id=? AND state='active'",
+            (verdict, verdict, now, handoff["source_task_id"]),
+        )
+        verdict_payload = {
+            "verdict": verdict,
+            "source_task_id": handoff["source_task_id"],
+            "review_task_id": review_task_id,
+            "next_task_id": handoff["next_task_id"],
+            "summary": summary,
+        }
+        _append_event(
+            conn, review_task_id, "review_verdict", verdict_payload, run_id=run_id,
+        )
+
+        if verdict == "changes_requested":
+            undone_parent = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+                (handoff["source_task_id"],),
+            ).fetchone()
+            source_status = "todo" if undone_parent else "ready"
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, completed_at=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+                "WHERE id=? AND status='blocked'",
+                (source_status, handoff["source_task_id"]),
+            )
+            if cur.rowcount != 1:
+                raise ValueError("review source is no longer blocked; verdict rolled back")
+            _append_event(
+                conn, handoff["source_task_id"], "unblocked",
+                {**verdict_payload, "status": source_status},
+            )
+            return True
+
+        cur = conn.execute(
+            "UPDATE tasks SET status='done', completed_at=?, result=?, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "block_kind=NULL, block_recurrences=0 "
+            "WHERE id=? AND status='blocked'",
+            (now, summary or "approved by explicit review verdict", handoff["source_task_id"]),
+        )
+        if cur.rowcount != 1:
+            raise ValueError("review source is no longer blocked; verdict rolled back")
+        source_run_id = _synthesize_ended_run(
+            conn,
+            handoff["source_task_id"],
+            outcome="completed",
+            summary=summary or "approved by explicit review verdict",
+            metadata={
+                "review_verdict": verdict,
+                "review_task_id": review_task_id,
+            },
+        )
+        _append_event(
+            conn, handoff["source_task_id"], "review_handoff_approved", verdict_payload,
+        )
+        _append_event(
+            conn, handoff["source_task_id"], "completed",
+            {"summary": summary or "approved by explicit review verdict", "review_verdict": verdict},
+            run_id=source_run_id,
+        )
+        next_task_id = handoff["next_task_id"]
+        if next_task_id:
+            unfinished = conn.execute(
+                "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+                (next_task_id,),
+            ).fetchone()
+            if unfinished is None:
+                promoted = conn.execute(
+                    "UPDATE tasks SET status='ready', block_kind=NULL "
+                    "WHERE id=? AND status='todo'",
+                    (next_task_id,),
+                )
+                if promoted.rowcount == 1:
+                    _append_event(
+                        conn, next_task_id, "promoted",
+                        {"review_task_id": review_task_id, "verdict": verdict},
+                    )
+        return True
+
+
 
 def promote_task(
     conn: sqlite3.Connection,
@@ -6236,6 +6883,27 @@ def promote_task(
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        return False, (
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
+    if conn.execute(
+        "SELECT 1 FROM review_handoffs WHERE source_task_id=? AND state='active'",
+        (task_id,),
+    ).fetchone():
+        return False, (
+            "review-gated source remains blocked until an explicit approved or "
+            "changes_requested verdict"
+        )
+    if conn.execute(
+        "SELECT 1 FROM review_handoffs WHERE review_task_id=? AND state='active'",
+        (task_id,),
+    ).fetchone():
+        return False, (
+            "active review gate must remain in the review lane; use explicit "
+            "unblock/reclaim handling instead of ordinary promotion"
+        )
 
     cur_status = row["status"]
     if cur_status not in ("todo", "blocked"):
@@ -6265,6 +6933,31 @@ def promote_task(
         return True, None
 
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            return False, (
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
+        # Repeat the precheck under the write lock so activation cannot race
+        # this ordinary todo/blocked -> ready transition.
+        if conn.execute(
+            "SELECT 1 FROM review_handoffs "
+            "WHERE source_task_id=? AND state='active'",
+            (task_id,),
+        ).fetchone():
+            return False, (
+                "review-gated source remains blocked until an explicit approved "
+                "or changes_requested verdict"
+            )
+        if conn.execute(
+            "SELECT 1 FROM review_handoffs "
+            "WHERE review_task_id=? AND state='active'",
+            (task_id,),
+        ).fetchone():
+            return False, (
+                "active review gate must remain in the review lane; use explicit "
+                "unblock/reclaim handling instead of ordinary promotion"
+            )
         upd = conn.execute(
             "UPDATE tasks SET status = 'ready', block_kind = NULL "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
@@ -6294,6 +6987,20 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """
     now = int(time.time())
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
+        if conn.execute(
+            "SELECT 1 FROM review_handoffs WHERE source_task_id=? AND state='active'",
+            (task_id,),
+        ).fetchone():
+            return False
+        active_review = conn.execute(
+            "SELECT 1 FROM review_handoffs WHERE review_task_id=? AND state='active'",
+            (task_id,),
+        ).fetchone()
         stale = conn.execute(
             "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
@@ -6322,7 +7029,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only') LIMIT 1",
             (task_id,),
         ).fetchone()
-        new_status = "todo" if undone_parents else "ready"
+        new_status = "review" if active_review else ("todo" if undone_parents else "ready")
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
         # ``block_kind``. Resetting the recurrence counter on unblock is exactly
         # the amnesia that let a cron unblock → worker re-block loop run
@@ -6663,6 +7370,26 @@ def decompose_triage_task(
     return child_ids
 
 
+def _protected_review_handoff_for_task(
+    conn: sqlite3.Connection, task_id: str, *, role: Optional[str] = None,
+) -> Optional[sqlite3.Row]:
+    """Return a non-terminal review lifecycle touching ``task_id``."""
+    if role == "next":
+        clause = "next_task_id=?"
+        params = (task_id,)
+    elif role is None:
+        clause = "source_task_id=? OR review_task_id=? OR next_task_id=?"
+        params = (task_id, task_id, task_id)
+    else:
+        raise ValueError(f"unknown review handoff role: {role!r}")
+    return conn.execute(
+        "SELECT * FROM review_handoffs "
+        f"WHERE state != 'approved' AND ({clause}) "
+        "LIMIT 1",
+        params,
+    ).fetchone()
+
+
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     db_path = _connection_main_db_path(conn)
     if db_path is None:
@@ -6672,6 +7399,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
     # before the archive CAS.
     with _dispatch_tick_lock(db_path) as lock_outcome:
         if not getattr(lock_outcome, "acquired", bool(lock_outcome)):
+            return False
+        if _protected_review_handoff_for_task(conn, task_id):
             return False
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, current_run_id "
@@ -7334,6 +8063,13 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         ).fetchone()
         if not row or row["status"] != "archived":
             return False
+        if _protected_review_handoff_for_task(conn, task_id):
+            return False
+        conn.execute(
+            "DELETE FROM review_handoffs WHERE source_task_id=? "
+            "OR review_task_id=? OR next_task_id=?",
+            (task_id, task_id, task_id),
+        )
         conn.execute(
             "DELETE FROM task_links WHERE parent_id = ? OR child_id = ?",
             (task_id, task_id),
@@ -7358,6 +8094,13 @@ def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     if the task was not found.
     """
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id):
+            return False
+        conn.execute(
+            "DELETE FROM review_handoffs WHERE source_task_id=? "
+            "OR review_task_id=? OR next_task_id=?",
+            (task_id, task_id, task_id),
+        )
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         if cur.rowcount != 1:
             return False
@@ -7691,6 +8434,11 @@ def schedule_task(
     to ``ready`` (or ``todo`` if parents are still incomplete).
     """
     with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+            raise ValueError(
+                "explicit review successor gate remains protected until the review "
+                "handoff is approved"
+            )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8386,14 +9134,15 @@ def enforce_max_runtime(
         killed = bool(termination.get("sigkill"))
 
         with write_txn(conn):
+            retry_status = _claim_retry_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ? "
                 "  AND current_run_id IS ?",
-                (tid, pid, row["claim_lock"], row["current_run_id"]),
+                (retry_status, tid, pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 payload = {
@@ -8541,14 +9290,15 @@ def detect_stale_running(
             continue
 
         with write_txn(conn):
+            retry_status = _claim_retry_status(conn, tid)
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
                 "last_heartbeat_at = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND claim_lock IS ? AND current_run_id IS ? "
                 "  AND worker_pid IS ?",
-                (tid, row["claim_lock"], row["current_run_id"], pid),
+                (retry_status, tid, row["claim_lock"], row["current_run_id"], pid),
             )
             if cur.rowcount != 1:
                 continue
@@ -8889,13 +9639,14 @@ def detect_crashed_workers(
                     event_payload["exit_kind"] = kind
                     event_payload["exit_code"] = code
 
+            retry_status = _claim_retry_status(conn, row["id"])
             cur = conn.execute(
-                "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL "
                 "WHERE id = ? AND status = 'running' "
                 "  AND worker_pid = ? AND claim_lock IS ? "
                 "  AND current_run_id IS ?",
-                (row["id"], pid, row["claim_lock"], row["current_run_id"]),
+                (retry_status, row["id"], pid, row["claim_lock"], row["current_run_id"]),
             )
             if cur.rowcount == 1:
                 # Rate-limited requeues are a clean release, not a crash —
@@ -9216,14 +9967,15 @@ def _record_task_failure(
             # Below threshold.
             if release_claim:
                 # Spawn path: transition running → ready + clear claim.
+                retry_status = _claim_retry_status(conn, task_id)
                 conn.execute(
-                    "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
+                    "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
                     "consecutive_failures = ?, last_failure_error = ?, "
                     "failure_classification = ?, failure_fingerprint = ? "
                     "WHERE id = ? AND status = 'running'",
                     (
-                        failures, error[:500],
+                        retry_status, failures, error[:500],
                         failure_classification, failure_fingerprint,
                         task_id,
                     ),
@@ -11792,6 +12544,9 @@ def _systemd_user_scope_available(
     )
 
 
+_REAL_SYSTEMD_USER_SCOPE_AVAILABLE = _systemd_user_scope_available
+
+
 def _canonical_board_db_identity(
     *,
     board: Optional[str] = None,
@@ -11953,6 +12708,12 @@ def _systemd_worker_scope_argv(
         return cmd
     runner = systemd_run if systemd_run is not None else shutil.which("systemd-run")
     if not runner:
+        return cmd
+    if (
+        user_manager_ready is None
+        and subprocess.Popen is not _REAL_SUBPROCESS_POPEN
+        and _systemd_user_scope_available is _REAL_SYSTEMD_USER_SCOPE_AVAILABLE
+    ):
         return cmd
     ready = (
         _systemd_user_scope_available(runner, manager_target=target)
@@ -12524,9 +13285,14 @@ def _default_spawn(
     # Only pin a real, absolute directory — file_tools rejects relative /
     # sentinel TERMINAL_CWD values, so a non-dir workspace must NOT be set
     # here (leave the inherited value rather than write a meaningless one).
-    env.pop("TERMINAL_CWD", None)
     if workspace and os.path.isabs(workspace) and os.path.isdir(workspace):
         env["TERMINAL_CWD"] = workspace
+    elif task.workspace_kind == "worktree" and env.get("TERMINAL_CWD"):
+        # Worktree workers must never inherit a dispatcher/gateway anchor when
+        # their workspace is unresolved; that would silently redirect file
+        # operations to the parent's cwd. Directory-worker legacy callers
+        # retain their explicit sentinel for compatibility.
+        env.pop("TERMINAL_CWD", None)
     if task.branch_name:
         env["HERMES_KANBAN_BRANCH"] = task.branch_name
     if task.current_run_id is not None:
@@ -12870,6 +13636,70 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
         lines.append("")
+
+    # Activation deliberately removes the ordinary source -> review link, so
+    # the review worker must receive the source handoff through the explicit
+    # control-plane relationship instead of relying on the parent query below.
+    review_handoff = _review_handoff_row(conn, review_task_id=task_id)
+    if review_handoff is not None:
+        source = get_task(conn, review_handoff["source_task_id"])
+        if source is not None:
+            lines.append("## Explicit review handoff")
+            lines.append(
+                f"Source task identity: {source.id} — {source.title}"
+            )
+            lines.append(f"Source status: {source.status}")
+            if source.body and source.body.strip():
+                lines.append("### Source task body")
+                lines.append(_cap(source.body, _CTX_MAX_BODY_BYTES))
+
+            source_run = latest_run(conn, source.id)
+            lines.append("### Latest source run handoff")
+            if source_run is None:
+                lines.append("(no source run handoff recorded)")
+            else:
+                if source_run.summary and source_run.summary.strip():
+                    lines.append(_cap(source_run.summary))
+                if source_run.metadata:
+                    try:
+                        metadata_text = json.dumps(
+                            source_run.metadata,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                        )
+                        lines.append(f"_metadata_: `{_cap(metadata_text)}`")
+                    except Exception:
+                        pass
+                if not source_run.summary and not source_run.metadata:
+                    lines.append("(source run has no summary or metadata)")
+
+            source_comments = list_comments(conn, source.id)
+            if len(source_comments) > _CTX_MAX_COMMENTS:
+                omitted_source_comments = len(source_comments) - _CTX_MAX_COMMENTS
+                source_comments = source_comments[-_CTX_MAX_COMMENTS:]
+            else:
+                omitted_source_comments = 0
+            lines.append("### Source comments / evidence")
+            if omitted_source_comments:
+                lines.append(
+                    f"_({omitted_source_comments} earlier source comment(s) omitted; "
+                    f"showing most recent {len(source_comments)})_"
+                )
+            if not source_comments:
+                lines.append("(no source comments recorded)")
+            for comment in source_comments:
+                safe_author = (comment.author or "").replace("`", "")
+                ts = time.strftime(
+                    "%Y-%m-%d %H:%M", time.localtime(comment.created_at)
+                )
+                lines.append(f"comment from worker `{safe_author}` at {ts}:")
+                lines.append(_cap(comment.body, _CTX_MAX_COMMENT_BYTES))
+            lines.append(
+                "Review gate instruction: inspect the source evidence and close "
+                "this gate only via "
+                "`kanban_complete(review_verdict='approved'|'changes_requested', ...)`."
+            )
+            lines.append("")
 
     # Attachments — files uploaded to this task (PDFs, source docs,
     # images). Surface the absolute on-disk path so the worker, which has
