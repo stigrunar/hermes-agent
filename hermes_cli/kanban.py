@@ -513,9 +513,23 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
 
     # --- link / unlink ---
-    p_link = sub.add_parser("link", help="Add a parent->child dependency")
+    p_link = sub.add_parser("link", help="Add a dependency or explicit review gate")
     p_link.add_argument("parent_id")
     p_link.add_argument("child_id")
+    p_link.add_argument(
+        "--relationship", choices=["dependency", "review_gate"],
+        default="dependency",
+    )
+    p_link.add_argument(
+        "--next-task", default=None,
+        help="Successor released only by approval (review_gate only)",
+    )
+    p_verdict = sub.add_parser(
+        "review-verdict", help="Close an explicit review gate with a verdict",
+    )
+    p_verdict.add_argument("task_id", help="Review gate task id")
+    p_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
+    p_verdict.add_argument("--summary", default=None)
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
@@ -1053,6 +1067,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
+            "review-verdict": _cmd_review_verdict,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
@@ -1834,9 +1849,11 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
                 f"WHERE parent_id IN ({placeholders}) AND child_id IN ({placeholders})",
                 tuple(ids) + tuple(ids),
             ))
+        review_handoffs = kb.list_review_handoffs(conn)
 
         chain_by_task = kd.compute_chain_diagnostics(
             graph_rows, links, ev_by, run_by,
+            review_handoffs=review_handoffs,
         )
         reconciliation_context = {
             str(row["id"]): {
@@ -1940,8 +1957,23 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
 
 def _cmd_link(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        kb.link_tasks(conn, args.parent_id, args.child_id)
-    print(f"Linked {args.parent_id} -> {args.child_id}")
+        kb.link_tasks(
+            conn,
+            args.parent_id,
+            args.child_id,
+            relationship=args.relationship,
+            next_task_id=args.next_task,
+        )
+    print(f"Linked {args.parent_id} -> {args.child_id} ({args.relationship})")
+    return 0
+
+
+def _cmd_review_verdict(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        kb.submit_review_verdict(
+            conn, args.task_id, verdict=args.verdict, summary=args.summary,
+        )
+    print(f"Review verdict for {args.task_id}: {args.verdict}")
     return 0
 
 
