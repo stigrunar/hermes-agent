@@ -224,6 +224,17 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "claim_lock": r.claim_lock,
         "claim_expires": r.claim_expires,
         "worker_pid": r.worker_pid,
+        "reap_state": r.reap_state,
+        "terminal_requested_at": r.terminal_requested_at,
+        "reap_attempt_uuid": r.reap_attempt_uuid,
+        "reap_lease_owner": r.reap_lease_owner,
+        "reap_lease_expires": r.reap_lease_expires,
+        "reap_heartbeat_at": r.reap_heartbeat_at,
+        "reap_term_sent_at": r.reap_term_sent_at,
+        "reap_kill_sent_at": r.reap_kill_sent_at,
+        "reap_attempts": r.reap_attempts,
+        "reap_error": r.reap_error,
+        "reap_completed_at": r.reap_completed_at,
         "max_runtime_seconds": r.max_runtime_seconds,
         "last_heartbeat_at": r.last_heartbeat_at,
         "started_at": r.started_at,
@@ -1541,6 +1552,12 @@ def list_active_workers(
                 r.claim_expires,
                 r.last_heartbeat_at,
                 r.max_runtime_seconds
+                , r.reap_state
+                , r.reap_attempt_uuid
+                , r.reap_lease_owner
+                , r.reap_lease_expires
+                , r.reap_heartbeat_at
+                , r.reap_attempts
             FROM task_runs r
             JOIN tasks t ON t.id = r.task_id
             WHERE r.ended_at IS NULL
@@ -1563,6 +1580,12 @@ def list_active_workers(
                 "claim_expires": row["claim_expires"],
                 "last_heartbeat_at": row["last_heartbeat_at"],
                 "max_runtime_seconds": row["max_runtime_seconds"],
+                "reap_state": row["reap_state"],
+                "reap_attempt_uuid": row["reap_attempt_uuid"],
+                "reap_lease_owner": row["reap_lease_owner"],
+                "reap_lease_expires": row["reap_lease_expires"],
+                "reap_heartbeat_at": row["reap_heartbeat_at"],
+                "reap_attempts": row["reap_attempts"],
             }
             for row in rows
         ]

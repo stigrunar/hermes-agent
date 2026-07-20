@@ -114,6 +114,9 @@ def test_workers_active_with_running_task(client):
     assert w["task_status"] == "running"
     assert w["task_title"] == "active-worker"
     assert w["task_assignee"] == "alice"
+    assert w["reap_state"] is None
+    assert w["reap_attempt_uuid"] is None
+    assert w["reap_attempts"] == 0
 
 
 def test_workers_active_excludes_ended_runs(client):
@@ -364,8 +367,8 @@ def test_terminate_run_409_already_ended(client):
     assert "already ended" in r.json()["detail"]
 
 
-def test_terminate_run_ok(client, monkeypatch):
-    """Happy path: live run is terminated, signal fn invoked, reason recorded."""
+def test_terminate_run_ok(client):
+    """Termination persists phase one; the leased reaper owns all signals."""
     conn = kb.connect()
     try:
         task_id, run_id = _setup_running_task_with_run(
@@ -374,34 +377,6 @@ def test_terminate_run_ok(client, monkeypatch):
     finally:
         conn.close()
 
-    plugin_module = sys.modules["hermes_dashboard_plugin_kanban_worker_runs_test"]
-    original_conn = plugin_module._conn
-    endpoint_connections = []
-
-    def _capture_endpoint_conn(board=None):
-        endpoint_conn = original_conn(board=board)
-        endpoint_connections.append(endpoint_conn)
-        return endpoint_conn
-
-    monkeypatch.setattr(plugin_module, "_conn", _capture_endpoint_conn)
-
-    # Capture signal calls so we don't actually SIGTERM a random PID.
-    sent = []
-
-    def _fake_terminate(
-        pid,
-        prev_lock,
-        *,
-        conn=None,
-        task_id=None,
-        run_id=None,
-        signal_fn=None,
-    ):
-        sent.append((pid, prev_lock, conn, task_id, run_id))
-        return {"signal": "SIGTERM", "delivered": True}
-
-    monkeypatch.setattr(kb, "_terminate_reclaimed_worker", _fake_terminate)
-
     r = client.post(
         f"/api/plugins/kanban/runs/{run_id}/terminate",
         json={"reason": "operator abort"},
@@ -409,27 +384,24 @@ def test_terminate_run_ok(client, monkeypatch):
     assert r.status_code == 200, r.text
     body = r.json()
     assert body == {"ok": True, "run_id": run_id, "task_id": task_id}
-    assert len(endpoint_connections) == 1
-    assert len(sent) == 1
-    sent_pid, sent_lock, sent_conn, sent_task_id, sent_run_id = sent[0]
-    assert sent_pid == 33333
-    assert sent_lock is not None  # claim_lock was non-null
-    assert sent_conn is endpoint_connections[0]
-    assert sent_task_id == task_id
-    assert sent_run_id == run_id
 
-    # Task is back to ready, claim cleared.
+    # This fixture is deliberately legacy PID-only: it must remain fenced,
+    # with ownership intact, until an exact identity can be verified.
     conn = kb.connect()
     try:
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
+        run = kb.get_run(conn, run_id)
     finally:
         conn.close()
-    assert row["status"] == "ready"
-    assert row["claim_lock"] is None
-    assert row["worker_pid"] is None
+    assert row["status"] == "running"
+    assert row["claim_lock"] is not None
+    assert row["worker_pid"] == 33333
+    assert run is not None
+    assert run.reap_state == "identity_unverifiable"
+    assert run.terminal_payload is not None
 
 
 def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):
