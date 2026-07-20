@@ -12327,6 +12327,11 @@ _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
 _ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS = 5
 _ENDED_WORKER_SCOPE_CLEANUP_LIMIT = 4
 _WORKER_SCOPE_CLEANUP_FINAL_EVENT = "worker_scope_cleanup_finalized"
+_LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT = "legacy_worker_launch_classified"
+_LEGACY_DIRECT_CLASSIFIED_LAUNCH_MODE = "legacy-direct-classified"
+_LOCAL_MACHINE_ID_PATH = Path("/etc/machine-id")
+_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
+_LEGACY_SCOPE_CGROUP_SCAN_LIMIT = 4096
 
 
 class _WorkerLaunchUncertain(RuntimeError):
@@ -12817,6 +12822,354 @@ def _valid_worker_scope_unit(unit: str) -> bool:
     )
 
 
+def _local_legacy_classifier_identity() -> Optional[str]:
+    """Return a non-secret identity for this exact Linux host and UID.
+
+    The operator compatibility record must stop applying when a board moves
+    to another host. The identity therefore comes only from the fixed-system
+    local machine-id plus the kernel UID; no receipt, environment,
+    username, hostname, path, or caller-provided selector participates. The
+    directory-owner check tolerates user-namespace remapping of host root.
+    """
+    if not sys.platform.startswith("linux"):
+        return None
+    getuid = getattr(os, "getuid", None)
+    geteuid = getattr(os, "geteuid", None)
+    if getuid is None or geteuid is None:
+        return None
+    uid = int(getuid())
+    if uid < 0 or uid != int(geteuid()):
+        return None
+    path = _LOCAL_MACHINE_ID_PATH
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd: Optional[int] = None
+    try:
+        fd = os.open(path, flags)
+        info = os.fstat(fd)
+        parent_info = os.lstat(path.parent)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or not stat.S_ISDIR(parent_info.st_mode)
+            or info.st_uid != parent_info.st_uid
+            or stat.S_IMODE(info.st_mode) & 0o022
+            or stat.S_IMODE(parent_info.st_mode) & 0o022
+            or (parent_info.st_uid == uid and uid != 0)
+        ):
+            return None
+        raw = os.read(fd, 128)
+        if os.read(fd, 1):
+            return None
+    except (OSError, TypeError, ValueError):
+        return None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+    try:
+        machine_id = raw.decode("ascii").strip().lower()
+    except (UnicodeDecodeError, UnboundLocalError):
+        return None
+    if re.fullmatch(r"[0-9a-f]{32}", machine_id) is None:
+        return None
+    material = f"legacy-worker-host-v1\0{machine_id}\0{uid}".encode("ascii")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _locally_present_legacy_worker_scope(
+    units: Iterable[str],
+) -> tuple[Optional[str], str]:
+    """Return exact local cgroup evidence as ``(unit, state)``.
+
+    This is positive evidence only. Absence never classifies a receipt as
+    direct and never authorizes a stop; it merely leaves an explicit trusted
+    operator classification in control. The bounded walk stays below the
+    fixed local cgroup-v2 user-manager subtree and follows no symlinks.
+    """
+    expected = {unit for unit in units if _valid_worker_scope_unit(unit)}
+    if not expected or not sys.platform.startswith("linux"):
+        return None, "unknown"
+    getuid = getattr(os, "getuid", None)
+    geteuid = getattr(os, "geteuid", None)
+    if getuid is None or geteuid is None:
+        return None, "unknown"
+    uid = int(getuid())
+    if uid < 0 or uid != int(geteuid()):
+        return None, "unknown"
+    root = _CGROUP_V2_ROOT
+    user_root = root / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
+    try:
+        controllers = os.lstat(root / "cgroup.controllers")
+    except FileNotFoundError:
+        return None, "unknown"
+    except (OSError, TypeError, ValueError):
+        return None, "unknown"
+    try:
+        user_info = os.lstat(user_root)
+    except FileNotFoundError:
+        return None, "not-found"
+    except (OSError, TypeError, ValueError):
+        return None, "unknown"
+    if not stat.S_ISREG(controllers.st_mode) or not stat.S_ISDIR(user_info.st_mode):
+        return None, "unknown"
+    if user_info.st_uid not in {0, uid}:
+        return None, "unknown"
+
+    visited = 0
+    scan_failed = False
+
+    def mark_scan_failed(_error: OSError) -> None:
+        nonlocal scan_failed
+        scan_failed = True
+
+    try:
+        for current, dirnames, _filenames in os.walk(
+            user_root,
+            topdown=True,
+            onerror=mark_scan_failed,
+            followlinks=False,
+        ):
+            safe_children: list[str] = []
+            for name in dirnames:
+                visited += 1
+                if visited > _LEGACY_SCOPE_CGROUP_SCAN_LIMIT:
+                    return None, "unknown"
+                child = Path(current) / name
+                try:
+                    child_info = os.lstat(child)
+                except OSError:
+                    scan_failed = True
+                    continue
+                if not stat.S_ISDIR(child_info.st_mode):
+                    continue
+                if name in expected:
+                    if child_info.st_uid in {0, uid}:
+                        return name, "active"
+                    return None, "unknown"
+                safe_children.append(name)
+            dirnames[:] = safe_children
+    except OSError:
+        return None, "unknown"
+    return (None, "unknown") if scan_failed else (None, "not-found")
+
+
+def _classified_legacy_direct_scope_status(
+    candidates: Iterable[str],
+    *,
+    manager_target: Optional[_SystemdUserManagerTarget],
+) -> _WorkerScopeStatus:
+    """Honor a trusted direct record unless local scope evidence intervenes."""
+    evidenced_unit, evidence_state = _locally_present_legacy_worker_scope(candidates)
+    if evidenced_unit is not None or evidence_state == "unknown":
+        return _WorkerScopeStatus(
+            evidenced_unit,
+            "unknown",
+            manager_target,
+            "legacy",
+        )
+    return _WorkerScopeStatus(
+        None,
+        "not-applicable",
+        None,
+        _LEGACY_DIRECT_CLASSIFIED_LAUNCH_MODE,
+    )
+
+
+def _legacy_classifier_board_identity(
+    conn: sqlite3.Connection,
+    *,
+    db_path: Optional[os.PathLike[str] | str] = None,
+) -> Optional[str]:
+    """Hash the active connection's canonical path without persisting it."""
+    resolved = (
+        _canonical_db_path(db_path)
+        if db_path is not None
+        else _connection_main_db_path(conn)
+    )
+    if resolved is None:
+        return None
+    material = f"legacy-worker-board-v1\0{resolved}".encode("utf-8")
+    return hashlib.sha256(material).hexdigest()
+
+
+def _legacy_worker_launch_classification(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    spawned_event_id: int,
+    spawned_payload_raw: str,
+    spawned_pid: object,
+    db_path: Optional[os.PathLike[str] | str] = None,
+) -> Optional[str]:
+    """Validate one durable, exact-receipt-bound legacy classification."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id=? AND run_id=? AND kind=? ORDER BY id ASC",
+        (task_id, int(run_id), _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT),
+    ).fetchall()
+    if not rows:
+        return None
+    if len(rows) != 1 or type(spawned_pid) is not int or int(spawned_pid) <= 0:
+        return "invalid"
+    try:
+        payload = json.loads(rows[0]["payload"]) if rows[0]["payload"] else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "invalid"
+    expected_keys = {
+        "version",
+        "run_id",
+        "launch_mode",
+        "pid",
+        "spawned_event_id",
+        "spawned_receipt_sha256",
+        "host_identity",
+        "board_identity",
+    }
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        return "invalid"
+    identity = _local_legacy_classifier_identity()
+    board_identity = _legacy_classifier_board_identity(conn, db_path=db_path)
+    expected_digest = hashlib.sha256(spawned_payload_raw.encode("utf-8")).hexdigest()
+    if (
+        type(payload.get("version")) is not int
+        or payload.get("version") != 1
+        or type(payload.get("run_id")) is not int
+        or payload.get("run_id") != int(run_id)
+        or payload.get("launch_mode") != "direct"
+        or type(payload.get("pid")) is not int
+        or payload.get("pid") != int(spawned_pid)
+        or type(payload.get("spawned_event_id")) is not int
+        or payload.get("spawned_event_id") != int(spawned_event_id)
+        or not isinstance(payload.get("spawned_receipt_sha256"), str)
+        or not secrets.compare_digest(
+            payload.get("spawned_receipt_sha256"),
+            expected_digest,
+        )
+        or identity is None
+        or not isinstance(payload.get("host_identity"), str)
+        or not secrets.compare_digest(payload.get("host_identity"), identity)
+        or board_identity is None
+        or not isinstance(payload.get("board_identity"), str)
+        or not secrets.compare_digest(
+            payload.get("board_identity"),
+            board_identity,
+        )
+    ):
+        return "invalid"
+    return "direct"
+
+
+def classify_legacy_worker_run(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    launch_mode: str,
+    expected_pid: int,
+) -> bool:
+    """Durably classify one ended PID-only local run by explicit operator fact.
+
+    Only the irrecoverably ambiguous legacy ``{"pid": N}`` shape is eligible.
+    The record is bound to the exact spawned event bytes, run, PID, and current
+    fixed machine identity. It cannot classify modern receipts or travel with
+    a copied board, and repeated identical calls are idempotent.
+    """
+    if launch_mode != "direct":
+        raise ValueError("legacy launch classification only accepts direct")
+    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
+        raise ValueError("run_id must be a positive integer")
+    if (
+        isinstance(expected_pid, bool)
+        or not isinstance(expected_pid, int)
+        or expected_pid <= 0
+    ):
+        raise ValueError("expected_pid must be a positive integer")
+    identity = _local_legacy_classifier_identity()
+    if identity is None:
+        raise RuntimeError("trusted local machine identity is unavailable")
+    board_identity = _legacy_classifier_board_identity(conn)
+    if board_identity is None:
+        raise RuntimeError("canonical board identity is unavailable")
+
+    with write_txn(conn):
+        run = conn.execute(
+            "SELECT r.ended_at, t.current_run_id "
+            "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+            "WHERE r.id=? AND r.task_id=?",
+            (int(run_id), task_id),
+        ).fetchone()
+        if run is None:
+            raise ValueError("unknown task/run pair")
+        if run["ended_at"] is None or (
+            run["current_run_id"] is not None
+            and int(run["current_run_id"]) == int(run_id)
+        ):
+            raise ValueError("legacy launch classification requires a non-current ended run")
+        spawned = conn.execute(
+            "SELECT id, payload FROM task_events "
+            "WHERE task_id=? AND run_id=? AND kind='spawned' ORDER BY id ASC",
+            (task_id, int(run_id)),
+        ).fetchall()
+        if len(spawned) != 1 or not isinstance(spawned[0]["payload"], str):
+            raise ValueError("legacy launch classification requires one spawned receipt")
+        raw_payload = spawned[0]["payload"]
+        try:
+            receipt = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise ValueError("legacy spawned receipt is malformed") from None
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"pid"}
+            or type(receipt.get("pid")) is not int
+            or receipt.get("pid") <= 0
+        ):
+            raise ValueError("only an exact PID-only legacy receipt can be classified")
+        if receipt["pid"] != expected_pid:
+            raise ValueError("expected PID does not match the legacy spawned receipt")
+
+        classification = {
+            "version": 1,
+            "run_id": int(run_id),
+            "launch_mode": "direct",
+            "pid": int(expected_pid),
+            "spawned_event_id": int(spawned[0]["id"]),
+            "spawned_receipt_sha256": hashlib.sha256(
+                raw_payload.encode("utf-8")
+            ).hexdigest(),
+            "host_identity": identity,
+            "board_identity": board_identity,
+        }
+        existing = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id=? AND run_id=? AND kind=? ORDER BY id ASC",
+            (task_id, int(run_id), _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT),
+        ).fetchall()
+        if existing:
+            if len(existing) != 1:
+                raise ValueError("legacy launch classification is ambiguous")
+            try:
+                current = (
+                    json.loads(existing[0]["payload"])
+                    if existing[0]["payload"]
+                    else None
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                current = None
+            if current != classification:
+                raise ValueError("legacy launch classification does not match")
+            return True
+        _append_event(
+            conn,
+            task_id,
+            _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT,
+            classification,
+            run_id=int(run_id),
+        )
+        return True
+
+
 def _systemd_user_scope_state(
     unit: str,
     *,
@@ -12935,7 +13288,7 @@ def _worker_scope_state(
     # manager migration or loss of the systemd-run launcher binary.
     try:
         event = conn.execute(
-            "SELECT payload FROM task_events "
+            "SELECT id, payload FROM task_events "
             "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
             "ORDER BY id DESC LIMIT 1",
             (task_id, int(run_id)),
@@ -12983,17 +13336,49 @@ def _worker_scope_state(
         )
     ):
         return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    if not scope_possible:
-        # A DB can move between hosts. Only an explicit direct receipt above
-        # is safe to finalize without a user-systemd manager; legacy/scoped
-        # receipts remain pending so another host can reconcile them later.
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-
     resolved_db_path = (
         _canonical_db_path(db_path)
         if db_path is not None
         else _connection_main_db_path(conn)
     )
+    legacy_classification: Optional[str] = None
+    if not has_launch_mode:
+        legacy_classification = _legacy_worker_launch_classification(
+            conn,
+            task_id,
+            int(run_id),
+            spawned_event_id=int(event["id"]),
+            spawned_payload_raw=str(event["payload"]),
+            spawned_pid=payload.get("pid"),
+            db_path=resolved_db_path,
+        )
+        if legacy_classification == "invalid":
+            return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+    if not scope_possible:
+        # A DB can move between hosts. Only an explicit direct receipt above
+        # or an exact, same-host operator classification is safe to finalize
+        # without a user-systemd manager. Legacy/scoped receipts otherwise
+        # remain pending so another host can reconcile them later.
+        if legacy_classification == "direct":
+            if resolved_db_path is None:
+                return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+            try:
+                candidates = (
+                    _worker_scope_unit_name(
+                        task_id,
+                        int(run_id),
+                        db_path=resolved_db_path,
+                    ),
+                    _legacy_worker_scope_unit_name(task_id, int(run_id)),
+                )
+            except (OSError, TypeError, ValueError):
+                return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+            return _classified_legacy_direct_scope_status(
+                candidates,
+                manager_target=None,
+            )
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+
     if resolved_db_path is None:
         return _WorkerScopeStatus(None, "unknown", None, launch_mode)
     try:
@@ -13020,6 +13405,11 @@ def _worker_scope_state(
         # only the replacement process's own UID and fixed /run/user path.
         target = _current_systemd_user_manager_target()
     if target is None:
+        if legacy_classification == "direct":
+            return _classified_legacy_direct_scope_status(
+                (current_unit, legacy_unit),
+                manager_target=None,
+            )
         return _WorkerScopeStatus(None, "unknown", None, launch_mode)
 
     if launch_mode == "systemd-user-scope":
@@ -13063,6 +13453,11 @@ def _worker_scope_state(
         return _WorkerScopeStatus(unknown_unit, "unknown", target, launch_mode)
     if inactive_unit is not None:
         return _WorkerScopeStatus(inactive_unit, "inactive", target, launch_mode)
+    if legacy_classification == "direct":
+        return _classified_legacy_direct_scope_status(
+            candidates,
+            manager_target=target,
+        )
     return _WorkerScopeStatus(None, "not-found", target, launch_mode)
 
 

@@ -472,6 +472,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Human-readable reason (recorded on the reclaimed event)",
     )
 
+    p_classify_legacy = sub.add_parser(
+        "classify-legacy-run",
+        help="Classify one ended PID-only legacy run after operator verification",
+    )
+    p_classify_legacy.add_argument("task_id")
+    p_classify_legacy.add_argument("run_id", type=int)
+    p_classify_legacy.add_argument(
+        "--launch-mode",
+        choices=("direct",),
+        required=True,
+        help="Verified historical launch mode (only direct is classifiable)",
+    )
+    p_classify_legacy.add_argument(
+        "--pid",
+        type=int,
+        required=True,
+        help="Exact PID from the legacy spawned receipt",
+    )
+
     p_reassign = sub.add_parser(
         "reassign",
         help="Reassign a task to a different profile, optionally reclaiming first",
@@ -1063,6 +1082,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
+            "classify-legacy-run": _cmd_classify_legacy_run,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1767,6 +1787,22 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
         )
         return 1
     print(f"Reclaimed {args.task_id}")
+    return 0
+
+
+def _cmd_classify_legacy_run(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        kb.classify_legacy_worker_run(
+            conn,
+            args.task_id,
+            args.run_id,
+            launch_mode=args.launch_mode,
+            expected_pid=args.pid,
+        )
+    print(
+        f"Classified legacy run {args.run_id} for {args.task_id} as direct "
+        f"on this host (pid {args.pid})"
+    )
     return 0
 
 
