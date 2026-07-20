@@ -393,7 +393,7 @@ def test_anthropic_and_copilot_env_credentials_are_profile_owned(monkeypatch):
     assert source == "COPILOT_GITHUB_TOKEN"
 
 
-def test_copilot_cli_host_override_is_profile_owned(monkeypatch):
+def test_copilot_cli_host_override_does_not_authorize_host_credentials(monkeypatch):
     from types import SimpleNamespace
 
     from hermes_cli import copilot_auth
@@ -423,15 +423,12 @@ def test_copilot_cli_host_override_is_profile_owned(monkeypatch):
     finally:
         ss.reset_secret_scope(token)
 
-    assert observed["command"] == [
-        "synthetic-gh",
-        "auth",
-        "token",
-        "--hostname",
-        "synthetic-profile-github.invalid",
-    ]
-    assert resolved == "synthetic-profile-copilot-cli-token"
-    assert source == "gh auth token"
+    # A scoped hostname selects no credential by itself. The host ``gh``
+    # credential store remains ambient state and must not be consulted while a
+    # profile scope or multiplexed runtime is active.
+    assert observed == {}
+    assert resolved == ""
+    assert source == ""
 
 
 def test_anthropic_setup_token_postcheck_uses_profile_scope(monkeypatch):
