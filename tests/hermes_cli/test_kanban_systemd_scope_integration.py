@@ -203,11 +203,11 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
         ) == "not-found"
 
         leader_code = (
-            "import os,subprocess,sys;"
+            "import os,subprocess,sys,time;"
             "child=subprocess.Popen([sys.executable,'-c',"
             "'import time;time.sleep(300)']);"
             "print(os.getpid(),child.pid,flush=True);"
-            "child.wait()"
+            "time.sleep(0.5)"
         )
         payload = [sys.executable, "-c", leader_code]
         ready_read, ready_write = os.pipe()
@@ -292,6 +292,25 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
             expected_claim_lock=claimed.claim_lock,
         ) is True
 
+        # The worker leader exits after launching its descendant. The durable
+        # task/run receipt is then closed while the exact scope remains active
+        # solely because that descendant outlived the leader.
+        proc.wait(timeout=5.0)
+        assert _wait_original_process_dead(leader_pid, leader_identity)
+        assert _process_identity(child_pid) == child_identity
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="fixture worker finished",
+            expected_run_id=claimed.current_run_id,
+        )
+        ended_at = int(time.time())
+        conn.execute(
+            "UPDATE task_runs SET ended_at=? WHERE id=?",
+            (ended_at, claimed.current_run_id),
+        )
+        conn.commit()
+
         # First remove, then poison, both ambient selectors. Receipt recovery
         # and the stop path must keep using the validated persisted identity.
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
@@ -307,20 +326,22 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
             "DBUS_SESSION_BUS_ADDRESS",
             f"unix:path={bogus_runtime / 'wrong-bus'}",
         )
-        termination = kb._terminate_reclaimed_worker(
-            leader_pid,
-            claimed.claim_lock,
-            conn=conn,
-            task_id=task_id,
-            run_id=claimed.current_run_id,
+        cleanup = kb._reconcile_ended_worker_scopes(
+            conn,
+            process_effects=True,
+            db_path=db_path,
+            now=(
+                ended_at
+                + kb._ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS
+                + 1
+            ),
         )
-        assert termination["scope_unit"] == unit
-        assert termination["scope_stop_attempted"] is True
-        assert termination["terminated"] is True
-        assert termination["scope_state"] == "not-found"
-
-        proc.wait(timeout=5.0)
-        assert _wait_original_process_dead(leader_pid, leader_identity)
+        assert cleanup == [{
+            "task_id": task_id,
+            "run_id": claimed.current_run_id,
+            "action": "collected",
+            "reason": "ended_scope_stopped",
+        }]
         assert _wait_original_process_dead(child_pid, child_identity)
         assert kb._systemd_user_scope_state(
             unit,
