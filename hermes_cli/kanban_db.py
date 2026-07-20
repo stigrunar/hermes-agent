@@ -8439,6 +8439,11 @@ def schedule_task(
                 "explicit review successor gate remains protected until the review "
                 "handoff is approved"
             )
+        if _active_review_handoff_for_task(conn, task_id) is not None:
+            raise ValueError(
+                "active review lifecycle tasks cannot be scheduled; submit or "
+                "reclaim the explicit review verdict first"
+            )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -8603,6 +8608,13 @@ class DispatchResult:
     paths, exception text, task data, or secrets."""
 
     continuation_decisions: list[dict[str, Any]] = field(default_factory=list)
+    scope_cleanup: list[dict[str, Any]] = field(default_factory=list)
+    """Bounded ended-run scope reconciliation decisions.
+
+    Entries contain only task/run ids plus fixed action/reason literals. Scope
+    unit names, user-bus paths, receipt payloads, and manager addresses are
+    deliberately excluded from this operator-facing surface.
+    """
 
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
@@ -11449,6 +11461,11 @@ def _dispatch_once_locked(
         reap_worker_zombies()
 
     result = DispatchResult()
+    result.scope_cleanup = _reconcile_ended_worker_scopes(
+        conn,
+        process_effects=not preview_mode,
+        db_path=db_path,
+    )
     result.reclaimed = release_stale_claims(
         conn, process_effects=not preview_mode,
     )
@@ -11623,6 +11640,18 @@ def _dispatch_once_locked(
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _task_has_pending_ended_worker_scope(conn, row["id"]):
+            if not any(
+                item.get("task_id") == row["id"]
+                and item.get("action") == "spawn_deferred"
+                for item in result.scope_cleanup
+            ):
+                result.scope_cleanup.append({
+                    "task_id": row["id"],
+                    "action": "spawn_deferred",
+                    "reason": "cleanup_pending",
+                })
+            continue
         row_assignee = row["assignee"]
         report = reconciliation_reports.get(str(row["id"]))
         if report is not None and not report.actionable:
@@ -11872,6 +11901,18 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if _task_has_pending_ended_worker_scope(conn, row["id"]):
+            if not any(
+                item.get("task_id") == row["id"]
+                and item.get("action") == "spawn_deferred"
+                for item in result.scope_cleanup
+            ):
+                result.scope_cleanup.append({
+                    "task_id": row["id"],
+                    "action": "spawn_deferred",
+                    "reason": "cleanup_pending",
+                })
+            continue
         report = reconciliation_reports.get(str(row["id"]))
         if report is not None and not report.actionable:
             blocking = [
@@ -12283,6 +12324,9 @@ _SYSTEMD_USER_RUNTIME_ROOT = Path("/run/user")
 _SYSTEMD_SCOPE_MIN_VERSION = 236  # --collect was added in systemd 236.
 _SYSTEMD_PROBE_TIMEOUT_SECONDS = 2.0
 _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
+_ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS = 5
+_ENDED_WORKER_SCOPE_CLEANUP_LIMIT = 4
+_WORKER_SCOPE_CLEANUP_FINAL_EVENT = "worker_scope_cleanup_finalized"
 
 
 class _WorkerLaunchUncertain(RuntimeError):
@@ -12877,10 +12921,13 @@ def _worker_scope_state(
     conn: sqlite3.Connection,
     task_id: str,
     run_id: Optional[int],
+    *,
+    db_path: Optional[os.PathLike[str] | str] = None,
 ) -> _WorkerScopeStatus:
     """Resolve an attempt's scope only through its authenticated manager."""
-    if run_id is None or not _systemd_user_scope_possible():
+    if run_id is None:
         return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
+    scope_possible = _systemd_user_scope_possible()
 
     # New runs persist the launch mode and exact opaque unit alongside the
     # real worker PID in the spawned event. This keeps direct/custom spawn_fn
@@ -12936,15 +12983,24 @@ def _worker_scope_state(
         )
     ):
         return _WorkerScopeStatus(None, "unknown", None, "invalid")
+    if not scope_possible:
+        # A DB can move between hosts. Only an explicit direct receipt above
+        # is safe to finalize without a user-systemd manager; legacy/scoped
+        # receipts remain pending so another host can reconcile them later.
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
 
-    db_path = _connection_main_db_path(conn)
-    if db_path is None:
+    resolved_db_path = (
+        _canonical_db_path(db_path)
+        if db_path is not None
+        else _connection_main_db_path(conn)
+    )
+    if resolved_db_path is None:
         return _WorkerScopeStatus(None, "unknown", None, launch_mode)
     try:
         current_unit = _worker_scope_unit_name(
             task_id,
             int(run_id),
-            db_path=db_path,
+            db_path=resolved_db_path,
         )
         legacy_unit = _legacy_worker_scope_unit_name(task_id, int(run_id))
     except (OSError, TypeError, ValueError):
@@ -13008,6 +13064,309 @@ def _worker_scope_state(
     if inactive_unit is not None:
         return _WorkerScopeStatus(inactive_unit, "inactive", target, launch_mode)
     return _WorkerScopeStatus(None, "not-found", target, launch_mode)
+
+
+def _ended_worker_scope_cleanup_authorized(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+) -> bool:
+    """Return whether one durable ended run no longer owns the task."""
+    row = conn.execute(
+        "SELECT r.ended_at, t.current_run_id, "
+        "       EXISTS(SELECT 1 FROM task_events e "
+        "              WHERE e.task_id=r.task_id AND e.run_id=r.id "
+        "                AND e.kind='spawned') AS has_receipt "
+        "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+        "WHERE r.id=? AND r.task_id=?",
+        (int(run_id), task_id),
+    ).fetchone()
+    return bool(
+        row is not None
+        and row["ended_at"] is not None
+        and bool(row["has_receipt"])
+        and (
+            row["current_run_id"] is None
+            or int(row["current_run_id"]) != int(run_id)
+        )
+    )
+
+
+def _finalize_ended_worker_scope_cleanup(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    *,
+    disposition: str,
+    launch_mode: str,
+) -> bool:
+    """Durably mark one proved-terminal scope receipt as reconciled."""
+    with write_txn(conn):
+        if not _ended_worker_scope_cleanup_authorized(conn, task_id, run_id):
+            return False
+        exists = conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
+            (task_id, int(run_id), _WORKER_SCOPE_CLEANUP_FINAL_EVENT),
+        ).fetchone()
+        if exists is None:
+            _append_event(
+                conn,
+                task_id,
+                _WORKER_SCOPE_CLEANUP_FINAL_EVENT,
+                {
+                    "run_id": int(run_id),
+                    "disposition": disposition,
+                    "launch_mode": launch_mode,
+                },
+                run_id=int(run_id),
+            )
+        return True
+
+
+def _validated_ended_worker_scope_target(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: int,
+    status: _WorkerScopeStatus,
+    *,
+    db_path: os.PathLike[str] | str,
+) -> Optional[tuple[str, _SystemdUserManagerTarget]]:
+    """Reconstruct and revalidate the exact unit/manager before stopping."""
+    unit = status.unit
+    target = status.manager_target
+    if not isinstance(unit, str) or not _valid_worker_scope_unit(unit):
+        return None
+    canonical_db_path = _canonical_db_path(db_path)
+    if canonical_db_path is None:
+        return None
+    try:
+        opaque_unit = _worker_scope_unit_name(
+            task_id,
+            int(run_id),
+            db_path=canonical_db_path,
+        )
+        legacy_unit = _legacy_worker_scope_unit_name(task_id, int(run_id))
+    except (OSError, TypeError, ValueError):
+        return None
+    if status.launch_mode == "systemd-user-scope":
+        if unit != opaque_unit:
+            return None
+    elif status.launch_mode == "legacy":
+        if unit not in {opaque_unit, legacy_unit}:
+            return None
+    else:
+        return None
+    if target is None:
+        return None
+    resolved_target = _resolve_systemd_user_manager_target(
+        target.manager_kind,
+        target.manager_uid,
+    )
+    if resolved_target is None:
+        return None
+    return unit, resolved_target
+
+
+def _task_has_pending_ended_worker_scope(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Fence respawn while an ended scoped receipt is not yet reconciled."""
+    return conn.execute(
+        "SELECT 1 FROM task_runs r "
+        "WHERE r.task_id=? AND r.ended_at IS NOT NULL "
+        "  AND EXISTS(SELECT 1 FROM task_events spawned "
+        "             WHERE spawned.task_id=r.task_id AND spawned.run_id=r.id "
+        "               AND spawned.kind='spawned') "
+        "  AND NOT EXISTS(SELECT 1 FROM task_events finalized "
+        "                 WHERE finalized.task_id=r.task_id "
+        "                   AND finalized.run_id=r.id AND finalized.kind=?) "
+        "  AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=r.task_id "
+        "                 AND t.current_run_id=r.id) LIMIT 1",
+        (task_id, _WORKER_SCOPE_CLEANUP_FINAL_EVENT),
+    ).fetchone() is not None
+
+
+def _reconcile_ended_worker_scopes(
+    conn: sqlite3.Connection,
+    *,
+    process_effects: bool,
+    db_path: os.PathLike[str] | str,
+    now: Optional[int] = None,
+    limit: int = _ENDED_WORKER_SCOPE_CLEANUP_LIMIT,
+) -> list[dict[str, Any]]:
+    """Stop and collect exact scopes for durably ended worker runs.
+
+    Work is bounded per dispatcher tick. Each candidate must have an ended
+    ``task_runs`` row, an exact run-bound ``spawned`` receipt, and must no
+    longer be the task's current run. Unknown identity/state remains pending
+    and fences respawn without preventing later candidates or unrelated work.
+    """
+    if limit <= 0:
+        return []
+    observed_now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT r.id AS run_id, r.task_id, r.ended_at, t.status AS task_status "
+        "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
+        "WHERE r.ended_at IS NOT NULL "
+        "  AND (t.current_run_id IS NULL OR t.current_run_id != r.id) "
+        "  AND EXISTS(SELECT 1 FROM task_events spawned "
+        "             WHERE spawned.task_id=r.task_id AND spawned.run_id=r.id "
+        "               AND spawned.kind='spawned') "
+        "  AND NOT EXISTS(SELECT 1 FROM task_events finalized "
+        "                 WHERE finalized.task_id=r.task_id "
+        "                   AND finalized.run_id=r.id AND finalized.kind=?) "
+        "ORDER BY CASE WHEN t.status IN ('ready','review') THEN 0 ELSE 1 END, "
+        "         r.ended_at ASC, r.id ASC LIMIT ?",
+        (_WORKER_SCOPE_CLEANUP_FINAL_EVENT, int(limit)),
+    ).fetchall()
+    decisions: list[dict[str, Any]] = []
+    for row in rows:
+        task_id = str(row["task_id"])
+        run_id = int(row["run_id"])
+        base = {"task_id": task_id, "run_id": run_id}
+        try:
+            status = _worker_scope_state(
+                conn,
+                task_id,
+                run_id,
+                db_path=db_path,
+            )
+        except Exception:
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "scope_state_error",
+            })
+            continue
+        if not isinstance(status, _WorkerScopeStatus):
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "invalid_scope_status",
+            })
+            continue
+        if status.state == "not-applicable":
+            if _finalize_ended_worker_scope_cleanup(
+                conn,
+                task_id,
+                run_id,
+                disposition="not_applicable",
+                launch_mode=status.launch_mode,
+            ):
+                continue
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "lifecycle_changed",
+            })
+            continue
+        if status.state == "not-found":
+            if _finalize_ended_worker_scope_cleanup(
+                conn,
+                task_id,
+                run_id,
+                disposition="absent",
+                launch_mode=status.launch_mode,
+            ):
+                continue
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "lifecycle_changed",
+            })
+            continue
+        if status.state == "unknown":
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "scope_state_unknown",
+            })
+            continue
+        if status.state not in {"active", "inactive"}:
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "invalid_scope_state",
+            })
+            continue
+        if int(row["ended_at"]) > (
+            observed_now - _ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS
+        ):
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "post_end_grace",
+            })
+            continue
+        validated = _validated_ended_worker_scope_target(
+            conn,
+            task_id,
+            run_id,
+            status,
+            db_path=db_path,
+        )
+        if validated is None:
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "scope_identity_invalid",
+            })
+            continue
+        if not _ended_worker_scope_cleanup_authorized(conn, task_id, run_id):
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "lifecycle_changed",
+            })
+            continue
+        if not process_effects:
+            decisions.append({
+                **base,
+                "action": "would_collect",
+                "reason": "ended_scope_active",
+            })
+            continue
+        unit, manager_target = validated
+        try:
+            stopped = _stop_systemd_user_scope(
+                unit,
+                manager_target=manager_target,
+            )
+        except Exception:
+            stopped = None
+        if stopped is True:
+            if _finalize_ended_worker_scope_cleanup(
+                conn,
+                task_id,
+                run_id,
+                disposition="collected",
+                launch_mode=status.launch_mode,
+            ):
+                decisions.append({
+                    **base,
+                    "action": "collected",
+                    "reason": "ended_scope_stopped",
+                })
+            else:
+                decisions.append({
+                    **base,
+                    "action": "deferred",
+                    "reason": "lifecycle_changed",
+                })
+        elif stopped is False:
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "scope_stop_incomplete",
+            })
+        else:
+            decisions.append({
+                **base,
+                "action": "deferred",
+                "reason": "scope_stop_unknown",
+            })
+    return decisions
 
 
 def _available_capabilities_from_toolsets(toolsets: Iterable[str]) -> set[str]:

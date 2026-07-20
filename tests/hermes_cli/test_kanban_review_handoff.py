@@ -325,6 +325,93 @@ def test_active_review_reclaim_unblock_and_promote_stay_in_review_lane(kanban_ho
         assert kb.get_task(conn, source).status == "blocked"
 
 
+def test_schedule_rejects_active_source_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        source, _, _ = _registered_chain(conn)
+        _activate(conn, source)
+        handoff_before = kb.list_review_handoffs(conn)[0]
+        events_before = list(kb.list_events(conn, source))
+
+        with pytest.raises(ValueError, match="active review lifecycle"):
+            kb.schedule_task(conn, source, reason="must not park active source")
+
+        assert kb.get_task(conn, source).status == "blocked"
+        assert kb.list_review_handoffs(conn)[0] == handoff_before
+        assert kb.list_events(conn, source) == events_before
+
+
+def test_schedule_rejects_claimed_review_gate_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        source, review, _ = _registered_chain(conn)
+        _activate(conn, source)
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert claimed is not None
+        assert claimed.current_run_id is not None
+
+        with pytest.raises(ValueError, match="active review lifecycle"):
+            kb.schedule_task(
+                conn,
+                review,
+                reason="must not park claimed review",
+                expected_run_id=claimed.current_run_id,
+            )
+
+        task = kb.get_task(conn, review)
+        run = kb.latest_run(conn, review)
+        assert task is not None
+        assert run is not None
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
+        assert run.status == "running"
+        assert run.ended_at is None
+        assert kb.list_review_handoffs(conn)[0]["state"] == "active"
+
+
+def test_schedule_rejects_blocked_review_gate_without_mutation(kanban_home):
+    with kb.connect() as conn:
+        source, review, _ = _registered_chain(conn)
+        _activate(conn, source)
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert claimed is not None
+        assert kb.block_task(
+            conn,
+            review,
+            reason="review worker needs operator input",
+            kind="needs_input",
+            expected_run_id=claimed.current_run_id,
+        )
+        events_before = list(kb.list_events(conn, review))
+
+        with pytest.raises(ValueError, match="active review lifecycle"):
+            kb.schedule_task(conn, review, reason="must not park blocked review")
+
+        assert kb.get_task(conn, review).status == "blocked"
+        assert kb.list_review_handoffs(conn)[0]["state"] == "active"
+        assert kb.list_events(conn, review) == events_before
+
+
+def test_schedule_allows_unrelated_and_changes_requested_source(kanban_home):
+    with kb.connect() as conn:
+        source, review, _ = _registered_chain(conn)
+        unrelated = kb.create_task(conn, title="unrelated")
+        _activate(conn, source)
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert claimed is not None
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict="changes_requested",
+            summary="please recut",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        assert kb.schedule_task(conn, unrelated, reason="ordinary delay") is True
+        assert kb.schedule_task(conn, source, reason="delay the recut") is True
+        assert kb.get_task(conn, unrelated).status == "scheduled"
+        assert kb.get_task(conn, source).status == "scheduled"
+        assert kb.list_review_handoffs(conn)[0]["state"] == "changes_requested"
+
+
 @pytest.mark.parametrize("state", ["active", "changes_requested"])
 def test_review_successor_cannot_be_force_promoted_before_approval(kanban_home, state):
     with kb.connect() as conn:

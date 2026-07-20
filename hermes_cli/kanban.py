@@ -2645,6 +2645,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "skipped_locked": res.skipped_locked,
             "dispatch_lock_error": res.dispatch_lock_error,
             "continuation_decisions": res.continuation_decisions,
+            "scope_cleanup": res.scope_cleanup,
         }, indent=2))
         return 0
     if res.skipped_locked:
@@ -2698,6 +2699,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 for task_id, finding in res.skipped_reconciliation
             )
         )
+    if res.scope_cleanup:
+        print("Worker scope cleanup:")
+        for item in res.scope_cleanup:
+            run_suffix = (
+                f" run {item['run_id']}" if item.get("run_id") is not None else ""
+            )
+            print(
+                f"  - {item.get('task_id')}{run_suffix}: "
+                f"{item.get('action')} ({item.get('reason')})"
+            )
     if res.continuations:
         print(f"Continuation audit decisions: {len(res.continuations)}")
     if res.continuation_decisions:
