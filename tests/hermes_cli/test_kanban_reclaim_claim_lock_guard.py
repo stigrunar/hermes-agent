@@ -21,6 +21,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_worker_process as kp
 
 
 @pytest.fixture
@@ -41,6 +42,21 @@ def kanban_home(tmp_path, monkeypatch):
 def conn(kanban_home):
     with kb.connect() as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def deterministic_worker_identity(monkeypatch):
+    """Keep the claim-lock guard tests exact-identity deterministic."""
+    monkeypatch.setattr(
+        kp,
+        "read_identity",
+        lambda pid: kp.ProcessIdentity(int(pid), float(int(pid)) + 0.25),
+    )
+    monkeypatch.setattr(
+        kp,
+        "identity_state",
+        lambda identity: "alive" if kb._pid_alive(identity.pid) else "gone",
+    )
 
 
 def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
@@ -65,32 +81,35 @@ def test_stale_crash_reset_rejected_for_reclaimed_task(conn):
         (tid,),
     )
     conn.commit()
-    kb.claim_task(conn, tid, claimer=f"{host}:B")
-    sleeper = subprocess.Popen(["sleep", "30"])
-    try:
-        kb._set_worker_pid(conn, tid, sleeper.pid)
+    replacement = kb.claim_task(conn, tid, claimer=f"{host}:B")
+    assert replacement is not None and replacement.current_run_id is not None
+    replacement_pid = int(old["worker_pid"]) + 1
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (replacement_pid, tid))
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=? WHERE id=?",
+        (replacement_pid, replacement.current_run_id),
+    )
+    conn.commit()
 
-        # The stale reset for worker A — same shape as the guarded UPDATE in
-        # detect_crashed_workers — must reject (rowcount 0) because B owns it.
-        cur = conn.execute(
-            "UPDATE tasks SET status='ready', claim_lock=NULL, "
-            "claim_expires=NULL, worker_pid=NULL "
-            "WHERE id=? AND status='running' AND worker_pid=? AND claim_lock IS ?",
-            (tid, old["worker_pid"], old["claim_lock"]),
-        )
-        conn.commit()
-        assert cur.rowcount == 0, "stale reclaim wrongly clobbered the re-claimed task"
+    # The stale reset for worker A — same shape as the guarded UPDATE in
+    # detect_crashed_workers — must reject (rowcount 0) because B owns it.
+    cur = conn.execute(
+        "UPDATE tasks SET status='ready', claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL "
+        "WHERE id=? AND status='running' AND worker_pid=? AND claim_lock IS ?",
+        (tid, old["worker_pid"], old["claim_lock"]),
+    )
+    conn.commit()
+    assert cur.rowcount == 0, "stale reclaim wrongly clobbered the re-claimed task"
 
-        final = conn.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id=?", (tid,)
-        ).fetchone()
-        assert final["status"] == "running"
-        assert final["claim_lock"] == f"{host}:B"
-    finally:
-        sleeper.terminate()
+    final = conn.execute(
+        "SELECT status, claim_lock FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert final["status"] == "running"
+    assert final["claim_lock"] == f"{host}:B"
 
 
-def test_genuine_crash_still_reclaims(conn):
+def test_genuine_crash_still_reclaims(conn, monkeypatch):
     """When the claim_lock still matches the dead worker, the crash reclaim
     fires normally — the guard must not break the legitimate path."""
     host = kb._claimer_id().split(":", 1)[0]
@@ -109,5 +128,14 @@ def test_genuine_crash_still_reclaims(conn):
 
     crashed = kb.detect_crashed_workers(conn)
     assert tid in crashed
+    monkeypatch.setattr(
+        kb,
+        "_worker_scope_state",
+        lambda *_a, **_kw: kb._WorkerScopeStatus(
+            "hermes-test-worker.scope", "inactive", "test-manager",
+            "systemd-user-scope", True,
+        ),
+    )
+    kb.reconcile_worker_reaps(conn, protected_pid_fn=lambda: set())
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
     assert final["status"] in ("ready", "blocked", "todo")
