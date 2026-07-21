@@ -378,6 +378,11 @@ export const ja = defineLocale({
         personality: '人格',
         showReasoning: '推論ブロック'
       },
+      desktop: {
+        repoScanEnabled: 'リポジトリの自動検出',
+        repoScanRoots: 'リポジトリの検索ルート',
+        repoScanExcludePaths: '除外するリポジトリパス'
+      },
       agent: {
         maxTurns: '最大エージェントステップ',
         imageInputMode: '画像添付',
@@ -533,6 +538,11 @@ export const ja = defineLocale({
         personality: '新しいセッションのデフォルトのアシスタントスタイルです。',
         showReasoning: 'バックエンドが推論内容を提供したときに表示します。'
       },
+      desktop: {
+        repoScanEnabled: 'ローカルフォルダを検索して Git リポジトリをプロジェクトに表示します。',
+        repoScanRoots: '検索するフォルダです。空の場合はホームディレクトリを検索します。',
+        repoScanExcludePaths: 'リポジトリ検出時に除外するフォルダとその配下です。'
+      },
       timezone:
         'Hermes がローカル時刻のコンテキストを必要とするときに使用します。空欄ならシステムのタイムゾーンを使います。',
       agent: {
@@ -621,7 +631,9 @@ export const ja = defineLocale({
       failedLoad: '設定の読み込みに失敗しました',
       autosaveFailed: '自動保存に失敗しました',
       imported: '設定をインポートしました',
-      invalidJson: '設定 JSON が無効です'
+      invalidJson: '設定 JSON が無効です',
+      keepAwakeTitle: 'コンピューターをスリープさせない',
+      keepAwakeDesc: '本体のスリープを防ぎ、長時間や夜通しの実行を継続します。画面は暗転できます。'
     },
     credentials: {
       pasteKey: 'キーを貼り付け',
