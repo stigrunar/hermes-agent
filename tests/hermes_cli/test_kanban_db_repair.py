@@ -317,11 +317,11 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
     conn = kb.connect(db_path=db_path)
     proxy = _ConnProxy(conn, executed)
     try:
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 1, "first tick should checkpoint"
 
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 1, "ticks inside the interval must not checkpoint"
 
         # Age the per-path timestamp past the interval → next tick fires.
@@ -329,7 +329,7 @@ def test_dispatch_tick_runs_wal_checkpoint_at_interval(tmp_path, monkeypatch):
         kb._LAST_WAL_CHECKPOINT[key] -= (
             kb._WAL_CHECKPOINT_INTERVAL_SECONDS + 1.0
         )
-        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert len(executed) == 2, "tick after the interval should checkpoint"
         assert all("TRUNCATE" in sql.upper() for sql in executed)
     finally:
@@ -347,9 +347,7 @@ def test_wal_checkpoint_failure_never_fails_the_tick(tmp_path, monkeypatch):
     conn = kb.connect(db_path=db_path)
     proxy = _ConnProxy(conn, executed, fail_checkpoint=True)
     try:
-        result = kb.dispatch_once(
-            proxy, spawn_fn=lambda *a, **k: None, dry_run=True,
-        )
+        result = kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None)
         assert not result.skipped_locked
         assert executed, "checkpoint was attempted (and failed) this tick"
     finally:
@@ -371,10 +369,35 @@ def test_wal_checkpoint_truncates_wal_file(tmp_path, monkeypatch):
         wal = tmp_path / "kanban.db-wal"
         assert wal.exists() and wal.stat().st_size > 0
 
-        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None, dry_run=True)
+        kb.dispatch_once(conn, spawn_fn=lambda *a, **k: None)
         assert wal.stat().st_size == 0, (
             "wal_checkpoint(TRUNCATE) should reset the -wal file to 0 bytes"
         )
+    finally:
+        conn.close()
+
+
+def test_dry_run_never_checkpoints_or_mutates_wal(tmp_path, monkeypatch):
+    """The local dry-run contract remains write-free after WAL integration."""
+    db_path = tmp_path / "kanban.db"
+    _build_board_db(db_path, tasks=1)
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setattr(kb, "_LAST_WAL_CHECKPOINT", {})
+
+    executed: list[str] = []
+    conn = kb.connect(db_path=db_path)
+    proxy = _ConnProxy(conn, executed)
+    try:
+        for i in range(3):
+            kb.create_task(conn, title=f"dry-run-wal-{i}")
+        wal = tmp_path / "kanban.db-wal"
+        before = wal.stat().st_size
+
+        kb.dispatch_once(proxy, spawn_fn=lambda *a, **k: None, dry_run=True)
+
+        assert executed == []
+        assert wal.stat().st_size == before
+        assert kb._LAST_WAL_CHECKPOINT == {}
     finally:
         conn.close()
 
