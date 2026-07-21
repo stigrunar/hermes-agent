@@ -147,7 +147,7 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
     tmp_path,
     monkeypatch,
 ):
-    """Exercise receipt -> explicit target -> whole-unit stop without ambient bus."""
+    """Exercise Phase B receipt recovery and whole-unit stop without ambient bus."""
     systemd_run = shutil.which("systemd-run")
     systemctl = shutil.which("systemctl")
     if not systemd_run or not systemctl:
@@ -191,9 +191,11 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
         claimed = kb.claim_task(conn, task_id)
         assert claimed is not None
         assert claimed.current_run_id is not None
+        assert claimed.claim_lock is not None
+        run_id = int(claimed.current_run_id)
         unit = kb._worker_scope_unit_name(
             task_id,
-            claimed.current_run_id,
+            run_id,
             db_path=db_path,
         )
         assert kb._systemd_user_scope_state(
@@ -288,34 +290,34 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
             conn,
             task_id,
             handle,
-            expected_run_id=claimed.current_run_id,
+            expected_run_id=run_id,
             expected_claim_lock=claimed.claim_lock,
         ) is True
 
-        # The worker leader exits after launching its descendant. The durable
-        # task/run receipt is then closed while the exact scope remains active
-        # solely because that descendant outlived the leader.
+        spawned = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "spawned"
+        ]
+        assert len(spawned) == 1
+        assert spawned[0].payload is not None
+        assert spawned[0].payload["launch_mode"] == "systemd-user-scope"
+        assert spawned[0].payload["scope_unit"] == unit
+        assert spawned[0].payload["manager_kind"] == target.manager_kind
+        assert spawned[0].payload["manager_uid"] == target.manager_uid
+        assert spawned[0].payload["launch_acknowledged"] is True
+
+        # The leader exits while its descendant keeps the exact scope active.
+        # Phase B must recover that acknowledged receipt, stop the whole unit,
+        # and finalize only after the child is proved gone.
         proc.wait(timeout=5.0)
         assert _wait_original_process_dead(leader_pid, leader_identity)
         assert _process_identity(child_pid) == child_identity
-        assert kb.complete_task(
-            conn,
-            task_id,
-            result="fixture worker finished",
-            expected_run_id=claimed.current_run_id,
-        )
-        ended_at = int(time.time())
-        conn.execute(
-            "UPDATE task_runs SET ended_at=? WHERE id=?",
-            (ended_at, claimed.current_run_id),
-        )
-        conn.commit()
 
         # First remove, then poison, both ambient selectors. Receipt recovery
         # and the stop path must keep using the validated persisted identity.
         monkeypatch.delenv("XDG_RUNTIME_DIR", raising=False)
         monkeypatch.delenv("DBUS_SESSION_BUS_ADDRESS", raising=False)
-        status = kb._worker_scope_state(conn, task_id, claimed.current_run_id)
+        status = kb._worker_scope_state(conn, task_id, run_id)
         assert tuple(status) == (unit, "active")
         assert status.manager_target is not None
         assert status.manager_target.manager_uid == os.getuid()
@@ -326,23 +328,68 @@ def test_native_cross_manager_receipt_stops_descendants_and_collects(
             "DBUS_SESSION_BUS_ADDRESS",
             f"unix:path={bogus_runtime / 'wrong-bus'}",
         )
-        cleanup = kb._reconcile_ended_worker_scopes(
+
+        assert kb.complete_task(
             conn,
-            process_effects=True,
-            db_path=db_path,
-            now=(
-                ended_at
-                + kb._ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS
-                + 1
-            ),
+            task_id,
+            result="fixture worker finished",
+            expected_run_id=run_id,
         )
-        assert cleanup == [{
-            "task_id": task_id,
-            "run_id": claimed.current_run_id,
-            "action": "collected",
-            "reason": "ended_scope_stopped",
-        }]
+        pending_task = kb.get_task(conn, task_id)
+        pending_run = kb.get_run(conn, run_id)
+        assert pending_task is not None and pending_task.status == "running"
+        assert pending_task.current_run_id == run_id
+        assert pending_task.worker_pid == leader_pid
+        assert pending_run is not None
+        assert pending_run.ended_at is None
+        assert pending_run.reap_state == "terminal_requested"
+        pending_events = kb.list_events(conn, task_id)
+        assert sum(event.kind == "terminal_requested" for event in pending_events) == 1
+        assert sum(event.kind == "completed" for event in pending_events) == 0
+
+        decisions = kb.reconcile_worker_reaps(conn, process_effects=True)
+        assert len(decisions) == 1
+        assert decisions[0]["task_id"] == task_id
+        assert decisions[0]["run_id"] == run_id
+        assert decisions[0]["state"] == "finalized"
         assert _wait_original_process_dead(child_pid, child_identity)
+        done_task = kb.get_task(conn, task_id)
+        done_run = kb.get_run(conn, run_id)
+        assert done_task is not None and done_task.status == "done"
+        assert done_task.current_run_id is None
+        assert done_task.worker_pid is None
+        assert done_run is not None
+        assert done_run.status == "done"
+        assert done_run.outcome == "completed"
+        assert done_run.ended_at is not None
+        assert done_run.reap_state == "finalized"
+        assert done_run.reap_error in (None, "")
+        assert done_run.reap_term_intent_at is None
+        assert done_run.reap_kill_intent_at is None
+        assert done_run.reap_term_sent_at is None
+        assert done_run.reap_kill_sent_at is None
+        final_events = kb.list_events(conn, task_id)
+        assert sum(event.kind == "terminal_requested" for event in final_events) == 1
+        assert sum(event.kind == "completed" for event in final_events) == 1
+
+        signature = (
+            done_run.reap_state,
+            done_run.reap_error,
+            done_run.reap_completed_at,
+            tuple((event.id, event.kind, event.run_id) for event in final_events),
+        )
+        assert kb.reconcile_worker_reaps(conn, process_effects=True) == []
+        idempotent_run = kb.get_run(conn, run_id)
+        assert idempotent_run is not None
+        assert (
+            idempotent_run.reap_state,
+            idempotent_run.reap_error,
+            idempotent_run.reap_completed_at,
+            tuple(
+                (event.id, event.kind, event.run_id)
+                for event in kb.list_events(conn, task_id)
+            ),
+        ) == signature
         assert kb._systemd_user_scope_state(
             unit,
             manager_target=target,

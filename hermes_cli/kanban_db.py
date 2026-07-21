@@ -4320,6 +4320,10 @@ def _end_run(
                    WHEN reap_state = 'reaped' THEN 'finalized'
                    ELSE reap_state
                END,
+               reap_error    = CASE
+                   WHEN reap_state = 'reaped' THEN NULL
+                   ELSE reap_error
+               END,
                reap_completed_at = CASE
                    WHEN reap_state = 'reaped' THEN ?
                    ELSE reap_completed_at
@@ -9827,18 +9831,7 @@ def _request_terminal_transition(
     capture_state, targets, capture_reason = _capture_run_worker_tree(conn, run_id)
     identity = _decode_process_identity(row["worker_identity"])
     scope = _worker_scope_state(conn, task_id, run_id)
-    scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
-        _scope_status_fields(scope)
-    )
-    scope_evidence = scope_state in {"active", "inactive"} or (
-        scope_state == "not-found" and scope_ack is True
-    )
-    trusted_scope = bool(
-        scope_unit
-        and (scope_manager_target is not None or scope_launch_mode == "legacy")
-        and scope_evidence
-        and scope_launch_mode in {"systemd-user-scope", "legacy"}
-    )
+    trusted_scope, _scope_proves_gone = _trusted_worker_scope_evidence(scope)
     # A claim that has not recorded a worker PID/identity is still inside the
     # dispatch lock's pre-spawn window. With no exact worker boundary to reap,
     # release it through the ordinary CAS after this lock-protected check;
@@ -10234,7 +10227,8 @@ def _finalize_reassignment_terminal(
         cur = conn.execute(
             "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
             "error=?, ended_at=?, reap_state='finalized_historical', "
-            "reap_completed_at=? WHERE id=? AND reap_state='reaped'",
+            "reap_error=NULL, reap_completed_at=? "
+            "WHERE id=? AND reap_state='reaped'",
             (_redact_diagnostic(error), now, now, int(run_id)),
         )
         if cur.rowcount != 1:
@@ -10292,7 +10286,8 @@ def _finalize_generic_terminal(
             conn.execute(
                 "UPDATE task_runs SET status=?, outcome=?, error=?, metadata=?, "
                 "ended_at=COALESCE(ended_at, ?), reap_state='finalized_historical', "
-                "reap_completed_at=? WHERE id=? AND reap_state='reaped'",
+                "reap_error=NULL, reap_completed_at=? "
+                "WHERE id=? AND reap_state='reaped'",
                 (run_status, outcome, _redact_diagnostic(error),
                  json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else None,
                  now, now, int(run_id)),
@@ -10633,31 +10628,28 @@ def reconcile_worker_reaps(
                 for item in targets
             )
             scope = _worker_scope_state(conn, task_id, run_id)
-            scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
-                _scope_status_fields(scope)
+            (
+                scope_unit,
+                scope_state,
+                scope_manager_target,
+                scope_launch_mode,
+                scope_ack,
+            ) = _scope_status_fields(scope)
+            trusted_scope, scope_proves_gone = _trusted_worker_scope_evidence(
+                scope
             )
-            scope_evidence = scope_state in {"active", "inactive"} or (
-                scope_state == "not-found" and scope_ack is True
-            )
-            trusted_scope = bool(
-                scope_unit
-                and (scope_manager_target is not None or scope_launch_mode == "legacy")
-                and scope_evidence
-                and scope_launch_mode in {"systemd-user-scope", "legacy"}
-            )
-            scope_proves_gone = trusted_scope and (
-                scope_state == "inactive"
-                or (
-                    scope_state == "not-found"
-                    and scope_ack is True
-                )
+            scope_covers_incomplete_capture = trusted_scope and (
+                scope_launch_mode == "legacy" or scope_ack is True
             )
             unknown = (
                 capture_state in {"unknown", "reused"}
                 or not protection_known or protected
                 or any(state == "unknown" for _, state in states)
                 or any(state == "reused" for _, state in states)
-                or (capture_state == "incomplete" and not scope_proves_gone)
+                or (
+                    capture_state == "incomplete"
+                    and not scope_covers_incomplete_capture
+                )
             )
             if unknown:
                 attempts_row = conn.execute(
@@ -10706,15 +10698,16 @@ def reconcile_worker_reaps(
                     decisions.append({**base, "state": "identity_unverifiable", "reason": reason})
                     continue
                 scope = _worker_scope_state(conn, task_id, run_id)
-                scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
-                    _scope_status_fields(scope)
+                (
+                    scope_unit,
+                    scope_state,
+                    scope_manager_target,
+                    scope_launch_mode,
+                    scope_ack,
+                ) = _scope_status_fields(scope)
+                trusted_scope, scope_proves_gone = (
+                    _trusted_worker_scope_evidence(scope)
                 )
-                trusted_scope = bool(
-                    scope_unit
-                    and (scope_manager_target is not None or scope_launch_mode == "legacy")
-                    and scope_state == "inactive"
-                )
-                scope_proves_gone = trusted_scope
                 if scope_proves_gone:
                     alive = []
             if not alive and not trusted_scope:
@@ -14083,6 +14076,33 @@ def _scope_status_fields(scope: Any) -> tuple[Any, str, Any, str, Optional[bool]
     except (TypeError, ValueError):
         return None, "unknown", None, "invalid", None
     return unit, state, None, "legacy", None
+
+
+def _trusted_worker_scope_evidence(scope: Any) -> tuple[bool, bool]:
+    """Return authenticated scope-boundary and scope-gone evidence.
+
+    An acknowledged systemd launch may be collected immediately after a
+    successful ``stop`` because worker scopes use ``--collect``.  Treat that
+    exact receipt's ``not-found`` state the same before and after stopping,
+    while keeping every unacknowledged or malformed boundary fail closed.
+    """
+    unit, state, manager_target, launch_mode, launch_acknowledged = (
+        _scope_status_fields(scope)
+    )
+    authenticated_receipt = bool(
+        unit
+        and (manager_target is not None or launch_mode == "legacy")
+        and launch_mode in {"systemd-user-scope", "legacy"}
+    )
+    trusted = authenticated_receipt and (
+        state in {"active", "inactive"}
+        or (state == "not-found" and launch_acknowledged is True)
+    )
+    proves_gone = trusted and (
+        state == "inactive"
+        or (state == "not-found" and launch_acknowledged is True)
+    )
+    return trusted, proves_gone
 
 
 class _WorkerLaunchPid(int):
