@@ -166,6 +166,231 @@ def test_normal_terminal_request_waits_for_worker_exit_before_finalization(
             assert kb.get_task(conn, child).status == "todo"
 
 
+def test_acknowledged_scope_with_gone_root_stops_and_finalizes_without_pid_fallback(
+    kanban_home,
+    process_harness,
+    monkeypatch,
+):
+    _states, signals, send = process_harness
+    unit = "hermes-test-worker.scope"
+    target_token = object()
+    stopped: list[str] = []
+
+    def scope_state(*_args, **_kwargs):
+        return kb._WorkerScopeStatus(
+            unit,
+            "not-found" if stopped else "active",
+            target_token,
+            "systemd-user-scope",
+            True,
+        )
+
+    def stop_scope(candidate, *, manager_target):
+        assert candidate == unit
+        assert manager_target is target_token
+        stopped.append(candidate)
+        return True
+
+    monkeypatch.setattr(kb, "_worker_scope_state", scope_state)
+    monkeypatch.setattr(kb, "_stop_systemd_user_scope", stop_scope)
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "incomplete",
+            tuple(previous) or (root,),
+            "root_gone_before_tree_capture",
+        ),
+    )
+
+    with kb.connect() as conn:
+        task_id, run_id, _identity = _active_worker(
+            conn,
+            title="scope collected immediately after stop",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="scope stopped",
+            expected_run_id=run_id,
+        )
+        conn.execute(
+            "UPDATE task_runs SET reap_error='scope_stop_failed' WHERE id=?",
+            (run_id,),
+        )
+        conn.commit()
+
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=1025,
+            signal_fn=send,
+            protected_pid_fn=lambda: set(),
+            owner_id="scope-race-reaper",
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["state"] == "finalized"
+        assert stopped == [unit]
+        assert signals == []
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "done"
+        assert task.current_run_id is None
+        assert run.reap_state == "finalized"
+        assert run.reap_error is None
+        assert run.reap_term_intent_at is None
+        assert run.reap_kill_intent_at is None
+        assert run.reap_term_sent_at is None
+        assert run.reap_kill_sent_at is None
+        events = kb.list_events(conn, task_id)
+        assert sum(event.kind == "terminal_requested" for event in events) == 1
+        assert sum(event.kind == "completed" for event in events) == 1
+
+        signature = (
+            run.reap_state,
+            run.reap_error,
+            run.reap_completed_at,
+            tuple((event.id, event.kind, event.run_id) for event in events),
+        )
+        assert kb.reconcile_worker_reaps(
+            conn,
+            now=1026,
+            signal_fn=send,
+            protected_pid_fn=lambda: set(),
+            owner_id="scope-race-reaper",
+        ) == []
+        final_run = kb.get_run(conn, run_id)
+        final_events = kb.list_events(conn, task_id)
+        assert (
+            final_run.reap_state,
+            final_run.reap_error,
+            final_run.reap_completed_at,
+            tuple(
+                (event.id, event.kind, event.run_id)
+                for event in final_events
+            ),
+        ) == signature
+        assert signals == []
+
+
+@pytest.mark.parametrize("launch_acknowledged", [None, False])
+def test_collected_scope_without_acknowledgement_remains_fail_closed(
+    kanban_home,
+    process_harness,
+    monkeypatch,
+    launch_acknowledged,
+):
+    states, signals, send = process_harness
+    monkeypatch.setattr(
+        kb,
+        "_worker_scope_state",
+        lambda *_args, **_kwargs: kb._WorkerScopeStatus(
+            "hermes-test-worker.scope",
+            "not-found",
+            object(),
+            "systemd-user-scope",
+            launch_acknowledged,
+        ),
+    )
+
+    with kb.connect() as conn:
+        task_id, run_id, identity = _active_worker(
+            conn,
+            title="unacknowledged collected scope",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="must remain pending",
+            expected_run_id=run_id,
+        )
+        states[identity.pid] = "gone"
+
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=1035,
+            signal_fn=send,
+            protected_pid_fn=lambda: set(),
+            owner_id=f"unacknowledged-{launch_acknowledged}",
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert decisions[0]["reason"] == "scope_identity_unknown"
+        assert signals == []
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert task.status == "running"
+        assert task.current_run_id == run_id
+        assert run.reap_state == "identity_unverifiable"
+        assert run.reap_error == "scope_identity_unknown"
+        events = kb.list_events(conn, task_id)
+        assert sum(event.kind == "terminal_requested" for event in events) == 1
+        assert sum(event.kind == "completed" for event in events) == 0
+
+
+@pytest.mark.parametrize("launch_acknowledged", [None, False])
+def test_active_scope_without_acknowledgement_cannot_close_incomplete_capture(
+    kanban_home,
+    process_harness,
+    monkeypatch,
+    launch_acknowledged,
+):
+    _states, signals, send = process_harness
+    monkeypatch.setattr(
+        kb,
+        "_worker_scope_state",
+        lambda *_args, **_kwargs: kb._WorkerScopeStatus(
+            "hermes-test-worker.scope",
+            "active",
+            object(),
+            "systemd-user-scope",
+            launch_acknowledged,
+        ),
+    )
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "incomplete",
+            tuple(previous) or (root,),
+            "root_gone_before_tree_capture",
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_stop_systemd_user_scope",
+        lambda *_args, **_kwargs: pytest.fail("unacknowledged scope was stopped"),
+    )
+
+    with kb.connect() as conn:
+        task_id, run_id, _identity = _active_worker(
+            conn,
+            title="unacknowledged active scope",
+        )
+        assert kb.complete_task(
+            conn,
+            task_id,
+            result="must remain pending",
+            expected_run_id=run_id,
+        )
+
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=1036,
+            signal_fn=send,
+            protected_pid_fn=lambda: set(),
+            owner_id=f"active-unacknowledged-{launch_acknowledged}",
+        )
+
+        assert len(decisions) == 1
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert decisions[0]["reason"] == "root_gone_before_tree_capture"
+        assert signals == []
+        assert kb.get_task(conn, task_id).status == "running"
+        assert kb.get_run(conn, run_id).reap_state == "identity_unverifiable"
+
+
 def test_reassignment_is_deferred_applied_atomically_and_retryable(
     kanban_home, process_harness, trusted_scope,
 ):
@@ -883,6 +1108,11 @@ def test_reaped_run_is_restart_finalizable_after_crash(kanban_home, process_harn
     with kb.connect() as conn:
         task_id, run_id, identity = _active_worker(conn, title="restart reaped")
         assert kb.complete_task(conn, task_id, result="ok", expected_run_id=run_id)
+        conn.execute(
+            "UPDATE task_runs SET reap_error='transient_before_reaped' WHERE id=?",
+            (run_id,),
+        )
+        conn.commit()
         states[identity.pid] = "gone"
         original = kb._finalize_reaped_run
         monkeypatch.setattr(kb, "_finalize_reaped_run", lambda *_args, **_kwargs: False)
@@ -900,12 +1130,14 @@ def test_reaped_run_is_restart_finalizable_after_crash(kanban_home, process_harn
         )
         assert first[0]["state"] == "reaped"
         assert kb.get_run(conn, run_id).reap_state == "reaped"
+        assert kb.get_run(conn, run_id).reap_error == "transient_before_reaped"
         monkeypatch.setattr(kb, "_finalize_reaped_run", original)
         second = kb.reconcile_worker_reaps(
             conn, now=1501, signal_fn=send, protected_pid_fn=lambda: set(),
         )
         assert second[0]["state"] == "finalized"
         assert kb.get_task(conn, task_id).status == "done"
+        assert kb.get_run(conn, run_id).reap_error is None
         assert signals == []
 
 
