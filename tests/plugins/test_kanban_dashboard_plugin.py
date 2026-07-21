@@ -71,9 +71,12 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # The board exposes every actionable status once, in the source-defined
+    # order, while terminal history is represented by ``suppressed``.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - kb.NON_ACTIONABLE_STATUSES
+    expected_columns = kb.VALID_STATUSES - kb.NON_ACTIONABLE_STATUSES - {"cancelled"}
+    assert set(names) == expected_columns
+    assert "cancelled" not in names
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
@@ -81,6 +84,47 @@ def test_board_empty(client):
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
+
+
+def test_cancelled_task_is_history_not_todo(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "cancel me", "assignee": "operator"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        assert kb.cancel_task(conn, task["id"], reason="operator")
+
+    data = client.get("/api/plugins/kanban/board").json()
+    assert all(task["id"] not in column["tasks"] for column in data["columns"])
+    history = next(item for item in data["suppressed"] if item["id"] == task["id"])
+    assert history["status"] == "cancelled"
+    assert history["non_authorizing"] is True
+
+
+def test_manual_recovery_required_remains_visible_on_board(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "manual recovery", "assignee": "operator"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task["id"], claimer="operator:test")
+        assert claimed is not None and claimed.current_run_id is not None
+        conn.execute(
+            "UPDATE task_runs SET reap_state='manual_recovery_required', "
+            "terminal_requested_at=100, reap_attempts=4 WHERE id=?",
+            (claimed.current_run_id,),
+        )
+        conn.commit()
+
+    data = client.get("/api/plugins/kanban/board").json()
+    running = next(column for column in data["columns"] if column["name"] == "running")
+    card = next(item for item in running["tasks"] if item["id"] == task["id"])
+    assert card["recovery_state"] == "manual_recovery_required"
+    assert card["reap_state"] == "manual_recovery_required"
+    assert any(
+        diagnostic["kind"] == "worker_manual_recovery_required"
+        for diagnostic in card["diagnostics"]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -836,30 +880,49 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     assert child_after["status"] == "ready"
 
 
-def test_reopening_parent_demotes_ready_child(client):
-    """Reopening a completed parent must invalidate ready children immediately.
+@pytest.mark.parametrize("terminal_status", sorted(kb.TERMINAL_STATUSES))
+def test_reopening_parent_demotes_ready_children(client, terminal_status):
+    """Reopening any terminal parent invalidates fan-in and sibling children.
 
     The dispatcher re-checks parent completion on claim, but the dashboard
     should not keep showing a stale child as ready after an operator drags
-    its parent back out of done for more work.
+    its parent back out of a canonical terminal state for more work.
     """
     parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
-    child = client.post(
+    other_parent = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "other p"},
+    ).json()["task"]
+    fan_in_child = client.post(
         "/api/plugins/kanban/tasks",
-        json={"title": "c", "parents": [parent["id"]]},
+        json={
+            "title": "fan-in child",
+            "parents": [parent["id"], other_parent["id"]],
+        },
     ).json()["task"]
-    assert child["status"] == "todo"
-
-    r = client.patch(
-        f"/api/plugins/kanban/tasks/{parent['id']}",
-        json={"status": "done"},
-    )
-    assert r.status_code == 200
-
-    child_after_done = client.get(
-        f"/api/plugins/kanban/tasks/{child['id']}"
+    sibling_child = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "sibling child", "parents": [parent["id"]]},
     ).json()["task"]
-    assert child_after_done["status"] == "ready"
+    assert fan_in_child["status"] == "todo"
+    assert sibling_child["status"] == "todo"
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status=? WHERE id=?",
+            (terminal_status, parent["id"]),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='done' WHERE id=?",
+            (other_parent["id"],),
+        )
+        conn.commit()
+        kb.recompute_ready(conn)
+
+    for child in (fan_in_child, sibling_child):
+        child_after_terminal = client.get(
+            f"/api/plugins/kanban/tasks/{child['id']}"
+        ).json()["task"]
+        assert child_after_terminal["status"] == "ready"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
@@ -867,10 +930,11 @@ def test_reopening_parent_demotes_ready_child(client):
     )
     assert r.status_code == 200
 
-    child_after_reopen = client.get(
-        f"/api/plugins/kanban/tasks/{child['id']}"
-    ).json()["task"]
-    assert child_after_reopen["status"] == "todo"
+    for child in (fan_in_child, sibling_child):
+        child_after_reopen = client.get(
+            f"/api/plugins/kanban/tasks/{child['id']}"
+        ).json()["task"]
+        assert child_after_reopen["status"] == "todo"
 
 
 def test_patch_reassign(client):
@@ -905,6 +969,152 @@ def test_patch_invalid_status(client):
         json={"status": "banana"},
     )
     assert r.status_code == 400
+
+
+def test_patch_status_cancelled_uses_kernel_and_returns_finalized_truth(client):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "cancel through patch"},
+    ).json()["task"]
+
+    response = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "cancelled", "cancel_reason": "operator"},
+    )
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["task"]["status"] == "cancelled"
+    assert body["state"] == "finalized"
+    assert body["cancellation_applied"] is True
+    assert body["historical_preserved"] is False
+    with kb.connect() as conn:
+        event = kb.list_events(conn, task["id"])[-1]
+        assert event.kind == "cancelled"
+        assert event.payload == {"reason": "operator"}
+
+
+def test_patch_cancelled_reports_pending_manual_and_conflict_truth(
+    client, monkeypatch,
+):
+    from hermes_cli import kanban_worker_process as kp
+
+    task = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "active cancellation", "assignee": "worker"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, task["id"])
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        identity = kp.ProcessIdentity(45672, 456.72)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, task["id"]))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+            (
+                identity.pid,
+                json.dumps(identity.to_dict()),
+                json.dumps([identity.to_dict()]),
+                run_id,
+            ),
+        )
+        conn.commit()
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "captured", tuple(previous) or (root,),
+        ),
+    )
+
+    stale = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={"status": "cancelled", "expected_run_id": run_id + 1},
+    )
+    assert stale.status_code == 409
+
+    pending = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "cancelled",
+            "cancel_reason": "operator",
+            "expected_run_id": run_id,
+        },
+    )
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["state"] == "pending_reap"
+    assert pending.json()["reap_state"] == "terminal_requested"
+    assert pending.json()["task"]["status"] == "running"
+
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE task_runs SET reap_state='manual_recovery_required' WHERE id=?",
+            (run_id,),
+        )
+        conn.commit()
+    manual = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "cancelled",
+            "cancel_reason": "operator",
+            "expected_run_id": run_id,
+        },
+    )
+    assert manual.status_code == 200, manual.text
+    assert manual.json()["state"] == "manual_recovery_required"
+
+    conflict = client.patch(
+        f"/api/plugins/kanban/tasks/{task['id']}",
+        json={
+            "status": "cancelled",
+            "cancel_reason": "different intent",
+            "expected_run_id": run_id,
+        },
+    )
+    assert conflict.status_code == 409
+    assert "terminal_transition_conflict" in conflict.json()["detail"]
+
+
+@pytest.mark.parametrize("terminal_status", sorted(kb.TERMINAL_STATUSES))
+@pytest.mark.parametrize("surface", ["patch", "bulk"])
+def test_dashboard_cancel_preserves_historical_terminal_status(
+    client, terminal_status, surface,
+):
+    task = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "historical cancel noop"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        conn.execute(
+            "UPDATE tasks SET status=?, completed_at=123 WHERE id=?",
+            (terminal_status, task["id"]),
+        )
+        conn.commit()
+        before = [(event.id, event.kind) for event in kb.list_events(conn, task["id"])]
+
+    if surface == "patch":
+        response = client.patch(
+            f"/api/plugins/kanban/tasks/{task['id']}",
+            json={"status": "cancelled"},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()
+        assert payload["historical_preserved"] is True
+        assert payload["cancellation_applied"] is False
+    else:
+        response = client.post(
+            "/api/plugins/kanban/tasks/bulk",
+            json={"ids": [task["id"]], "status": "cancelled"},
+        )
+        assert response.status_code == 200, response.text
+        payload = response.json()["results"][0]
+        assert payload["ok"] is True
+        assert payload["historical_preserved"] is True
+        assert payload["cancellation_applied"] is False
+
+    with kb.connect() as conn:
+        preserved = kb.get_task(conn, task["id"])
+        assert preserved.status == terminal_status
+        assert preserved.completed_at == 123
+        assert [(event.id, event.kind) for event in kb.list_events(conn, task["id"])] == before
 
 
 def test_patch_status_running_rejected(client):
@@ -1569,6 +1779,43 @@ def test_bulk_status_done_forwards_completion_summary(client):
             assert run.metadata == {"source": "dashboard"}
     finally:
         conn.close()
+
+
+def test_bulk_status_cancelled_reports_each_finalized_and_stale_expected_run(
+    client,
+):
+    first = client.post(
+        "/api/plugins/kanban/tasks", json={"title": "bulk cancel first"},
+    ).json()["task"]
+    second = client.post(
+        "/api/plugins/kanban/tasks",
+        json={"title": "bulk cancel stale", "assignee": "worker"},
+    ).json()["task"]
+    with kb.connect() as conn:
+        claimed = kb.claim_task(conn, second["id"])
+        assert claimed is not None and claimed.current_run_id is not None
+        second_run_id = claimed.current_run_id
+
+    response = client.post(
+        "/api/plugins/kanban/tasks/bulk",
+        json={
+            "ids": [first["id"], second["id"]],
+            "status": "cancelled",
+            "cancel_reason": "bulk operator",
+            "expected_run_ids": {second["id"]: second_run_id + 1},
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    results = {item["id"]: item for item in response.json()["results"]}
+    assert results[first["id"]]["ok"] is True
+    assert results[first["id"]]["status"] == "cancelled"
+    assert results[first["id"]]["state"] == "finalized"
+    assert results[second["id"]]["ok"] is False
+    assert "refused" in results[second["id"]]["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, second["id"]).status == "running"
+        assert kb.get_task(conn, second["id"]).current_run_id == second_run_id
 
 
 def test_bulk_status_running_rejected(client):
@@ -2450,14 +2697,23 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["ok"] is True
     assert body["task_id"] == t
 
-    # Confirm the task is back to ready.
+    # Phase B accepts the request but keeps the claim until the exact worker
+    # tree can be proven gone by the leased reaper.
+    assert body["state"] == "pending_reap"
+    assert body["status"] == "running"
+    assert body["reap_state"] == "identity_unverifiable"
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["claim_lock"] is None
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
+        assert row["current_run_id"] is not None
+        reap = conn2.execute(
+            "SELECT reap_state FROM task_runs WHERE id=?", (row["current_run_id"],),
+        ).fetchone()
+        assert reap["reap_state"] == "identity_unverifiable"
     finally:
         conn2.close()
 
@@ -2523,9 +2779,9 @@ def test_reassign_endpoint_409_on_running_without_reclaim(client):
     assert r.status_code == 409
 
 
-def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
-    """With reclaim_first=true, a running task is reclaimed+reassigned in
-    one call."""
+def test_reassign_endpoint_with_reclaim_first_defers_on_running(client):
+    """With reclaim_first=true, the reassignment is durable but deferred
+    until Phase B proves the worker tree is gone."""
     import secrets
     conn = kb.connect()
     try:
@@ -2552,15 +2808,24 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
         json={"profile": "new", "reclaim_first": True, "reason": "switch"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["assignee"] == "new"
+    body = r.json()
+    assert body["state"] == "pending_reap"
+    assert body["status"] == "running"
+    assert body["assignee"] == "orig"
+    assert body["requested_assignee"] == "new"
+    assert body["reap_state"] == "identity_unverifiable"
 
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, assignee FROM tasks WHERE id=?", (t,),
+            "SELECT status, assignee, current_run_id FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["assignee"] == "new"
+        assert row["status"] == "running"
+        assert row["assignee"] == "orig"
+        payload = conn2.execute(
+            "SELECT terminal_payload FROM task_runs WHERE id=?", (row["current_run_id"],),
+        ).fetchone()["terminal_payload"]
+        assert json.loads(payload)["assignee"] == "new"
     finally:
         conn2.close()
 

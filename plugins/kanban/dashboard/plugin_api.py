@@ -224,6 +224,20 @@ def _run_dict(r: kanban_db.Run) -> dict[str, Any]:
         "claim_lock": r.claim_lock,
         "claim_expires": r.claim_expires,
         "worker_pid": r.worker_pid,
+        "reap_state": r.reap_state,
+        "terminal_requested_at": r.terminal_requested_at,
+        "reap_attempt_uuid": r.reap_attempt_uuid,
+        "reap_lease_owner": r.reap_lease_owner,
+        "reap_lease_expires": r.reap_lease_expires,
+        "reap_heartbeat_at": r.reap_heartbeat_at,
+        "reap_term_sent_at": r.reap_term_sent_at,
+        "reap_kill_sent_at": r.reap_kill_sent_at,
+        "reap_term_intent_at": r.reap_term_intent_at,
+        "reap_kill_intent_at": r.reap_kill_intent_at,
+        "reap_signal_progress": r.reap_signal_progress,
+        "reap_attempts": r.reap_attempts,
+        "reap_error": r.reap_error,
+        "reap_completed_at": r.reap_completed_at,
         "max_runtime_seconds": r.max_runtime_seconds,
         "last_heartbeat_at": r.last_heartbeat_at,
         "started_at": r.started_at,
@@ -512,6 +526,21 @@ def get_board(
                 full[:_CARD_SUMMARY_PREVIEW_CHARS] if full else None
             )
             d = _task_dict(t, latest_summary=preview)
+            if t.status == "running" and t.current_run_id is not None:
+                current_run = kanban_db.get_run(conn, t.current_run_id)
+                if current_run is not None and current_run.reap_state:
+                    requested = (
+                        current_run.terminal_payload.get("assignee")
+                        if isinstance(current_run.terminal_payload, dict)
+                        else None
+                    )
+                    d["recovery_state"] = (
+                        "manual_recovery_required"
+                        if current_run.reap_state == "manual_recovery_required"
+                        else "pending_reap"
+                    )
+                    d["reap_state"] = current_run.reap_state
+                    d["requested_assignee"] = requested
             d["link_counts"] = link_counts.get(t.id, {"parents": 0, "children": 0})
             d["comment_count"] = comment_counts.get(t.id, 0)
             d["progress"] = progress.get(t.id)  # None when the task has no children
@@ -877,6 +906,8 @@ class UpdateTaskBody(BaseModel):
     body: Optional[str] = None
     result: Optional[str] = None
     block_reason: Optional[str] = None
+    cancel_reason: Optional[str] = None
+    expected_run_id: Optional[int] = None
     # Structured handoff fields — forwarded to complete_task when status
     # transitions to 'done'. Dashboard parity with ``hermes kanban
     # complete --summary ... --metadata ...``.
@@ -907,7 +938,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
         task = kanban_db.get_task(conn, task_id)
         if task is None:
             raise HTTPException(status_code=404, detail=f"task {task_id} not found")
-        if payload.status is not None:
+        if payload.status is not None and payload.status != "cancelled":
             status_error = _review_handoff_status_error(conn, task_id)
             if status_error is not None:
                 raise HTTPException(status_code=409, detail=status_error)
@@ -933,6 +964,7 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 raise HTTPException(status_code=404, detail="task not found")
 
         # --- status -------------------------------------------------------
+        cancellation_state: Optional[dict[str, Any]] = None
         if payload.status is not None:
             s = payload.status
             ok = True
@@ -957,6 +989,30 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                     ok = _set_status_direct(conn, task_id, "ready")
             elif s == "archived":
                 ok = kanban_db.archive_task(conn, task_id)
+            elif s == "cancelled":
+                try:
+                    ok = kanban_db.cancel_task(
+                        conn,
+                        task_id,
+                        reason=payload.cancel_reason,
+                        expected_run_id=payload.expected_run_id,
+                    )
+                except kanban_db.TerminalTransitionConflict as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                current = kanban_db.get_task(conn, task_id)
+                preserved = bool(
+                    not ok
+                    and current is not None
+                    and current.status in kanban_db.TERMINAL_STATUSES
+                )
+                if preserved:
+                    ok = True
+                if ok:
+                    cancellation_state = {
+                        **_recovery_state(conn, task_id),
+                        "cancellation_applied": not preserved,
+                        "historical_preserved": preserved,
+                    }
             elif s == "running":
                 raise HTTPException(
                     status_code=400,
@@ -1026,7 +1082,10 @@ def update_task(task_id: str, payload: UpdateTaskBody, board: Optional[str] = Qu
                 )
 
         updated = kanban_db.get_task(conn, task_id)
-        return {"task": _task_dict(updated) if updated else None}
+        response = {"task": _task_dict(updated) if updated else None}
+        if cancellation_state is not None:
+            response.update(cancellation_state)
+        return response
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:
@@ -1061,12 +1120,14 @@ def _parents_blocking_ready(
     no-op.  Returns ``[]`` when nothing blocks the transition (e.g. no
     parents, or all parents already terminal).
     """
+    terminal_statuses = tuple(sorted(kanban_db.TERMINAL_STATUSES))
+    terminal_placeholders = ",".join("?" for _ in terminal_statuses)
     rows = conn.execute(
         "SELECT t.id, t.title, t.status FROM tasks t "
         "JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ? "
-        "AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only')",
-        (task_id,),
+        f"AND t.status NOT IN ({terminal_placeholders})",
+        (task_id, *terminal_statuses),
     ).fetchall()
     return [
         {"id": r["id"], "title": r["title"], "status": r["status"]}
@@ -1138,13 +1199,14 @@ def _set_status_direct(
                 (task_id,),
             ).fetchall()
             if parent_statuses and not all(
-                p["status"] == "done" for p in parent_statuses
+                p["status"] in kanban_db.TERMINAL_STATUSES
+                for p in parent_statuses
             ):
                 return False
 
         reopening_satisfied_parent = (
-            prev["status"] in {"done", "archived"}
-            and new_status not in {"done", "archived"}
+            prev["status"] in kanban_db.TERMINAL_STATUSES
+            and new_status not in kanban_db.TERMINAL_STATUSES
         )
 
         cur = conn.execute(
@@ -1162,10 +1224,10 @@ def _set_status_direct(
             (task_id, None, json.dumps({"status": new_status}), int(time.time())),
         )
         if reopening_satisfied_parent:
-            # A parent leaving done/archived invalidates any direct child that
-            # was sitting in ready solely because that parent used to satisfy
-            # the dependency gate. Demote those children immediately so the
-            # dashboard does not keep advertising stale-ready work.
+            # A parent leaving any canonical terminal state invalidates every
+            # direct child that was sitting in ready because that parent used
+            # to satisfy the dependency gate. Demote those children immediately
+            # so the dashboard does not keep advertising stale-ready work.
             for row in conn.execute(
                 "SELECT child_id FROM task_links WHERE parent_id = ? ORDER BY child_id",
                 (task_id,),
@@ -1268,9 +1330,12 @@ def submit_review_verdict(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.submit_review_verdict(
-            conn, task_id, verdict=payload.verdict, summary=payload.summary,
-        )
+        try:
+            ok = kanban_db.submit_review_verdict(
+                conn, task_id, verdict=payload.verdict, summary=payload.summary,
+            )
+        except kanban_db.TerminalTransitionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(status_code=409, detail="review run ownership changed")
         return {"ok": True, "verdict": payload.verdict}
@@ -1311,6 +1376,8 @@ class BulkTaskBody(BaseModel):
     summary: Optional[str] = None
     metadata: Optional[dict] = None
     reclaim_first: bool = False
+    cancel_reason: Optional[str] = None
+    expected_run_ids: Optional[dict[str, int]] = None
 
 
 @router.post("/tasks/bulk")
@@ -1335,7 +1402,11 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                     entry.update(ok=False, error="not found")
                     results.append(entry)
                     continue
-                if payload.status is not None and not payload.archive:
+                if (
+                    payload.status is not None
+                    and payload.status != "cancelled"
+                    and not payload.archive
+                ):
                     status_error = _review_handoff_status_error(conn, tid)
                     if status_error is not None:
                         entry.update(ok=False, error=status_error)
@@ -1373,6 +1444,38 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                         continue
                     elif s == "scheduled":
                         ok = kanban_db.schedule_task(conn, tid)
+                    elif s == "cancelled":
+                        try:
+                            ok = kanban_db.cancel_task(
+                                conn,
+                                tid,
+                                reason=payload.cancel_reason,
+                                expected_run_id=(payload.expected_run_ids or {}).get(tid),
+                            )
+                        except kanban_db.TerminalTransitionConflict as exc:
+                            entry.update(ok=False, error=str(exc), state="conflict")
+                            results.append(entry)
+                            continue
+                        current = kanban_db.get_task(conn, tid)
+                        preserved = bool(
+                            not ok
+                            and current is not None
+                            and current.status in kanban_db.TERMINAL_STATUSES
+                        )
+                        if preserved:
+                            ok = True
+                        if ok:
+                            state = _recovery_state(conn, tid)
+                            entry.update(
+                                {
+                                    key: state[key]
+                                    for key in (
+                                        "status", "reap_state", "pending_reap", "state",
+                                    )
+                                },
+                                cancellation_applied=not preserved,
+                                historical_preserved=preserved,
+                            )
                     elif s in {"todo", "triage"}:
                         ok = _set_status_direct(conn, tid, s)
                     else:
@@ -1394,8 +1497,17 @@ def bulk_update(payload: BulkTaskBody, board: Optional[str] = Query(None)):
                             )
                         if not ok:
                             entry.update(ok=False, error="assign refused")
-                    except RuntimeError as e:
+                    except (RuntimeError, kanban_db.TerminalTransitionConflict) as e:
                         entry.update(ok=False, error=str(e))
+                    else:
+                        state = _recovery_state(conn, tid)
+                        entry.update({
+                            key: state[key]
+                            for key in (
+                                "status", "assignee", "requested_assignee",
+                                "reap_state", "state",
+                            )
+                        })
                 if payload.priority is not None:
                     with kanban_db.write_txn(conn):
                         conn.execute(
@@ -1541,6 +1653,12 @@ def list_active_workers(
                 r.claim_expires,
                 r.last_heartbeat_at,
                 r.max_runtime_seconds
+                , r.reap_state
+                , r.reap_attempt_uuid
+                , r.reap_lease_owner
+                , r.reap_lease_expires
+                , r.reap_heartbeat_at
+                , r.reap_attempts
             FROM task_runs r
             JOIN tasks t ON t.id = r.task_id
             WHERE r.ended_at IS NULL
@@ -1563,6 +1681,12 @@ def list_active_workers(
                 "claim_expires": row["claim_expires"],
                 "last_heartbeat_at": row["last_heartbeat_at"],
                 "max_runtime_seconds": row["max_runtime_seconds"],
+                "reap_state": row["reap_state"],
+                "reap_attempt_uuid": row["reap_attempt_uuid"],
+                "reap_lease_owner": row["reap_lease_owner"],
+                "reap_lease_expires": row["reap_lease_expires"],
+                "reap_heartbeat_at": row["reap_heartbeat_at"],
+                "reap_attempts": row["reap_attempts"],
             }
             for row in rows
         ]
@@ -1699,7 +1823,12 @@ def terminate_run_endpoint(
                 status_code=409,
                 detail=f"run {run_id} already ended",
             )
-        ok = kanban_db.reclaim_task(conn, r.task_id, reason=payload.reason)
+        try:
+            ok = kanban_db.reclaim_task(
+                conn, r.task_id, reason=payload.reason, expected_run_id=run_id,
+            )
+        except kanban_db.TerminalTransitionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1708,7 +1837,12 @@ def terminate_run_endpoint(
                     "longer in a reclaimable state"
                 ),
             )
-        return {"ok": True, "run_id": run_id, "task_id": r.task_id}
+        return {
+            "ok": True,
+            "run_id": run_id,
+            "task_id": r.task_id,
+            **_recovery_state(conn, r.task_id),
+        }
     finally:
         conn.close()
 
@@ -1719,6 +1853,37 @@ def terminate_run_endpoint(
 
 class ReclaimBody(BaseModel):
     reason: Optional[str] = None
+
+
+def _recovery_state(conn, task_id: str) -> dict[str, Any]:
+    """Describe whether a recovery request is pending or finalized."""
+    task = kanban_db.get_task(conn, task_id)
+    if task is None:
+        return {"status": None, "assignee": None, "reap_state": None, "state": "missing"}
+    run = kanban_db.get_run(conn, task.current_run_id) if task.current_run_id else None
+    reap_state = run.reap_state if run is not None else None
+    pending = task.status == "running" and reap_state in (
+        kanban_db._REAP_PENDING_STATES | {"reaped"}
+    )
+    requested_assignee = None
+    if run is not None and isinstance(run.terminal_payload, dict):
+        requested_assignee = run.terminal_payload.get("assignee")
+    if reap_state == "manual_recovery_required":
+        state = "manual_recovery_required"
+    elif pending:
+        state = "pending_reap"
+    elif task.status == "running":
+        state = "manual_recovery_required"
+    else:
+        state = "finalized"
+    return {
+        "status": task.status,
+        "assignee": task.assignee,
+        "requested_assignee": requested_assignee,
+        "reap_state": reap_state,
+        "pending_reap": pending,
+        "state": state,
+    }
 
 
 @router.post("/tasks/{task_id}/reclaim")
@@ -1737,7 +1902,10 @@ def reclaim_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        try:
+            ok = kanban_db.reclaim_task(conn, task_id, reason=payload.reason)
+        except kanban_db.TerminalTransitionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1746,7 +1914,7 @@ def reclaim_task_endpoint(
                     "(not running, or unknown id)"
                 ),
             )
-        return {"ok": True, "task_id": task_id}
+        return {"ok": True, "task_id": task_id, **_recovery_state(conn, task_id)}
     finally:
         conn.close()
 
@@ -1825,12 +1993,15 @@ def reassign_task_endpoint(
     board = _resolve_board(board)
     conn = _conn(board=board)
     try:
-        ok = kanban_db.reassign_task(
-            conn, task_id,
-            payload.profile or None,
-            reclaim_first=bool(payload.reclaim_first),
-            reason=payload.reason,
-        )
+        try:
+            ok = kanban_db.reassign_task(
+                conn, task_id,
+                payload.profile or None,
+                reclaim_first=bool(payload.reclaim_first),
+                reason=payload.reason,
+            )
+        except kanban_db.TerminalTransitionConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         if not ok:
             raise HTTPException(
                 status_code=409,
@@ -1839,7 +2010,16 @@ def reassign_task_endpoint(
                     "running (pass reclaim_first=true to release the claim first)"
                 ),
             )
-        return {"ok": True, "task_id": task_id, "assignee": payload.profile or None}
+        state = _recovery_state(conn, task_id)
+        return {
+            "ok": True,
+            "task_id": task_id,
+            # This is the current durable value. During pending_reap it is
+            # intentionally still the old assignee.
+            "assignee": state["assignee"],
+            "requested_assignee": payload.profile or None,
+            **{key: state[key] for key in ("status", "reap_state", "state")},
+        }
     finally:
         conn.close()
 

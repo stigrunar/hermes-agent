@@ -87,7 +87,7 @@
   }
 
   // Order matches BOARD_COLUMNS in plugin_api.py.
-  const COLUMN_ORDER = ["triage", "todo", "ready", "running", "blocked", "done"];
+  const COLUMN_ORDER = ["triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done"];
   // English fallback dictionaries — used when the i18n catalog is missing
   // a key, and as defaults for the get*() helpers below so callers running
   // outside any React component (where there's no `t`) still get sane text.
@@ -1418,9 +1418,12 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ reason: `recovery action for ${diag.kind}` }),
-        }).then(function () {
-          setMsg({ ok: true, text: tx(t, "reclaimedMessage",
-            "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
+        }).then(function (data) {
+          const pending = data && (data.state === "pending_reap" || data.state === "manual_recovery_required");
+          setMsg({ ok: true, text: pending
+            ? tx(t, "reclaimPendingMessage", "Reclaim pending for {id}: {state} (status {status}).",
+              { id: task.id, state: data.state, status: data.status })
+            : tx(t, "reclaimedMessage", "Reclaimed {id}. Task is back to ready.", { id: task.id }) });
           if (onRefresh) onRefresh();
         }).catch(function (err) {
           setMsg({ ok: false, text: tx(t, "reclaimFailed", "Reclaim failed: ") + (err.message || err) });
@@ -1443,11 +1446,16 @@
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(body),
-        }).then(function () {
+        }).then(function (data) {
+          const pending = data && (data.state === "pending_reap" || data.state === "manual_recovery_required");
           setMsg({
             ok: true,
-            text: tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
-              { id: task.id, profile: reassignProfile }),
+            text: pending
+              ? tx(t, "reassignPendingMessage", "Reassign pending for {id}: requested {requested}, current {current} ({state}).",
+                { id: task.id, requested: data.requested_assignee || "(unassigned)",
+                  current: data.assignee || "(unassigned)", state: data.state })
+              : tx(t, "reassignedMessage", "Reassigned {id} to {profile}.",
+                { id: task.id, profile: reassignProfile }),
           });
           if (onRefresh) onRefresh();
         }).catch(function (err) {

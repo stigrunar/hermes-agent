@@ -1844,14 +1844,26 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     conn = kb.connect()
     try:
         run1 = kb.latest_run(conn, worker_env)
-        kb._set_worker_pid(conn, worker_env, 98765)
+        identity = {"pid": 98765, "create_time": 987.65}
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (98765, worker_env),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+            (98765, json.dumps(identity), json.dumps([identity]), run1.id),
+        )
+        conn.commit()
         monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
+        monkeypatch.setattr(_kb, "_exact_identity_state", lambda _receipt: "gone")
         assert kb.detect_crashed_workers(conn) == [worker_env]
 
-        kb.claim_task(conn, worker_env)
-        run2 = kb.latest_run(conn, worker_env)
-        assert run2.id != run1.id
+        # Phase B keeps the exact worker claim fenced until the leased reaper
+        # proves the managed boundary gone; a second claim cannot bypass that
+        # pending state.
+        assert kb.get_task(conn, worker_env).status == "running"
+        assert kb.latest_run(conn, worker_env).reap_state in {
+            "terminal_requested", "reap_pending", "reaping", "identity_unverifiable",
+        }
     finally:
         conn.close()
 
@@ -1865,14 +1877,9 @@ def test_worker_complete_rejects_stale_run_id(worker_env, monkeypatch):
     try:
         task = kb.get_task(conn, worker_env)
         assert task.status == "running"
-        assert task.current_run_id == run2.id
+        assert task.current_run_id == run1.id
     finally:
         conn.close()
-
-    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(run2.id))
-    out = kt._handle_complete({"summary": "current completion"})
-    d = json.loads(out)
-    assert d.get("ok") is True
 
 
 def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):

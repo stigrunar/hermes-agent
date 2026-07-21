@@ -120,7 +120,7 @@ def test_exactly_900_seconds_old_is_not_older_than_sla(
     ("kind", "reason", "metadata"),
     [
         ("needs_input", "human decision required", {}),
-        ("capability", "review-required: human signoff", {}),
+            ("needs_input", "human signoff", {}),
         ("capability", "requires human input before continuing", {}),
         ("capability", "maintenance-window: wait for window", {}),
         ("capability", "wait for the maintenance window", {}),
@@ -322,6 +322,65 @@ def test_pending_linked_parent_cannot_be_bypassed(
         assert decisions[0]["reason"] == "parent_dependency_pending"
         assert decisions[0]["dependency_task_id"] == parent
         assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 2
+
+
+@pytest.mark.parametrize("terminal_status", ["superseded", "stale_continuity_only"])
+def test_reconciliation_continuation_route_accepts_canonical_terminal_parent(
+    kanban_home, terminal_status,
+):
+    """The blocker-SLA classifier must not treat historical fan-in as open."""
+    now = int(time.time())
+    with kb.connect_closing() as conn:
+        parent = kb.create_task(conn, title="historical parent")
+        source = kb.create_task(conn, title="todo blocker", parents=[parent])
+        assert kb.mark_task_non_actionable(
+            conn, parent, status=terminal_status, actor="controller",
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='todo', block_kind='capability', "
+                "started_at=? WHERE id=?",
+                (now - kb.CONTINUATION_BLOCKER_SLA_SECONDS - 1, source),
+            )
+            conn.execute(
+                "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                "VALUES (?, 'blocked', ?, ?)",
+                (source, json.dumps({"reason": "self-fixable blocker"}), now - 901),
+            )
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (source,)).fetchone()
+
+        route = kb._blocked_continuation_route(conn, row, now=now)
+
+        assert route is not None
+        assert route[:2] == ("ops", "route_ops")
+
+
+@pytest.mark.parametrize("terminal_status", ["superseded", "stale_continuity_only"])
+@pytest.mark.parametrize("dependency_shape", ["linked-parent", "explicit-metadata"])
+def test_autonomous_continuation_accepts_every_canonical_terminal_dependency(
+    kanban_home, tmp_path, monkeypatch, terminal_status, dependency_shape,
+):
+    """Linked and metadata-named dependencies share the canonical terminal set."""
+    _spawnable_profiles(monkeypatch)
+    with kb.connect_closing() as conn:
+        dependency = kb.create_task(conn, title="historical dependency")
+        assert kb.mark_task_non_actionable(
+            conn, dependency, status=terminal_status, actor="controller",
+        )
+        metadata = (
+            {"dependency_task_id": dependency}
+            if dependency_shape == "explicit-metadata"
+            else None
+        )
+        source = _make_blocked(conn, tmp_path, metadata=metadata)
+        if dependency_shape == "linked-parent":
+            kb.link_tasks(conn, dependency, source)
+
+        decision = kb.continue_blocked_tasks(conn)[0]
+
+        assert decision["source_task_id"] == source
+        assert decision["decision"] == "routed"
+        assert decision["dependency_task_id"] == dependency
 
 
 @pytest.mark.parametrize("target", ["worker", " CoDeX ", "ACP"])

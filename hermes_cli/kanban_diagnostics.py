@@ -1349,6 +1349,88 @@ def _terminal_active_run_diagnostic(
     runs: list[Any],
     now: int,
 ) -> Optional[Diagnostic]:
+    current_run_id = _task_field(task, "current_run_id")
+    current_run = next((
+        run for run in reversed(runs)
+        if _task_field(run, "id") == current_run_id
+    ), None)
+    if (
+        current_run is not None
+        and _task_field(current_run, "ended_at") is None
+        and _task_field(current_run, "worker_pid") is not None
+        and not _task_field(current_run, "worker_identity")
+    ):
+        return Diagnostic(
+            kind="worker_identity_unverifiable",
+            severity="critical",
+            title="Live worker has only a legacy numeric PID",
+            detail=(
+                "PID alone is not ownership proof. This run is retained "
+                "fail-closed and cannot be signalled or finalized until exact "
+                "worker identity is available or an operator resolves it."
+            ),
+            actions=[],
+            first_seen_at=int(_task_field(current_run, "started_at", now) or now),
+            last_seen_at=now,
+            data={"status": _task_field(task, "status"), "run_id": current_run_id,
+                  "reap_state": "identity_unverifiable"},
+        )
+    reap_run = next((
+        run for run in reversed(runs)
+        if str(_task_field(run, "reap_state") or "") in {
+            "terminal_requested", "reap_pending", "reaping",
+            "identity_unverifiable", "manual_recovery_required", "gave_up",
+        }
+    ), None)
+    if reap_run is not None:
+        reap_state = str(_task_field(reap_run, "reap_state"))
+        kind_by_state = {
+            "terminal_requested": "worker_reap_pending",
+            "reap_pending": "worker_reap_pending",
+            "reaping": "worker_reaping",
+            "identity_unverifiable": "worker_identity_unverifiable",
+            "manual_recovery_required": "worker_manual_recovery_required",
+            "gave_up": "worker_reap_gave_up",
+        }
+        title_by_state = {
+            "terminal_requested": "Terminal outcome is waiting for worker exit",
+            "reap_pending": "Worker tree reaping is pending",
+            "reaping": "A leased reaper owns this worker tree",
+            "identity_unverifiable": "Worker identity cannot be verified",
+            "manual_recovery_required": "Manual worker recovery is required",
+            "gave_up": "Worker reaper gave up fail-closed",
+        }
+        run_id = _task_field(reap_run, "id")
+        return Diagnostic(
+            kind=kind_by_state[reap_state],
+            severity=("critical" if reap_state in {
+                "identity_unverifiable", "manual_recovery_required", "gave_up",
+            }
+                      else "warning"),
+            title=title_by_state[reap_state],
+            detail=(
+                "The requested terminal outcome is fenced until the exact owned "
+                "worker tree is confirmed gone. No dependency promotion, workspace "
+                "release, replacement, or current-run clearing is allowed yet."
+            ),
+            actions=[],
+            first_seen_at=int(
+                _task_field(reap_run, "terminal_requested_at", now) or now
+            ),
+            last_seen_at=now,
+            data={
+                "status": _task_field(task, "status"),
+                "run_id": run_id,
+                "reap_state": reap_state,
+                "attempt_uuid": _task_field(reap_run, "reap_attempt_uuid"),
+                "lease_owner": _task_field(reap_run, "reap_lease_owner"),
+                "lease_expires": _task_field(reap_run, "reap_lease_expires"),
+                "heartbeat_at": _task_field(reap_run, "reap_heartbeat_at"),
+                "attempts": int(_task_field(reap_run, "reap_attempts", 0) or 0),
+                "term_sent_at": _task_field(reap_run, "reap_term_sent_at"),
+                "kill_sent_at": _task_field(reap_run, "reap_kill_sent_at"),
+            },
+        )
     status = _task_field(task, "status")
     if status not in _TERMINAL_STATUSES:
         return None
@@ -1982,7 +2064,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     "failed Nx", which reads as a current failure. It re-fires if the new
     run fails too (status leaves ``running`` with a recorded outcome).
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in (_TERMINAL_STATUSES | {"running"}):
         return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
@@ -2114,7 +2196,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
     so a retried card kept showing "crashed Nx" over an active run. The
     banner re-fires if the new attempt also crashes.
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in (_TERMINAL_STATUSES | {"running"}):
         return []
     failure_threshold = int(cfg.get(
         "failure_threshold",

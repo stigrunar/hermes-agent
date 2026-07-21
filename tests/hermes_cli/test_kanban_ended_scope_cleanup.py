@@ -74,6 +74,9 @@ def _scoped_run(
             result="finished",
             expected_run_id=run_id,
         )
+        task_status = "done"
+        run_status = "completed"
+        run_outcome = "completed"
     elif final_status == "ready":
         assert kb.block_task(
             conn,
@@ -81,14 +84,31 @@ def _scoped_run(
             reason="retry later",
             expected_run_id=run_id,
         )
-        assert kb.unblock_task(conn, task_id)
-        assert kb.get_task(conn, task_id).status == "ready"
+        task_status = "ready"
+        run_status = "blocked"
+        run_outcome = "blocked"
     else:  # pragma: no cover - test helper misuse
         raise AssertionError(final_status)
+    # These tests exercise cleanup of already-ended historical scopes, not the
+    # Phase B reaper itself. Materialize the post-reap fixture explicitly so
+    # scope cleanup cannot run before terminal finalization.
+    ended_at = int(time.time()) - 30
     conn.execute(
-        "UPDATE task_runs SET ended_at=? WHERE id=?",
-        (int(time.time()) - 30, run_id),
+        "UPDATE tasks SET status=?, current_run_id=NULL, claim_lock=NULL, "
+        "claim_expires=NULL, worker_pid=NULL, last_heartbeat_at=NULL, "
+        "completed_at=? WHERE id=?",
+        (
+            task_status,
+            ended_at if task_status == "done" else None,
+            task_id,
+        ),
     )
+    conn.execute(
+        "UPDATE task_runs SET status=?, outcome=?, ended_at=?, "
+        "reap_state='finalized', reap_completed_at=? WHERE id=?",
+        (run_status, run_outcome, ended_at, ended_at, run_id),
+    )
+    assert kb.get_task(conn, task_id).status == task_status
     conn.commit()
     return task_id, run_id, unit
 
@@ -917,10 +937,16 @@ def test_modern_direct_receipt_remains_not_applicable_and_not_classifiable(
             reason="retry direct",
             expected_run_id=run_id,
         )
-        assert kb.unblock_task(conn, task_id)
+        ended_at = int(time.time()) - 30
         conn.execute(
-            "UPDATE task_runs SET ended_at=? WHERE id=?",
-            (int(time.time()) - 30, run_id),
+            "UPDATE tasks SET status='ready', current_run_id=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL WHERE id=?",
+            (task_id,),
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='blocked', outcome='blocked', ended_at=?, "
+            "reap_state='finalized', reap_completed_at=? WHERE id=?",
+            (ended_at, ended_at, run_id),
         )
         conn.commit()
 

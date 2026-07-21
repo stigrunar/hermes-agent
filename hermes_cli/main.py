@@ -15317,10 +15317,11 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        return result if type(result) is int else None
     else:
         parser.print_help()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

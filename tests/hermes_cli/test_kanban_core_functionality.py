@@ -24,6 +24,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_worker_process as kp
 from hermes_cli.kanban import run_slash
 
 
@@ -51,6 +52,47 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kb.init_db()
     return home
+
+
+@pytest.fixture(autouse=True)
+def deterministic_phase_b_worker_identity(monkeypatch):
+    """Give legacy lifecycle cases exact identities and trusted completion proof."""
+    monkeypatch.setattr(
+        kp,
+        "read_identity",
+        lambda pid: kp.ProcessIdentity(int(pid), float(int(pid)) + 0.25),
+    )
+    monkeypatch.setattr(
+        kp,
+        "identity_state",
+        lambda identity: "alive" if kb._pid_alive(identity.pid) else "gone",
+    )
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "captured", tuple(dict.fromkeys([root, *previous]))
+        ),
+    )
+    monkeypatch.setattr(
+        kp,
+        "protected_process_identities",
+        lambda extra=(): ({int(pid) for pid in extra}, set()),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_worker_scope_state",
+        lambda *_args, **_kwargs: kb._WorkerScopeStatus(
+            "hermes-test-worker.scope", "inactive", "test-manager",
+            "systemd-user-scope", True,
+        ),
+    )
+
+
+def _finish_phase_b_reap(conn, *, signal_fn=None):
+    return kb.reconcile_worker_reaps(
+        conn, protected_pid_fn=lambda: set(), signal_fn=signal_fn,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -498,6 +540,109 @@ def test_board_stats(kanban_home):
         assert stats["oldest_ready_age_seconds"] is not None
     finally:
         conn.close()
+
+
+def test_cancelled_is_terminal_for_claim_unblock_parent_gating_and_stats(kanban_home):
+    conn = kb.connect()
+    try:
+        parent = kb.create_task(conn, title="cancelled parent", assignee="x")
+        child = kb.create_task(
+            conn, title="dependent child", assignee="y", parents=[parent],
+        )
+
+        assert kb.cancel_task(conn, parent, reason="operator")
+        assert kb.get_task(conn, parent).status == "cancelled"
+        assert kb.claim_task(conn, parent) is None
+        assert kb.unblock_task(conn, parent) is False
+        assert kb.recompute_ready(conn) == 1
+        assert kb.get_task(conn, child).status == "ready"
+
+        stats = kb.board_stats(conn)
+        assert stats["by_status"]["cancelled"] == 1
+        assert stats["by_assignee"]["x"]["cancelled"] == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("terminal_status", sorted(kb.TERMINAL_STATUSES))
+def test_cancel_task_preserves_every_terminal_classification(
+    kanban_home, terminal_status,
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=terminal_status, assignee="x")
+        conn.execute(
+            "UPDATE tasks SET status=?, completed_at=123 WHERE id=?",
+            (terminal_status, task_id),
+        )
+        conn.commit()
+        before = [(event.id, event.kind, event.payload) for event in kb.list_events(conn, task_id)]
+
+        assert kb.cancel_task(conn, task_id, reason="must remain historical") is False
+
+        task = kb.get_task(conn, task_id)
+        assert task.status == terminal_status
+        assert task.completed_at == 123
+        assert [(event.id, event.kind, event.payload) for event in kb.list_events(conn, task_id)] == before
+
+
+def test_cancel_task_still_cancels_nonterminal_task(kanban_home):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="active cancellation", assignee="x")
+        assert kb.cancel_task(conn, task_id, reason="operator") is True
+        assert kb.get_task(conn, task_id).status == "cancelled"
+        assert [event.kind for event in kb.list_events(conn, task_id)].count("cancelled") == 1
+
+
+@pytest.mark.parametrize("terminal_status", ["superseded", "stale_continuity_only"])
+@pytest.mark.parametrize("verdict", ["changes_requested", "approved"])
+def test_review_verdict_uses_canonical_terminal_fan_in_for_recuts_and_successors(
+    kanban_home, terminal_status, verdict,
+):
+    """Both verdict fan-in gates accept every canonical terminal parent."""
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+        review = kb.create_task(
+            conn, title="review", assignee="reviewer", parents=[source],
+        )
+        successor = kb.create_task(conn, title="successor", assignee="operator")
+        kb.register_review_handoff(
+            conn, source, review, next_task_id=successor,
+        )
+        source_claim = kb.claim_task(conn, source, claimer="builder:1")
+        assert source_claim is not None
+        assert kb.block_task(
+            conn,
+            source,
+            reason="review-required: exact review",
+            expected_run_id=source_claim.current_run_id,
+        )
+
+        historical_parent = kb.create_task(conn, title="historical fan-in")
+        assert kb.mark_task_non_actionable(
+            conn,
+            historical_parent,
+            status=terminal_status,
+            actor="controller",
+        )
+        fan_in_target = source if verdict == "changes_requested" else successor
+        kb.link_tasks(conn, historical_parent, fan_in_target)
+
+        review_claim = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert review_claim is not None
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict=verdict,
+            summary="exact verdict",
+            expected_run_id=review_claim.current_run_id,
+        )
+
+        if verdict == "changes_requested":
+            assert kb.get_task(conn, source).status == "ready"
+            assert kb.get_task(conn, successor).status == "todo"
+        else:
+            assert kb.get_task(conn, source).status == "done"
+            assert kb.get_task(conn, successor).status == "ready"
 
 
 def test_task_age_helper(kanban_home):
@@ -980,10 +1125,17 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
 
             task = kb.get_task(conn, tid)
-            assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
+            assert task.status == "running"
+            _finish_phase_b_reap(conn, signal_fn=_signal_fn)
+            # The exact identity was already gone at reaper time, so the
+            # kernel-safe signal path correctly delivered no signal; the
+            # trusted scope boundary still authorized finalization.
+            assert killed == []
+            task = kb.get_task(conn, tid)
+            assert task.status == "ready", \
+                f"timed-out task should reset to ready, got {task.status}"
             assert task.worker_pid is None
             assert task.last_heartbeat_at is None
 
@@ -1026,6 +1178,7 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
                 _age_active_run(conn, tid)
                 timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
                 assert tid in timed_out
+                _finish_phase_b_reap(conn)
                 task = kb.get_task(conn, tid)
                 assert task.consecutive_failures == expected_failures
             task = kb.get_task(conn, tid)
@@ -1232,7 +1385,11 @@ def test_spawned_event_emitted_with_pid(kanban_home, all_assignees_spawnable):
         events = kb.list_events(conn, tid)
         spawned = [e for e in events if e.kind == "spawned"]
         assert len(spawned) == 1
-        assert spawned[0].payload == {"pid": 98765, "launch_mode": "direct"}
+        assert spawned[0].payload == {
+            "pid": 98765,
+            "launch_mode": "direct",
+            "identity_verified": True,
+        }
     finally:
         conn.close()
 
@@ -1496,6 +1653,7 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
                 (int(time.time()) - 10, tid),
             )
         kb.release_stale_claims(conn)
+        _finish_phase_b_reap(conn)
 
         # Attempt 2: claim then crash (simulated: pid dead).
         kb.claim_task(conn, tid)
@@ -1504,6 +1662,7 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
         _kb._pid_alive = lambda pid: False
         try:
             kb.detect_crashed_workers(conn)
+            _finish_phase_b_reap(conn)
         finally:
             _kb._pid_alive = original_alive
 
@@ -1533,6 +1692,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [tid]
+        _finish_phase_b_reap(conn)
 
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
@@ -1554,6 +1714,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
             summary="current completion",
             expected_run_id=run2.id,
         )
+        _finish_phase_b_reap(conn)
         runs = kb.list_runs(conn, tid)
         assert [r.outcome for r in runs] == ["crashed", "completed"]
         assert runs[-1].summary == "current completion"
@@ -1574,6 +1735,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
         kb._set_worker_pid(conn, tid, 98765)
         monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
         assert kb.detect_crashed_workers(conn) == [tid]
+        _finish_phase_b_reap(conn)
 
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
@@ -1588,6 +1750,7 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
 
         assert kb.heartbeat_worker(conn, tid, note="current", expected_run_id=run2.id)
         assert kb.block_task(conn, tid, reason="current block", expected_run_id=run2.id)
+        _finish_phase_b_reap(conn)
         assert kb.get_task(conn, tid).status == "blocked"
     finally:
         conn.close()
@@ -2036,9 +2199,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
     finally:
         conn.close()
     # Bulk + summary is refused (stderr message, no mutation).
-    # Note: hermes_cli.main doesn't propagate sub-command exit codes
-    # (args.func(args) discards the return value), so we check the side
-    # effects instead.
+    # The top-level module entry must preserve the command's rejection code.
     from subprocess import run as _run
     import os, sys
     env = os.environ.copy()
@@ -2047,6 +2208,7 @@ def test_cli_bulk_complete_with_summary_rejects(kanban_home):
          "complete", a, b, "--summary", "oops"],
         capture_output=True, text=True, env=env,
     )
+    assert r.returncode == 2, r
     assert "per-task" in r.stderr, r.stderr
     # The tasks must still be running (no partial apply).
     conn = kb.connect()
@@ -4546,9 +4708,8 @@ def test_complete_prose_scan_ignores_existing_ids(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
-    """Manual reclaim releases the claim, resets status, and emits a
-    ``reclaimed`` event even when claim_expires has not passed."""
+def test_reclaim_task_defers_pid_only_worker(kanban_home, monkeypatch):
+    """Manual reclaim stays pending when the exact worker identity is absent."""
     import signal
     import time
     import secrets
@@ -4589,27 +4750,22 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert kb.reclaim_task(conn, t, reason="test reason", signal_fn=_signal) is True
 
         row = conn.execute(
-            "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
+            "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id=?",
             (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["claim_lock"] is None
-        assert row["worker_pid"] is None
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
+        assert row["worker_pid"] == 12345
+        reap = conn.execute(
+            "SELECT reap_state FROM task_runs WHERE id=?", (row["current_run_id"],),
+        ).fetchone()
+        assert reap["reap_state"] == "identity_unverifiable"
 
-        import json as _json
-        reclaim_evs = [
-            _json.loads(r["payload"])
-            for r in conn.execute(
-                "SELECT payload FROM task_events WHERE task_id=? AND kind='reclaimed'",
-                (t,),
-            )
-        ]
-        assert len(reclaim_evs) == 1
-        assert reclaim_evs[0].get("manual") is True
-        assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        assert not conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='reclaimed'",
+            (t,),
+        ).fetchone()
+        assert killed == []
     finally:
         conn.close()
 
@@ -4646,9 +4802,9 @@ def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
         conn.close()
 
 
-def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
-    """With ``reclaim_first=True``, a running task is reclaimed and
-    reassigned in one operation."""
+def test_reassign_task_with_reclaim_first_defers_profile_switch(kanban_home):
+    """With ``reclaim_first=True``, a PID-only running task stores the
+    reassignment until exact reaping can finalize it."""
     import time
     import secrets
     conn = kb.connect()
@@ -4676,10 +4832,14 @@ def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
         ) is True
 
         row = conn.execute(
-            "SELECT assignee, status FROM tasks WHERE id=?", (t,),
+            "SELECT assignee, status, current_run_id FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["assignee"] == "new-profile"
-        assert row["status"] == "ready"
+        assert row["assignee"] == "orig"
+        assert row["status"] == "running"
+        payload = conn.execute(
+            "SELECT terminal_payload FROM task_runs WHERE id=?", (row["current_run_id"],),
+        ).fetchone()["terminal_payload"]
+        assert json.loads(payload)["assignee"] == "new-profile"
     finally:
         conn.close()
 
@@ -4731,6 +4891,7 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         assert before.consecutive_failures == 0
 
         kb.enforce_max_runtime(conn, signal_fn=_signal)
+        _finish_phase_b_reap(conn)
 
         after = kb.get_task(conn, tid)
         assert after.consecutive_failures == 1
@@ -4797,10 +4958,12 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
                     "UPDATE tasks SET current_run_id=? WHERE id=?",
                     (rid, tid),
                 )
+            kb._set_worker_pid(conn, tid, os.getpid(), expected_run_id=rid)
             state["sent_term"] = False
             # Lower the threshold by monkeypatching the default.
             monkeypatch.setattr(_kb, "DEFAULT_FAILURE_LIMIT", 3)
             kb.enforce_max_runtime(conn, signal_fn=_signal)
+            _finish_phase_b_reap(conn)
 
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should
@@ -4830,6 +4993,7 @@ def test_detect_crashed_workers_increments_counter(kanban_home):
         kb._set_worker_pid(conn, tid, 99999)  # fake pid — not alive
 
         kb.detect_crashed_workers(conn)
+        _finish_phase_b_reap(conn)
 
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 1
@@ -4858,7 +5022,9 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     original_alive = _kb._pid_alive
     _kb._pid_alive = lambda p: False
     try:
-        return _kb.detect_crashed_workers(conn)
+        result = _kb.detect_crashed_workers(conn)
+        _finish_phase_b_reap(conn)
+        return result
     finally:
         _kb._pid_alive = original_alive
 
@@ -5108,6 +5274,7 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
             kb.detect_crashed_workers(conn)
         finally:
             _kb._pid_alive = original_alive
+        _finish_phase_b_reap(conn)
 
         task = kb.get_task(conn, tid)
         assert task.status == "ready", (
@@ -5122,9 +5289,8 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
         conn.close()
 
 
-def test_reclaim_task_clears_failure_counter(kanban_home):
-    """Operator reclaim wipes the counter so the next retry gets a fresh
-    budget."""
+def test_reclaim_task_defers_failure_counter_clear_without_identity(kanban_home):
+    """A PID-only reclaim keeps failure state until exact reaping finalizes."""
     import secrets
     conn = kb.connect()
     try:
@@ -5153,9 +5319,10 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         assert ok
 
         task = kb.get_task(conn, tid)
-        assert task.consecutive_failures == 0
-        assert task.last_failure_error is None
-        assert task.status == "ready"
+        assert task.status == "running"
+        assert task.consecutive_failures == 4
+        run = kb.get_run(conn, task.current_run_id)
+        assert run.reap_state == "identity_unverifiable"
     finally:
         conn.close()
 
@@ -5188,6 +5355,7 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
             stale_timeout_seconds=14400,
         )
         assert t in res.stale, "Stale task should appear in result.stale"
+        _finish_phase_b_reap(conn)
         assert kb.get_task(conn, t).status == "ready"
 
 

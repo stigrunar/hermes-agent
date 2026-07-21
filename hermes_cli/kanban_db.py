@@ -87,6 +87,7 @@ import sys
 import threading
 import logging
 import time
+import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -203,11 +204,13 @@ _WORKER_PROFILE_AMBIENT_PREFIXES = ("OP_SESSION_", "AWS_ENDPOINT_URL_")
 
 VALID_STATUSES = {
     "triage", "todo", "scheduled", "ready", "running", "blocked", "review",
-    "done", "archived", "superseded", "stale_continuity_only",
+    "done", "archived", "cancelled", "superseded", "stale_continuity_only",
 }
 VALID_INITIAL_STATUSES = {"running", "blocked"}
-NON_ACTIONABLE_STATUSES = {"archived", "superseded", "stale_continuity_only"}
-TERMINAL_STATUSES = {"done", "archived", "superseded", "stale_continuity_only"}
+NON_ACTIONABLE_STATUSES = {
+    "archived", "cancelled", "superseded", "stale_continuity_only",
+}
+TERMINAL_STATUSES = {"done", "archived", "cancelled", "superseded", "stale_continuity_only"}
 CONTROLLER_ACCEPT_VERDICTS = {"accepted", "approved", "approved_not_live"}
 DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
 
@@ -232,6 +235,14 @@ DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+
+
+def _terminal_status_sql() -> tuple[str, tuple[str, ...]]:
+    """Return SQL placeholders and values derived from the canonical set."""
+    values = tuple(sorted(TERMINAL_STATUSES))
+    return ",".join("?" for _ in values), values
+
+
 REVIEW_REQUIRED_PREFIX = "review-required:"
 VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
 AUTONOMOUS_CONTINUATION_BLOCK_KINDS = frozenset({"capability", "transient"})
@@ -461,6 +472,10 @@ DEFAULT_BOARD = "default"
 _CURRENT_BOARD_OVERRIDE: ContextVar[str | None] = ContextVar(
     "hermes_kanban_current_board_override",
     default=None,
+)
+_DISPATCH_LOCK_HELD: ContextVar[bool] = ContextVar(
+    "hermes_kanban_dispatch_lock_held",
+    default=False,
 )
 
 
@@ -1173,6 +1188,23 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
+    worker_identity: Optional[dict]
+    worker_tree: Optional[list[dict]]
+    terminal_payload: Optional[dict]
+    terminal_requested_at: Optional[int]
+    reap_state: Optional[str]
+    reap_attempt_uuid: Optional[str]
+    reap_lease_owner: Optional[str]
+    reap_lease_expires: Optional[int]
+    reap_heartbeat_at: Optional[int]
+    reap_term_sent_at: Optional[int]
+    reap_kill_sent_at: Optional[int]
+    reap_term_intent_at: Optional[int]
+    reap_kill_intent_at: Optional[int]
+    reap_signal_progress: Optional[dict]
+    reap_attempts: int
+    reap_error: Optional[str]
+    reap_completed_at: Optional[int]
     max_runtime_seconds: Optional[int]
     last_heartbeat_at: Optional[int]
     started_at: int
@@ -1184,10 +1216,21 @@ class Run:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
         try:
             meta = json.loads(row["metadata"]) if row["metadata"] else None
         except Exception:
             meta = None
+
+        def _json_column(name: str, expected_type):
+            if name not in keys or not row[name]:
+                return None
+            try:
+                value = json.loads(row[name])
+            except (TypeError, ValueError):
+                return None
+            return value if isinstance(value, expected_type) else None
+
         return cls(
             id=int(row["id"]),
             task_id=row["task_id"],
@@ -1197,6 +1240,45 @@ class Run:
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             worker_pid=row["worker_pid"],
+            worker_identity=_json_column("worker_identity", dict),
+            worker_tree=_json_column("worker_tree", list),
+            terminal_payload=_json_column("terminal_payload", dict),
+            terminal_requested_at=(
+                row["terminal_requested_at"] if "terminal_requested_at" in keys else None
+            ),
+            reap_state=row["reap_state"] if "reap_state" in keys else None,
+            reap_attempt_uuid=(
+                row["reap_attempt_uuid"] if "reap_attempt_uuid" in keys else None
+            ),
+            reap_lease_owner=(
+                row["reap_lease_owner"] if "reap_lease_owner" in keys else None
+            ),
+            reap_lease_expires=(
+                row["reap_lease_expires"] if "reap_lease_expires" in keys else None
+            ),
+            reap_heartbeat_at=(
+                row["reap_heartbeat_at"] if "reap_heartbeat_at" in keys else None
+            ),
+            reap_term_sent_at=(
+                row["reap_term_sent_at"] if "reap_term_sent_at" in keys else None
+            ),
+            reap_kill_sent_at=(
+                row["reap_kill_sent_at"] if "reap_kill_sent_at" in keys else None
+            ),
+            reap_term_intent_at=(
+                row["reap_term_intent_at"] if "reap_term_intent_at" in keys else None
+            ),
+            reap_kill_intent_at=(
+                row["reap_kill_intent_at"] if "reap_kill_intent_at" in keys else None
+            ),
+            reap_signal_progress=_json_column("reap_signal_progress", dict),
+            reap_attempts=(
+                int(row["reap_attempts"] or 0) if "reap_attempts" in keys else 0
+            ),
+            reap_error=row["reap_error"] if "reap_error" in keys else None,
+            reap_completed_at=(
+                row["reap_completed_at"] if "reap_completed_at" in keys else None
+            ),
             max_runtime_seconds=row["max_runtime_seconds"],
             last_heartbeat_at=row["last_heartbeat_at"],
             started_at=int(row["started_at"]),
@@ -1395,6 +1477,25 @@ CREATE TABLE IF NOT EXISTS task_runs (
     claim_lock          TEXT,
     claim_expires       INTEGER,
     worker_pid          INTEGER,
+    -- Exact worker ownership and durable two-phase terminal journal. Numeric
+    -- PID alone is never sufficient ownership proof.
+    worker_identity     TEXT,
+    worker_tree         TEXT,
+    terminal_payload    TEXT,
+    terminal_requested_at INTEGER,
+    reap_state          TEXT,
+    reap_attempt_uuid   TEXT,
+    reap_lease_owner    TEXT,
+    reap_lease_expires  INTEGER,
+    reap_heartbeat_at   INTEGER,
+    reap_term_sent_at   INTEGER,
+    reap_kill_sent_at   INTEGER,
+    reap_term_intent_at INTEGER,
+    reap_kill_intent_at INTEGER,
+    reap_signal_progress TEXT,
+    reap_attempts       INTEGER NOT NULL DEFAULT 0,
+    reap_error          TEXT,
+    reap_completed_at   INTEGER,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -1848,7 +1949,14 @@ def _dispatch_tick_lock(db_path: Path):
                         ):
                             outcome = _DispatchLockOutcome(False, "identity_mismatch")
 
-        yield outcome
+        lock_token = None
+        if outcome.acquired:
+            lock_token = _DISPATCH_LOCK_HELD.set(True)
+        try:
+            yield outcome
+        finally:
+            if lock_token is not None:
+                _DISPATCH_LOCK_HELD.reset(lock_token)
     finally:
         if fd is not None:
             try:
@@ -2529,6 +2637,42 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 
     _rebuild_drifted_tables(conn)
 
+    # Ultra Phase B: additive, backward-compatible terminal worker-reaping
+    # journal. Keep this after drift rebuilds because a legacy task_runs table
+    # may have been reconstructed immediately above.
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone():
+        run_cols = {
+            row["name"] for row in conn.execute("PRAGMA table_info(task_runs)")
+        }
+        run_additions = {
+            "worker_identity": "worker_identity TEXT",
+            "worker_tree": "worker_tree TEXT",
+            "terminal_payload": "terminal_payload TEXT",
+            "terminal_requested_at": "terminal_requested_at INTEGER",
+            "reap_state": "reap_state TEXT",
+            "reap_attempt_uuid": "reap_attempt_uuid TEXT",
+            "reap_lease_owner": "reap_lease_owner TEXT",
+            "reap_lease_expires": "reap_lease_expires INTEGER",
+            "reap_heartbeat_at": "reap_heartbeat_at INTEGER",
+            "reap_term_sent_at": "reap_term_sent_at INTEGER",
+            "reap_kill_sent_at": "reap_kill_sent_at INTEGER",
+            "reap_term_intent_at": "reap_term_intent_at INTEGER",
+            "reap_kill_intent_at": "reap_kill_intent_at INTEGER",
+            "reap_signal_progress": "reap_signal_progress TEXT",
+            "reap_attempts": "reap_attempts INTEGER NOT NULL DEFAULT 0",
+            "reap_error": "reap_error TEXT",
+            "reap_completed_at": "reap_completed_at INTEGER",
+        }
+        for name, definition in run_additions.items():
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, definition)
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_reap "
+            "ON task_runs(reap_state, reap_lease_expires, id)"
+        )
+
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
@@ -2566,13 +2710,21 @@ _REBUILD_SPECS = {
         " id INTEGER PRIMARY KEY AUTOINCREMENT,"
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
-        " worker_pid INTEGER, max_runtime_seconds INTEGER,"
+        " worker_pid INTEGER, worker_identity TEXT, worker_tree TEXT,"
+        " terminal_payload TEXT, terminal_requested_at INTEGER, reap_state TEXT,"
+        " reap_attempt_uuid TEXT, reap_lease_owner TEXT, reap_lease_expires INTEGER,"
+        " reap_heartbeat_at INTEGER, reap_term_sent_at INTEGER,"
+        " reap_kill_sent_at INTEGER, reap_term_intent_at INTEGER,"
+        " reap_kill_intent_at INTEGER, reap_signal_progress TEXT,"
+        " reap_attempts INTEGER NOT NULL DEFAULT 0,"
+        " reap_error TEXT, reap_completed_at INTEGER, max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
+            "CREATE INDEX idx_runs_reap ON task_runs(reap_state, reap_lease_expires, id)",
         ),
     ),
     "kanban_notify_subs": (
@@ -3097,7 +3249,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status NOT IN ('archived', 'superseded', 'stale_continuity_only') "
+            "AND status NOT IN ('archived', 'cancelled', 'superseded', 'stale_continuity_only') "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
@@ -3326,7 +3478,7 @@ def list_tasks(
         query += " AND current_step_key = ?"
         params.append(current_step_key)
     if not include_archived and status not in NON_ACTIONABLE_STATUSES:
-        query += " AND status NOT IN ('archived', 'superseded', 'stale_continuity_only')"
+        query += " AND status NOT IN ('archived', 'cancelled', 'superseded', 'stale_continuity_only')"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3428,7 +3580,7 @@ def _validate_review_handoff_graph(
             tuple(ids),
         ).fetchall()
     }
-    if tasks[source_task_id]["status"] in ("done", "archived"):
+    if tasks[source_task_id]["status"] in TERMINAL_STATUSES:
         raise ValueError("review handoff source is already terminal")
     if tasks[review_task_id]["status"] not in ("todo", "ready", "blocked"):
         raise ValueError(
@@ -3486,6 +3638,18 @@ def register_review_handoff(
     before any mutation.
     """
     with write_txn(conn):
+        accepted_terminal = conn.execute(
+            "SELECT r.id FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.id=? AND r.reap_state IN "
+            "('terminal_requested','reap_pending','reaping',"
+            "'identity_unverifiable','manual_recovery_required','reaped')",
+            (source_task_id,),
+        ).fetchone()
+        if accepted_terminal is not None:
+            raise ValueError(
+                "terminal transition already accepted; review handoff cannot "
+                "mutate the pending terminal intent"
+            )
         existing = _review_handoff_row(conn, source_task_id=source_task_id)
         if existing is not None:
             if (
@@ -4091,6 +4255,8 @@ def _append_diagnostic_event(
     )
 
 
+
+
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4149,7 +4315,15 @@ def _end_run(
                ended_at      = ?,
                claim_lock    = NULL,
                claim_expires = NULL,
-               worker_pid    = NULL
+               worker_pid    = NULL,
+               reap_state    = CASE
+                   WHEN reap_state = 'reaped' THEN 'finalized'
+                   ELSE reap_state
+               END,
+               reap_completed_at = CASE
+                   WHEN reap_state = 'reaped' THEN ?
+                   ELSE reap_completed_at
+               END
          WHERE id = ?
            AND ended_at IS NULL
         """,
@@ -4159,6 +4333,7 @@ def _end_run(
             summary,
             error,
             json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
+            now,
             now,
             run_id,
         ),
@@ -4322,7 +4497,9 @@ def _dependency_wait_changed(conn: sqlite3.Connection, task_id: str) -> bool:
         "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
         "WHERE l.child_id = ?", (task_id,),
     ).fetchall()
-    return bool(parents) and all(parent["status"] in ("done", "archived") for parent in parents)
+    return bool(parents) and all(
+        parent["status"] in TERMINAL_STATUSES for parent in parents
+    )
 
 
 def recompute_ready(
@@ -4687,11 +4864,12 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        terminal_placeholders, terminal_statuses = _terminal_status_sql()
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only') LIMIT 1",
-            (task_id,),
+            f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
+            (task_id, *terminal_statuses),
         ).fetchone()
         if undone:
             conn.execute(
@@ -5000,15 +5178,16 @@ def release_stale_claims(
     Returns the number of stale claims actually reclaimed (live-pid
     extensions don't count). Safe to call often.
     """
+    release_stale_claims._last_transition_conflicts = []  # type: ignore[attr-defined]
     now = int(time.time())
     reclaimed = 0
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       current_run_id "
-        "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?",
+        "SELECT t.id, t.claim_lock, t.worker_pid, t.claim_expires, "
+        "t.last_heartbeat_at, t.current_run_id, r.worker_identity "
+        "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status = 'running' AND t.claim_expires IS NOT NULL "
+        "  AND t.claim_expires < ?",
         (now,),
     ).fetchall()
     for row in stale:
@@ -5042,6 +5221,17 @@ def release_stale_claims(
         if scope_status is not None:
             _, scope_state = scope_status
             scope_launch_mode = getattr(scope_status, "launch_mode", "legacy")
+        exact_identity = _decode_process_identity(row["worker_identity"])
+        exact_state = (
+            _exact_identity_state(row["worker_identity"])
+            if exact_identity is not None else "unknown"
+        )
+        if row["worker_pid"] is not None and (
+            exact_identity is None or exact_state == "unknown" or scope_state == "unknown"
+        ):
+            # PID-only, inaccessible, or scope-unknown ownership stays live and
+            # fenced. Never signal or release on a numeric PID guess.
+            continue
         if scope_state == "unknown":
             termination = (
                 _terminate_reclaimed_worker(
@@ -5084,9 +5274,48 @@ def release_stale_claims(
             and scope_state in {"inactive", "not-found"}
         )
         if (
+            process_effects
+            and exact_identity is not None
+            and (heartbeat_stale or exact_state in {"gone", "reused"}
+                 or scoped_unit_needs_collection)
+        ):
+            error = f"stale_lock={row['claim_lock']}"
+            try:
+                requested = _request_terminal_transition(
+                    conn, row["id"], action="reclaimed",
+                    payload={
+                    "task_status": _claim_retry_status(conn, row["id"]),
+                    "run_status": "reclaimed", "outcome": "reclaimed",
+                    "event_kind": "reclaimed", "error": error,
+                    "event_payload": {
+                        "stale_lock": row["claim_lock"],
+                        "worker_pid": int(row["worker_pid"]),
+                        "claim_expires": int(row["claim_expires"]),
+                        "last_heartbeat_at": (
+                            int(row["last_heartbeat_at"])
+                            if row["last_heartbeat_at"] is not None else None
+                        ),
+                        "host_local": host_local,
+                        "heartbeat_stale": bool(heartbeat_stale),
+                    },
+                },
+                    expected_run_id=row["current_run_id"],
+                )
+            except TerminalTransitionConflict as exc:
+                requested = False
+                release_stale_claims._last_transition_conflicts.append({  # type: ignore[attr-defined]
+                    "task_id": row["id"],
+                    "state": "conflict",
+                    "reason": "terminal_transition_conflict",
+                    "detail": str(exc),
+                })
+            if requested:
+                reclaimed += 1
+                continue
+        if (
             host_local
             and row["worker_pid"]
-            and _pid_alive(row["worker_pid"])
+            and exact_state == "alive"
             and not heartbeat_stale
             and not scoped_unit_needs_collection
         ):
@@ -5220,6 +5449,7 @@ def reclaim_task(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Operator-driven reclaim: stop the worker, then reset it to ``ready``.
 
@@ -5229,9 +5459,10 @@ def reclaim_task(
     when an operator wants to abort a running worker without waiting
     for the TTL to expire (e.g. after seeing a hallucination warning).
 
-    Returns True if a reclaim happened. Returns False if the task is not
-    reclaimable or if its host-local worker/scope could not be proved gone;
-    retaining the claim in that case prevents duplicate execution.
+    Returns True if the reclaim happened or a durable terminal request was
+    accepted. Returns False if the task is not reclaimable; an accepted
+    request retains the claim until the leased reaper proves the worker tree
+    gone, preventing duplicate execution.
     """
     db_path = _connection_main_db_path(conn)
     if db_path is None:
@@ -5249,6 +5480,7 @@ def reclaim_task(
                 task_id,
                 reason=reason,
                 signal_fn=signal_fn,
+                expected_run_id=expected_run_id,
             )
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, current_run_id "
@@ -5291,6 +5523,7 @@ def _reclaim_task_locked(
     *,
     reason: Optional[str] = None,
     signal_fn=None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Reclaim after the caller has excluded a concurrent dispatch tick."""
     row = conn.execute(
@@ -5300,10 +5533,29 @@ def _reclaim_task_locked(
     ).fetchone()
     if not row:
         return False
+    if expected_run_id is not None and int(row["current_run_id"] or 0) != int(expected_run_id):
+        return False
     if row["status"] != "running" and row["claim_lock"] is None:
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    if row["worker_pid"] is not None:
+        return _request_terminal_transition(
+            conn, task_id, action="reclaimed",
+            payload={
+                "task_status": _claim_retry_status(conn, task_id),
+                "run_status": "reclaimed", "outcome": "reclaimed",
+                "event_kind": "reclaimed",
+                "error": (
+                    f"manual_reclaim: {reason}" if reason
+                    else f"manual_reclaim lock={prev_lock}"
+                ),
+                "event_payload": {"manual": True, "reason": reason,
+                                  "prev_lock": prev_lock},
+                "clear_failure_counter": True,
+            },
+            expected_run_id=row["current_run_id"],
+        )
     termination = _terminate_reclaimed_worker(
         row["worker_pid"],
         prev_lock,
@@ -5363,6 +5615,47 @@ def _reclaim_task_locked(
     return True
 
 
+def cancel_task(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    reason: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Cancel a task, reaping an active exact worker before finalization."""
+    if _request_terminal_transition(
+        conn, task_id, action="cancelled",
+        payload={
+            "task_status": "cancelled", "run_status": "cancelled",
+            "outcome": "cancelled", "event_kind": "cancelled",
+            "error": reason, "event_payload": {"reason": reason},
+        },
+        expected_run_id=expected_run_id,
+    ):
+        return True
+    with write_txn(conn):
+        terminal_statuses = tuple(sorted(TERMINAL_STATUSES))
+        params: tuple[Any, ...] = ()
+        guard = ""
+        if expected_run_id is not None:
+            guard = " AND current_run_id=?"
+            params = (int(expected_run_id),)
+        terminal_placeholders = ",".join("?" for _ in terminal_statuses)
+        cur = conn.execute(
+            "UPDATE tasks SET status='cancelled', claim_lock=NULL, "
+            "claim_expires=NULL, worker_pid=NULL, completed_at=? "
+            f"WHERE id=? AND status NOT IN ({terminal_placeholders})" + guard,
+            (int(time.time()), task_id, *terminal_statuses, *params),
+        )
+        if cur.rowcount != 1:
+            return False
+        run_id = _end_run(
+            conn, task_id, outcome="cancelled", status="cancelled", error=reason,
+        )
+        _append_event(conn, task_id, "cancelled", {"reason": reason}, run_id=run_id)
+    return True
+
+
 def reassign_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5379,11 +5672,47 @@ def reassign_task(
     otherwise the function refuses to reassign a currently-running task
     and returns False (caller can retry with ``reclaim_first=True``).
 
-    Returns True if the reassign landed. ``profile`` may be ``None`` to
-    unassign entirely.
+    Returns True if the reassign landed or its durable post-reap intent was
+    accepted. ``profile`` may be ``None`` to unassign entirely.
     """
+    profile = _canonical_assignee(profile)
     if reclaim_first:
-        # Safe to call even if nothing to reclaim.
+        # Reassignment is itself the terminal intent.  Do not request a plain
+        # reclaim and then race the leased reaper with assign_task(): Phase B
+        # deliberately keeps the claim while the exact worker tree is live.
+        row = conn.execute(
+            "SELECT status, worker_pid, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        if row["status"] == "running" and row["worker_pid"] is not None:
+            return _request_terminal_transition(
+                conn,
+                task_id,
+                action="reassign",
+                payload={
+                    "assignee": profile,
+                    "task_status": _claim_retry_status(conn, task_id),
+                    "run_status": "reclaimed",
+                    "outcome": "reclaimed",
+                    "event_kind": "reclaimed",
+                    "error": (
+                        f"manual_reassign: {reason}" if reason
+                        else "manual_reassign"
+                    ),
+                    "event_payload": {
+                        "manual": True,
+                        "reason": reason,
+                        "reassigned_to": profile,
+                    },
+                    "clear_failure_counter": True,
+                },
+                expected_run_id=row["current_run_id"],
+            )
+        # A running row without a worker PID is the legacy/no-worker case;
+        # retain the existing reclaim path for it, where there is no exact
+        # worker tree to defer.
         reclaim_task(conn, task_id, reason=reason or "reassign")
     # assign_task handles its own txn + the still-running guard.
     try:
@@ -5579,6 +5908,7 @@ def complete_task(
     metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None,
     expected_run_id: Optional[int] = None,
+    _after_reap: bool = False,
 ) -> bool:
     """Transition ``running|ready -> done`` and record ``result``.
 
@@ -5610,7 +5940,8 @@ def complete_task(
     """
     now = int(time.time())
 
-    _assert_task_completion_allowed(conn, task_id)
+    if not _after_reap:
+        _assert_task_completion_allowed(conn, task_id)
 
     # A controller must not mark a dispatcher-owned running task terminal
     # while its worker process can still mutate the workspace.  The active
@@ -5655,6 +5986,24 @@ def complete_task(
     else:
         verified_cards = []
 
+    # Active workers request a terminal outcome first, then return and exit.
+    # The exact-tree reaper calls this function again only after every owned
+    # identity is proved gone; until then task status/current_run/workspace and
+    # dependency eligibility remain unchanged.
+    if not _after_reap and _request_terminal_transition(
+        conn,
+        task_id,
+        action="complete",
+        payload={
+            "result": result,
+            "summary": summary,
+            "metadata": metadata,
+            "created_cards": verified_cards,
+        },
+        expected_run_id=expected_run_id,
+    ):
+        return True
+
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -5662,7 +6011,8 @@ def complete_task(
         # Keep the early check above for actionable errors, but repeat it
         # under the write lock immediately before the task CAS. A handoff can
         # be registered after the precheck and must win over completion.
-        _assert_task_completion_allowed(conn, task_id)
+        if not _after_reap:
+            _assert_task_completion_allowed(conn, task_id)
         if expected_run_id is None:
             cur = conn.execute(
                 """
@@ -6382,6 +6732,8 @@ def block_task(
     kind: Optional[str] = None,
     dependency_task_id: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _after_reap: bool = False,
+    _accepted_dependency_payload: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Transition ``running``/``ready`` → ``blocked`` (or route elsewhere).
 
@@ -6414,13 +6766,71 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Validate the policy-bearing portions before accepting phase one. The
+    # worker will exit after this call, so discovering an invalid review or
+    # dependency handoff only after reaping would strand a workerless running
+    # task with an unfulfillable terminal request.
+    if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
+        raise ValueError(
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
+    _request_review_required = bool(
+        reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
+    )
+    if not _after_reap and _request_review_required:
+        handoff = _review_handoff_row(conn, source_task_id=task_id)
+        if handoff is None:
+            raise ValueError(
+                "review-required handoff cannot activate: no explicit review "
+                "relationship (no registered review_handoff). Register exactly "
+                "one with kanban_link relationship='review_gate' before blocking; "
+                "no task state was changed"
+            )
+        # An active handoff has already detached the review gate. Terminal
+        # delivery retries must remain idempotent even though the review card
+        # is intentionally in ``review`` rather than a releasable parking
+        # status. New handoffs still require a releasable review card before
+        # phase one can strand the workerless task.
+        if handoff["state"] != "active":
+            review = conn.execute(
+                "SELECT status FROM tasks WHERE id=?", (handoff["review_task_id"],)
+            ).fetchone()
+            if review is None or review["status"] not in ("todo", "ready", "blocked", "done"):
+                raise ValueError("registered review gate is not releasable")
+    accepted_dependency_payload = None
+    if kind == "dependency" and not _after_reap:
+        accepted_dependency_payload = _dependency_wait_payload(
+            conn, task_id, reason, dependency_task_id,
+        )
+        if not any(
+            (dependency := get_task(conn, dep_id)) is not None
+            and dependency.status not in TERMINAL_STATUSES
+            for dep_id in accepted_dependency_payload["dependency_ids"]
+        ):
+            raise ValueError("dependency_wait_requires_unfinished_parent")
+    terminal_payload = {
+            "reason": reason,
+            "kind": kind,
+            "dependency_task_id": dependency_task_id,
+    }
+    if accepted_dependency_payload is not None:
+        terminal_payload["dependency_wait_payload"] = accepted_dependency_payload
+    if not _after_reap and _request_terminal_transition(
+        conn,
+        task_id,
+        action="block",
+        payload=terminal_payload,
+        expected_run_id=expected_run_id,
+    ):
+        return True
     review_required = bool(
         reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
     )
     routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
-        if _protected_review_handoff_for_task(conn, task_id, role="next"):
+        if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
             raise ValueError(
                 "explicit review successor gate remains protected until the review "
                 "handoff is approved"
@@ -6439,7 +6849,7 @@ def block_task(
             else 0
         )
 
-        if review_required:
+        if review_required and not _after_reap:
             handoff = _review_handoff_row(conn, source_task_id=task_id)
             if handoff is not None:
                 if handoff["state"] == "active":
@@ -6531,8 +6941,12 @@ def block_task(
         if kind == "dependency":
             if dependency_task_id and get_task(conn, dependency_task_id) is None:
                 raise ValueError(f"dependency task {dependency_task_id} not found")
-            dependency_payload = _dependency_wait_payload(
-                conn, task_id, reason, dependency_task_id,
+            dependency_payload = (
+                dict(_accepted_dependency_payload)
+                if _after_reap and isinstance(_accepted_dependency_payload, dict)
+                else _dependency_wait_payload(
+                    conn, task_id, reason, dependency_task_id,
+                )
             )
             # A dependency wait without a stable unfinished dependency has no
             # valid release condition. Explicit dependency ids, task ids in
@@ -6542,10 +6956,10 @@ def block_task(
             # rejection is completely mutation-free.
             unfinished_dependency = any(
                 (dependency := get_task(conn, dep_id)) is not None
-                and dependency.status not in ("done", "archived")
+                and dependency.status not in TERMINAL_STATUSES
                 for dep_id in dependency_payload["dependency_ids"]
             )
-            if not unfinished_dependency:
+            if not unfinished_dependency and not _after_reap:
                 raise ValueError("dependency_wait_requires_unfinished_parent")
             cur = conn.execute(
                 """
@@ -6708,6 +7122,7 @@ def submit_review_verdict(
     verdict: str,
     summary: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    _after_reap: bool = False,
 ) -> bool:
     """Close an active explicit review gate with an auditable verdict.
 
@@ -6720,6 +7135,46 @@ def submit_review_verdict(
         raise ValueError(
             f"review verdict must be one of {sorted(VALID_REVIEW_VERDICTS)}"
         )
+    # A reviewer worker may still be mutating its checkout when it submits a
+    # verdict.  Journal the exact verdict first and let the same Phase B reaper
+    # own the worker exit.  The private post-reap flag is used only by the
+    # reaper after it has proved the exact tree gone; normal callers cannot
+    # bypass this gate.
+    if not _after_reap and expected_run_id is not None:
+        review = conn.execute(
+            "SELECT status, current_run_id, worker_pid FROM tasks WHERE id=?",
+            (review_task_id,),
+        ).fetchone()
+        if (
+            review is not None
+            and review["status"] == "running"
+            and review["worker_pid"] is not None
+            and int(review["current_run_id"] or 0) == int(expected_run_id)
+        ):
+            handoff = _review_handoff_row(conn, review_task_id=review_task_id)
+            if handoff is None:
+                raise ValueError(
+                    f"task {review_task_id} is not an explicitly registered review gate"
+                )
+            if handoff["state"] == verdict and handoff["verdict"] == verdict:
+                return True
+            if handoff["state"] != "active":
+                raise ValueError(
+                    f"review handoff is {handoff['state']}, not active; verdict rejected"
+                )
+            return _request_terminal_transition(
+                conn,
+                review_task_id,
+                action="review_verdict",
+                payload={
+                    "verdict": verdict,
+                    "summary": summary,
+                    "review_task_id": review_task_id,
+                    "source_task_id": handoff["source_task_id"],
+                    "next_task_id": handoff["next_task_id"],
+                },
+                expected_run_id=expected_run_id,
+            )
     with write_txn(conn):
         handoff = _review_handoff_row(conn, review_task_id=review_task_id)
         if handoff is None:
@@ -6790,10 +7245,11 @@ def submit_review_verdict(
         )
 
         if verdict == "changes_requested":
+            terminal_placeholders, terminal_statuses = _terminal_status_sql()
             undone_parent = conn.execute(
                 "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
-                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
-                (handoff["source_task_id"],),
+                f"WHERE l.child_id=? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
+                (handoff["source_task_id"], *terminal_statuses),
             ).fetchone()
             source_status = "todo" if undone_parent else "ready"
             cur = conn.execute(
@@ -6839,10 +7295,11 @@ def submit_review_verdict(
         )
         next_task_id = handoff["next_task_id"]
         if next_task_id:
+            terminal_placeholders, terminal_statuses = _terminal_status_sql()
             unfinished = conn.execute(
                 "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
-                "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
-                (next_task_id,),
+                f"WHERE l.child_id=? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
+                (next_task_id, *terminal_statuses),
             ).fetchone()
             if unfinished is None:
                 promoted = conn.execute(
@@ -7023,11 +7480,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # if parents are still in progress the task must wait in 'todo'
         # until recompute_ready picks it up. RCA: Bug 2 at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
+        terminal_placeholders, terminal_statuses = _terminal_status_sql()
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only') LIMIT 1",
-            (task_id,),
+            f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
+            (task_id, *terminal_statuses),
         ).fetchone()
         new_status = "review" if active_review else ("todo" if undone_parents else "ready")
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
@@ -7623,16 +8081,17 @@ def validate_detached_live_path_mapping(
         raise ValueError(
             f"detached task {detached_task_id} is parent-gated behind {source_task_id}"
         )
+    terminal_placeholders, terminal_statuses = _terminal_status_sql()
     children = conn.execute(
-        """
+        f"""
         SELECT t.id, t.status, t.claim_lock, t.worker_pid, t.current_run_id
           FROM tasks t
           JOIN task_links l ON l.child_id = t.id
          WHERE l.parent_id = ?
-           AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only')
+           AND t.status NOT IN ({terminal_placeholders})
          ORDER BY t.id
         """,
-        (source_task_id,),
+        (source_task_id, *terminal_statuses),
     ).fetchall()
     active_children = [
         row["id"]
@@ -8049,6 +8508,55 @@ def controller_closeout_task(
     return True
 
 
+
+
+def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Hard-delete a task and cascade to all related rows.
+
+    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
+    we explicitly delete from child tables first, then the task row.
+    This keeps the operation atomic (single ``write_txn``).
+
+    Returns ``True`` if the task existed and was deleted, ``False``
+    if the task was not found.
+    """
+    with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id):
+            return False
+        conn.execute(
+            "DELETE FROM review_handoffs WHERE source_task_id=? "
+            "OR review_task_id=? OR next_task_id=?",
+            (task_id, task_id, task_id),
+        )
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if cur.rowcount != 1:
+            return False
+        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
+    recompute_ready(conn)
+    return True
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Permanently remove an already-archived task and its related rows.
 
@@ -8083,35 +8591,6 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
-
-    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
-
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
-    """
-    with write_txn(conn):
-        if _protected_review_handoff_for_task(conn, task_id):
-            return False
-        conn.execute(
-            "DELETE FROM review_handoffs WHERE source_task_id=? "
-            "OR review_task_id=? OR next_task_id=?",
-            (task_id, task_id, task_id),
-        )
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
-    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8608,6 +9087,8 @@ class DispatchResult:
     paths, exception text, task data, or secrets."""
 
     continuation_decisions: list[dict[str, Any]] = field(default_factory=list)
+    worker_reaps: list[dict[str, Any]] = field(default_factory=list)
+    """Bounded exact-identity terminal reaper decisions for this tick."""
     scope_cleanup: list[dict[str, Any]] = field(default_factory=list)
     """Bounded ended-run scope reconciliation decisions.
 
@@ -8615,6 +9096,8 @@ class DispatchResult:
     unit names, user-bus paths, receipt payloads, and manager addresses are
     deliberately excluded from this operator-facing surface.
     """
+    maintenance_conflicts: list[dict[str, Any]] = field(default_factory=list)
+    """Terminal-intent CAS conflicts observed by maintenance sensors."""
 
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
@@ -8829,6 +9312,13 @@ def _terminate_reclaimed_worker(
         return info
     info["host_local"] = True
 
+    # A claim with no persisted worker PID has no external process boundary.
+    # Do not reinterpret a synthetic/legacy scope lookup as a live managed
+    # worker in this pre-spawn window; the database-only reclaim path can
+    # safely release it without a stop or signal.
+    if not pid or pid <= 0:
+        return info
+
     # A systemd scope has no main process: a dead leader PID does not mean its
     # descendants are gone. Prefer the reconstructed unit identity whenever
     # this dispatcher could have launched one, including the legacy name while
@@ -9016,12 +9506,1416 @@ def _defer_reclaim_for_live_worker(
             )
 
 
+# ---------------------------------------------------------------------------
+# Ultra Phase B: exact worker-tree terminal reaping
+# ---------------------------------------------------------------------------
+
+_REAPER_INSTANCE_UUID = str(uuid.uuid4())
+_REAPER_LOCAL_LOCK = threading.Lock()
+_REAP_LEASE_SECONDS = 15
+_REAP_TERM_GRACE_SECONDS = 2
+_REAP_GIVE_UP_ATTEMPTS = 8
+_REAP_CANDIDATE_LIMIT = 32
+_REAP_PENDING_STATES = frozenset({
+    "terminal_requested", "reap_pending", "reaping", "identity_unverifiable",
+    "manual_recovery_required",
+})
+_REAP_LEASABLE_STATES = _REAP_PENDING_STATES | {"reaped"}
+
+
+class TerminalTransitionConflict(ValueError):
+    """A terminal request conflicts with the already durable run intent."""
+
+    code = "terminal_transition_conflict"
+
+
+def _normalize_terminal_intent(action: str, payload: dict[str, Any]) -> dict[str, Any]:
+    """Return the canonical durable terminal payload."""
+    if not isinstance(payload, dict):
+        raise TypeError("terminal transition payload must be a mapping")
+
+    def normalize(value: Any) -> Any:
+        if isinstance(value, dict):
+            return {str(key): normalize(value[key]) for key in sorted(value)}
+        if isinstance(value, (list, tuple)):
+            return [normalize(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        raise TypeError(f"unsupported terminal intent value: {type(value).__name__}")
+
+    return {"action": str(action), **normalize(payload)}
+
+
+def _terminal_intent_json(intent: dict[str, Any]) -> str:
+    return json.dumps(intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def _terminal_intent_identity(
+    task_id: str,
+    run_id: int,
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    """Return stable request identity without discarding durable diagnostics.
+
+    Max-runtime retries are the one terminal action whose diagnostic rendering
+    changes on every maintenance tick. The originally accepted elapsed value
+    stays in ``terminal_payload`` for reporting, but it is not part of the
+    semantic CAS identity. Every other field and every other action remains an
+    exact comparison.
+    """
+    semantic = dict(intent)
+    if semantic.get("action") == "timed_out":
+        semantic.pop("error", None)
+        event_payload = semantic.get("event_payload")
+        if isinstance(event_payload, dict):
+            stable_event_payload = dict(event_payload)
+            stable_event_payload.pop("elapsed_seconds", None)
+            semantic["event_payload"] = stable_event_payload
+    return {
+        "task_id": str(task_id),
+        "run_id": int(run_id),
+        "intent": semantic,
+    }
+
+
+def _terminal_intents_match(
+    task_id: str,
+    run_id: int,
+    accepted: dict[str, Any],
+    requested: dict[str, Any],
+) -> bool:
+    return _terminal_intent_json(
+        _terminal_intent_identity(task_id, run_id, accepted)
+    ) == _terminal_intent_json(
+        _terminal_intent_identity(task_id, run_id, requested)
+    )
+
+
+def _decode_process_identity(value: Any):
+    from hermes_cli.kanban_worker_process import ProcessIdentity
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    return ProcessIdentity.from_mapping(value) if isinstance(value, dict) else None
+
+
+def _reap_wall_now(clock_fn=None) -> int:
+    """Read wall time at the point of each reaper side effect.
+
+    ``reconcile_worker_reaps(now=...)`` retains its historical argument for
+    callers, but it is deliberately not a production clock. A dispatcher tick
+    may have spent enough time probing processes or waiting on a signal that
+    its initial timestamp is already stale when a lease/journal is written.
+    Tests that need deterministic time inject ``clock_fn``.
+    """
+    return int(clock_fn()) if clock_fn is not None else int(time.time())
+
+
+def _exact_identity_state(value: Any) -> str:
+    from hermes_cli.kanban_worker_process import identity_state
+    identity = _decode_process_identity(value)
+    return identity_state(identity) if identity is not None else "unknown"
+
+
+def _decode_process_tree(value: Any) -> list[Any]:
+    from hermes_cli.kanban_worker_process import ProcessIdentity
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise ValueError("worker_tree_malformed") from exc
+    if not isinstance(value, list):
+        raise ValueError("worker_tree_malformed")
+    identities = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("worker_tree_malformed")
+        identity = ProcessIdentity.from_mapping(item)
+        if identity is None:
+            raise ValueError("worker_tree_malformed")
+        identities.append(identity)
+    return identities
+
+
+def _capture_run_worker_tree(
+    conn: sqlite3.Connection,
+    run_id: int,
+    *,
+    reap_attempt_uuid: Optional[str] = None,
+    reap_lease_owner: Optional[str] = None,
+    reap_now: Optional[int] = None,
+    reap_clock_fn=None,
+) -> tuple[str, list[Any], Optional[str]]:
+    """Refresh one run's exact ancestry-derived worker set."""
+    from hermes_cli.kanban_worker_process import capture_process_tree
+    row = conn.execute(
+        "SELECT worker_identity, worker_tree FROM task_runs WHERE id=?", (int(run_id),)
+    ).fetchone()
+    if row is None:
+        return "unknown", [], "run_missing"
+    root = _decode_process_identity(row["worker_identity"])
+    try:
+        previous = _decode_process_tree(row["worker_tree"])
+    except ValueError:
+        return "unknown", [], "worker_tree_malformed"
+    if root is None:
+        return "unknown", previous, "identity_unverifiable"
+    captured = capture_process_tree(root, previous)
+    targets = list(captured.targets)
+    if captured.state in {"captured", "reused"}:
+        with write_txn(conn):
+            tree_json = json.dumps(
+                [item.to_dict() for item in targets], sort_keys=True,
+            )
+            if reap_attempt_uuid is None or reap_lease_owner is None:
+                conn.execute(
+                    "UPDATE task_runs SET worker_tree=? WHERE id=?",
+                    (tree_json, int(run_id)),
+                )
+            else:
+                now = _reap_wall_now(reap_clock_fn)
+                cur = conn.execute(
+                    "UPDATE task_runs SET worker_tree=? WHERE id=? "
+                    "AND reap_state='reaping' AND reap_attempt_uuid=? "
+                    "AND reap_lease_owner=? AND reap_lease_expires>?",
+                    (
+                        tree_json, int(run_id), reap_attempt_uuid,
+                        reap_lease_owner, now,
+                    ),
+                )
+                if cur.rowcount != 1:
+                    return "unknown", targets, "reap_lease_lost"
+    return captured.state, targets, captured.reason
+
+
+def refresh_worker_process_ownership(conn: sqlite3.Connection) -> None:
+    """Capture descendants while leaders still retain their ancestry."""
+    rows = conn.execute(
+        "SELECT r.id FROM task_runs r JOIN tasks t ON t.current_run_id=r.id "
+        "WHERE t.status='running' AND r.worker_identity IS NOT NULL AND r.ended_at IS NULL"
+    ).fetchall()
+    for row in rows:
+        try:
+            _capture_run_worker_tree(conn, int(row["id"]))
+        except Exception:
+            continue
+
+
+def _run_reap_state(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
+    row = conn.execute(
+        "SELECT r.reap_state FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.id=?", (task_id,),
+    ).fetchone()
+    return str(row["reap_state"]) if row and row["reap_state"] else None
+
+
+def phase_b_rollback_preflight(conn: sqlite3.Connection) -> dict[str, Any]:
+    """Drain or refuse rollback before old code can see Phase-B actions.
+
+    External activation must call this while candidate code is still loaded,
+    before checking out ``e7fb0f84...`` or ``6998848...``.  Reaped
+    ``reassign``/``review_verdict`` rows are finalized with this implementation;
+    any still-live or ambiguous new-action row refuses rollback and leaves the
+    candidate services/DB recoverable.  Old code is never allowed to consume
+    those payloads.
+    """
+    states = tuple(sorted(_REAP_PENDING_STATES | {"reaped"}))
+    placeholders = ", ".join("?" for _ in states)
+    rows = conn.execute(
+        "SELECT id, task_id, reap_state, terminal_payload FROM task_runs "
+        f"WHERE reap_state IN ({placeholders}) ORDER BY id",
+        states,
+    ).fetchall()
+    drained: list[int] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["terminal_payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+        if not isinstance(payload, dict):
+            return {
+                "ok": False,
+                "reason": "phase_b_payload_unknown",
+                "run_id": int(row["id"]),
+                "task_id": row["task_id"],
+            }
+        if row["reap_state"] != "reaped":
+            return {
+                "ok": False,
+                "reason": "phase_b_action_pending",
+                "run_id": int(row["id"]),
+                "task_id": row["task_id"],
+            }
+        try:
+            finalized = _finalize_reaped_run(
+                conn, int(row["id"]), str(row["task_id"]),
+            )
+        except TerminalTransitionConflict:
+            finalized = False
+        except Exception:
+            finalized = False
+        if not finalized:
+            return {
+                "ok": False,
+                "reason": "phase_b_action_drain_failed",
+                "run_id": int(row["id"]),
+                "task_id": row["task_id"],
+            }
+        drained.append(int(row["id"]))
+    return {"ok": True, "drained_run_ids": drained}
+
+
+def _request_terminal_transition(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    action: str,
+    payload: dict[str, Any],
+    expected_run_id: Optional[int],
+) -> bool:
+    """Persist phase one for an active worker with exact intent CAS."""
+    if not _DISPATCH_LOCK_HELD.get():
+        db_path = _connection_main_db_path(conn)
+        if db_path is not None:
+            with _dispatch_tick_lock(db_path) as lock_outcome:
+                if not lock_outcome.acquired:
+                    active = conn.execute(
+                        "SELECT status, current_run_id FROM tasks WHERE id=?",
+                        (task_id,),
+                    ).fetchone()
+                    if active is not None and active["status"] == "running":
+                        raise TerminalTransitionConflict(
+                            "dispatch_lock_busy"
+                        )
+                    return False
+                return _request_terminal_transition(
+                    conn,
+                    task_id,
+                    action=action,
+                    payload=payload,
+                    expected_run_id=expected_run_id,
+                )
+    intent = _normalize_terminal_intent(action, payload)
+    row = conn.execute(
+        "SELECT t.status, t.current_run_id, t.worker_pid, r.worker_identity, r.worker_tree, "
+        "r.reap_state, r.terminal_payload FROM tasks t LEFT JOIN task_runs r "
+        "ON r.id=t.current_run_id WHERE t.id=?", (task_id,),
+    ).fetchone()
+    if (row is None or row["current_run_id"] is None
+            or row["status"] != "running"
+            or (expected_run_id is not None
+                and int(row["current_run_id"]) != int(expected_run_id))):
+        return False
+    run_id = int(row["current_run_id"])
+    if row["reap_state"] in _REAP_PENDING_STATES or row["reap_state"] == "reaped":
+        try:
+            existing_payload = json.loads(row["terminal_payload"] or "{}")
+            existing = _normalize_terminal_intent(
+                str(existing_payload.get("action") or ""), existing_payload,
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raise TerminalTransitionConflict(
+                "terminal_transition_payload_malformed"
+            ) from None
+        if not _terminal_intents_match(task_id, run_id, existing, intent):
+            raise TerminalTransitionConflict("terminal_transition_conflict")
+        return True
+    if row["reap_state"] in {"finalized", "finalized_historical"}:
+        return False
+    capture_state, targets, capture_reason = _capture_run_worker_tree(conn, run_id)
+    identity = _decode_process_identity(row["worker_identity"])
+    scope = _worker_scope_state(conn, task_id, run_id)
+    scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
+        _scope_status_fields(scope)
+    )
+    scope_evidence = scope_state in {"active", "inactive"} or (
+        scope_state == "not-found" and scope_ack is True
+    )
+    trusted_scope = bool(
+        scope_unit
+        and (scope_manager_target is not None or scope_launch_mode == "legacy")
+        and scope_evidence
+        and scope_launch_mode in {"systemd-user-scope", "legacy"}
+    )
+    # A claim that has not recorded a worker PID/identity is still inside the
+    # dispatch lock's pre-spawn window. With no exact worker boundary to reap,
+    # release it through the ordinary CAS after this lock-protected check;
+    # active PID-only legacy runs (which do have worker_pid) remain fenced.
+    if row["worker_pid"] is None and identity is None:
+        return False
+    requested_state = (
+        "terminal_requested"
+        if (
+            identity is not None and capture_state in {"captured", "reused"}
+        ) or (
+            trusted_scope and capture_state in {"captured", "reused", "incomplete"}
+        )
+        else "identity_unverifiable"
+    )
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET terminal_payload=?, terminal_requested_at=?, "
+            "reap_state=?, reap_error=?, worker_tree=? "
+            "WHERE id=? AND ended_at IS NULL AND reap_state IS NULL",
+            (_terminal_intent_json(intent), now,
+             requested_state, _redact_diagnostic(capture_reason),
+             json.dumps([item.to_dict() for item in targets], sort_keys=True), run_id),
+        )
+        if cur.rowcount != 1:
+            winner = conn.execute(
+                "SELECT reap_state, terminal_payload FROM task_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            if winner is None or winner["reap_state"] not in (_REAP_PENDING_STATES | {"reaped"}):
+                return False
+            try:
+                winner_payload = json.loads(winner["terminal_payload"] or "{}")
+                winner_intent = _normalize_terminal_intent(
+                    str(winner_payload.get("action") or ""), winner_payload,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                raise TerminalTransitionConflict(
+                    "terminal_transition_payload_malformed"
+                ) from None
+            if not _terminal_intents_match(
+                task_id, run_id, winner_intent, intent,
+            ):
+                raise TerminalTransitionConflict("terminal_transition_conflict")
+            return True
+        _append_event(
+            conn, task_id, "terminal_requested",
+            {"action": action, "run_id": run_id, "reap_state": requested_state,
+             "identity_verified": identity is not None, "captured_processes": len(targets)},
+            run_id=run_id,
+        )
+    return True
+
+
+def _protected_reap_identities(
+    conn: sqlite3.Connection,
+    candidate_run_id: int,
+    *,
+    protected_pid_fn=None,
+) -> tuple[bool, set[int], set[tuple[int, float]]]:
+    """Protect managed services, gateway/dispatcher/ancestors, and current runs."""
+    from hermes_cli.kanban_worker_process import protected_process_identities
+
+    def exact_pid(value: Any, label: str) -> Optional[int]:
+        if value is None:
+            return None
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"{label}_malformed")
+        return int(value)
+
+    def validate_receipt(row: sqlite3.Row, label: str) -> set[int]:
+        """Validate every persisted member before adding it to protection."""
+        task_pid = exact_pid(row["task_worker_pid"], f"{label}_task_worker_pid")
+        run_pid = exact_pid(row["run_worker_pid"], f"{label}_run_worker_pid")
+        raw_identity = row["worker_identity"]
+        identity = _decode_process_identity(raw_identity)
+        if raw_identity is not None and identity is None:
+            raise ValueError(f"{label}_worker_identity_malformed")
+        identity_pid = identity.pid if identity is not None else None
+        present_pids = {
+            value for value in (task_pid, run_pid, identity_pid) if value is not None
+        }
+        if len(present_pids) > 1:
+            raise ValueError(f"{label}_worker_pid_mismatch")
+        if identity is not None and (task_pid is None or run_pid is None):
+            raise ValueError(f"{label}_worker_receipt_partial")
+
+        raw_tree = row["worker_tree"]
+        tree = [] if raw_tree is None else _decode_process_tree(raw_tree)
+        if raw_tree is not None and not tree:
+            raise ValueError(f"{label}_worker_tree_partial")
+        if tree:
+            if identity is None:
+                raise ValueError(f"{label}_worker_tree_root_without_identity")
+            root = tree[0]
+            if (root.pid, root.create_time) != (identity.pid, identity.create_time):
+                raise ValueError(f"{label}_worker_tree_root_mismatch")
+            if present_pids and root.pid not in present_pids:
+                raise ValueError(f"{label}_worker_tree_pid_mismatch")
+        return present_pids
+
+    def validate_current_receipt() -> None:
+        row = conn.execute(
+            "SELECT t.worker_pid AS task_worker_pid, r.worker_pid AS run_worker_pid, "
+            "r.worker_identity, r.worker_tree FROM tasks t "
+            "JOIN task_runs r ON r.id=t.current_run_id WHERE r.id=?",
+            (int(candidate_run_id),),
+        ).fetchone()
+        if row is None:
+            # Historical runs are intentionally not current protection
+            # receipts. Their exact target is already represented by the
+            # reaper capture; validate the newer current run in ``rows``.
+            return
+        validate_receipt(row, "candidate")
+
+    try:
+        validate_current_receipt()
+        if protected_pid_fn is not None:
+            service_pids = set(protected_pid_fn())
+        else:
+            from hermes_cli.gateway import _get_service_pids
+            from gateway.status import get_running_pid
+            service_pids = set(_get_service_pids())
+            if gateway_pid := get_running_pid(cleanup_stale=False):
+                service_pids.add(int(gateway_pid))
+        protected_pids, protected_exact = protected_process_identities(service_pids)
+        rows = conn.execute(
+            "SELECT t.worker_pid AS task_worker_pid, r.worker_pid AS run_worker_pid, "
+            "r.worker_identity, r.worker_tree "
+            "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE r.id != ?", (int(candidate_run_id),)
+        ).fetchall()
+        for index, row in enumerate(rows):
+            protected_pids.update(validate_receipt(row, f"protected_{index}"))
+            identity = _decode_process_identity(row["worker_identity"])
+            if identity is not None:
+                protected_pids.add(identity.pid)
+                protected_exact.add((identity.pid, identity.create_time))
+            decoded_tree = [] if row["worker_tree"] is None else _decode_process_tree(row["worker_tree"])
+            for identity in decoded_tree:
+                protected_pids.add(identity.pid)
+                protected_exact.add((identity.pid, identity.create_time))
+        return True, protected_pids, protected_exact
+    except Exception:
+        return False, {os.getpid()}, set()
+
+
+def _lease_reap_run(
+    conn: sqlite3.Connection, run_id: int, *, now: int, owner: str, lease_seconds: int,
+) -> Optional[str]:
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT reap_state, reap_attempt_uuid, reap_lease_owner, reap_lease_expires "
+            "FROM task_runs WHERE id=?", (int(run_id),),
+        ).fetchone()
+        if row is None or row["reap_state"] not in _REAP_LEASABLE_STATES:
+            return None
+        lease_owner = row["reap_lease_owner"]
+        lease_expires = int(row["reap_lease_expires"] or 0)
+        if lease_owner and lease_owner != owner and lease_expires > now:
+            return None
+        attempt_uuid = (
+            str(row["reap_attempt_uuid"])
+            if lease_owner == owner and row["reap_attempt_uuid"] else str(uuid.uuid4())
+        )
+        cur = conn.execute(
+            "UPDATE task_runs SET reap_state=CASE WHEN reap_state='reaped' "
+            "THEN 'reaped' ELSE 'reaping' END, reap_attempt_uuid=?, "
+            "reap_lease_owner=?, reap_lease_expires=?, reap_heartbeat_at=?, "
+            "reap_attempts=reap_attempts+1 WHERE id=? AND reap_state IN "
+                "('terminal_requested','reap_pending','reaping','identity_unverifiable',"
+                "'manual_recovery_required','reaped') "
+            "AND (reap_lease_owner IS NULL OR reap_lease_owner=? "
+            "OR reap_lease_expires IS NULL OR reap_lease_expires<=?)",
+            (attempt_uuid, owner, now + max(1, int(lease_seconds)), now,
+             int(run_id), owner, now),
+        )
+        return attempt_uuid if cur.rowcount == 1 else None
+
+
+def _renew_reap_lease(
+    conn: sqlite3.Connection, run_id: int, attempt_uuid: str, *,
+    now: int, owner: str, lease_seconds: int,
+) -> bool:
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET reap_lease_expires=?, reap_heartbeat_at=? "
+            "WHERE id=? AND reap_state='reaping' AND reap_attempt_uuid=? "
+            "AND reap_lease_owner=? AND reap_lease_expires>?",
+            (
+                now + max(1, int(lease_seconds)), now, int(run_id), attempt_uuid,
+                owner, now,
+            ),
+        )
+        return cur.rowcount == 1
+
+
+def _signal_with_reap_lease(
+    conn: sqlite3.Connection,
+    run_id: int,
+    attempt_uuid: str,
+    owner: str,
+    identity: Any,
+    sig: int,
+    *,
+    now: int,
+    lease_seconds: int,
+    protected_pid_fn=None,
+    signal_fn=None,
+    clock_fn=None,
+) -> tuple[str, str | None]:
+    """Fence one signal with a durable pre-effect intent.
+
+    SQLite cannot atomically commit a journal row and deliver a Unix signal.
+    The intent is therefore committed first.  If the process dies before the
+    post-effect receipt, a new owner refuses to blindly repeat the phase and
+    exposes deterministic ``signal_delivery_uncertain`` recovery instead.
+    """
+    from hermes_cli.kanban_worker_process import KILL_SIGNAL, TERM_SIGNAL, signal_exact
+    intent_column = "reap_term_intent_at" if sig == TERM_SIGNAL else "reap_kill_intent_at"
+    sent_column = "reap_term_sent_at" if sig == TERM_SIGNAL else "reap_kill_sent_at"
+    phase = "term" if sig == TERM_SIGNAL else "kill"
+    identity_key = f"{identity.pid}:{identity.create_time}"
+    before = _reap_wall_now(clock_fn)
+    with write_txn(conn):
+        lease = conn.execute(
+            "SELECT reap_state, reap_attempt_uuid, reap_lease_owner, "
+            "reap_lease_expires, "+intent_column+", "+sent_column+", reap_signal_progress"+
+            " FROM task_runs WHERE id=?",
+            (int(run_id),),
+        ).fetchone()
+        if (
+            lease is None
+            or lease["reap_state"] != "reaping"
+            or lease["reap_attempt_uuid"] != attempt_uuid
+            or lease["reap_lease_owner"] != owner
+            or int(lease["reap_lease_expires"] or 0) <= before
+        ):
+            return "lease_lost", None
+        try:
+            progress = json.loads(lease["reap_signal_progress"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return "unknown", "signal_progress_malformed"
+        if not isinstance(progress, dict):
+            return "unknown", "signal_progress_malformed"
+        phase_progress = progress.get(phase, {})
+        if not isinstance(phase_progress, dict):
+            return "unknown", "signal_progress_malformed"
+        if phase_progress.get(identity_key) == "sent":
+            return "already_sent", None
+        if lease[sent_column] is not None and not phase_progress:
+            return "already_sent", None
+        if phase_progress.get(identity_key) == "intent" or lease[intent_column] is not None:
+            return "signal_delivery_uncertain", "signal_delivery_uncertain"
+        protection_known, protected_pids, protected_exact = _protected_reap_identities(
+            conn, run_id, protected_pid_fn=protected_pid_fn,
+        )
+        if not protection_known:
+            return "unknown", "protection_census_unknown"
+        # The protection census may be slow.  Never journal/send using the
+        # timestamp read before that census; the CAS below is the fresh lease
+        # boundary immediately before the signal intent is committed.
+        before = _reap_wall_now(clock_fn)
+        phase_progress[identity_key] = "intent"
+        progress[phase] = phase_progress
+        cur = conn.execute(
+            f"UPDATE task_runs SET {intent_column}=?, reap_signal_progress=?, reap_heartbeat_at=? "
+            "WHERE id=? AND reap_state='reaping' AND reap_attempt_uuid=? "
+            "AND reap_lease_owner=? AND reap_lease_expires>? AND "+intent_column+" IS NULL",
+            (
+                before, json.dumps(progress, sort_keys=True), before,
+                int(run_id), attempt_uuid, owner, before,
+            ),
+        )
+        if cur.rowcount != 1:
+            return "lease_lost", None
+    def renew_before_signal() -> bool:
+        # signal_exact invokes this while its pidfd is already bound.  The
+        # fresh read and CAS therefore fence both lease expiry and ownership
+        # takeover in the last step before the kernel send.
+        fresh_now = _reap_wall_now(clock_fn)
+        return _renew_reap_lease(
+            conn, run_id, attempt_uuid, now=fresh_now,
+            owner=owner, lease_seconds=lease_seconds,
+        )
+
+    try:
+        state = signal_exact(
+            identity,
+            sig,
+            protected_pids=protected_pids,
+            protected_identities=protected_exact,
+            signal_fn=signal_fn,
+            pre_signal_fn=renew_before_signal,
+        )
+    except Exception:
+        # The external-effect atomicity gap is explicit: the callback may
+        # have delivered the signal before the process failed. Keep the
+        # committed intent and require operator recovery; never repeat it.
+        return "signal_delivery_uncertain", "signal_delivery_uncertain"
+    after = _reap_wall_now(clock_fn)
+    if state == "signal_delivery_uncertain":
+        return state, state
+    if state in {"protected", "unknown"}:
+        with write_txn(conn):
+            conn.execute(
+                f"UPDATE task_runs SET {intent_column}=NULL, reap_error=? "
+                "WHERE id=? AND reap_attempt_uuid=? AND reap_lease_owner=?",
+                (state, int(run_id), attempt_uuid, owner),
+            )
+        return state, "signal_identity_unknown"
+    with write_txn(conn):
+        progress[phase][identity_key] = "sent"
+        cur = conn.execute(
+            f"UPDATE task_runs SET {sent_column}=?, {intent_column}=NULL, "
+            "reap_signal_progress=?, "
+            "reap_heartbeat_at=?, reap_lease_expires=? "
+            "WHERE id=? AND reap_state='reaping' AND reap_attempt_uuid=? "
+            "AND reap_lease_owner=? AND reap_lease_expires>?",
+            (
+                after, json.dumps(progress, sort_keys=True), after,
+                after + max(1, int(lease_seconds)), int(run_id),
+                attempt_uuid, owner, after,
+            ),
+        )
+        if cur.rowcount != 1:
+            return "lease_lost", None
+        return state, None
+
+
+def _finalize_reassignment_terminal(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    """Apply a deferred reassignment only after the worker tree is reaped."""
+    assignee = _canonical_assignee(payload.get("assignee"))
+    task_status = str(payload.get("task_status") or "ready")
+    error = payload.get("error")
+    now = int(time.time()) if now is None else int(now)
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        is_current = bool(
+            current is not None
+            and current["current_run_id"] is not None
+            and int(current["current_run_id"]) == int(run_id)
+        )
+        if is_current:
+            cur = conn.execute(
+                "UPDATE tasks SET assignee=?, status=?, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, last_heartbeat_at=NULL, "
+                "consecutive_failures=0, last_failure_error=NULL, "
+                "failure_classification=NULL, failure_fingerprint=NULL "
+                "WHERE id=? AND current_run_id=?",
+                (assignee, task_status, task_id, int(run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            if _end_run(
+                conn,
+                task_id,
+                outcome="reclaimed",
+                status="reclaimed",
+                error=str(error) if error is not None else None,
+            ) != run_id:
+                return False
+            event_payload = {
+                "manual": True,
+                "reassigned_to": assignee,
+                "reason": payload.get("event_payload", {}).get("reason")
+                if isinstance(payload.get("event_payload"), dict)
+                else None,
+                "deferred": True,
+            }
+            _append_event(conn, task_id, "reclaimed", event_payload, run_id=run_id)
+            _append_event(
+                conn,
+                task_id,
+                "assigned",
+                {"assignee": assignee, "deferred": True, "run_id": run_id},
+                run_id=run_id,
+            )
+            return True
+
+        # A newer run already owns the task. Close only this historical run;
+        # never apply its old reassignment intent to the newer task state.
+        cur = conn.execute(
+            "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+            "error=?, ended_at=?, reap_state='finalized_historical', "
+            "reap_completed_at=? WHERE id=? AND reap_state='reaped'",
+            (_redact_diagnostic(error), now, now, int(run_id)),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "reassignment_historical",
+            {"reassigned_to": assignee, "historical": True, "run_id": run_id},
+            run_id=run_id,
+        )
+        return True
+
+
+def _finalize_generic_terminal(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    payload: dict[str, Any],
+    *,
+    now: Optional[int] = None,
+) -> bool:
+    now = int(time.time()) if now is None else int(now)
+    task_status = str(payload.get("task_status") or "ready")
+    outcome = str(payload.get("outcome") or payload.get("action") or "reclaimed")
+    run_status = str(payload.get("run_status") or outcome)
+    event_kind = str(payload.get("event_kind") or outcome)
+    event_payload = payload.get("event_payload")
+    event_payload = dict(event_payload) if isinstance(event_payload, dict) else {}
+    error = payload.get("error")
+    metadata = payload.get("metadata")
+    with write_txn(conn):
+        current = conn.execute(
+            "SELECT current_run_id FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        is_current = bool(
+            current is not None and current["current_run_id"] is not None
+            and int(current["current_run_id"]) == int(run_id)
+        )
+        if is_current:
+            cur = conn.execute(
+                "UPDATE tasks SET status=?, claim_lock=NULL, claim_expires=NULL, "
+                "worker_pid=NULL, last_heartbeat_at=NULL WHERE id=? AND current_run_id=?",
+                (task_status, task_id, int(run_id)),
+            )
+            if cur.rowcount != 1:
+                return False
+            if _end_run(
+                conn, task_id, outcome=outcome, status=run_status,
+                error=str(error) if error is not None else None,
+                metadata=dict(metadata) if isinstance(metadata, dict) else None,
+            ) != run_id:
+                return False
+        else:
+            conn.execute(
+                "UPDATE task_runs SET status=?, outcome=?, error=?, metadata=?, "
+                "ended_at=COALESCE(ended_at, ?), reap_state='finalized_historical', "
+                "reap_completed_at=? WHERE id=? AND reap_state='reaped'",
+                (run_status, outcome, _redact_diagnostic(error),
+                 json.dumps(metadata, ensure_ascii=False) if isinstance(metadata, dict) else None,
+                 now, now, int(run_id)),
+            )
+        # A historical attempt may be finalized after a newer current run
+        # exists.  Preserve the audit row, but never emit an ordinary current
+        # lifecycle event that gateway watchers could attribute to that newer
+        # attempt.
+        emitted_event_kind = event_kind
+        if not is_current and not emitted_event_kind.endswith("_historical"):
+            emitted_event_kind = f"{emitted_event_kind}_historical"
+        _append_event(conn, task_id, emitted_event_kind, event_payload, run_id=run_id)
+        if is_current and payload.get("clear_failure_counter"):
+            conn.execute(
+                "UPDATE tasks SET consecutive_failures=0, last_failure_error=NULL, "
+                "failure_classification=NULL, failure_fingerprint=NULL WHERE id=?",
+                (task_id,),
+            )
+        if is_current and payload.get("last_failure_error"):
+            conn.execute(
+                "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                (str(_redact_diagnostic(payload["last_failure_error"]))[:500], task_id),
+            )
+        if is_current and payload.get("record_failure"):
+            row = conn.execute(
+                "SELECT consecutive_failures, max_retries FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            limit = int(
+                row["max_retries"] if row and row["max_retries"] is not None
+                else payload.get("failure_limit") or DEFAULT_FAILURE_LIMIT
+            )
+            failure_error = str(_redact_diagnostic(error or outcome))[:500]
+            protocol_violation = bool(payload.get("protocol_violation"))
+            if protocol_violation:
+                # Clean worker exits are a separate bounded retry budget. They
+                # must not consume the ordinary crash/timeout counter, while
+                # the closed run now makes the trailing violation streak
+                # durable for restart-safe finalization.
+                protocol_violations = _protocol_violation_streak(conn, task_id)
+                conn.execute(
+                    "UPDATE tasks SET last_failure_error=? WHERE id=?",
+                    (failure_error, task_id),
+                )
+                force_trip = protocol_violations >= limit
+            else:
+                failures = int(row["consecutive_failures"] or 0) + 1 if row else 1
+                conn.execute(
+                    "UPDATE tasks SET consecutive_failures=?, last_failure_error=? "
+                    "WHERE id=?",
+                    (failures, failure_error, task_id),
+                )
+                force_trip = failures >= limit
+            if force_trip:
+                conn.execute(
+                    "UPDATE tasks SET status='blocked' WHERE id=? AND status='ready'",
+                    (task_id,),
+                )
+                failure_payload = {
+                    "failures": (
+                        protocol_violations if protocol_violation
+                        else failures
+                    ),
+                    "effective_limit": limit,
+                    "error": failure_error,
+                    "trigger_outcome": outcome,
+                }
+                if protocol_violation:
+                    failure_payload.update({
+                        "protocol_violations": protocol_violations,
+                        "protocol_violation_limit": limit,
+                    })
+                extra = payload.get("failure_event_payload")
+                if isinstance(extra, dict):
+                    failure_payload.update(extra)
+                _append_diagnostic_event(
+                    conn, task_id, "gave_up", failure_payload, run_id=run_id,
+                )
+                if protocol_violation:
+                    auto_blocked = getattr(
+                        detect_crashed_workers, "_last_auto_blocked", None,
+                    )
+                    if isinstance(auto_blocked, list) and task_id not in auto_blocked:
+                        auto_blocked.append(task_id)
+    return True
+
+
+def _finalize_reaped_run(
+    conn: sqlite3.Connection,
+    run_id: int,
+    task_id: str,
+    *,
+    attempt_uuid: Optional[str] = None,
+    owner: Optional[str] = None,
+    lease_seconds: int = _REAP_LEASE_SECONDS,
+    now: Optional[int] = None,
+    clock_fn=None,
+) -> bool:
+    if attempt_uuid is not None and owner is not None:
+        lease_now = _reap_wall_now(clock_fn)
+        with write_txn(conn):
+            cur = conn.execute(
+                "UPDATE task_runs SET reap_lease_expires=?, reap_heartbeat_at=? "
+                "WHERE id=? AND reap_state='reaped' AND reap_attempt_uuid=? "
+                "AND reap_lease_owner=? AND reap_lease_expires>?",
+                (
+                    lease_now + max(1, int(lease_seconds)), lease_now, int(run_id),
+                    attempt_uuid, owner, lease_now,
+                ),
+            )
+            if cur.rowcount != 1:
+                return False
+    row = conn.execute(
+        "SELECT terminal_payload FROM task_runs WHERE id=? AND reap_state='reaped'",
+        (int(run_id),),
+    ).fetchone()
+    if row is None:
+        return False
+    final_now = _reap_wall_now(clock_fn)
+    try:
+        payload = json.loads(row["terminal_payload"] or "{}")
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if payload.get("action") == "reassign":
+        return _finalize_reassignment_terminal(
+            conn, run_id, task_id, payload, now=final_now,
+        )
+    current = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    is_current = bool(
+        current is not None
+        and current["current_run_id"] is not None
+        and int(current["current_run_id"]) == int(run_id)
+    )
+    if not is_current and payload.get("action") in {
+        "complete", "block", "review_verdict",
+    }:
+        action = str(payload["action"])
+        if action == "review_verdict":
+            historical_event_payload = {
+                "verdict": payload.get("verdict"),
+                "summary": payload.get("summary"),
+                "source_task_id": payload.get("source_task_id"),
+                "review_task_id": payload.get("review_task_id", task_id),
+                "next_task_id": payload.get("next_task_id"),
+                "historical": True,
+            }
+            return _finalize_generic_terminal(
+                conn,
+                run_id,
+                task_id,
+                {
+                    **payload,
+                    "task_status": "done",
+                    "run_status": "completed",
+                    "outcome": "completed",
+                    "event_kind": "review_verdict_historical",
+                    "event_payload": historical_event_payload,
+                },
+                now=final_now,
+            )
+        historical = {
+            **payload,
+            "task_status": "done" if action == "complete" else "blocked",
+            "run_status": "completed" if action == "complete" else "blocked",
+            "outcome": "completed" if action == "complete" else "blocked",
+            "event_kind": "completed_historical" if action == "complete" else "blocked_historical",
+            "event_payload": (
+                {
+                    "result": payload.get("result"),
+                    "summary": payload.get("summary"),
+                    "historical": True,
+                }
+                if action == "complete"
+                else {
+                    "reason": payload.get("reason"),
+                    "kind": payload.get("kind"),
+                    "dependency_task_id": payload.get("dependency_task_id"),
+                    "historical": True,
+                }
+            ),
+        }
+        return _finalize_generic_terminal(
+            conn, run_id, task_id, historical, now=final_now,
+        )
+    if payload.get("action") == "complete":
+        return complete_task(
+            conn, task_id, result=payload.get("result"), summary=payload.get("summary"),
+            metadata=payload.get("metadata"), created_cards=payload.get("created_cards"),
+            expected_run_id=run_id, _after_reap=True,
+        )
+    if payload.get("action") == "review_verdict":
+        return submit_review_verdict(
+            conn,
+            task_id,
+            verdict=str(payload.get("verdict") or ""),
+            summary=payload.get("summary"),
+            expected_run_id=run_id,
+            _after_reap=True,
+        )
+    if payload.get("action") == "block":
+        finalized = block_task(
+            conn, task_id, reason=payload.get("reason"), kind=payload.get("kind"),
+            dependency_task_id=payload.get("dependency_task_id"),
+            expected_run_id=run_id, _after_reap=True,
+            _accepted_dependency_payload=payload.get("dependency_wait_payload"),
+        )
+        if finalized and payload.get("kind") == "dependency":
+            # The accepted intent was validated against an unfinished parent.
+            # That parent may have completed while the worker was exiting;
+            # recompute the now-satisfied gate after applying the intent.
+            recompute_ready(conn)
+        return finalized
+    return _finalize_generic_terminal(
+        conn, run_id, task_id, payload, now=final_now,
+    )
+
+
+def _mark_reap_uncertain(
+    conn: sqlite3.Connection, run_id: int, attempt_uuid: str, owner: str,
+    now: int, state: str, reason: str,
+) -> None:
+    with write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET reap_state=?, reap_error=?, reap_heartbeat_at=?, "
+            "reap_lease_expires=MAX(COALESCE(reap_lease_expires, 0), ?) "
+            "WHERE id=? AND reap_attempt_uuid=? "
+            "AND reap_lease_owner=? AND reap_lease_expires>?",
+            (state, _redact_diagnostic(reason), now, now + _REAP_LEASE_SECONDS,
+             run_id, attempt_uuid, owner, now),
+        )
+
+
+def reconcile_worker_reaps(
+    conn: sqlite3.Connection,
+    *,
+    process_effects: bool = True,
+    now: Optional[int] = None,
+    lease_seconds: int = _REAP_LEASE_SECONDS,
+    term_grace_seconds: int = _REAP_TERM_GRACE_SECONDS,
+    signal_fn=None,
+    protected_pid_fn=None,
+    owner_id: Optional[str] = None,
+    limit: int = _REAP_CANDIDATE_LIMIT,
+    clock_fn=None,
+) -> list[dict[str, Any]]:
+    """Lease, reap, and finalize terminal-requested runs idempotently."""
+    from hermes_cli.kanban_worker_process import (
+        KILL_SIGNAL, TERM_SIGNAL, identity_state,
+    )
+    if limit <= 0 or not _REAPER_LOCAL_LOCK.acquire(blocking=False):
+        return []
+    try:
+        observed_now = _reap_wall_now(clock_fn)
+        owner = owner_id or _REAPER_INSTANCE_UUID
+        rows = conn.execute(
+            "SELECT id, task_id, reap_state FROM task_runs WHERE reap_state IN "
+            "('terminal_requested','reap_pending','reaping','identity_unverifiable',"
+            "'manual_recovery_required','reaped') "
+            "ORDER BY terminal_requested_at ASC, id ASC LIMIT ?", (int(limit),),
+        ).fetchall()
+        decisions: list[dict[str, Any]] = []
+        for candidate in rows:
+            run_id, task_id = int(candidate["id"]), str(candidate["task_id"])
+            candidate_state = candidate["reap_state"]
+            if candidate_state == "manual_recovery_required":
+                # This is an operator-visible fence, not an automatic retry
+                # state. Re-leasing it would permit a blind duplicate signal.
+                decisions.append({
+                    "task_id": task_id,
+                    "run_id": run_id,
+                    "state": "manual_recovery_required",
+                    "reason": "manual_recovery_required",
+                })
+                continue
+            observed_now = _reap_wall_now(clock_fn)
+            attempt_uuid = _lease_reap_run(
+                conn, run_id, now=observed_now, owner=owner, lease_seconds=lease_seconds,
+            )
+            if attempt_uuid is None:
+                continue
+            base = {"task_id": task_id, "run_id": run_id,
+                    "attempt_uuid": attempt_uuid, "lease_owner": owner}
+            if candidate_state == "reaped":
+                try:
+                    finalized = _finalize_reaped_run(
+                        conn, run_id, task_id,
+                        attempt_uuid=attempt_uuid, owner=owner,
+                        lease_seconds=lease_seconds,
+                        now=_reap_wall_now(clock_fn),
+                        clock_fn=clock_fn,
+                    )
+                except TerminalTransitionConflict:
+                    finalized = False
+                    reason = "terminal_transition_conflict"
+                    _mark_reap_uncertain(
+                        conn, run_id, attempt_uuid, owner,
+                        _reap_wall_now(clock_fn),
+                        "manual_recovery_required", reason,
+                    )
+                except Exception as exc:
+                    finalized = False
+                    reason = f"finalization_deferred:{type(exc).__name__}"
+                else:
+                    reason = "finalization_deferred"
+                decisions.append({
+                    **base,
+                    "state": (
+                        "finalized" if finalized
+                        else "conflict" if reason == "terminal_transition_conflict"
+                        else "reaped"
+                    ),
+                    **({"reason": reason} if not finalized else {}),
+                })
+                continue
+            capture_state, targets, capture_reason = _capture_run_worker_tree(
+                conn,
+                run_id,
+                reap_attempt_uuid=attempt_uuid,
+                reap_lease_owner=owner,
+                reap_now=observed_now,
+                reap_clock_fn=clock_fn,
+            )
+            if capture_reason == "reap_lease_lost":
+                decisions.append({**base, "state": "lease_lost"})
+                continue
+            observed_now = _reap_wall_now(clock_fn)
+            protection_known, protected_pids, protected_exact = _protected_reap_identities(
+                conn, run_id, protected_pid_fn=protected_pid_fn,
+            )
+            states = [(item, identity_state(item)) for item in targets]
+            protected = any(
+                item.pid in protected_pids
+                or (item.pid, item.create_time) in protected_exact
+                for item in targets
+            )
+            scope = _worker_scope_state(conn, task_id, run_id)
+            scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
+                _scope_status_fields(scope)
+            )
+            scope_evidence = scope_state in {"active", "inactive"} or (
+                scope_state == "not-found" and scope_ack is True
+            )
+            trusted_scope = bool(
+                scope_unit
+                and (scope_manager_target is not None or scope_launch_mode == "legacy")
+                and scope_evidence
+                and scope_launch_mode in {"systemd-user-scope", "legacy"}
+            )
+            scope_proves_gone = trusted_scope and (
+                scope_state == "inactive"
+                or (
+                    scope_state == "not-found"
+                    and scope_ack is True
+                )
+            )
+            unknown = (
+                capture_state in {"unknown", "reused"}
+                or not protection_known or protected
+                or any(state == "unknown" for _, state in states)
+                or any(state == "reused" for _, state in states)
+                or (capture_state == "incomplete" and not scope_proves_gone)
+            )
+            if unknown:
+                attempts_row = conn.execute(
+                    "SELECT reap_attempts FROM task_runs WHERE id=?", (run_id,)
+                ).fetchone()
+                attempts = int(attempts_row["reap_attempts"] or 0) if attempts_row else 0
+                reap_state = (
+                    "manual_recovery_required" if attempts >= _REAP_GIVE_UP_ATTEMPTS
+                    else "identity_unverifiable"
+                )
+                reason = (
+                    "protected_identity" if protected
+                    else capture_reason or "identity_or_protection_unknown"
+                )
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now, reap_state, reason,
+                )
+                decisions.append({**base, "state": reap_state, "reason": reason})
+                continue
+
+            alive = [item for item, state in states if state == "alive"]
+            if scope_proves_gone:
+                alive = []
+            if scope_state == "active" and trusted_scope:
+                # The scope is the managed worker boundary. Stop it through
+                # the authenticated manager before considering any PID census.
+                observed_now = _reap_wall_now(clock_fn)
+                if not _renew_reap_lease(
+                    conn, run_id, attempt_uuid, now=observed_now,
+                    owner=owner, lease_seconds=lease_seconds,
+                ):
+                    decisions.append({**base, "state": "lease_lost"})
+                    continue
+                stopped = _stop_systemd_user_scope(
+                    scope_unit,
+                    **({"manager_target": scope_manager_target}
+                       if scope_manager_target is not None else {}),
+                )
+                observed_now = _reap_wall_now(clock_fn)
+                if stopped is not True:
+                    reason = "scope_stop_failed" if stopped is False else "scope_identity_unknown"
+                    _mark_reap_uncertain(
+                        conn, run_id, attempt_uuid, owner, observed_now,
+                        "identity_unverifiable", reason,
+                    )
+                    decisions.append({**base, "state": "identity_unverifiable", "reason": reason})
+                    continue
+                scope = _worker_scope_state(conn, task_id, run_id)
+                scope_unit, scope_state, scope_manager_target, scope_launch_mode, scope_ack = (
+                    _scope_status_fields(scope)
+                )
+                trusted_scope = bool(
+                    scope_unit
+                    and (scope_manager_target is not None or scope_launch_mode == "legacy")
+                    and scope_state == "inactive"
+                )
+                scope_proves_gone = trusted_scope
+                if scope_proves_gone:
+                    alive = []
+            if not alive and not trusted_scope:
+                attempts_row = conn.execute(
+                    "SELECT reap_attempts FROM task_runs WHERE id=?", (run_id,)
+                ).fetchone()
+                attempts = int(attempts_row["reap_attempts"] or 0) if attempts_row else 0
+                reap_state = (
+                    "manual_recovery_required" if attempts >= _REAP_GIVE_UP_ATTEMPTS
+                    else "identity_unverifiable"
+                )
+                reason = (
+                    "scope_identity_unknown"
+                    if scope_state == "unknown"
+                    or (
+                        scope_state == "not-found"
+                        and scope_launch_mode == "systemd-user-scope"
+                        and scope_ack is not True
+                    )
+                    else "complete_boundary_untrusted"
+                )
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now, reap_state, reason,
+                )
+                decisions.append({**base, "state": reap_state, "reason": reason})
+                continue
+            if not alive:
+                if scope_state == "unknown" or (
+                    scope_state == "not-found" and scope_launch_mode == "systemd-user-scope"
+                    and scope_ack is not True
+                ):
+                    reason = (
+                        "scope_still_active" if scope_state == "active"
+                        else "scope_identity_unknown"
+                    )
+                    _mark_reap_uncertain(
+                        conn, run_id, attempt_uuid, owner, observed_now,
+                        "identity_unverifiable", reason,
+                    )
+                    decisions.append({**base, "state": "identity_unverifiable", "reason": reason})
+                    continue
+                with write_txn(conn):
+                    cur = conn.execute(
+                        "UPDATE task_runs SET reap_state='reaped', reap_completed_at=?, "
+                        "reap_heartbeat_at=? WHERE id=? "
+                        "AND reap_state='reaping' AND reap_attempt_uuid=? "
+                        "AND reap_lease_owner=? AND reap_lease_expires>?",
+                        (observed_now, observed_now, run_id, attempt_uuid, owner,
+                         observed_now),
+                    )
+                try:
+                    finalized = cur.rowcount == 1 and _finalize_reaped_run(
+                        conn,
+                        run_id,
+                        task_id,
+                        attempt_uuid=attempt_uuid,
+                        owner=owner,
+                        lease_seconds=lease_seconds,
+                        now=_reap_wall_now(clock_fn),
+                        clock_fn=clock_fn,
+                    )
+                except TerminalTransitionConflict:
+                    finalized = False
+                    finalization_reason = "terminal_transition_conflict"
+                    _mark_reap_uncertain(
+                        conn, run_id, attempt_uuid, owner,
+                        _reap_wall_now(clock_fn),
+                        "manual_recovery_required", finalization_reason,
+                    )
+                except Exception:
+                    finalized = False
+                    finalization_reason = "finalization_deferred"
+                else:
+                    finalization_reason = "finalization_deferred"
+                if finalized:
+                    decisions.append({**base, "state": "finalized"})
+                else:
+                    decisions.append({
+                        **base, "state": "conflict" if finalization_reason == "terminal_transition_conflict" else "reaped",
+                        "reason": finalization_reason,
+                    })
+                continue
+
+            if not process_effects:
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now,
+                    "reap_pending", "preview",
+                )
+                decisions.append({**base, "state": "reap_pending", "preview": True})
+                continue
+
+            timing = conn.execute(
+                "SELECT reap_term_sent_at, reap_kill_sent_at, "
+                "reap_term_intent_at, reap_kill_intent_at FROM task_runs WHERE id=?",
+                (run_id,),
+            ).fetchone()
+            term_at = timing["reap_term_sent_at"] if timing else None
+            kill_at = timing["reap_kill_sent_at"] if timing else None
+            term_intent = timing["reap_term_intent_at"] if timing else None
+            kill_intent = timing["reap_kill_intent_at"] if timing else None
+            sig = None
+            if term_at is None and term_intent is None:
+                sig = TERM_SIGNAL
+            elif (
+                kill_at is None and kill_intent is None and term_at is not None
+                and observed_now >= int(term_at) + max(0, int(term_grace_seconds))
+            ):
+                sig = KILL_SIGNAL
+            elif (term_at is None and term_intent is not None) or (
+                kill_at is None and kill_intent is not None
+            ):
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now,
+                    "manual_recovery_required", "signal_delivery_uncertain",
+                )
+                decisions.append({
+                    **base, "state": "manual_recovery_required",
+                    "reason": "signal_delivery_uncertain",
+                })
+                continue
+            if sig is None:
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now,
+                    "reap_pending", "term_grace",
+                )
+                decisions.append({**base, "state": "reap_pending", "reason": "term_grace"})
+                continue
+            observed_now = _reap_wall_now(clock_fn)
+            if not _renew_reap_lease(
+                conn, run_id, attempt_uuid, now=observed_now,
+                owner=owner, lease_seconds=lease_seconds,
+            ):
+                decisions.append({**base, "state": "lease_lost"})
+                continue
+            signal_states = []
+            lease_lost = False
+            signal_reason = None
+            for identity in reversed(alive):
+                state, reason = _signal_with_reap_lease(
+                    conn,
+                    run_id,
+                    attempt_uuid,
+                    owner,
+                    identity,
+                    sig,
+                    now=observed_now,
+                    lease_seconds=lease_seconds,
+                    protected_pid_fn=protected_pid_fn,
+                    signal_fn=signal_fn,
+                    clock_fn=clock_fn,
+                )
+                if state == "lease_lost":
+                    lease_lost = True
+                    break
+                signal_states.append(state)
+                if state in {"unknown", "protected", "signal_delivery_uncertain"}:
+                    signal_reason = reason or "signal_identity_unknown"
+                    break
+            if lease_lost:
+                decisions.append({**base, "state": "lease_lost"})
+                continue
+            if signal_reason is not None:
+                observed_now = _reap_wall_now(clock_fn)
+                uncertain_state = (
+                    "manual_recovery_required"
+                    if signal_reason == "signal_delivery_uncertain"
+                    else "identity_unverifiable"
+                )
+                _mark_reap_uncertain(
+                    conn, run_id, attempt_uuid, owner, observed_now,
+                    uncertain_state, signal_reason,
+                )
+                decisions.append({**base, "state": uncertain_state,
+                                  "reason": signal_reason})
+                continue
+            observed_now = _reap_wall_now(clock_fn)
+            with write_txn(conn):
+                conn.execute(
+                    "UPDATE task_runs SET reap_state='reap_pending', "
+                    "reap_heartbeat_at=? WHERE id=? "
+                    "AND reap_attempt_uuid=? AND reap_lease_owner=? "
+                    "AND reap_lease_expires>?",
+                    (
+                        observed_now, run_id, attempt_uuid, owner,
+                        observed_now,
+                    ),
+                )
+            decisions.append({**base, "state": "reap_pending",
+                              "signal": "KILL" if sig == KILL_SIGNAL else "TERM"})
+        return decisions
+    finally:
+        _REAPER_LOCAL_LOCK.release()
+
+
 def heartbeat_worker(
     conn: sqlite3.Connection,
     task_id: str,
     *,
     note: Optional[str] = None,
     expected_run_id: Optional[int] = None,
+    clock_fn=None,
 ) -> bool:
     """Record a ``heartbeat`` event + touch ``last_heartbeat_at``.
 
@@ -9033,7 +10927,7 @@ def heartbeat_worker(
     Returns True on success, False if the task is not in a state that
     should be heartbeating (not running, or claim expired).
     """
-    now = int(time.time())
+    now = _reap_wall_now(clock_fn)
     with write_txn(conn):
         if expected_run_id is None:
             cur = conn.execute(
@@ -9064,6 +10958,11 @@ def heartbeat_worker(
             {"note": note} if note else None,
             run_id=run_id,
         )
+    if run_id is not None:
+        try:
+            _capture_run_worker_tree(conn, run_id)
+        except Exception:
+            pass
     return True
 
 
@@ -9072,21 +10971,12 @@ def enforce_max_runtime(
     *,
     signal_fn=None,
     process_effects: bool = True,
+    clock_fn=None,
 ) -> list[str]:
-    """Terminate workers whose per-task ``max_runtime_seconds`` has elapsed.
-
-    Sends SIGTERM, waits a short grace window, then SIGKILL. Emits a
-    ``timed_out`` event and drops the task back to ``ready`` so the next
-    dispatcher tick re-spawns it — unless the spawn-failure circuit
-    breaker has already given up, in which case the task stays blocked
-    where ``_record_spawn_failure`` parked it.
-
-    Runs host-local: only tasks claimed by this host are candidates
-    (same reasoning as ``detect_crashed_workers``). ``signal_fn`` is a
-    test hook; defaults to ``os.kill`` on POSIX.
-    """
+    """Request timeout; the leased reaper owns signalling/finalization."""
     timed_out: list[str] = []
-    now = int(time.time())
+    enforce_max_runtime._last_transition_conflicts = []  # type: ignore[attr-defined]
+    now = _reap_wall_now(clock_fn)
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
 
     rows = conn.execute(
@@ -9110,90 +11000,34 @@ def enforce_max_runtime(
         if elapsed < int(row["max_runtime_seconds"]):
             continue
 
-        pid = int(row["worker_pid"])
-        tid = row["id"]
-        termination = (
-            _terminate_reclaimed_worker(
-                pid,
-                row["claim_lock"],
-                conn=conn,
-                task_id=tid,
-                run_id=row["current_run_id"],
-                signal_fn=signal_fn,
-            )
-            if process_effects
-            else {
-                "prev_pid": pid,
-                "host_local": True,
-                "termination_attempted": False,
-                "terminated": False,
-                "sigkill": False,
-                "preview": True,
-            }
-        )
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn,
-                tid,
-                row["claim_lock"],
-                now,
-                termination,
-                reason="max_runtime_worker_alive",
-                expected_run_id=row["current_run_id"],
-                expected_pid=row["worker_pid"],
-            )
+        pid, tid = int(row["worker_pid"]), row["id"]
+        error = f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s"
+        if not process_effects:
+            timed_out.append(tid)
             continue
-        killed = bool(termination.get("sigkill"))
-
-        with write_txn(conn):
-            retry_status = _claim_retry_status(conn, tid)
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL, "
-                "last_heartbeat_at = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ? "
-                "  AND current_run_id IS ?",
-                (retry_status, tid, pid, row["claim_lock"], row["current_run_id"]),
-            )
-            if cur.rowcount == 1:
-                payload = {
-                    "pid": pid,
-                    "elapsed_seconds": int(elapsed),
-                    "limit_seconds": int(row["max_runtime_seconds"]),
-                    "sigkill": killed,
-                    "preview": not process_effects,
-                }
-                payload.update(termination)
-                run_id = _end_run(
-                    conn, tid,
-                    outcome="timed_out", status="timed_out",
-                    error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                    metadata=payload,
-                )
-                _append_event(
-                    conn, tid, "timed_out", payload, run_id=run_id,
-                )
-                timed_out.append(tid)
-        # Increment the unified failure counter. Outside the write_txn
-        # above because ``_record_task_failure`` opens its own. If the
-        # breaker trips, this flips the task ``ready → blocked`` and
-        # emits a ``gave_up`` event on top of the ``timed_out`` we
-        # already emitted.
-        if cur.rowcount == 1:
-            _record_task_failure(
-                conn, tid,
-                error=f"elapsed {int(elapsed)}s > limit {int(row['max_runtime_seconds'])}s",
-                outcome="timed_out",
-                release_claim=False,
-                end_run=False,
+        try:
+            requested = _request_terminal_transition(
+                conn, tid, action="timed_out",
+                payload={
+                "task_status": _claim_retry_status(conn, tid),
+                "run_status": "timed_out", "outcome": "timed_out",
+                "event_kind": "timed_out", "error": error,
+                "event_payload": {"pid": pid, "elapsed_seconds": int(elapsed),
+                                  "limit_seconds": int(row["max_runtime_seconds"])},
+                "record_failure": True,
+            },
                 expected_run_id=row["current_run_id"],
-                event_payload_extra={
-                    "pid": pid,
-                    "sigkill": killed,
-                    **termination,
-                },
             )
+        except TerminalTransitionConflict as exc:
+            requested = False
+            enforce_max_runtime._last_transition_conflicts.append({  # type: ignore[attr-defined]
+                "task_id": tid,
+                "state": "conflict",
+                "reason": "terminal_transition_conflict",
+                "detail": str(exc),
+            })
+        if requested:
+            timed_out.append(tid)
     return timed_out
 
 
@@ -9233,6 +11067,7 @@ def detect_stale_running(
     immediately).  ``signal_fn`` is a test hook; defaults to ``os.kill``
     on POSIX.
     """
+    detect_stale_running._last_transition_conflicts = []  # type: ignore[attr-defined]
     if stale_timeout_seconds <= 0:
         return []
 
@@ -9243,7 +11078,7 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
-        "       t.current_run_id, "
+        "       t.current_run_id, r.worker_identity, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -9267,6 +11102,48 @@ def detect_stale_running(
         pid = row["worker_pid"]
         tid = row["id"]
         lock = row["claim_lock"] or ""
+
+        if pid is not None:
+            identity = _decode_process_identity(row["worker_identity"])
+            if identity is None or _exact_identity_state(row["worker_identity"]) == "unknown":
+                continue
+            payload = {
+                "elapsed_seconds": int(elapsed),
+                "last_heartbeat_at": int(last_hb) if last_hb is not None else None,
+                "heartbeat_age_seconds": int(hb_age) if hb_age is not None else None,
+                "timeout_seconds": stale_timeout_seconds,
+                "pid": int(pid),
+            }
+            if process_effects:
+                try:
+                    requested = _request_terminal_transition(
+                        conn, tid, action="stale",
+                        payload={
+                    "task_status": _claim_retry_status(conn, tid),
+                    "run_status": "stale", "outcome": "stale",
+                    "event_kind": "stale",
+                    "error": ((f"no heartbeat for {int(hb_age)}s "
+                               if hb_age is not None else "no heartbeat ever ")
+                              + f"after {int(elapsed)}s running"),
+                    "event_payload": payload, "metadata": payload,
+                },
+                        expected_run_id=row["current_run_id"],
+                    )
+                except TerminalTransitionConflict as exc:
+                    requested = False
+                    detect_stale_running._last_transition_conflicts.append({  # type: ignore[attr-defined]
+                        "task_id": tid,
+                        "state": "conflict",
+                        "reason": "terminal_transition_conflict",
+                        "detail": str(exc),
+                    })
+            else:
+                requested = False
+            if requested:
+                reclaimed.append(tid)
+            elif not process_effects:
+                reclaimed.append(tid)
+            continue
 
         # Terminate the worker if it's still host-local.
         termination = (
@@ -9471,6 +11348,7 @@ def detect_crashed_workers(
     (the public return stays the crashed-only ``list[str]``).
     """
     crashed: list[str] = []
+    detect_crashed_workers._last_transition_conflicts = []  # type: ignore[attr-defined]
     rate_limited: list[str] = []
     if not process_effects:
         detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
@@ -9488,322 +11366,113 @@ def detect_crashed_workers(
     deferred_scope_runs: set[tuple[str, Optional[int]]] = set()
     collected_scope_runs: set[tuple[str, Optional[int]]] = set()
     candidates = conn.execute(
-        "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
-        "FROM tasks WHERE status = 'running' AND worker_pid IS NOT NULL"
+        "SELECT t.id, t.worker_pid, t.claim_lock, t.started_at, t.current_run_id, "
+        "r.worker_identity FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status = 'running' AND t.worker_pid IS NOT NULL"
     ).fetchall()
+    planned: list[dict[str, Any]] = []
     for row in candidates:
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
         started_at = row["started_at"]
-        if started_at is not None:
-            grace = _resolve_crash_grace_seconds()
-            if time.time() - started_at < grace:
-                continue
-        scope_status = (
-            _worker_scope_state(conn, row["id"], row["current_run_id"])
-            if process_effects
-            else None
-        )
-        if scope_status is None:
-            scope_state = "not-found"
-            scope_launch_mode = "legacy"
-        else:
-            _, scope_state = scope_status
-            scope_launch_mode = getattr(scope_status, "launch_mode", "legacy")
-        pid_alive = _pid_alive(row["worker_pid"])
-        if pid_alive and not (
-            scope_state == "unknown"
-            or (
-                scope_launch_mode == "systemd-user-scope"
-                and scope_state in {"inactive", "not-found"}
-            )
-        ):
+        if started_at is not None and time.time() - started_at < _resolve_crash_grace_seconds():
             continue
-        termination = (
-            _terminate_reclaimed_worker(
-                row["worker_pid"],
-                row["claim_lock"],
-                conn=conn,
-                task_id=row["id"],
-                run_id=row["current_run_id"],
-                scope_status=scope_status,
-                pid_known_dead=not pid_alive,
+        identity = _decode_process_identity(row["worker_identity"])
+        if identity is None:
+            # Live legacy PID-only rows are deliberately unverifiable and stay
+            # fenced. PID reuse can never manufacture a crash transition.
+            continue
+        state = _exact_identity_state(row["worker_identity"])
+        if state in {"alive", "unknown"}:
+            continue
+        pid = int(row["worker_pid"])
+        kind, code = _classify_worker_exit(pid)
+        protocol_violation = kind == "clean_exit"
+        rate_limited_exit = kind == "rate_limited"
+        if protocol_violation:
+            error_text = (
+                "worker exited cleanly (rc=0) without calling kanban_complete "
+                "or kanban_block — protocol violation"
             )
-            if process_effects
-            else {
-                "prev_pid": int(row["worker_pid"]),
-                "host_local": True,
-                "termination_attempted": scope_state == "active",
-                "terminated": bool(
-                    not pid_alive and scope_state in {"inactive", "not-found"}
+            event_kind = "protocol_violation"
+        elif rate_limited_exit:
+            error_text = f"pid {pid} exited rate-limited (quota wall)"
+            event_kind = "rate_limited"
+        else:
+            error_text = (
+                f"pid {pid} exited with code {code}" if kind == "nonzero_exit"
+                else f"pid {pid} killed by signal {code}" if kind == "signaled"
+                else f"pid {pid} exact identity is gone"
+            )
+            event_kind = "crashed"
+        outcome = "rate_limited" if rate_limited_exit else "crashed"
+        planned.append({
+            "row": row,
+            "pid": pid,
+            "kind": kind,
+            "code": code,
+            "protocol_violation": protocol_violation,
+            "rate_limited_exit": rate_limited_exit,
+            "error_text": error_text,
+            "event_kind": event_kind,
+            "outcome": outcome,
+        })
+
+    fingerprint_counts: dict[str, int] = {}
+    for item in planned:
+        if item["protocol_violation"] or item["rate_limited_exit"]:
+            continue
+        fingerprint = _error_fingerprint(item["error_text"])
+        fingerprint_counts[fingerprint] = fingerprint_counts.get(fingerprint, 0) + 1
+
+    for item in planned:
+        row = item["row"]
+        pid = item["pid"]
+        error_text = item["error_text"]
+        protocol_violation = item["protocol_violation"]
+        rate_limited_exit = item["rate_limited_exit"]
+        outcome = item["outcome"]
+        failure_limit = None
+        if not protocol_violation and not rate_limited_exit:
+            if fingerprint_counts.get(_error_fingerprint(error_text), 0) >= 3:
+                failure_limit = 1
+        try:
+            requested = _request_terminal_transition(
+                conn, row["id"], action=outcome,
+                payload={
+                "task_status": _claim_retry_status(conn, row["id"]),
+                "run_status": outcome, "outcome": outcome,
+                "event_kind": item["event_kind"], "error": error_text,
+                "event_payload": {"pid": pid, "claimer": row["claim_lock"],
+                                  "exit_kind": item["kind"],
+                                  "exit_code": item["code"]},
+                "metadata": {"protocol_violation": protocol_violation},
+                "record_failure": not rate_limited_exit,
+                "protocol_violation": protocol_violation,
+                "failure_limit": (
+                    _PROTOCOL_VIOLATION_FAILURE_LIMIT
+                    if protocol_violation else failure_limit
                 ),
-                "sigkill": False,
-                "scope_state": scope_state,
-                "scope_unknown": scope_state == "unknown",
-                "preview": True,
-            }
-        )
-        if _worker_survived_termination(termination):
-            _defer_reclaim_for_live_worker(
-                conn,
-                row["id"],
-                row["claim_lock"],
-                int(time.time()),
-                termination,
-                reason="crashed_leader_scope_alive",
+                "last_failure_error": error_text,
+                "failure_event_payload": {
+                    "pid": pid,
+                    "claimer": row["claim_lock"],
+                },
+                },
                 expected_run_id=row["current_run_id"],
-                expected_pid=row["worker_pid"],
             )
-            deferred_scope_runs.add((row["id"], row["current_run_id"]))
-        elif (
-            scope_launch_mode == "systemd-user-scope"
-            and termination.get("terminated")
-        ):
-            collected_scope_runs.add((row["id"], row["current_run_id"]))
-
-    with write_txn(conn):
-        rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, current_run_id "
-            "FROM tasks "
-            "WHERE status = 'running' AND worker_pid IS NOT NULL"
-        ).fetchall()
-        for row in rows:
-            run_key = (row["id"], row["current_run_id"])
-            if run_key in deferred_scope_runs:
-                continue
-            # Only check liveness for claims owned by this host.
-            lock = row["claim_lock"] or ""
-            if not lock.startswith(host_prefix):
-                continue
-            # Skip liveness check inside the launch-window grace period
-            # so a freshly-spawned worker isn't reclaimed before its PID
-            # is visible on /proc.
-            started_at = row["started_at"] if "started_at" in row.keys() else None
-            if started_at is not None:
-                grace = _resolve_crash_grace_seconds()
-                if time.time() - started_at < grace:
-                    continue
-            if run_key not in collected_scope_runs and _pid_alive(row["worker_pid"]):
-                continue
-
-            pid = int(row["worker_pid"])
-            kind, code = _classify_worker_exit(pid)
-            rate_limited_exit = False
-            if kind == "clean_exit":
-                # Worker subprocess returned 0 but its task is still
-                # ``running`` in the DB — it exited without calling
-                # ``kanban_complete`` / ``kanban_block``. Overwhelmingly the
-                # work itself succeeded and only the paperwork was skipped, so
-                # a retry usually completes; the corrective sentence below is
-                # surfaced to the retry worker via the prior-attempt error in
-                # ``build_worker_context`` (guidance approach from #61817).
-                protocol_violation = True
-                error_text = (
-                    "worker exited cleanly (rc=0) without calling "
-                    "kanban_complete or kanban_block — protocol violation. "
-                    "If the prior run already did the work, verify it and "
-                    "report the result via kanban_complete; a run that ends "
-                    "without a terminal kanban call counts as failed no "
-                    "matter what it did."
-                )
-                event_kind = "protocol_violation"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                    # Durable marker for _protocol_violation_streak: _end_run
-                    # copies this payload into the run metadata, which is how
-                    # the violation-only retry budget is derived later.
-                    "protocol_violation": True,
-                }
-            elif kind == "rate_limited":
-                # Worker bailed because the provider rate-limited / exhausted
-                # quota (EX_TEMPFAIL sentinel). This is NOT a task failure —
-                # the task is fine, the account just hit a wall. Release it
-                # back to ``ready`` so the respawn guard defers it until the
-                # quota window clears, and crucially do NOT count a failure
-                # (skip ``_record_task_failure``) so a long quota window can't
-                # trip the circuit breaker and permanently block the card.
-                protocol_violation = False
-                rate_limited_exit = True
-                error_text = (
-                    f"pid {pid} exited rate-limited (quota wall) — "
-                    f"requeued without counting a failure"
-                )
-                event_kind = "rate_limited"
-                event_payload = {
-                    "pid": pid,
-                    "claimer": row["claim_lock"],
-                    "exit_code": code,
-                }
-            else:
-                protocol_violation = False
-                if kind == "nonzero_exit":
-                    error_text = f"pid {pid} exited with code {code}"
-                elif kind == "signaled":
-                    error_text = f"pid {pid} killed by signal {code}"
-                else:
-                    error_text = f"pid {pid} not alive"
-                event_kind = "crashed"
-                event_payload = {"pid": pid, "claimer": row["claim_lock"]}
-                if code is not None and kind != "unknown":
-                    event_payload["exit_kind"] = kind
-                    event_payload["exit_code"] = code
-
-            retry_status = _claim_retry_status(conn, row["id"])
-            cur = conn.execute(
-                "UPDATE tasks SET status = ?, claim_lock = NULL, "
-                "claim_expires = NULL, worker_pid = NULL "
-                "WHERE id = ? AND status = 'running' "
-                "  AND worker_pid = ? AND claim_lock IS ? "
-                "  AND current_run_id IS ?",
-                (retry_status, row["id"], pid, row["claim_lock"], row["current_run_id"]),
-            )
-            if cur.rowcount == 1:
-                # Rate-limited requeues are a clean release, not a crash —
-                # record the run outcome as ``rate_limited`` so the board
-                # history doesn't show a phantom crash for a quota wall.
-                _run_outcome = "rate_limited" if rate_limited_exit else "crashed"
-                run_id = _end_run(
-                    conn, row["id"],
-                    outcome=_run_outcome, status=_run_outcome,
-                    error=error_text,
-                    metadata=dict(event_payload),
-                )
-                _append_event(
-                    conn, row["id"], event_kind,
-                    event_payload,
-                    run_id=run_id,
-                )
-                if rate_limited_exit:
-                    # Stamp the failure-error column so ``check_respawn_guard``
-                    # recognizes this as a quota blocker and defers the
-                    # respawn until the window clears — WITHOUT touching
-                    # ``consecutive_failures`` (that's the whole point: no
-                    # breaker trip on a throttle).
-                    conn.execute(
-                        "UPDATE tasks SET last_failure_error = ? WHERE id = ?",
-                        (error_text[:500], row["id"]),
-                    )
-                    rate_limited.append(row["id"])
-                else:
-                    if protocol_violation:
-                        # Stamp the failure error now: a below-budget
-                        # violation never reaches ``_record_task_failure``
-                        # (which stamps this column for every other failure
-                        # kind), yet the board UI and the retry worker's
-                        # context still need the violation message + the
-                        # corrective guidance it carries.
-                        conn.execute(
-                            "UPDATE tasks SET last_failure_error = ? "
-                            "WHERE id = ?",
-                            (error_text[:500], row["id"]),
-                        )
-                    crashed.append(row["id"])
-                    crash_details.append(
-                        (row["id"], pid, row["claim_lock"],
-                         protocol_violation, error_text, run_id)
-                    )
-    # Outside the main txn: account each crashed task and maybe trip the
-    # breaker (the task transitions ready → blocked with a ``gave_up`` event
-    # on top of the event we already emitted).
-    #
-    # Protocol-violation crashes (clean exit, no terminal tool call) get a
-    # BOUNDED retry, not an immediate trip: empirically ~96% of these tasks
-    # complete on a later run (a goal-mode finalize nudge, or the model simply
-    # emitting kanban_complete/kanban_block next time), so blocking on the first
-    # occurrence just churned them through the respawn cycle. The retry budget
-    # is a violation-only streak (``_protocol_violation_streak``): earlier
-    # timeouts / nonzero exits neither consume nor extend it, and a
-    # below-budget violation does not tick the unified
-    # ``consecutive_failures`` counter, so the two budgets stay independent.
-    # A per-task ``max_retries`` overrides the violation bound with the same
-    # top precedence it has for every other failure kind. Systemic same-error
-    # crashes still trip immediately.
-    auto_blocked: list[str] = []
-    if crash_details:
-        # Fingerprint errors to detect systemic failures.
-        _fp_counts: dict[str, int] = {}
-        for _, _, _, _, err_text, _ in crash_details:
-            fp = _error_fingerprint(err_text)
-            _fp_counts[fp] = _fp_counts.get(fp, 0) + 1
-        for (
-            tid,
-            pid,
-            claimer,
-            protocol_violation,
-            error_text,
-            ended_run_id,
-        ) in crash_details:
-            if protocol_violation:
-                streak = _protocol_violation_streak(conn, tid)
-                trow = conn.execute(
-                    "SELECT max_retries FROM tasks WHERE id = ?", (tid,),
-                ).fetchone()
-                if trow is None:
-                    continue  # task deleted mid-loop
-                task_override = (
-                    trow["max_retries"] if "max_retries" in trow.keys() else None
-                )
-                violation_limit = (
-                    int(task_override)
-                    if task_override is not None
-                    else _PROTOCOL_VIOLATION_FAILURE_LIMIT
-                )
-                if streak < violation_limit:
-                    # Below budget: the task is already back at ``ready``
-                    # (respawn allowed) with ``last_failure_error`` stamped.
-                    # Deliberately no ``_record_task_failure`` call — a
-                    # below-budget violation must not consume the unified
-                    # failure budget, just as other failure kinds don't
-                    # consume this one.
-                    continue
-                # Streak reached the bound: trip the breaker. ``force_trip``
-                # skips the threshold resolution inside
-                # ``_record_task_failure`` because the decision — including
-                # the per-task ``max_retries`` override — was already made
-                # against the violation streak above.
-                tripped = _record_task_failure(
-                    conn, tid,
-                    error=error_text,
-                    outcome="crashed",
-                    failure_limit=violation_limit,
-                    force_trip=True,
-                    release_claim=False,
-                    end_run=False,
-                    expected_run_id=ended_run_id,
-                    event_payload_extra={
-                        "pid": pid,
-                        "claimer": claimer,
-                        "protocol_violations": streak,
-                        "protocol_violation_limit": violation_limit,
-                    },
-                )
-                if tripped:
-                    auto_blocked.append(tid)
-                continue
-            fp = _error_fingerprint(error_text)
-            is_systemic = _fp_counts.get(fp, 0) >= 3
-            tripped = _record_task_failure(
-                conn, tid,
-                error=error_text,
-                outcome="crashed",
-                failure_limit=1 if is_systemic else None,
-                release_claim=False,
-                end_run=False,
-                expected_run_id=ended_run_id,
-                event_payload_extra={"pid": pid, "claimer": claimer},
-            )
-            if tripped:
-                auto_blocked.append(tid)
-    # Stash auto-blocked ids on the function for the dispatch loop to pick up.
-    # Keeps the public return type (``list[str]``) stable for direct callers
-    # and tests that destructure the result; ``dispatch_once`` reads this
-    # side-channel attribute to populate ``DispatchResult.auto_blocked``.
-    detect_crashed_workers._last_auto_blocked = auto_blocked  # type: ignore[attr-defined]
-    # Same side-channel for rate-limited requeues — these did NOT count a
-    # failure and are NOT crashes, so they stay out of the ``crashed`` return.
+        except TerminalTransitionConflict as exc:
+            requested = False
+            detect_crashed_workers._last_transition_conflicts.append({  # type: ignore[attr-defined]
+                "task_id": row["id"],
+                "state": "conflict",
+                "reason": "terminal_transition_conflict",
+                "detail": str(exc),
+            })
+        if requested:
+            (rate_limited if rate_limited_exit else crashed).append(row["id"])
+    detect_crashed_workers._last_auto_blocked = []  # type: ignore[attr-defined]
     detect_crashed_workers._last_rate_limited = rate_limited  # type: ignore[attr-defined]
     return crashed
 
@@ -10055,6 +11724,17 @@ def _set_worker_pid(
     launcher returns an int-compatible value carrying its opaque unit. Returns
     ``False`` when the worker completed or lost its claim before persistence.
     """
+    from hermes_cli.kanban_worker_process import read_identity
+
+    worker_identity = read_identity(int(pid))
+    identity_json = (
+        json.dumps(worker_identity.to_dict(), sort_keys=True)
+        if worker_identity is not None else None
+    )
+    tree_json = (
+        json.dumps([worker_identity.to_dict()], sort_keys=True)
+        if worker_identity is not None else None
+    )
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
@@ -10082,10 +11762,11 @@ def _set_worker_pid(
             return False
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ? "
+                "UPDATE task_runs SET worker_pid = ?, worker_identity = ?, "
+                "worker_tree = ? "
                 "WHERE id = ? AND status = 'running' AND ended_at IS NULL "
                 "  AND claim_lock IS ?",
-                (int(pid), int(run_id), claim_lock),
+                (int(pid), identity_json, tree_json, int(run_id), claim_lock),
             )
         # Only the exact private handle returned by ``_default_spawn`` may
         # declare a scoped launch. A custom ``spawn_fn`` is allowed to return
@@ -10100,6 +11781,7 @@ def _set_worker_pid(
         payload: dict[str, Any] = {
             "pid": int(pid),
             "launch_mode": "systemd-user-scope" if scoped_launch else "direct",
+            "identity_verified": worker_identity is not None,
         }
         if scoped_launch:
             db_path = _connection_main_db_path(conn)
@@ -10552,10 +12234,11 @@ def _blocked_continuation_route(
         "age_seconds": max(0, now - since),
         "sla_seconds": CONTINUATION_BLOCKER_SLA_SECONDS,
     }
+    terminal_placeholders, terminal_statuses = _terminal_status_sql()
     known_parent_wait = status == "todo" and conn.execute(
         "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-        "WHERE l.child_id = ? AND p.status NOT IN ('done','archived') LIMIT 1",
-        (row["id"],),
+        f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
+        (row["id"], *terminal_statuses),
     ).fetchone() is not None
     if kind == "dependency" or known_parent_wait:
         # Parent-gated work has an exact automatic release condition in the
@@ -11073,7 +12756,7 @@ def continue_blocked_tasks(
         ).fetchall()
         unfinished_parents = [
             r["id"] for r in parent_rows
-            if r["status"] not in ("done", "archived")
+            if r["status"] not in TERMINAL_STATUSES
         ]
         if unfinished_parents:
             parent_id = unfinished_parents[0]
@@ -11118,7 +12801,7 @@ def continue_blocked_tasks(
                 ))
                 continue
             observed = _dependency_fingerprint(conn, dependency_task_id)
-            if dependency.status not in ("done", "archived"):
+            if dependency.status not in TERMINAL_STATUSES:
                 decisions.append(_continuation_skip(
                     task.id, "dependency_unchanged_or_unfinished",
                     block_event_id=event["id"],
@@ -11461,6 +13144,9 @@ def _dispatch_once_locked(
         reap_worker_zombies()
 
     result = DispatchResult()
+    if not preview_mode:
+        refresh_worker_process_ownership(conn)
+        result.worker_reaps = reconcile_worker_reaps(conn)
     result.scope_cleanup = _reconcile_ended_worker_scopes(
         conn,
         process_effects=not preview_mode,
@@ -11469,9 +13155,15 @@ def _dispatch_once_locked(
     result.reclaimed = release_stale_claims(
         conn, process_effects=not preview_mode,
     )
+    result.maintenance_conflicts.extend(
+        getattr(release_stale_claims, "_last_transition_conflicts", [])
+    )
     result.stale = detect_stale_running(
         conn, stale_timeout_seconds=stale_timeout_seconds,
         process_effects=not preview_mode,
+    )
+    result.maintenance_conflicts.extend(
+        getattr(detect_stale_running, "_last_transition_conflicts", [])
     )
     crash_attrs = {
         name: getattr(detect_crashed_workers, name, None)
@@ -11480,6 +13172,9 @@ def _dispatch_once_locked(
     result.crashed = detect_crashed_workers(
         conn,
         process_effects=not preview_mode,
+    )
+    result.maintenance_conflicts.extend(
+        getattr(detect_crashed_workers, "_last_transition_conflicts", [])
     )
     # detect_crashed_workers stashes protocol-violation auto-blocks on
     # itself so the public list-return stays stable. Pull them into the
@@ -11508,6 +13203,9 @@ def _dispatch_once_locked(
                 setattr(detect_crashed_workers, name, value)
     result.timed_out = enforce_max_runtime(
         conn, process_effects=not preview_mode,
+    )
+    result.maintenance_conflicts.extend(
+        getattr(enforce_max_runtime, "_last_transition_conflicts", [])
     )
     result.promoted = recompute_ready(conn, failure_limit=failure_limit)
     if enable_continuations:
@@ -12371,6 +14069,20 @@ class _WorkerScopeStatus:
         # shape for internal callers and third-party tests.
         yield self.unit
         yield self.state
+
+
+def _scope_status_fields(scope: Any) -> tuple[Any, str, Any, str, Optional[bool]]:
+    """Read modern scope receipts and legacy two-tuple test seams alike."""
+    if isinstance(scope, _WorkerScopeStatus):
+        return (
+            scope.unit, scope.state, scope.manager_target,
+            scope.launch_mode, scope.launch_acknowledged,
+        )
+    try:
+        unit, state = scope
+    except (TypeError, ValueError):
+        return None, "unknown", None, "invalid", None
+    return unit, state, None, "legacy", None
 
 
 class _WorkerLaunchPid(int):

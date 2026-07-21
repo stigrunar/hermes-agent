@@ -498,6 +498,38 @@ def redact_cdp_url(value: object) -> str:
     return text
 
 
+def redact_for_persistence(value):
+    """Force-redact explicitly classified durable diagnostic values.
+
+    Functional task payloads must keep their original credentials when they
+    are needed for a workflow.  This stricter recursive boundary is reserved
+    for persisted diagnostic/error metadata, where reusable credentials,
+    URL-auth/query secrets, and host identity paths must not survive.
+    """
+    if isinstance(value, str):
+        text = redact_sensitive_text(
+            value,
+            force=True,
+            full_mask=True,
+            redact_url_credentials=True,
+        )
+        if not text:
+            return text
+        text = _redact_url_query_params(text)
+        text = _redact_url_userinfo(text)
+        text = _redact_http_request_target_query_params(text)
+        text = _LOCAL_HOME_PATH_RE.sub("<home>", text)
+        text = _USER_RUNTIME_PATH_RE.sub("<user-runtime>", text)
+        return text
+    if isinstance(value, dict):
+        return {key: redact_for_persistence(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [redact_for_persistence(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(redact_for_persistence(item) for item in value)
+    return value
+
+
 def _redact_http_request_target_query_params(text: str) -> str:
     """Redact sensitive query params in HTTP access-log request targets."""
     def _sub(m: re.Match) -> str:
@@ -763,43 +795,6 @@ def redact_sensitive_text(
     return text
 
 
-def redact_for_persistence(value):
-    """Force-redact an explicitly classified durable diagnostic value.
-
-    Active browser/tool workflows and functional persistence fields preserve
-    web query credentials and ``user:password@`` URLs because masking them can
-    destroy a callback, signed URL, handoff, or archived result. Callers use
-    this stricter pass only for schema fields whose producer classifies them as
-    machine-generated diagnostics, such as authentication, delivery, or fixed
-    execution failures. It forces the normal redactor on and additionally
-    masks URL query credentials, URL userinfo, and HTTP request-target query
-    strings.
-
-    Dictionaries and sequences are handled recursively so structured event
-    payloads and diagnostic metadata cannot bypass the text boundary.
-    Non-text scalar values pass through unchanged.
-
-    This targets recognized secret, URL-auth, and phone-number patterns. It is
-    not a comprehensive arbitrary-PII sanitizer and must not be applied to
-    opaque functional content merely because that content is persisted.
-    """
-    if isinstance(value, str):
-        text = redact_sensitive_text(value, force=True, full_mask=True)
-        if not text:
-            return text
-        text = _redact_url_query_params(text)
-        text = _redact_url_userinfo(text)
-        text = _redact_http_request_target_query_params(text)
-        text = _LOCAL_HOME_PATH_RE.sub("<home>", text)
-        text = _USER_RUNTIME_PATH_RE.sub("<user-runtime>", text)
-        return text
-    if isinstance(value, dict):
-        return {key: redact_for_persistence(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_for_persistence(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_for_persistence(item) for item in value)
-    return value
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),

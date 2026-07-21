@@ -17,6 +17,60 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_worker_process as kp
+
+
+@pytest.fixture(autouse=True)
+def deterministic_worker_identity(monkeypatch):
+    """Give legacy lifecycle tests exact synthetic identities.
+
+    Phase B production capture is covered against psutil in the focused reaper
+    suite. This long-standing DB suite uses intentionally fake PIDs and mocks
+    ``kb._pid_alive``; bridge those fixtures to the new exact-identity surface
+    so their lifecycle assertions remain deterministic.
+    """
+    monkeypatch.setattr(
+        kp,
+        "read_identity",
+        lambda pid: kp.ProcessIdentity(int(pid), float(int(pid)) + 0.25),
+    )
+    monkeypatch.setattr(
+        kp,
+        "identity_state",
+        lambda identity: "alive" if kb._pid_alive(identity.pid) else "gone",
+    )
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "captured", tuple(dict.fromkeys([root, *previous]))
+        ),
+    )
+    monkeypatch.setattr(
+        kp,
+        "protected_process_identities",
+        lambda extra=(): ({int(pid) for pid in extra}, set()),
+    )
+
+
+def _finish_terminal_reap(conn, monkeypatch, *, signal_fn=None, now=9_000_000):
+    """Confirm exact synthetic workers gone and finish pending transitions."""
+    with monkeypatch.context() as scoped:
+        scoped.setattr(kp, "identity_state", lambda _identity: "gone")
+        scoped.setattr(
+            kb,
+            "_worker_scope_state",
+            lambda *_a, **_kw: kb._WorkerScopeStatus(
+                "hermes-test-worker.scope", "inactive", "test-manager",
+                "systemd-user-scope", True,
+            ),
+        )
+        return kb.reconcile_worker_reaps(
+            conn,
+            now=now,
+            signal_fn=signal_fn,
+            protected_pid_fn=lambda: set(),
+        )
 
 
 @pytest.fixture
@@ -453,8 +507,11 @@ def test_stale_claim_reclaimed(kanban_home, monkeypatch):
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         reclaimed = kb.release_stale_claims(conn, signal_fn=_signal)
         assert reclaimed == 1
+        assert kb.get_task(conn, t).status == "running"
+        _finish_terminal_reap(conn, monkeypatch, signal_fn=_signal)
         assert kb.get_task(conn, t).status == "ready"
-        assert killed == [signal.SIGTERM]
+        # Exact identity was already gone; a recycled PID is never signalled.
+        assert killed == []
 
 
 def test_stale_claim_with_live_pid_extends_instead_of_reclaiming(
@@ -563,7 +620,7 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
             },
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
-        assert reclaimed == 0
+        assert reclaimed == 1
 
         assert kb.get_task(conn, t).status == "running"
         worker_pid = conn.execute(
@@ -573,14 +630,14 @@ def test_stale_claim_deferred_when_live_worker_survives_termination(
         claim_expires = conn.execute(
             "SELECT claim_expires FROM tasks WHERE id = ?", (t,),
         ).fetchone()[0]
-        assert claim_expires > old_expires  # claim held, not released
+        assert claim_expires == old_expires  # claim held until leased reaping
 
         kinds = [
             r["kind"] for r in conn.execute(
                 "SELECT kind FROM task_events WHERE task_id = ?", (t,),
             ).fetchall()
         ]
-        assert "reclaim_deferred" in kinds
+        assert "terminal_requested" in kinds
         assert "reclaimed" not in kinds
 
 
@@ -611,6 +668,7 @@ def test_stale_claim_reclaimed_when_termination_succeeds(
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
+        _finish_terminal_reap(conn, monkeypatch)
         assert kb.get_task(conn, t).status == "ready"
 
 
@@ -645,6 +703,7 @@ def test_stale_claim_released_when_worker_not_host_local(
         )
         reclaimed = kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
         assert reclaimed == 1
+        _finish_terminal_reap(conn, monkeypatch)
         assert kb.get_task(conn, t).status == "ready"
 
 
@@ -682,14 +741,15 @@ def test_detect_stale_defers_when_live_worker_survives(kanban_home, monkeypatch)
         stale = kb.detect_stale_running(
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
-        assert stale == []
+        assert stale == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: {os.getpid()},
+        )
         assert kb.get_task(conn, t).status == "running"
-        kinds = [
-            r["kind"] for r in conn.execute(
-                "SELECT kind FROM task_events WHERE task_id = ?", (t,),
-            ).fetchall()
-        ]
-        assert "reclaim_deferred" in kinds
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert decisions[0]["reason"] == "protected_identity"
 
 
 def test_scope_termination_stops_unit_instead_of_only_leader(
@@ -753,6 +813,7 @@ def test_scoped_spawn_receipt_persists_only_manager_kind_and_uid(
         assert event.payload == {
             "pid": 12345,
             "launch_mode": "systemd-user-scope",
+            "identity_verified": True,
             "scope_unit": unit,
             "manager_kind": kb._SYSTEMD_USER_MANAGER_KIND,
             "manager_uid": os.getuid(),
@@ -782,7 +843,11 @@ def test_custom_int_subclass_cannot_inject_scoped_receipt_data(kanban_home):
         assert kb._set_worker_pid(conn, t, pid) is True
 
         event = next(e for e in kb.list_events(conn, t) if e.kind == "spawned")
-        assert event.payload == {"pid": 12345, "launch_mode": "direct"}
+        assert event.payload == {
+            "pid": 12345,
+            "launch_mode": "direct",
+            "identity_verified": True,
+        }
         assert secret not in json.dumps(event.payload)
 
 
@@ -814,6 +879,7 @@ def test_candidate_scoped_receipt_without_manager_identity_is_compatible(
         assert event.payload == {
             "pid": 12345,
             "launch_mode": "systemd-user-scope",
+            "identity_verified": True,
             "scope_unit": unit,
         }
 
@@ -1012,14 +1078,18 @@ def test_scoped_uid_mismatch_defers_crash_reclaim(kanban_home, monkeypatch):
         monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
         monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
 
-        assert kb.detect_crashed_workers(conn) == []
+        assert kb.detect_crashed_workers(conn) == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         assert task.status == "running"
         assert task.worker_pid == 12345
-        assert any(
-            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
-        )
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_state == "identity_unverifiable"
 
 
 def test_scoped_manager_unavailable_defers_without_pid_fallback(
@@ -1067,19 +1137,19 @@ def test_scoped_manager_unavailable_defers_without_pid_fallback(
             ),
         )
 
-        assert kb.detect_crashed_workers(conn) == []
+        assert kb.detect_crashed_workers(conn) == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         assert task.status == "running"
         assert task.claim_lock == claimed.claim_lock
         assert task.worker_pid == 12345
-        deferred = [
-            event
-            for event in kb.list_events(conn, t)
-            if event.kind == "reclaim_deferred"
-        ]
-        assert len(deferred) == 1
-        assert deferred[0].payload["scope_unknown"] is True
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_error == "scope_identity_unknown"
 
 
 def test_uncertain_scoped_launch_not_found_retains_live_pid(
@@ -1144,13 +1214,9 @@ def test_uncertain_scoped_launch_not_found_retains_live_pid(
         assert task.status == "running"
         assert task.claim_lock == claimed.claim_lock
         assert task.worker_pid == 12345
-        deferred = [
-            event
-            for event in kb.list_events(conn, t)
-            if event.kind == "reclaim_deferred"
-        ]
-        assert len(deferred) == 1
-        assert deferred[0].payload["scope_unknown"] is True
+        assert not any(
+            event.kind == "terminal_requested" for event in kb.list_events(conn, t)
+        )
 
 
 def test_collected_scoped_receipt_never_signals_reused_pid(
@@ -1213,8 +1279,8 @@ def test_ttl_reclaim_defers_when_scope_state_is_unknown(kanban_home, monkeypatch
         task = kb.get_task(conn, t)
         assert task.status == "running"
         assert task.worker_pid == 12345
-        assert any(
-            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
+        assert not any(
+            event.kind == "terminal_requested" for event in kb.list_events(conn, t)
         )
 
 
@@ -1247,16 +1313,64 @@ def test_max_runtime_defers_when_scope_stop_does_not_finish(
             lambda _unit, **_kwargs: False,
         )
 
-        assert kb.enforce_max_runtime(conn) == []
-        assert kb.enforce_max_runtime(conn) == []
+        assert kb.enforce_max_runtime(conn) == [t]
+        assert kb.enforce_max_runtime(conn) == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
+        )
         assert kb.get_task(conn, t).status == "running"
-        deferred = [
-            event
-            for event in kb.list_events(conn, t)
-            if event.kind == "reclaim_deferred"
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_error == "scope_stop_failed"
+
+
+def test_max_runtime_adjacent_ticks_share_stable_terminal_intent(
+    kanban_home, monkeypatch,
+):
+    clocks = iter((100, 101))
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="stable timeout intent",
+            assignee="worker",
+            max_runtime_seconds=1,
+        )
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        assert kb._set_worker_pid(conn, task_id, 12345)
+        conn.execute("UPDATE tasks SET started_at=0 WHERE id=?", (task_id,))
+        conn.execute(
+            "UPDATE task_runs SET started_at=0 WHERE id=?",
+            (claimed.current_run_id,),
+        )
+        conn.commit()
+        unit = "hermes-kanban-worker-0123456789abcdef0123456789abcdef.scope"
+        monkeypatch.setattr(
+            kb, "_worker_scope_state", lambda *_args: (unit, "active"),
+        )
+
+        assert kb.enforce_max_runtime(conn, clock_fn=lambda: next(clocks)) == [task_id]
+        assert kb.enforce_max_runtime._last_transition_conflicts == []
+        accepted = kb.get_run(conn, claimed.current_run_id).terminal_payload
+        assert accepted["error"] == "elapsed 100s > limit 1s"
+        assert accepted["event_payload"] == {
+            "pid": 12345,
+            "elapsed_seconds": 100,
+            "limit_seconds": 1,
+        }
+
+        assert kb.enforce_max_runtime(conn, clock_fn=lambda: next(clocks)) == [task_id]
+        assert kb.enforce_max_runtime._last_transition_conflicts == []
+        assert kb.get_run(conn, claimed.current_run_id).terminal_payload == accepted
+        terminal_requests = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "terminal_requested"
         ]
-        assert len(deferred) == 1
-        assert deferred[0].payload["reason"] == "max_runtime_worker_alive"
+        assert len(terminal_requests) == 1
+        task = kb.get_task(conn, task_id)
+        assert task.status == "running"
+        assert task.current_run_id == claimed.current_run_id
 
 
 def test_reclaim_deferred_is_bounded_across_alternating_reasons(kanban_home):
@@ -1317,11 +1431,15 @@ def test_crash_reclaim_defers_while_scope_descendants_remain(
             lambda _unit, **_kwargs: False,
         )
 
-        assert kb.detect_crashed_workers(conn) == []
-        assert kb.get_task(conn, t).status == "running"
-        assert any(
-            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
+        assert kb.detect_crashed_workers(conn) == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
         )
+        assert kb.get_task(conn, t).status == "running"
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_error == "scope_stop_failed"
 
 
 def test_crash_reclaim_recovers_user_scope_after_dispatcher_manager_migration(
@@ -1384,15 +1502,20 @@ def test_crash_reclaim_recovers_user_scope_after_dispatcher_manager_migration(
             lambda _unit, **_kwargs: False,
         )
 
-        assert kb.detect_crashed_workers(conn) == []
+        assert kb.detect_crashed_workers(conn) == [t]
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         assert task.status == "running"
         assert task.worker_pid == 12345
-        assert queried == [unit]
-        assert any(
-            event.kind == "reclaim_deferred" for event in kb.list_events(conn, t)
-        )
+        assert queried
+        assert queried[-1] == unit
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_error == "scope_stop_failed"
 
 
 def test_manual_reclaim_defers_when_scope_state_is_unknown(
@@ -1412,19 +1535,18 @@ def test_manual_reclaim_defers_when_scope_state_is_unknown(
             ),
         )
 
-        assert kb.reclaim_task(conn, t, reason="operator requested stop") is False
+        assert kb.reclaim_task(conn, t, reason="operator requested stop") is True
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9_000_000,
+            protected_pid_fn=lambda: set(),
+        )
         task = kb.get_task(conn, t)
         assert task is not None
         assert task.status == "running"
         assert task.claim_lock == claimed.claim_lock
-        event = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id = ? AND kind = 'reclaim_deferred' "
-            "ORDER BY id DESC LIMIT 1",
-            (t,),
-        ).fetchone()
-        assert event is not None
-        assert json.loads(event["payload"])["reason"] == "manual_reclaim_worker_alive"
+        assert decisions[0]["state"] == "identity_unverifiable"
+        assert kb.list_runs(conn, t)[-1].reap_error == "scope_identity_unknown"
 
 
 def test_manual_reclaim_cannot_cross_launch_receipt_window(
@@ -1501,6 +1623,44 @@ def test_set_worker_pid_cas_ignores_fast_completed_run(kanban_home):
         assert not any(event.kind == "spawned" for event in kb.list_events(conn, t))
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 def test_stale_claim_reclaim_event_records_diagnostic_payload(
     kanban_home, monkeypatch,
 ):
@@ -1525,7 +1685,8 @@ def test_stale_claim_reclaim_event_records_diagnostic_payload(
         )
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-        kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None)
+        assert kb.release_stale_claims(conn, signal_fn=lambda _p, _s: None) == 1
+        _finish_terminal_reap(conn, monkeypatch)
         row = conn.execute(
             "SELECT payload FROM task_events "
             "WHERE task_id = ? AND kind = 'reclaimed'",
@@ -1546,22 +1707,22 @@ def test_detect_crashed_workers_systemic_failure_fast_block(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
     with kb.connect() as conn:
         task_ids = []
         for i in range(4):
             tid = kb.create_task(conn, title=f"task-{i}", assignee="a")
             host = _kb._claimer_id().split(":", 1)[0]
-            conn.execute(
-                "UPDATE tasks SET status='running', worker_pid=?, "
-                "claim_lock=? WHERE id=?",
-                (90000 + i, f"{host}:w{i}", tid),
-            )
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None
+            assert kb._set_worker_pid(conn, tid, 90000 + i)
             task_ids.append(tid)
         conn.commit()
 
         crashed = kb.detect_crashed_workers(conn)
         assert len(crashed) == 4
+        _finish_terminal_reap(conn, monkeypatch)
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
@@ -1577,22 +1738,22 @@ def test_detect_crashed_workers_isolated_failure_normal_retry(
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
     with kb.connect() as conn:
         task_ids = []
         for i in range(2):
             tid = kb.create_task(conn, title=f"iso-{i}", assignee="a")
             host = _kb._claimer_id().split(":", 1)[0]
-            conn.execute(
-                "UPDATE tasks SET status='running', worker_pid=?, "
-                "claim_lock=? WHERE id=?",
-                (80000 + i, f"{host}:w{i}", tid),
-            )
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None
+            assert kb._set_worker_pid(conn, tid, 80000 + i)
             task_ids.append(tid)
         conn.commit()
 
         crashed = kb.detect_crashed_workers(conn)
         assert len(crashed) == 2
+        _finish_terminal_reap(conn, monkeypatch)
 
         for tid in task_ids:
             task = kb.get_task(conn, tid)
@@ -1616,11 +1777,9 @@ def test_detect_crashed_workers_skips_freshly_claimed_tasks(
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="grace test", assignee="a")
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, "
-            "claim_lock=?, started_at=? WHERE id=?",
-            (99999, f"{host}:w", int(now), tid),
-        )
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None
+        assert kb._set_worker_pid(conn, tid, 99999)
         conn.commit()
 
         # With time = now (just claimed), grace period should suppress reclaim.
@@ -1643,15 +1802,14 @@ def test_detect_crashed_workers_grace_period_env_override(
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "5")
 
     now = 2_000_000.0
+    monkeypatch.setattr(_kb.time, "time", lambda: now)
 
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
         tid = kb.create_task(conn, title="env override test", assignee="a")
-        conn.execute(
-            "UPDATE tasks SET status='running', worker_pid=?, "
-            "claim_lock=?, started_at=? WHERE id=?",
-            (99999, f"{host}:w", int(now), tid),
-        )
+        claimed = kb.claim_task(conn, tid, claimer=f"{host}:w")
+        assert claimed is not None
+        assert kb._set_worker_pid(conn, tid, 99999)
         conn.commit()
 
         # 3s after claim: within 5s grace → no reclaim.
@@ -1726,10 +1884,9 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             # it with a rate_limited outcome), then point the claim at this
             # host + a dead pid so the crash path acts on it.
             kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert kb._set_worker_pid(conn, tid, pid)
             conn.execute(
-                "UPDATE tasks SET worker_pid=?, consecutive_failures=? "
-                "WHERE id=?",
-                (pid, 0, tid),
+                "UPDATE tasks SET consecutive_failures=0 WHERE id=?", (tid,),
             )
             conn.commit()
             _kb._record_worker_exit(
@@ -1741,6 +1898,7 @@ def test_rate_limit_exit_requeues_without_counting_failure(
             assert tid not in crashed
             rl = getattr(_kb.detect_crashed_workers, "_last_rate_limited", [])
             assert tid in rl
+            _finish_terminal_reap(conn, monkeypatch)
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready", (
@@ -1772,6 +1930,7 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
     import hermes_cli.kanban_db as _kb
 
     monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
 
     with kb.connect() as conn:
         host = _kb._claimer_id().split(":", 1)[0]
@@ -1779,14 +1938,17 @@ def test_real_crash_still_counts_and_trips_breaker(kanban_home, monkeypatch):
 
         for i in range(2):  # DEFAULT_FAILURE_LIMIT == 2
             pid = 60000 + i
-            conn.execute(
-                "UPDATE tasks SET status='running', worker_pid=?, "
-                "claim_lock=? WHERE id=?",
-                (pid, f"{host}:w{i}", tid),
-            )
+            claimed = kb.claim_task(conn, tid, claimer=f"{host}:w{i}")
+            assert claimed is not None
+            assert kb._set_worker_pid(conn, tid, pid)
             conn.commit()
             _kb._record_worker_exit(pid, _exited_status(1))  # generic failure
             kb.detect_crashed_workers(conn)
+            _finish_terminal_reap(conn, monkeypatch)
+            if i == 0:
+                first_result = kb.get_task(conn, tid)
+                assert first_result.status == "ready"
+                assert first_result.consecutive_failures == 1
 
         task = kb.get_task(conn, tid)
         assert task.status == "blocked", (
@@ -1895,9 +2057,10 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
         kb.claim_task(conn, t, claimer=f"{host}:first")
         first_run_id = kb.latest_run(conn, t).id
         old_started = int(time.time()) - 20
+        assert kb._set_worker_pid(conn, t, 999999)
         conn.execute(
-            "UPDATE tasks SET started_at = ?, worker_pid = ? WHERE id = ?",
-            (old_started, 999999, t),
+            "UPDATE tasks SET started_at = ? WHERE id = ?",
+            (old_started, t),
         )
         conn.execute(
             "UPDATE task_runs SET started_at = ?, worker_pid = ? WHERE id = ?",
@@ -1906,18 +2069,12 @@ def test_max_runtime_uses_current_run_start_after_retry(kanban_home, monkeypatch
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == [t]
+        _finish_terminal_reap(conn, monkeypatch)
         assert kb.get_task(conn, t).status == "ready"
 
         kb.claim_task(conn, t, claimer=f"{host}:retry")
         retry_run = kb.latest_run(conn, t)
-        conn.execute(
-            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
-            (999999, t),
-        )
-        conn.execute(
-            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
-            (999999, retry_run.id),
-        )
+        assert kb._set_worker_pid(conn, t, 999999)
 
         timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda _pid, _sig: None)
         assert timed_out == []
@@ -1978,12 +2135,13 @@ def test_max_runtime_failure_accounting_cannot_mutate_new_retry(
         monkeypatch.setattr(kb, "_record_task_failure", race_then_record)
 
         assert kb.enforce_max_runtime(conn) == [t]
+        _finish_terminal_reap(conn, monkeypatch)
         task = kb.get_task(conn, t)
-        assert task.status == "running"
-        assert task.current_run_id == retry["run_id"]
-        assert task.claim_lock == retry["claim_lock"]
-        assert task.worker_pid == 54321
-        assert task.consecutive_failures == 0
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 1
 
 
 def test_crash_failure_accounting_cannot_mutate_new_retry(
@@ -2027,12 +2185,17 @@ def test_crash_failure_accounting_cannot_mutate_new_retry(
         monkeypatch.setattr(kb, "_record_task_failure", race_then_record)
 
         assert kb.detect_crashed_workers(conn) == [t]
+        _finish_terminal_reap(conn, monkeypatch)
         task = kb.get_task(conn, t)
-        assert task.status == "running"
-        assert task.current_run_id == retry["run_id"]
-        assert task.claim_lock == retry["claim_lock"]
-        assert task.worker_pid == 54321
-        assert task.consecutive_failures == 0
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+        assert task.worker_pid is None
+        assert task.consecutive_failures == 1
+
+
+
+
 
 
 def test_heartbeat_extends_claim(kanban_home):
@@ -5438,6 +5601,7 @@ def test_detect_stale_returns_running_task_with_no_heartbeat(kanban_home, monkey
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: killed.append(s),
         )
         assert t in stale, "Task with no heartbeat for >4h should be reclaimed"
+        _finish_terminal_reap(conn, monkeypatch)
         task = kb.get_task(conn, t)
         assert task.status == "ready"
 
@@ -5472,6 +5636,7 @@ def test_detect_stale_returns_task_with_stale_heartbeat(kanban_home, monkeypatch
         assert t in stale, (
             "Task with heartbeat >1h old and started >4h ago should be stale"
         )
+        _finish_terminal_reap(conn, monkeypatch)
         assert kb.get_task(conn, t).status == "ready"
 
 
@@ -5581,7 +5746,8 @@ def test_detect_stale_skips_blocked_tasks(kanban_home, monkeypatch):
                 (five_hours_ago, t),
             )
         # Block the task explicitly.
-        kb.block_task(conn, t, reason="human requested block")
+        assert kb.block_task(conn, t, reason="human requested block")
+        _finish_terminal_reap(conn, monkeypatch)
 
         monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
         stale = kb.detect_stale_running(
@@ -5630,6 +5796,7 @@ def test_detect_stale_does_not_tick_failure_counter(kanban_home, monkeypatch):
             conn, stale_timeout_seconds=14400, signal_fn=lambda p, s: None,
         )
         assert t in stale, "Task should be reclaimed by stale detection"
+        _finish_terminal_reap(conn, monkeypatch)
 
         # Critical assertion: the failure counter MUST NOT have ticked.
         # Stale reclaim resets to ready for re-dispatch without penalty.

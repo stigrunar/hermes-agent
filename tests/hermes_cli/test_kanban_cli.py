@@ -174,6 +174,131 @@ def test_run_slash_block_unblock_cycle(kanban_home):
     assert "Unblocked" in kc.run_slash(f"unblock {tid}")
 
 
+def test_run_slash_cancel_nonterminal_task(kanban_home):
+    out = kc.run_slash("create 'cancel through cli' --assignee alice")
+    import re
+    tid = re.search(r"(t_[a-f0-9]+)", out).group(1)
+
+    result = kc.run_slash(f"cancel {tid} --reason 'operator requested'")
+
+    assert result == f"Cancelled {tid}"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "cancelled"
+        event = kb.list_events(conn, tid)[-1]
+        assert event.kind == "cancelled"
+        assert event.payload == {"reason": "operator requested"}
+
+
+def test_module_entry_cancel_propagates_exit_codes_and_fencing(kanban_home):
+    worktree_root = Path(__file__).resolve().parents[2]
+    env = {
+        **os.environ,
+        "HERMES_HOME": str(kanban_home),
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONPATH": str(worktree_root),
+    }
+
+    with kb.connect() as conn:
+        cancelled_id = kb.create_task(conn, title="module cancellation")
+        fenced_id = kb.create_task(conn, title="module fenced cancellation")
+        claimed = kb.claim_task(conn, fenced_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        fenced_run_id = claimed.current_run_id
+
+    cancelled = subprocess.run(
+        [
+            os.sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "cancel",
+            cancelled_id,
+            "--reason",
+            "subprocess proof",
+        ],
+        cwd=worktree_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert cancelled.returncode == 0, cancelled.stderr
+    assert f"Cancelled {cancelled_id}" in cancelled.stdout
+    with kb.connect() as conn:
+        assert kb.get_task(conn, cancelled_id).status == "cancelled"
+        events = kb.list_events(conn, cancelled_id)
+        assert events[-1].kind == "cancelled"
+        assert events[-1].payload == {"reason": "subprocess proof"}
+
+    fenced = subprocess.run(
+        [
+            os.sys.executable,
+            "-m",
+            "hermes_cli.main",
+            "kanban",
+            "cancel",
+            fenced_id,
+            "--expected-run-id",
+            str(fenced_run_id + 1),
+        ],
+        cwd=worktree_root,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert fenced.returncode != 0
+    assert "current run/status no longer matches" in fenced.stderr
+    with kb.connect() as conn:
+        task = kb.get_task(conn, fenced_id)
+        run = kb.get_run(conn, fenced_run_id)
+        assert task.status == "running"
+        assert task.current_run_id == fenced_run_id
+        assert run.ended_at is None
+        assert run.reap_state is None
+
+
+def test_run_slash_cancel_reports_pending_reap_and_honors_expected_run(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban_worker_process as kp
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="active cli cancellation", assignee="alice")
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        identity = kp.ProcessIdentity(45671, 456.71)
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, tid))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+            (
+                identity.pid,
+                json.dumps(identity.to_dict()),
+                json.dumps([identity.to_dict()]),
+                run_id,
+            ),
+        )
+        conn.commit()
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "captured", tuple(previous) or (root,),
+        ),
+    )
+
+    stale = kc.run_slash(f"cancel {tid} --expected-run-id {run_id + 1}")
+    assert "current run/status no longer matches" in stale
+
+    accepted = kc.run_slash(f"cancel {tid} --expected-run-id {run_id}")
+    assert f"Cancellation pending reap for {tid}" in accepted
+    assert f"run {run_id}" in accepted
+    with kb.connect() as conn:
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_run(conn, run_id).reap_state == "terminal_requested"
+
+
 def test_run_slash_json_output(kanban_home):
     out = kc.run_slash("create 'jsontask' --assignee alice --json")
     payload = json.loads(out)
@@ -415,7 +540,8 @@ def test_run_slash_reclaim_running_task(kanban_home):
         conn.close()
 
     out = kc.run_slash(f"reclaim {tid} --reason 'test'")
-    assert "Reclaimed" in out, out
+    assert "pending_reap" in out, out
+    assert "status=running" in out, out
     # Status back to ready.
     out2 = kc.run_slash(f"show {tid}")
     assert "ready" in out2.lower()
@@ -452,7 +578,8 @@ def test_run_slash_reassign_with_reclaim_flag(kanban_home):
         conn.close()
 
     out = kc.run_slash(f"reassign {tid} newbie --reclaim --reason 'switch'")
-    assert "Reassigned" in out, out
+    assert "pending_reap" in out, out
+    assert "requested_assignee=newbie" in out, out
     out2 = kc.run_slash(f"show {tid}")
     assert "newbie" in out2
 

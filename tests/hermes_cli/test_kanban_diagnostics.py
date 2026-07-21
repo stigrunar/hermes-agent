@@ -54,6 +54,23 @@ def test_typed_reconciliation_serialization_redacts_private_diagnostics():
     assert "<user-runtime>" in serialized
 
 
+def test_manual_recovery_required_remains_a_critical_chain_diagnostic():
+    task = _task(id="t_manual", status="done", current_run_id=7)
+    run = {
+        "id": 7,
+        "ended_at": None,
+        "status": "running",
+        "reap_state": "manual_recovery_required",
+        "terminal_requested_at": 100,
+        "reap_attempts": 4,
+    }
+    result = kd.compute_chain_diagnostics([task], [], {"t_manual": []}, {"t_manual": [run]}, now=200)
+    finding = result["t_manual"][0]
+    assert finding.kind == "worker_manual_recovery_required"
+    assert finding.severity == "critical"
+    assert finding.data["reap_state"] == "manual_recovery_required"
+
+
 # ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
@@ -313,7 +330,7 @@ def test_failure_rules_exempt_terminal_statuses():
     # streak survives in run history — but done means done: neither
     # failure rule may keep flagging a terminal card.
     runs = [_run(outcome="crashed", run_id=1), _run(outcome="crashed", run_id=2)]
-    for status in ("done", "archived"):
+    for status in ("done", "archived", "cancelled"):
         task = _task(status=status, assignee="crashy", consecutive_failures=3)
         assert kd.compute_task_diagnostics(task, [], runs) == []
 

@@ -600,6 +600,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                             help='JSON dict of structured facts (e.g. \'{"changed_files": [...], '
                                  '"tests_run": 12}\'). Stored on the closing run.')
 
+    p_cancel = sub.add_parser(
+        "cancel",
+        help="Cancel one task, reaping its exact active worker before finalization",
+    )
+    p_cancel.add_argument("task_id")
+    p_cancel.add_argument("--reason", default=None, help="Operator cancellation reason")
+    p_cancel.add_argument(
+        "--expected-run-id",
+        type=int,
+        default=None,
+        help="Refuse if the task's current run no longer matches this id",
+    )
+
     p_edit = sub.add_parser(
         "edit",
         help="Edit recovery fields on an already-completed task",
@@ -1095,6 +1108,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "attachments": _cmd_attachments,
             "attach-rm": _cmd_attach_rm,
             "complete": _cmd_complete,
+            "cancel":   _cmd_cancel,
             "edit":     _cmd_edit,
             "block":    _cmd_block,
             "schedule": _cmd_schedule,
@@ -1490,11 +1504,11 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
+            required_capabilities=getattr(args, "required_capabilities", None) or None,
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
             initial_status=getattr(args, "initial_status", "running"),
-            required_capabilities=getattr(args, "required_capabilities", None) or None,
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
@@ -1610,6 +1624,14 @@ def _cmd_show(args: argparse.Namespace) -> int:
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
+        current_run = next(
+            (run for run in runs if run.id == task.current_run_id), None
+        )
+        requested_assignee = (
+            current_run.terminal_payload.get("assignee")
+            if current_run and isinstance(current_run.terminal_payload, dict)
+            else None
+        )
         # Workers hand off via ``task_runs.summary``; ``tasks.result`` is left NULL unless the caller explicitly passed
         # ``result=``. Surfacing the latest summary here keeps ``show`` from
         # looking like a no-op when the worker actually did real work.
@@ -1650,6 +1672,17 @@ def _cmd_show(args: argparse.Namespace) -> int:
                 }
                 for r in runs
             ],
+            "recovery": {
+                "state": (
+                    "pending_reap"
+                    if task.status == "running" and current_run and current_run.reap_state
+                    else "finalized"
+                ),
+                "status": task.status,
+                "assignee": task.assignee,
+                "requested_assignee": requested_assignee,
+                "reap_state": current_run.reap_state if current_run else None,
+            },
         }
         print(json.dumps(payload, indent=2, ensure_ascii=False))
         return 0
@@ -1657,6 +1690,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
     print(f"Task {task.id}: {task.title}")
     print(f"  status:    {task.status}")
     print(f"  assignee:  {task.assignee or '-'}")
+    if task.status == "running" and current_run and current_run.reap_state:
+        print(f"  recovery:  pending_reap ({current_run.reap_state})")
+        if requested_assignee is not None or (
+            current_run.terminal_payload and "assignee" in current_run.terminal_payload
+        ):
+            print(f"  requested-assignee: {requested_assignee or '(unassigned)'}")
     if task.tenant:
         print(f"  tenant:    {task.tenant}")
     print(f"  workspace: {task.workspace_kind}" +
@@ -1776,44 +1815,48 @@ def _cmd_assign(args: argparse.Namespace) -> int:
 
 def _cmd_reclaim(args: argparse.Namespace) -> int:
     with kb.connect_closing() as conn:
-        ok = kb.reclaim_task(
-            conn, args.task_id,
-            reason=getattr(args, "reason", None),
-        )
+        try:
+            ok = kb.reclaim_task(
+                conn, args.task_id,
+                reason=getattr(args, "reason", None),
+            )
+        except kb.TerminalTransitionConflict as exc:
+            print(f"cannot reclaim {args.task_id}: {exc}", file=sys.stderr)
+            return 1
+        task = kb.get_task(conn, args.task_id)
+        run = kb.get_run(conn, task.current_run_id) if task and task.current_run_id else None
     if not ok:
         print(
             f"cannot reclaim {args.task_id} (not running or unknown id)",
             file=sys.stderr,
         )
         return 1
-    print(f"Reclaimed {args.task_id}")
-    return 0
-
-
-def _cmd_classify_legacy_run(args: argparse.Namespace) -> int:
-    with kb.connect_closing() as conn:
-        kb.classify_legacy_worker_run(
-            conn,
-            args.task_id,
-            args.run_id,
-            launch_mode=args.launch_mode,
-            expected_pid=args.pid,
+    if task and task.status == "running" and run and run.reap_state:
+        print(
+            f"Reclaim pending for {args.task_id}: pending_reap "
+            f"(status={task.status}, reap_state={run.reap_state})"
         )
-    print(
-        f"Classified legacy run {args.run_id} for {args.task_id} as direct "
-        f"on this host (pid {args.pid})"
-    )
+    else:
+        print(f"Reclaimed {args.task_id}")
     return 0
+
+
 
 
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
-        ok = kb.reassign_task(
-            conn, args.task_id, profile,
-            reclaim_first=bool(getattr(args, "reclaim", False)),
-            reason=getattr(args, "reason", None),
-        )
+        try:
+            ok = kb.reassign_task(
+                conn, args.task_id, profile,
+                reclaim_first=bool(getattr(args, "reclaim", False)),
+                reason=getattr(args, "reason", None),
+            )
+        except kb.TerminalTransitionConflict as exc:
+            print(f"cannot reassign {args.task_id}: {exc}", file=sys.stderr)
+            return 1
+        task = kb.get_task(conn, args.task_id)
+        run = kb.get_run(conn, task.current_run_id) if task and task.current_run_id else None
     if not ok:
         print(
             f"cannot reassign {args.task_id} "
@@ -1821,10 +1864,30 @@ def _cmd_reassign(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    if task and task.status == "running" and run and run.reap_state:
+        print(
+            f"Reassign pending for {args.task_id}: pending_reap "
+            f"(status={task.status}, assignee={task.assignee or '(unassigned)'}, "
+            f"requested_assignee={profile or '(unassigned)'})"
+        )
+    else:
+        print(
+            f"Reassigned {args.task_id} to "
+            f"{profile or '(unassigned)'}"
+            + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
+        )
+    return 0
+
+
+def _cmd_classify_legacy_run(args: argparse.Namespace) -> int:
+    with kb.connect_closing() as conn:
+        kb.classify_legacy_worker_run(
+            conn, args.task_id, args.run_id,
+            launch_mode=args.launch_mode, expected_pid=args.pid,
+        )
     print(
-        f"Reassigned {args.task_id} to "
-        f"{profile or '(unassigned)'}"
-        + (" (claim reclaimed)" if getattr(args, "reclaim", False) else "")
+        f"Classified legacy run {args.run_id} for {args.task_id} as direct "
+        f"on this host (pid {args.pid})"
     )
     return 0
 
@@ -2240,6 +2303,51 @@ def _cmd_complete(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
+def _cmd_cancel(args: argparse.Namespace) -> int:
+    """Cancel exactly one task through the Phase-B terminal transition."""
+    expected_run_id = getattr(args, "expected_run_id", None)
+    if expected_run_id is None:
+        expected_run_id = _worker_run_id_for(args.task_id)
+    with kb.connect_closing() as conn:
+        ok = kb.cancel_task(
+            conn,
+            args.task_id,
+            reason=getattr(args, "reason", None),
+            expected_run_id=expected_run_id,
+        )
+        task = kb.get_task(conn, args.task_id)
+        if not ok:
+            if task is None:
+                print(f"cannot cancel {args.task_id}: task not found", file=sys.stderr)
+                return 1
+            if task.status in kb.TERMINAL_STATUSES:
+                print(f"Unchanged {args.task_id}: already terminal ({task.status})")
+                return 0
+            print(
+                f"cannot cancel {args.task_id}: current run/status no longer matches",
+                file=sys.stderr,
+            )
+            return 1
+        if task is not None and task.current_run_id is not None:
+            run = kb.get_run(conn, task.current_run_id)
+            reap_state = run.reap_state if run is not None else None
+            if reap_state == "manual_recovery_required":
+                print(
+                    f"Cancellation for {args.task_id} requires manual recovery "
+                    f"(run {task.current_run_id})"
+                )
+            elif reap_state in (kb._REAP_PENDING_STATES | {"reaped"}):
+                print(
+                    f"Cancellation pending reap for {args.task_id} "
+                    f"(run {task.current_run_id}, state={reap_state})"
+                )
+            else:
+                print(f"Cancellation accepted for {args.task_id}")
+        else:
+            print(f"Cancelled {args.task_id}")
+    return 0
+
+
 def _cmd_edit(args: argparse.Namespace) -> int:
     raw_meta = getattr(args, "metadata", None)
     metadata = None
@@ -2434,97 +2542,12 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
-def _cmd_non_actionable(args: argparse.Namespace) -> int:
-    actor = getattr(args, "actor", None) or _profile_author()
-    with kb.connect_closing() as conn:
-        ok = kb.mark_task_non_actionable(
-            conn,
-            args.task_id,
-            status=args.status,
-            actor=actor,
-            reason=getattr(args, "reason", None),
-            superseded_by=getattr(args, "superseded_by", None),
-            live_path_task_id=getattr(args, "live_path_task_id", None),
-            canonical_live_path=getattr(args, "canonical_live_path", None),
-        )
-        task = kb.get_task(conn, args.task_id)
-    if getattr(args, "json", False):
-        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
-    else:
-        print(f"{args.task_id} -> {args.status}")
-    return 0 if ok else 1
 
 
-def _cmd_detached_live_path(args: argparse.Namespace) -> int:
-    actor = getattr(args, "actor", None) or _profile_author()
-    with kb.connect_closing() as conn:
-        res = kb.park_blocked_source_detached_path(
-            conn,
-            source_task_id=args.source_task_id,
-            detached_task_id=args.detached_task_id,
-            actor=actor,
-            reason=getattr(args, "reason", None),
-        )
-    if getattr(args, "json", False):
-        print(json.dumps(res, indent=2, ensure_ascii=False))
-    else:
-        print(
-            f"Recorded live path {res['live_path_task_id']} for {res['source_task_id']}; "
-            f"parked {len(res['parked_children'])} child task(s)."
-        )
-    return 0
 
 
-def _cmd_controller_closeout(args: argparse.Namespace) -> int:
-    actor = getattr(args, "actor", None) or _profile_author()
-    try:
-        receipt = json.loads(args.receipt)
-    except json.JSONDecodeError as exc:
-        print(f"kanban controller-closeout: invalid --receipt JSON: {exc}", file=sys.stderr)
-        return 2
-    with kb.connect_closing() as conn:
-        ok = kb.controller_closeout_task(
-            conn,
-            args.task_id,
-            receipt=receipt,
-            actor=actor,
-            result=getattr(args, "result", None),
-        )
-        task = kb.get_task(conn, args.task_id)
-    if getattr(args, "json", False):
-        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
-    else:
-        print(f"Controller closeout accepted for {args.task_id}")
-    return 0 if ok else 1
 
 
-def _load_reconcile_entries(args: argparse.Namespace) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    if getattr(args, "mapping", None):
-        raw = json.loads(Path(args.mapping).read_text(encoding="utf-8"))
-        if isinstance(raw, dict) and "entries" in raw:
-            raw = raw["entries"]
-        if not isinstance(raw, list):
-            raise ValueError("mapping file must contain a list or {\"entries\": [...]}")
-        for item in raw:
-            if not isinstance(item, dict):
-                raise ValueError("each mapping entry must be an object")
-            entries.append(item)
-    if getattr(args, "source", None) or getattr(args, "detached", None):
-        if not (getattr(args, "source", None) and getattr(args, "detached", None)):
-            raise ValueError("--source and --detached must be passed together")
-        entries.append(
-            {
-                "source_task_id": args.source,
-                "detached_task_id": args.detached,
-                "allow_terminal_evidence": bool(
-                    getattr(args, "allow_terminal_evidence", False)
-                ),
-            }
-        )
-    if not entries:
-        raise ValueError("pass --mapping or explicit --source/--detached IDs")
-    return entries
 
 
 def _preview_reconcile(conn, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2536,47 +2559,6 @@ def _preview_reconcile(conn, entries: list[dict[str, Any]]) -> list[dict[str, An
     )["preview"]
 
 
-def _cmd_reconcile_live_path(args: argparse.Namespace) -> int:
-    actor = getattr(args, "actor", None) or _profile_author()
-    apply_changes = bool(getattr(args, "apply", False))
-    try:
-        entries = _load_reconcile_entries(args)
-    except (ValueError, OSError, json.JSONDecodeError) as exc:
-        print(f"kanban reconcile-live-path: {exc}", file=sys.stderr)
-        return 2
-    connect_cm = kb.connect_closing if apply_changes else kb.connect_readonly_closing
-    with connect_cm() as conn:
-        db_path = str(kb.kanban_db_path())
-        board = kb.get_current_board()
-        reconciled = kb.reconcile_detached_live_paths(
-            conn,
-            entries,
-            actor=actor,
-            reason=getattr(args, "reason", None),
-            apply=apply_changes,
-        )
-        preview = reconciled["preview"]
-        applied = reconciled["applied"]
-    payload = {
-        "dry_run": not apply_changes,
-        "board": board,
-        "db_path": db_path,
-        "preview": preview,
-        "applied": applied,
-        "rollback": "Restore the pre-apply SQLite DB backup; this command does not maintain an internal undo log.",
-    }
-    if getattr(args, "json", False):
-        print(json.dumps(payload, indent=2, ensure_ascii=False))
-    else:
-        mode = "APPLY" if getattr(args, "apply", False) else "DRY RUN"
-        print(f"{mode}: board={board} db={db_path}")
-        print(f"Entries: {len(preview)}; child rows to park: {sum(len(p['children_to_park']) for p in preview)}")
-        if not getattr(args, "apply", False):
-            print("No changes written. Re-run with --apply to mutate this explicit mapping.")
-        else:
-            print(f"Applied {len(applied)} reconciliation entry(s).")
-        print("Rollback: restore the pre-apply SQLite DB backup.")
-    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:
@@ -2757,6 +2739,118 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 f"-> {decision.get('replacement_task_id') or '-'} "
                 f"({decision.get('reason')})"
             )
+    return 0
+
+
+def _cmd_non_actionable(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        ok = kb.mark_task_non_actionable(
+            conn, args.task_id, status=args.status, actor=actor,
+            reason=getattr(args, "reason", None),
+            superseded_by=getattr(args, "superseded_by", None),
+            live_path_task_id=getattr(args, "live_path_task_id", None),
+            canonical_live_path=getattr(args, "canonical_live_path", None),
+        )
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
+    else:
+        print(f"{args.task_id} -> {args.status}")
+    return 0 if ok else 1
+
+
+def _cmd_detached_live_path(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    with kb.connect_closing() as conn:
+        res = kb.park_blocked_source_detached_path(
+            conn, source_task_id=args.source_task_id,
+            detached_task_id=args.detached_task_id, actor=actor,
+            reason=getattr(args, "reason", None),
+        )
+    if getattr(args, "json", False):
+        print(json.dumps(res, indent=2, ensure_ascii=False))
+    else:
+        print(
+            f"Recorded live path {res['live_path_task_id']} for {res['source_task_id']}; "
+            f"parked {len(res['parked_children'])} child task(s)."
+        )
+    return 0
+
+
+def _cmd_controller_closeout(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    try:
+        receipt = json.loads(args.receipt)
+    except json.JSONDecodeError as exc:
+        print(f"kanban controller-closeout: invalid --receipt JSON: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        ok = kb.controller_closeout_task(
+            conn, args.task_id, receipt=receipt, actor=actor,
+            result=getattr(args, "result", None),
+        )
+        task = kb.get_task(conn, args.task_id)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "task": _task_to_dict(task) if task else None}, indent=2))
+    else:
+        print(f"Controller closeout accepted for {args.task_id}")
+    return 0 if ok else 1
+
+
+def _load_reconcile_entries(args: argparse.Namespace) -> list[dict[str, Any]]:
+    entries: list[dict[str, Any]] = []
+    if getattr(args, "mapping", None):
+        raw = json.loads(Path(args.mapping).read_text(encoding="utf-8"))
+        if isinstance(raw, dict) and "entries" in raw:
+            raw = raw["entries"]
+        if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
+            raise ValueError("mapping file must contain a list of objects or {\"entries\": [...]}")
+        entries.extend(raw)
+    source, detached = getattr(args, "source", None), getattr(args, "detached", None)
+    if source or detached:
+        if not (source and detached):
+            raise ValueError("--source and --detached must be passed together")
+        entries.append({
+            "source_task_id": source, "detached_task_id": detached,
+            "allow_terminal_evidence": bool(getattr(args, "allow_terminal_evidence", False)),
+        })
+    if not entries:
+        raise ValueError("pass --mapping or explicit --source/--detached IDs")
+    return entries
+
+
+def _cmd_reconcile_live_path(args: argparse.Namespace) -> int:
+    actor = getattr(args, "actor", None) or _profile_author()
+    try:
+        entries = _load_reconcile_entries(args)
+    except (ValueError, OSError, json.JSONDecodeError) as exc:
+        print(f"kanban reconcile-live-path: {exc}", file=sys.stderr)
+        return 2
+    apply_changes = bool(getattr(args, "apply", False))
+    connect_cm = kb.connect_closing if apply_changes else kb.connect_readonly_closing
+    with connect_cm() as conn:
+        result = kb.reconcile_detached_live_paths(
+            conn, entries, actor=actor,
+            reason=getattr(args, "reason", None), apply=apply_changes,
+        )
+        payload = {
+            "dry_run": not apply_changes,
+            "board": kb.get_current_board(),
+            "db_path": str(kb.kanban_db_path()),
+            "preview": result["preview"], "applied": result["applied"],
+            "rollback": "Restore the pre-apply SQLite DB backup; this command does not maintain an internal undo log.",
+        }
+    if getattr(args, "json", False):
+        print(json.dumps(payload, indent=2, ensure_ascii=False))
+    else:
+        mode = "APPLY" if apply_changes else "DRY RUN"
+        print(f"{mode}: board={payload['board']} db={payload['db_path']}")
+        print(f"Entries: {len(payload['preview'])}; child rows to park: "
+              f"{sum(len(item['children_to_park']) for item in payload['preview'])}")
+        print("No changes written. Re-run with --apply to mutate this explicit mapping." if not apply_changes
+              else f"Applied {len(payload['applied'])} reconciliation entry(s).")
+        print(f"Rollback: {payload['rollback']}")
     return 0
 
 
@@ -3294,6 +3388,7 @@ Common subcommands:
   `comment <id> <msg>`  Append a comment
   `attach <id> <path>`  Attach a local file; `attachments <id>` to list
   `complete <id>…`      Mark task(s) done
+  `cancel <id>`         Cancel one task (active workers are reaped first)
   `block <id> [reason]` Mark blocked; `schedule <id> [reason]` parks time-delay work; `unblock <id>` to revive
   `assign <id> <profile>`  Reassign
   `boards list`         Show all boards
