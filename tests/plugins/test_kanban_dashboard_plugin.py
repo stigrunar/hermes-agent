@@ -28,8 +28,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load plugins/kanban/dashboard/plugin_api.py."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -41,7 +41,12 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    """Return a freshly loaded Kanban dashboard router."""
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -227,6 +232,95 @@ def test_proven_replacement_leaves_columns_but_remains_auditable(client):
         diagnostic["kind"] == "replacement_suppressed"
         for diagnostic in detail.json()["task"]["diagnostics"]
     )
+
+
+def test_large_board_diagnostics_complete_within_desktop_limit(kanban_home):
+    task_count = 3_500
+    event_count = 70_000
+    run_count = 5_000
+    now = int(time.time())
+    task_ids = [f"t_perf_{index:04d}" for index in range(task_count)]
+    source_id, replacement_id = task_ids[:2]
+    head = "c" * 40
+    source_receipt = {
+        "replacement_task_id": replacement_id,
+        "canonical_live_task": replacement_id,
+    }
+    replacement_receipt = {
+        "supersedes_task_id": source_id,
+        "canonical_live_task": replacement_id,
+        "candidate_head": head,
+        "terminal_receipt": {
+            "state": "merged",
+            "task_id": replacement_id,
+            "head": head,
+        },
+    }
+
+    with kb.connect() as conn:
+        conn.execute("BEGIN IMMEDIATE")
+        conn.executemany(
+            "INSERT INTO tasks "
+            "(id, title, status, priority, created_at, workspace_kind) "
+            "VALUES (?, ?, ?, 0, ?, 'scratch')",
+            [
+                (
+                    task_id,
+                    f"Performance task {index}",
+                    "done" if task_id == replacement_id else "ready",
+                    now,
+                )
+                for index, task_id in enumerate(task_ids)
+            ],
+        )
+        conn.executemany(
+            "INSERT INTO task_events (task_id, kind, payload, created_at) "
+            "VALUES (?, 'progress', NULL, ?)",
+            [
+                (task_ids[index % task_count], now)
+                for index in range(event_count)
+            ],
+        )
+        run_rows = []
+        for index in range(run_count):
+            task_index = index % task_count
+            task_id = task_ids[task_index]
+            metadata = None
+            if index == task_count:
+                metadata = json.dumps({"reconciliation": source_receipt})
+            elif index == task_count + 1:
+                metadata = json.dumps({"reconciliation": replacement_receipt})
+            started_at = now + (index // task_count)
+            run_rows.append((task_id, started_at, started_at + 1, metadata))
+        conn.executemany(
+            "INSERT INTO task_runs "
+            "(task_id, status, outcome, started_at, ended_at, metadata) "
+            "VALUES (?, 'done', 'completed', ?, ?, ?)",
+            run_rows,
+        )
+        conn.commit()
+
+    plugin_api = _load_plugin_module()
+    started = time.perf_counter()
+    board = plugin_api.get_board(None, False, None, None, None)
+    elapsed = time.perf_counter() - started
+
+    ordinary = {
+        task["id"]: task
+        for column in board["columns"]
+        for task in column["tasks"]
+    }
+    suppressed = {task["id"]: task for task in board["suppressed"]}
+    assert len(ordinary) + len(suppressed) == task_count
+    assert source_id not in ordinary
+    assert replacement_id in ordinary
+    assert any(
+        diagnostic["kind"] == "replacement_suppressed"
+        and diagnostic["data"]["replacement"]["canonical_live_task"] == replacement_id
+        for diagnostic in suppressed[source_id]["diagnostics"]
+    )
+    assert board["latest_event_id"] == event_count
+    assert elapsed < 15, f"large board response took {elapsed:.3f}s"
 
 
 def test_non_actionable_rows_live_only_in_suppressed_audit(client):

@@ -329,13 +329,13 @@ def _compute_task_diagnostics(
         graph_rows, links, events_by_task, runs_by_task,
         review_handoffs=kanban_db.list_review_handoffs(conn),
     )
-    reconciliation_context = {
+    reconciliation_context = kd.build_reconciliation_context({
         str(row["id"]): {
             "task": row,
             "_runs": runs_by_task.get(str(row["id"]), []),
         }
         for row in graph_rows
-    }
+    })
     git_probe = kd.GitProbeSession()
     try:
         from hermes_cli.profiles import profile_exists

@@ -116,6 +116,265 @@ def _run(outcome="completed", run_id=1, error=None):
 
 
 # ---------------------------------------------------------------------------
+# Reconciliation context indexing
+# ---------------------------------------------------------------------------
+
+
+def _reconciliation_run(run_id: int, receipt: dict) -> dict:
+    return {
+        "id": run_id,
+        "started_at": run_id,
+        "ended_at": run_id + 1,
+        "metadata": {"reconciliation": receipt},
+    }
+
+
+def _reconciliation_entry(task: dict, receipt: dict | None = None) -> dict:
+    return {
+        "task": task,
+        "_runs": [] if receipt is None else [_reconciliation_run(1, receipt)],
+    }
+
+
+def _valid_replacement_receipt(source_id: str, replacement_id: str) -> dict:
+    head = "c" * 40
+    return {
+        "supersedes_task_id": source_id,
+        "canonical_live_task": replacement_id,
+        "candidate_head": head,
+        "terminal_receipt": {
+            "state": "merged",
+            "task_id": replacement_id,
+            "head": head,
+        },
+    }
+
+
+def _fingerprint_for(task_id: str, context) -> str:
+    item = context[task_id]
+    return kd.reconciliation_state_fingerprint(
+        item["task"], item["_runs"], tasks=context,
+    )
+
+
+def _replacement_for(task_id: str, context) -> dict:
+    item = context[task_id]
+    receipt, _run_id = kd.reconciliation_receipt(item["_runs"])
+    return kd._replacement_identity(item["task"], receipt, context)
+
+
+def _assert_optimized_reconciliation_parity(task_id: str, plain_context: dict):
+    optimized = kd.build_reconciliation_context(plain_context)
+    assert dict(optimized) == plain_context
+    assert _fingerprint_for(task_id, optimized) == _fingerprint_for(
+        task_id, plain_context,
+    )
+    assert _replacement_for(task_id, optimized) == _replacement_for(
+        task_id, plain_context,
+    )
+    return optimized
+
+
+def test_reconciliation_context_preserves_explicit_replacement_semantics():
+    source_id = "t_source"
+    replacement_id = "t_replacement"
+    source_receipt = {
+        "replacement_task_id": replacement_id,
+        "canonical_live_task": replacement_id,
+    }
+    plain = {
+        source_id: _reconciliation_entry(
+            _task(id=source_id, status="ready"), source_receipt,
+        ),
+        replacement_id: _reconciliation_entry(
+            _task(id=replacement_id, status="done"),
+            _valid_replacement_receipt(source_id, replacement_id),
+        ),
+    }
+
+    optimized = _assert_optimized_reconciliation_parity(source_id, plain)
+    replacement = _replacement_for(source_id, optimized)
+    assert replacement["proven"] is True
+    assert replacement["canonical_live_task"] == replacement_id
+
+
+def test_reconciliation_context_preserves_target_owned_supersedes_semantics():
+    source_id = "t_source"
+    replacement_id = "t_replacement"
+    plain = {
+        source_id: _reconciliation_entry(_task(id=source_id, status="ready")),
+        replacement_id: _reconciliation_entry(
+            _task(id=replacement_id, status="done"),
+            _valid_replacement_receipt(source_id, replacement_id),
+        ),
+    }
+
+    optimized = _assert_optimized_reconciliation_parity(source_id, plain)
+    assert _replacement_for(source_id, optimized)["replacement_task_id"] == replacement_id
+
+
+def test_reconciliation_context_preserves_ambiguous_replacements():
+    source_id = "t_source"
+    first_id = "t_first"
+    second_id = "t_second"
+    plain = {
+        source_id: _reconciliation_entry(
+            _task(id=source_id), {"replacement_task_id": first_id},
+        ),
+        first_id: _reconciliation_entry(
+            _task(id=first_id, status="done"),
+            _valid_replacement_receipt(source_id, first_id),
+        ),
+        second_id: _reconciliation_entry(
+            _task(id=second_id, status="done"),
+            _valid_replacement_receipt(source_id, second_id),
+        ),
+    }
+
+    optimized = _assert_optimized_reconciliation_parity(source_id, plain)
+    assert _replacement_for(source_id, optimized)["reason"] == (
+        "replacement_identity_ambiguous"
+    )
+
+
+@pytest.mark.parametrize(
+    ("source_receipt", "target_receipt", "expected_reason"),
+    [
+        ({"replacement_task_id": "t_source"}, None, "replacement_cycle"),
+        (
+            {"replacement_task_id": "t_target"},
+            {
+                "canonical_live_task": "t_target",
+                "terminal_receipt": {
+                    "state": "merged",
+                    "task_id": "t_target",
+                    "head": "c" * 40,
+                },
+            },
+            "replacement_backref_missing",
+        ),
+        (
+            {"replacement_task_id": "t_target"},
+            {
+                "supersedes_task_id": "t_source",
+                "canonical_live_task": "t_target",
+                "terminal_receipt": {
+                    "state": "merged",
+                    "task_id": "t_wrong",
+                    "head": "c" * 40,
+                },
+            },
+            "replacement_terminal_proof_invalid",
+        ),
+    ],
+)
+def test_reconciliation_context_preserves_replacement_failure_paths(
+    source_receipt,
+    target_receipt,
+    expected_reason,
+):
+    plain = {
+        "t_source": _reconciliation_entry(
+            _task(id="t_source", status="ready"), source_receipt,
+        ),
+    }
+    if target_receipt is not None:
+        plain["t_target"] = _reconciliation_entry(
+            _task(id="t_target", status="done"), target_receipt,
+        )
+
+    optimized = _assert_optimized_reconciliation_parity("t_source", plain)
+    assert _replacement_for("t_source", optimized)["reason"] == expected_reason
+
+
+def test_reconciliation_fingerprint_tracks_only_relevant_neighbors():
+    source_id = "t_source"
+    target_id = "t_target"
+    other_id = "t_other"
+    source_receipt = {
+        "replacement_task_id": target_id,
+        "canonical_live_task": target_id,
+    }
+    plain = {
+        source_id: _reconciliation_entry(_task(id=source_id), source_receipt),
+        target_id: _reconciliation_entry(
+            _task(id=target_id, status="done"),
+            _valid_replacement_receipt(source_id, target_id),
+        ),
+        other_id: _reconciliation_entry(
+            _task(id=other_id, status="ready"),
+            {"candidate_head": "d" * 40},
+        ),
+    }
+    optimized = _assert_optimized_reconciliation_parity(source_id, plain)
+    original = _fingerprint_for(source_id, optimized)
+
+    relevant_changed = {
+        **plain,
+        target_id: _reconciliation_entry(
+            _task(id=target_id, status="archived"),
+            _valid_replacement_receipt(source_id, target_id),
+        ),
+    }
+    relevant_optimized = kd.build_reconciliation_context(relevant_changed)
+    assert _fingerprint_for(source_id, relevant_optimized) != original
+    assert _fingerprint_for(source_id, relevant_optimized) == _fingerprint_for(
+        source_id, relevant_changed,
+    )
+
+    unrelated_changed = {
+        **plain,
+        other_id: _reconciliation_entry(
+            _task(id=other_id, status="blocked", current_run_id=99),
+            {"candidate_head": "e" * 40, "unrelated": "changed"},
+        ),
+    }
+    unrelated_optimized = kd.build_reconciliation_context(unrelated_changed)
+    assert _fingerprint_for(source_id, unrelated_optimized) == original
+    assert _fingerprint_for(source_id, unrelated_optimized) == _fingerprint_for(
+        source_id, unrelated_changed,
+    )
+
+
+def test_reconciliation_context_receipt_calls_scale_linearly(monkeypatch):
+    task_count = 128
+    plain = {
+        f"t_{index:04d}": {
+            "task": _task(id=f"t_{index:04d}", assignee=None, created_at=1),
+            "_runs": [{
+                "id": index + 1,
+                "started_at": index + 1,
+                "ended_at": index + 2,
+                "metadata": None,
+            }],
+        }
+        for index in range(task_count)
+    }
+    original = kd.reconciliation_receipt
+    receipt_calls = 0
+
+    def counted_receipt(runs):
+        nonlocal receipt_calls
+        receipt_calls += 1
+        return original(runs)
+
+    monkeypatch.setattr(kd, "reconciliation_receipt", counted_receipt)
+    optimized = kd.build_reconciliation_context(plain)
+    assert receipt_calls == task_count
+
+    for task_id, item in optimized.items():
+        kd.compute_task_diagnostics(
+            item["task"], [], item["_runs"], tasks=optimized, now=2,
+        )
+        assert _fingerprint_for(task_id, optimized)
+        assert kd._replacement_identity(
+            item["task"], {}, optimized,
+        )["source_task_id"] == task_id
+
+    assert receipt_calls == task_count
+
+
+# ---------------------------------------------------------------------------
 # Each rule — positive + negative + clearing
 # ---------------------------------------------------------------------------
 
