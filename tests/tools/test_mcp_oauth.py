@@ -109,6 +109,51 @@ class TestHermesTokenStorage:
         client_path = tmp_path / "mcp-tokens" / "test-server.client.json"
         assert client_path.exists()
 
+    def test_dynamic_client_secret_auth_method_is_preserved_when_server_omits_it(self, tmp_path, monkeypatch):
+        """An opt-in DCR client secret needs its configured token auth method."""
+        pytest.importorskip("mcp")
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("dcr-server", dynamic_client_auth_method="client_secret_post")
+        client_info = OAuthClientInformationFull.model_validate(
+            {
+                "client_id": "dcr-client",
+                "client_secret": "dcr-secret",
+                "redirect_uris": ["https://example.invalid/callback"],
+            }
+        )
+
+        asyncio.run(storage.set_client_info(client_info))
+        # The SDK retains this same object in its live context during the first
+        # token exchange, so persisting only a replacement instance is unsafe.
+        assert client_info.token_endpoint_auth_method == "client_secret_post"
+
+        stored = asyncio.run(storage.get_client_info())
+        assert stored is not None
+        assert stored.token_endpoint_auth_method == "client_secret_post"
+
+    def test_dynamic_client_secret_method_is_not_inferred_without_opt_in(self, tmp_path, monkeypatch):
+        """A returned DCR secret alone must not change a server's auth method."""
+        pytest.importorskip("mcp")
+        from mcp.shared.auth import OAuthClientInformationFull
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        storage = HermesTokenStorage("public-dcr-server")
+        client_info = OAuthClientInformationFull.model_validate(
+            {
+                "client_id": "dcr-client",
+                "client_secret": "dcr-secret",
+                "redirect_uris": ["https://example.invalid/callback"],
+            }
+        )
+
+        asyncio.run(storage.set_client_info(client_info))
+
+        stored = asyncio.run(storage.get_client_info())
+        assert stored is not None
+        assert stored.token_endpoint_auth_method is None
+
     def test_remove_cleans_up(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         storage = HermesTokenStorage("test-server")
@@ -927,6 +972,17 @@ def test_build_client_metadata_with_secret_is_confidential():
     from tools.mcp_oauth import _build_client_metadata, _configure_callback_port
 
     cfg = {"client_secret": "shh"}
+    _configure_callback_port(cfg)
+    md = _build_client_metadata(cfg)
+    assert md.token_endpoint_auth_method == "client_secret_post"
+
+
+def test_build_client_metadata_with_dynamic_client_auth_method_is_confidential():
+    """DCR can explicitly request a confidential-client token auth method."""
+    pytest.importorskip("mcp")
+    from tools.mcp_oauth import _build_client_metadata, _configure_callback_port
+
+    cfg = {"dynamic_client_auth_method": "client_secret_post"}
     _configure_callback_port(cfg)
     md = _build_client_metadata(cfg)
     assert md.token_endpoint_auth_method == "client_secret_post"
