@@ -9969,6 +9969,14 @@ def cmd_update(args):
         )
         return
 
+    # Resolve git release policy before the apply path installs signal/stdio
+    # protection or performs any backup, marker, process, or repository action.
+    # Non-git installs retain their package-manager update behavior.
+    branch = (
+        _resolve_update_branch(args)
+        if _install_method_for_warning == "git"
+        else None
+    )
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
@@ -9976,7 +9984,7 @@ def cmd_update(args):
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _cmd_update_impl(args, gateway_mode=gateway_mode, branch=branch)
     finally:
         _finalize_update_output(_update_io_state)
 
@@ -10042,9 +10050,12 @@ def _cmd_update_pip(args):
     print("✓ Update complete! Restart hermes to use the new version.")
 
 
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    if branch is None and (PROJECT_ROOT / ".git").exists():
+        branch = _resolve_update_branch(args)
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -10193,15 +10204,15 @@ def _cmd_update_impl(args, gateway_mode: bool):
         return
 
     # Fetch and pull
+    assert branch is not None
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
+        # The target branch was resolved before any apply-path mutation so the
+        # fetch can be scoped to the validated release channel.
         # A bare `git fetch origin` pulls every ref, and this repo carries
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        branch = _resolve_update_branch(args)
-
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch", "origin", branch],
