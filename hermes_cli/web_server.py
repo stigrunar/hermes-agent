@@ -4781,19 +4781,6 @@ def get_profiles_sessions_sidebar(
             s["archived"] = bool(s.get("archived"))
         return rows
 
-    def _slice(db, *, source=None, exclude=None, cap):
-        return db.list_sessions_rich(
-            source=source,
-            exclude_sources=exclude or None,
-            limit=cap,
-            offset=0,
-            min_message_count=1,
-            include_archived=False,
-            archived_only=False,
-            order_by_last_active=True,
-            compact_rows=True,
-        )
-
     for name, home in targets:
         db_path = Path(home) / "state.db"
         if not db_path.exists():
@@ -4804,23 +4791,22 @@ def get_profiles_sessions_sidebar(
             errors.append({"profile": name, "error": str(exc)})
             continue
         try:
-            if recents_scope == "all" or name == recents_scope:
-                recents_rows.extend(
-                    _tag(_slice(db, exclude=recents_exclude_list, cap=recents_cap), name)
-                )
-                rtotal = db.session_count(
-                    exclude_sources=recents_exclude_list or None,
-                    min_message_count=1,
-                    include_archived=False,
-                    archived_only=False,
-                    exclude_children=True,
-                )
+            include_recents = recents_scope == "all" or name == recents_scope
+            slices = db.list_sidebar_session_slices(
+                include_recents=include_recents,
+                recents_exclude_sources=recents_exclude_list or None,
+                recents_limit=recents_cap,
+                cron_limit=cron_cap,
+                messaging_exclude_sources=messaging_exclude_list or None,
+                messaging_limit=messaging_cap,
+            )
+            if include_recents:
+                recents_rows.extend(_tag(slices["recents"], name))
+                rtotal = slices["recents_total"]
                 recents_total += rtotal
                 recents_profile_totals[name] = rtotal
-            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
-            messaging_rows.extend(
-                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
-            )
+            cron_rows.extend(_tag(slices["cron"], name))
+            messaging_rows.extend(_tag(slices["messaging"], name))
         except Exception as exc:
             errors.append({"profile": name, "error": str(exc)})
         finally:
