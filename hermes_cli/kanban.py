@@ -1954,13 +1954,13 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             graph_rows, links, ev_by, run_by,
             review_handoffs=review_handoffs,
         )
-        reconciliation_context = {
+        reconciliation_context = kd.build_reconciliation_context({
             str(row["id"]): {
                 "task": row,
                 "_runs": run_by.get(str(row["id"]), []),
             }
             for row in graph_rows
-        }
+        })
         git_probe = kd.GitProbeSession()
         try:
             from hermes_cli.profiles import profile_exists

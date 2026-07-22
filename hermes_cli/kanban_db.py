@@ -91,7 +91,7 @@ import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from agent.redact import redact_for_persistence as _redact_diagnostic
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -4626,23 +4626,25 @@ def _reconciliation_data_version(conn: sqlite3.Connection) -> int:
 
 def _load_reconciliation_context(
     conn: sqlite3.Connection,
-) -> tuple[list[Any], dict[str, list[Any]], dict[str, Any]]:
+) -> tuple[list[Any], dict[str, list[Any]], Mapping[str, Any]]:
     """Load one board snapshot used by every report in a dispatch tick."""
+    from hermes_cli import kanban_diagnostics as _kd
+
     rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
     runs_by_task: dict[str, list[Any]] = {str(row["id"]): [] for row in rows}
     for run in conn.execute("SELECT * FROM task_runs ORDER BY id"):
         runs_by_task.setdefault(str(run["task_id"]), []).append(run)
-    context = {
+    context = _kd.build_reconciliation_context({
         str(row["id"]): {
             "task": row,
             "_runs": runs_by_task.get(str(row["id"]), []),
         }
         for row in rows
-    }
+    })
     return rows, runs_by_task, context
 
 
-def _reconciliation_context_token(context: dict[str, Any]) -> str:
+def _reconciliation_context_token(context: Mapping[str, Any]) -> str:
     """Hash the DB-backed reconciliation inputs for snapshot stability."""
     material = []
     for task_id, item in sorted(context.items()):
@@ -4675,7 +4677,7 @@ def _reconciliation_context_token(context: dict[str, Any]) -> str:
 def _reconciliation_reports_from_context(
     rows: list[Any],
     runs_by_task: dict[str, list[Any]],
-    context: dict[str, Any],
+    context: Mapping[str, Any],
     wanted: set[str],
     *,
     git_probe: Any,

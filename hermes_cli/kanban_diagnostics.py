@@ -792,6 +792,83 @@ def _context_parts(value: Any) -> tuple[Any, list[Any]]:
     return value, []
 
 
+@dataclass(frozen=True)
+class _ReconciliationContextRecord:
+    task: Any
+    runs: list[Any]
+    receipt: dict[str, Any]
+    receipt_run_id: Optional[int]
+
+
+class ReconciliationContext(Mapping[str, Any]):
+    """Mapping-compatible board snapshot with precomputed receipt indexes.
+
+    Values retain the existing ``{"task": ..., "_runs": [...]}`` contract so
+    ordinary mapping consumers continue to work. Diagnostics additionally use
+    the private records and reverse supersedes lookup to avoid rescanning every
+    task for each source task.
+    """
+
+    def __init__(self, tasks: Mapping[str, Any]):
+        self._items = dict(tasks)
+        records: dict[str, _ReconciliationContextRecord] = {}
+        superseders: dict[str, list[str]] = {}
+        for raw_task_id, value in self._items.items():
+            task_id = str(raw_task_id)
+            task, runs = _context_parts(value)
+            receipt, receipt_run_id = reconciliation_receipt(runs)
+            records[task_id] = _ReconciliationContextRecord(
+                task=task,
+                runs=runs,
+                receipt=receipt,
+                receipt_run_id=receipt_run_id,
+            )
+            superseded_id = str(receipt.get("supersedes_task_id") or "")
+            if superseded_id:
+                superseders.setdefault(superseded_id, []).append(task_id)
+        self._records = records
+        self._superseders = {
+            task_id: tuple(sorted(task_ids))
+            for task_id, task_ids in superseders.items()
+        }
+
+    def __getitem__(self, task_id: str) -> Any:
+        return self._items[task_id]
+
+    def __iter__(self):
+        return iter(self._items)
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def _record(self, task_id: str) -> Optional[_ReconciliationContextRecord]:
+        return self._records.get(str(task_id))
+
+    def _superseders_for(self, task_id: str) -> tuple[str, ...]:
+        return self._superseders.get(str(task_id), ())
+
+
+def build_reconciliation_context(
+    tasks: Mapping[str, Any],
+) -> ReconciliationContext:
+    """Build or retain one optimized, mapping-compatible board snapshot."""
+    if isinstance(tasks, ReconciliationContext):
+        return tasks
+    return ReconciliationContext(tasks)
+
+
+def _context_receipt(
+    task: Any,
+    runs: Iterable[Any],
+    tasks: Optional[Mapping[str, Any]],
+) -> tuple[dict[str, Any], Optional[int]]:
+    if isinstance(tasks, ReconciliationContext):
+        record = tasks._record(str(_task_field(task, "id") or ""))
+        if record is not None:
+            return record.receipt, record.receipt_run_id
+    return reconciliation_receipt(runs)
+
+
 def reconciliation_state_fingerprint(
     task: Any,
     runs: Iterable[Any],
@@ -800,28 +877,44 @@ def reconciliation_state_fingerprint(
 ) -> str:
     """Hash only DB-backed claim inputs, excluding clocks and probe output."""
     task_id = str(_task_field(task, "id") or "")
-    receipt, receipt_run_id = reconciliation_receipt(runs)
+    receipt, receipt_run_id = _context_receipt(task, runs, tasks)
     relevant_ids = {
         str(value) for value in (
             receipt.get("replacement_task_id"), receipt.get("canonical_live_task"),
         ) if value
     }
     related: list[dict[str, Any]] = []
-    for other_id, context in sorted((tasks or {}).items(), key=lambda item: str(item[0])):
-        other_task, other_runs = _context_parts(context)
-        other_receipt, other_run_id = reconciliation_receipt(other_runs)
-        if (
-            str(other_id) not in relevant_ids
-            and str(other_receipt.get("supersedes_task_id") or "") != task_id
+    if isinstance(tasks, ReconciliationContext):
+        related_ids = relevant_ids | set(tasks._superseders_for(task_id))
+        for other_id in sorted(related_ids):
+            record = tasks._record(other_id)
+            if record is None:
+                continue
+            related.append({
+                "id": other_id,
+                "status": _task_field(record.task, "status"),
+                "current_run_id": _task_field(record.task, "current_run_id"),
+                "receipt_run_id": record.receipt_run_id,
+                "receipt": record.receipt,
+            })
+    else:
+        for other_id, context in sorted(
+            (tasks or {}).items(), key=lambda item: str(item[0]),
         ):
-            continue
-        related.append({
-            "id": str(other_id),
-            "status": _task_field(other_task, "status"),
-            "current_run_id": _task_field(other_task, "current_run_id"),
-            "receipt_run_id": other_run_id,
-            "receipt": other_receipt,
-        })
+            other_task, other_runs = _context_parts(context)
+            other_receipt, other_run_id = reconciliation_receipt(other_runs)
+            if (
+                str(other_id) not in relevant_ids
+                and str(other_receipt.get("supersedes_task_id") or "") != task_id
+            ):
+                continue
+            related.append({
+                "id": str(other_id),
+                "status": _task_field(other_task, "status"),
+                "current_run_id": _task_field(other_task, "current_run_id"),
+                "receipt_run_id": other_run_id,
+                "receipt": other_receipt,
+            })
     material = {
         "task": {
             "id": task_id,
@@ -876,12 +969,17 @@ def _replacement_identity(
         ) if value
     }
     contexts: dict[str, tuple[Any, list[Any], dict[str, Any], Optional[int]]] = {}
-    for other_id, context in (tasks or {}).items():
-        other_task, other_runs = _context_parts(context)
-        other_receipt, other_run_id = reconciliation_receipt(other_runs)
-        contexts[str(other_id)] = (other_task, other_runs, other_receipt, other_run_id)
-        if str(other_receipt.get("supersedes_task_id") or "") == source_id:
-            named.add(str(other_id))
+    if isinstance(tasks, ReconciliationContext):
+        named.update(tasks._superseders_for(source_id))
+    else:
+        for other_id, context in (tasks or {}).items():
+            other_task, other_runs = _context_parts(context)
+            other_receipt, other_run_id = reconciliation_receipt(other_runs)
+            contexts[str(other_id)] = (
+                other_task, other_runs, other_receipt, other_run_id,
+            )
+            if str(other_receipt.get("supersedes_task_id") or "") == source_id:
+                named.add(str(other_id))
 
     base = {
         "proven": False,
@@ -899,7 +997,14 @@ def _replacement_identity(
     base["replacement_task_id"] = replacement_id
     if replacement_id == source_id:
         return {**base, "reason": "replacement_cycle"}
-    context = contexts.get(replacement_id)
+    if isinstance(tasks, ReconciliationContext):
+        record = tasks._record(replacement_id)
+        context = (
+            (record.task, record.runs, record.receipt, record.receipt_run_id)
+            if record is not None else None
+        )
+    else:
+        context = contexts.get(replacement_id)
     if context is None:
         return {**base, "reason": "replacement_not_found"}
     replacement_task, _runs, target_receipt, _run_id = context
@@ -1039,7 +1144,7 @@ def reconcile_task(
     """Build one deterministic guard receipt without mutating board or Git."""
     now_ts = int(now if now is not None else time.time())
     task_id = str(_task_field(task, "id") or "")
-    receipt, receipt_run_id = reconciliation_receipt(runs)
+    receipt, receipt_run_id = _context_receipt(task, runs, tasks)
     probe = git_probe or GitProbeSession()
     candidate = {
         "repo": receipt.get("repo"),
