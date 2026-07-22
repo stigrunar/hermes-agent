@@ -5,6 +5,7 @@ import os
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock
@@ -1869,6 +1870,341 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
         assert data["recents"]["total"] >= 1
+
+    def test_profiles_sessions_sidebar_matches_legacy_composition_across_profiles(self):
+        """The shared-query path is a semantic optimization, including all
+        listability and compression projection rules from the legacy calls."""
+        from hermes_state import SessionDB
+        from hermes_cli import profiles as profiles_mod
+
+        recents_exclude = ["cron", "telegram", "webhook"]
+        messaging_exclude = [
+            "cron", "cli", "codex", "desktop", "gateway", "local", "tui"
+        ]
+        homes = {
+            "default": profiles_mod.get_profile_dir("default"),
+            "worker": profiles_mod.get_profile_dir("worker"),
+        }
+        homes["worker"].mkdir(parents=True)
+
+        def _populate(db, prefix, base):
+            rows = (
+                ("desktop", "desktop"),
+                ("cli", "cli"),
+                ("cron", "cron"),
+                ("telegram", "telegram"),
+                ("webhook", "webhook"),
+                ("archived", "desktop"),
+            )
+            for index, (suffix, source) in enumerate(rows):
+                sid = f"{prefix}-{suffix}"
+                db.create_session(session_id=sid, source=source)
+                db.append_message(
+                    sid, role="user", content=f"{sid} preview", timestamp=base + index
+                )
+                db._conn.execute(
+                    "UPDATE sessions SET started_at=? WHERE id=?", (base + index, sid)
+                )
+            db._conn.execute(
+                "UPDATE sessions SET archived=1 WHERE id=?", (f"{prefix}-archived",)
+            )
+
+            parent = f"{prefix}-parent"
+            branch = f"{prefix}-branch"
+            delegate = f"{prefix}-delegate"
+            db.create_session(parent, "desktop")
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, ended_at=?, end_reason='branched' WHERE id=?",
+                (base + 10, base + 11, parent),
+            )
+            db.create_session(
+                branch,
+                "desktop",
+                parent_session_id=parent,
+                model_config={"_branched_from": parent},
+            )
+            db.append_message(branch, "user", "visible branch", timestamp=base + 12)
+            db._conn.execute(
+                "UPDATE sessions SET started_at=? WHERE id=?", (base + 12, branch)
+            )
+            db.create_session(
+                delegate,
+                "desktop",
+                parent_session_id=parent,
+                model_config={"_delegate_from": parent},
+            )
+            db.append_message(delegate, "user", "hidden delegate", timestamp=base + 13)
+
+            root = f"{prefix}-compression-root"
+            tip = f"{prefix}-compression-tip"
+            db.create_session(root, "desktop")
+            db.append_message(root, "user", "old root", timestamp=base + 20)
+            db._conn.execute(
+                "UPDATE sessions SET started_at=?, ended_at=?, end_reason='compression' WHERE id=?",
+                (base + 20, base + 21, root),
+            )
+            db.create_session(tip, "desktop", parent_session_id=root)
+            db.append_message(tip, "user", "newest compression tip", timestamp=base + 100)
+            db._conn.execute(
+                "UPDATE sessions SET started_at=? WHERE id=?", (base + 22, tip)
+            )
+            db._conn.commit()
+
+        def _legacy(db, include_recents):
+            recents = []
+            total = 0
+            if include_recents:
+                recents = db.list_sessions_rich(
+                    exclude_sources=recents_exclude,
+                    limit=20,
+                    offset=0,
+                    min_message_count=1,
+                    include_archived=False,
+                    archived_only=False,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                )
+                total = db.session_count(
+                    exclude_sources=recents_exclude,
+                    min_message_count=1,
+                    include_archived=False,
+                    archived_only=False,
+                    exclude_children=True,
+                )
+            return {
+                "recents": recents,
+                "cron": db.list_sessions_rich(
+                    source="cron",
+                    limit=50,
+                    offset=0,
+                    min_message_count=1,
+                    include_archived=False,
+                    archived_only=False,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                ),
+                "messaging": db.list_sessions_rich(
+                    exclude_sources=messaging_exclude,
+                    limit=100,
+                    offset=0,
+                    min_message_count=1,
+                    include_archived=False,
+                    archived_only=False,
+                    order_by_last_active=True,
+                    compact_rows=True,
+                ),
+                "recents_total": total,
+            }
+
+        for index, (name, home) in enumerate(homes.items()):
+            db = SessionDB(db_path=Path(home) / "state.db")
+            try:
+                _populate(db, name, 1_700_000_000 + index * 1_000)
+                include_recents = name == "worker"
+                expected = _legacy(db, include_recents)
+                actual = db.list_sidebar_session_slices(
+                    include_recents=include_recents,
+                    recents_exclude_sources=recents_exclude,
+                    recents_limit=20,
+                    cron_limit=50,
+                    messaging_exclude_sources=messaging_exclude,
+                    messaging_limit=100,
+                )
+                assert actual == expected
+            finally:
+                db.close()
+
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=worker&recents_limit=20"
+            "&recents_exclude=cron,telegram,webhook&cron_limit=50"
+            "&messaging_limit=100"
+            "&messaging_exclude=cron,cli,codex,desktop,gateway,local,tui"
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["errors"] == []
+        assert data["recents"]["profile_totals"] == {"worker": 4}
+        assert data["recents"]["total"] == 4
+        assert {row["profile"] for row in data["recents"]["sessions"]} == {"worker"}
+        assert "worker-compression-tip" in {
+            row["id"] for row in data["recents"]["sessions"]
+        }
+        all_ids = {
+            row["id"]
+            for group in ("recents", "cron", "messaging")
+            for row in data[group]["sessions"]
+        }
+        assert "worker-archived" not in all_ids
+        assert "worker-delegate" not in all_ids
+        assert "worker-branch" in all_ids
+        assert {row["profile"] for row in data["cron"]["sessions"]} == {
+            "default", "worker"
+        }
+        assert {row["profile"] for row in data["messaging"]["sessions"]} == {
+            "default", "worker"
+        }
+
+    def test_profiles_sessions_sidebar_uses_one_shared_query_helper_per_profile(
+        self, monkeypatch
+    ):
+        """One request must not invoke the legacy recursive list three times."""
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session("shared-query-proof", "desktop")
+            db.append_message("shared-query-proof", "user", "hello")
+        finally:
+            db.close()
+
+        original = SessionDB.list_sidebar_session_slices
+        calls = []
+        recursive_statements = []
+
+        def _tracked(self, **kwargs):
+            calls.append((Path(self.db_path), kwargs))
+            self._conn.set_trace_callback(
+                lambda statement: recursive_statements.append(statement)
+                if "WITH RECURSIVE" in statement
+                else None
+            )
+            try:
+                return original(self, **kwargs)
+            finally:
+                self._conn.set_trace_callback(None)
+
+        def _legacy_scan(*args, **kwargs):
+            raise AssertionError("sidebar request rebuilt a legacy list/count query")
+
+        monkeypatch.setattr(SessionDB, "list_sidebar_session_slices", _tracked)
+        monkeypatch.setattr(SessionDB, "list_sessions_rich", _legacy_scan)
+        monkeypatch.setattr(SessionDB, "session_count", _legacy_scan)
+
+        started = time.perf_counter()
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_exclude=cron,telegram&messaging_exclude=cron,desktop"
+        )
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        assert len(calls) == 1
+        assert calls[0][1]["include_recents"] is True
+        assert len(recursive_statements) == 1
+        assert elapsed < 15
+
+    def test_profiles_sessions_sidebar_large_history_completes_within_budget(self):
+        """A live-size session surface stays below Desktop's 15s timeout.
+
+        The fixture has 12k visible conversations, 12k+ messages, and 120
+        compression continuations. Inserts are bulk SQL and FTS triggers are
+        disabled only in this disposable test DB because sidebar listing does
+        not read either FTS table and indexing the fixture is not under test.
+        """
+        from hermes_state import SessionDB
+
+        visible_count = 12_000
+        compression_count = 120
+        base = 1_700_000_000.0
+
+        db = SessionDB()
+        try:
+            with db._lock:
+                for trigger in (
+                    "messages_fts_insert",
+                    "messages_fts_delete",
+                    "messages_fts_update",
+                    "messages_fts_trigram_insert",
+                    "messages_fts_trigram_delete",
+                    "messages_fts_trigram_update",
+                ):
+                    db._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+
+                db._conn.execute(
+                    """WITH RECURSIVE seq(i) AS (
+                           SELECT 0
+                           UNION ALL
+                           SELECT i + 1 FROM seq WHERE i + 1 < ?
+                       )
+                       INSERT INTO sessions
+                           (id, source, parent_session_id, started_at, ended_at,
+                            end_reason, message_count, archived, model_config)
+                       SELECT
+                           printf('scale-root-%05d', i),
+                           CASE i % 3
+                               WHEN 0 THEN 'desktop'
+                               WHEN 1 THEN 'cron'
+                               ELSE 'telegram'
+                           END,
+                           NULL,
+                           ? + i,
+                           CASE WHEN i < ? THEN ? + i + 1 ELSE NULL END,
+                           CASE WHEN i < ? THEN 'compression' ELSE NULL END,
+                           1,
+                           0,
+                           NULL
+                       FROM seq""",
+                    (visible_count, base, compression_count, base, compression_count),
+                )
+                db._conn.execute(
+                    """WITH RECURSIVE seq(i) AS (
+                           SELECT 0
+                           UNION ALL
+                           SELECT i + 1 FROM seq WHERE i + 1 < ?
+                       )
+                       INSERT INTO sessions
+                           (id, source, parent_session_id, started_at,
+                            message_count, archived, model_config)
+                       SELECT
+                           printf('scale-tip-%05d', i),
+                           CASE i % 3
+                               WHEN 0 THEN 'desktop'
+                               WHEN 1 THEN 'cron'
+                               ELSE 'telegram'
+                           END,
+                           printf('scale-root-%05d', i),
+                           ? + ? + i,
+                           1,
+                           0,
+                           NULL
+                       FROM seq""",
+                    (compression_count, base, visible_count),
+                )
+                db._conn.execute(
+                    """INSERT INTO messages (session_id, role, content, timestamp)
+                       SELECT id, 'user', 'message 0', started_at
+                       FROM sessions
+                       WHERE id GLOB 'scale-root-*' OR id GLOB 'scale-tip-*'"""
+                )
+                db._conn.commit()
+        finally:
+            db.close()
+
+        started = time.perf_counter()
+        response = self.client.get(
+            "/api/profiles/sessions/sidebar"
+            "?recents_profile=all&recents_limit=20"
+            "&recents_exclude=cron,telegram&cron_limit=50"
+            "&messaging_limit=100&messaging_exclude=cron,desktop"
+        )
+        elapsed = time.perf_counter() - started
+
+        assert response.status_code == 200
+        data = response.json()
+        assert data["errors"] == []
+        assert data["recents"]["total"] == visible_count // 3
+        assert data["recents"]["profile_totals"] == {
+            "default": visible_count // 3
+        }
+        assert len(data["recents"]["sessions"]) == 20
+        assert len(data["cron"]["sessions"]) == 50
+        assert len(data["messaging"]["sessions"]) == 100
+        assert any(
+            row["id"].startswith("scale-tip-")
+            for row in data["recents"]["sessions"]
+        )
+        assert elapsed < 15, f"sidebar request took {elapsed:.3f}s"
 
     def test_sessions_endpoint_reads_requested_profile(self):
         """The machine dashboard's global profile switcher must retarget
