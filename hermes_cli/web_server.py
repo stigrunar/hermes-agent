@@ -3999,8 +3999,25 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    from hermes_cli.update_channel import UpdateChannelError, resolve_update_branch
+
     try:
-        proc = _spawn_hermes_action(["update"], "hermes-update")
+        branch = resolve_update_branch(project_root=PROJECT_ROOT)
+    except UpdateChannelError as exc:
+        message = f"Hermes update blocked by release-channel policy: {exc}"
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_channel_unconfigured",
+            "message": message,
+        }
+
+    try:
+        proc = _spawn_hermes_action(
+            ["update", "--branch", branch], "hermes-update"
+        )
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")

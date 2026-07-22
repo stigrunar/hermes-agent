@@ -2387,7 +2387,30 @@ class TestWebServerEndpoints:
 
         assert resp.status_code == 200
         assert resp.json() == {"ok": True, "pid": 12345, "name": "hermes-update"}
-        assert calls == [(["update"], "hermes-update")]
+        assert calls == [(["update", "--branch", "main"], "hermes-update")]
+
+    def test_update_hermes_fails_closed_when_stig_channel_is_unconfigured(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_channel import UpdateChannelError
+
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            "hermes_cli.update_channel.resolve_update_branch",
+            lambda **_kwargs: (_ for _ in ()).throw(UpdateChannelError("missing channel")),
+        )
+        monkeypatch.setattr(
+            web_server,
+            "_spawn_hermes_action",
+            lambda *_args: pytest.fail("unconfigured update must not spawn"),
+        )
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        data = self.client.post("/api/hermes/update").json()
+
+        assert data["ok"] is False
+        assert data["error"] == "update_channel_unconfigured"
+        assert "missing channel" in data["message"]
 
     def test_action_status_reaps_completed_process(self, monkeypatch):
         import hermes_cli.web_server as web_server
