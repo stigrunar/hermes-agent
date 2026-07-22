@@ -104,7 +104,7 @@ import {
 } from './hardening'
 import { createLinkTitleWindow, guardLinkTitleSession, readLinkTitleWindowTitle } from './link-title-window'
 import { ensureMainWindow } from './main-window-lifecycle'
-import { serializeJsonBody, setRequestContentType } from './oauth-net-request'
+import { fetchJsonViaOauthSession as fetchJsonViaOauthSessionRequest } from './oauth-net-request'
 import { decideProfileDeleteAction, profileNameFromDeleteRequest, resolveRouteProfile } from './profile-delete-routing'
 import {
   buildSessionWindowUrl,
@@ -5489,115 +5489,12 @@ function openOauthLoginWindow(baseUrl, { silent = false } = {}) {
 // session cookie is attached automatically by Electron's net stack. Used for
 // authed REST against a gated gateway, including minting WS tickets.
 function fetchJsonViaOauthSession(url, options: any = {}) {
-  return new Promise((resolve, reject) => {
-    const sess = getOauthSession()
-
-    if (!sess) {
-      reject(new Error('OAuth session partition is unavailable.'))
-
-      return
-    }
-
-    let parsed
-
-    try {
-      parsed = new URL(url)
-    } catch (error) {
-      reject(new Error(`Invalid URL: ${error.message}`))
-
-      return
-    }
-
-    if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-      reject(new Error(`Unsupported Hermes backend URL protocol: ${parsed.protocol}`))
-
-      return
-    }
-
-    const multipart = options.upload ? multipartBody(options.upload) : null
-    const body = multipart ? multipart.body : serializeJsonBody(options.body)
-    const timeoutMs = resolveTimeoutMs(options.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-
-    const request = electronNet.request({
-      method: options.method || 'GET',
-      url,
-      session: sess,
-      useSessionCookies: true,
-      redirect: 'follow'
-    } as any)
-
-    setRequestContentType(request, multipart ? multipart.contentType : 'application/json')
-
-    let timedOut = false
-
-    const timer = setTimeout(() => {
-      timedOut = true
-
-      try {
-        request.abort()
-      } catch {
-        // already finished
-      }
-
-      reject(new Error(`Timed out connecting to Hermes backend after ${timeoutMs}ms`))
-    }, timeoutMs)
-
-    request.on('response', res => {
-      const chunks = []
-      res.on('data', chunk => chunks.push(Buffer.from(chunk)))
-      res.on('end', () => {
-        if (timedOut) {
-          return
-        }
-
-        clearTimeout(timer)
-        const text = Buffer.concat(chunks).toString('utf8')
-        const statusCode = res.statusCode || 500
-
-        if (statusCode >= 400) {
-          const err = new Error(`${statusCode}: ${text || ''}`) as any
-          err.statusCode = statusCode
-          reject(err)
-
-          return
-        }
-
-        if (!text) {
-          resolve(null)
-
-          return
-        }
-
-        const looksHtml = /^\s*<(?:!doctype|html)/i.test(text)
-        const contentType = String(res.headers['content-type'] || res.headers['Content-Type'] || '')
-
-        if (looksHtml || contentType.includes('text/html')) {
-          reject(new Error(`Expected JSON from ${url} but got HTML (status ${statusCode}).`))
-
-          return
-        }
-
-        try {
-          resolve(JSON.parse(text))
-        } catch {
-          reject(new Error(`Invalid JSON from ${url} (status ${statusCode}): ${text.slice(0, 200)}`))
-        }
-      })
-    })
-    request.on('error', error => {
-      if (timedOut) {
-        return
-      }
-
-      clearTimeout(timer)
-      reject(error)
-    })
-
-    if (body) {
-      request.write(body)
-    }
-
-    request.end()
+  return fetchJsonViaOauthSessionRequest(url, options, {
+    defaultTimeoutMs: DEFAULT_FETCH_TIMEOUT_MS,
+    multipartBody,
+    net: electronNet,
+    resolveTimeoutMs,
+    session: getOauthSession()
   })
 }
 

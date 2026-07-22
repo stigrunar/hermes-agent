@@ -3,7 +3,9 @@ import {
   Button,
   cn,
   ErrorState,
-  Loader
+  host,
+  Loader,
+  useValue
 } from '@hermes/plugin-sdk'
 import type { HermesPlugin, PluginContext } from '@hermes/plugin-sdk'
 import * as React from 'react'
@@ -24,31 +26,93 @@ interface KanbanBoard {
   latest_event_id?: number
 }
 
+const AUTO_REFRESH_DELAY_MS = 30_000
+const boardRequests = new WeakMap<PluginContext, Map<string, Promise<KanbanBoard>>>()
+
+function boardRequestFor(context: PluginContext, profile: string): Promise<KanbanBoard> | null {
+  return boardRequests.get(context)?.get(profile) ?? null
+}
+
+function requestBoard(context: PluginContext, profile: string): Promise<KanbanBoard> {
+  const existing = boardRequestFor(context, profile)
+
+  if (existing) {
+    return existing
+  }
+
+  const requestsForContext = boardRequests.get(context) ?? new Map<string, Promise<KanbanBoard>>()
+
+  const request = context.rest<KanbanBoard>('/board', { timeoutMs: 60_000 }).finally(() => {
+    if (requestsForContext.get(profile) === request) {
+      requestsForContext.delete(profile)
+    }
+  })
+
+  requestsForContext.set(profile, request)
+  boardRequests.set(context, requestsForContext)
+
+  return request
+}
+
 function KanbanPage({ context }: { context: PluginContext }) {
+  const profile = useValue(host.state.profile).trim() || 'default'
   const [board, setBoard] = React.useState<KanbanBoard | null>(null)
   const [error, setError] = React.useState<string | null>(null)
   const [loading, setLoading] = React.useState(true)
+  const autoRefreshTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null)
+  const requestGeneration = React.useRef(0)
 
-  const load = React.useCallback(() => {
-    setLoading(true)
+  const load = React.useCallback(async (showLoading = true) => {
+    const generation = ++requestGeneration.current
 
-    return context
-      .rest<KanbanBoard>('/board')
-      .then(value => {
+    if (showLoading) {
+      setLoading(true)
+    }
+
+    setError(null)
+
+    try {
+      // Shared boards can exceed the desktop bridge's generic 15 s timeout.
+      const value = await requestBoard(context, profile)
+
+      if (requestGeneration.current === generation) {
         setBoard(value)
-        setError(null)
-      })
-      .catch(reason => {
+      }
+    } catch (reason) {
+      if (requestGeneration.current === generation) {
         setError(reason instanceof Error ? reason.message : String(reason))
-      })
-      .finally(() => setLoading(false))
-  }, [context])
+      }
+    } finally {
+      if (showLoading && requestGeneration.current === generation) {
+        setLoading(false)
+      }
+    }
+  }, [context, profile])
 
   React.useEffect(() => {
     void load()
 
-    return context.socket('/events', () => void load())
-  }, [context, load])
+    const disposeSocket = context.socket('/events', () => {
+      if (boardRequestFor(context, profile) || autoRefreshTimer.current) {
+        return
+      }
+
+      autoRefreshTimer.current = setTimeout(() => {
+        autoRefreshTimer.current = null
+        void load(false)
+      }, AUTO_REFRESH_DELAY_MS)
+    })
+
+    return () => {
+      requestGeneration.current += 1
+      disposeSocket()
+
+      if (autoRefreshTimer.current) {
+        clearTimeout(autoRefreshTimer.current)
+        autoRefreshTimer.current = null
+      }
+    }
+  }, [context, load, profile])
 
   if (loading && !board) {
     return (
@@ -77,7 +141,21 @@ function KanbanPage({ context }: { context: PluginContext }) {
           <h1 className="text-lg font-semibold">Kanban</h1>
           <p className="text-xs text-(--ui-text-secondary)">Tasks from the active Hermes profile</p>
         </div>
-        <Button className="ml-auto" disabled={loading} onClick={() => void load()} size="sm" type="button" variant="outline">
+        <Button
+          className="ml-auto"
+          disabled={loading}
+          onClick={() => {
+            if (autoRefreshTimer.current) {
+              clearTimeout(autoRefreshTimer.current)
+              autoRefreshTimer.current = null
+            }
+
+            void load()
+          }}
+          size="sm"
+          type="button"
+          variant="outline"
+        >
           {loading ? 'Refreshing…' : 'Refresh'}
         </Button>
       </div>
