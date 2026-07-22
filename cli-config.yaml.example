@@ -1406,6 +1406,12 @@ display:
 # Update Behavior
 # =============================================================================
 updates:
+  # Optional git release branch used by bare CLI, messaging, and dashboard
+  # updates. An explicit `hermes update --branch NAME` takes precedence.
+  # Checkouts carrying a purpose-named `stig` deployment remote fail closed
+  # when this is unset instead of silently deploying main.
+  # release_channel: "your-tested-release-branch"
+
   # Create a full HERMES_HOME zip before every `hermes update`.
   # Backups land in ~/.hermes/backups/ and can be restored with `hermes import`.
   # Off by default because large homes can add minutes to every update.

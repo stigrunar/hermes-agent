@@ -4864,6 +4864,7 @@ class GatewaySlashCommandsMixin:
         import subprocess
         from datetime import datetime
         from hermes_cli.config import is_managed, format_managed_message
+        from hermes_cli.update_channel import UpdateChannelError, resolve_update_branch
 
         # Block non-messaging platforms (API server, webhooks, ACP)
         platform = event.source.platform
@@ -4890,6 +4891,11 @@ class GatewaySlashCommandsMixin:
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
             return t("gateway.update.hermes_cmd_not_found")
+
+        try:
+            branch = resolve_update_branch(project_root=project_root)
+        except UpdateChannelError as exc:
+            return f"✗ Update blocked by release-channel policy: {exc}"
 
         pending_path = _hermes_home / ".update_pending.json"
         output_path = _hermes_home / ".update_output.txt"
@@ -4962,7 +4968,7 @@ class GatewaySlashCommandsMixin:
                     [
                         sys.executable, "-c", helper,
                         str(output_path), str(exit_code_path),
-                        *hermes_cmd, "update", "--gateway",
+                        *hermes_cmd, "update", "--gateway", "--branch", branch,
                     ],
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
@@ -4972,6 +4978,7 @@ class GatewaySlashCommandsMixin:
                 hermes_cmd_str = " ".join(shlex.quote(part) for part in hermes_cmd)
                 update_cmd = (
                     f"PYTHONUNBUFFERED=1 {hermes_cmd_str} update --gateway"
+                    f" --branch {shlex.quote(branch)}"
                     f" > {shlex.quote(str(output_path))} 2>&1; "
                     # Avoid `status=$?`: `status` is a read-only special parameter
                     # in zsh, and this command string is copied/reused in macOS/zsh
