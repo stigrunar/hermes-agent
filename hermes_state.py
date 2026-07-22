@@ -5287,6 +5287,216 @@ class SessionDB:
 
         return sessions
 
+    def list_sidebar_session_slices(
+        self,
+        *,
+        include_recents: bool = True,
+        recents_exclude_sources: List[str] = None,
+        recents_limit: int = 20,
+        cron_limit: int = 50,
+        messaging_exclude_sources: List[str] = None,
+        messaging_limit: int = 100,
+    ) -> Dict[str, Any]:
+        """Return the three Desktop sidebar windows from one shared scan.
+
+        This is the request-local counterpart to three independent
+        ``list_sessions_rich(..., order_by_last_active=True)`` calls. The
+        listability seed, message activity, and recursive compression-chain
+        walk are materialized once, then source predicates derive recents,
+        cron, and messaging windows from the same ordered rows.
+
+        The filters intentionally match the sidebar route's historical
+        composition: active (non-archived) root/branch rows with at least one
+        message, delegate children hidden, compression roots ordered by all
+        lineage activity and projected to the preferred live tip. Standalone
+        ``list_sessions_rich`` and ``session_count`` callers remain unchanged.
+        """
+        recents_exclude_sources = recents_exclude_sources or []
+        messaging_exclude_sources = messaging_exclude_sources or []
+
+        def _exclude_clause(column: str, values: List[str]) -> Tuple[str, List[Any]]:
+            if not values:
+                return "1", []
+            placeholders = ",".join("?" for _ in values)
+            return f"{column} NOT IN ({placeholders})", list(values)
+
+        recents_clause, recents_params = _exclude_clause(
+            "o.source", recents_exclude_sources
+        )
+        messaging_clause, messaging_params = _exclude_clause(
+            "o.source", messaging_exclude_sources
+        )
+        selected_columns = self._compact_session_cols()
+
+        query = f"""
+            WITH RECURSIVE
+            activity AS MATERIALIZED (
+                SELECT session_id, MAX(timestamp) AS last_active
+                FROM messages
+                GROUP BY session_id
+            ),
+            listable AS MATERIALIZED (
+                SELECT s.id, s.source, s.started_at
+                FROM sessions s
+                WHERE {_LISTABLE_CHILD_SQL}
+                  AND {_delegate_from_json('s.model_config')} IS NULL
+                  AND s.message_count >= 1
+                  AND s.archived = 0
+            ),
+            chain(root_id, cur_id) AS (
+                SELECT id, id FROM listable
+                UNION ALL
+                SELECT c.root_id, child.id
+                FROM chain c
+                JOIN sessions parent ON parent.id = c.cur_id
+                JOIN sessions child ON child.parent_session_id = c.cur_id
+                WHERE parent.end_reason = 'compression'
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(child.model_config, '{{}}'), '$._delegate_from') IS NULL
+                  AND COALESCE(child.source, '') != 'tool'
+            ),
+            chain_max AS MATERIALIZED (
+                SELECT
+                    c.root_id,
+                    MAX(COALESCE(a.last_active, cs.started_at)) AS effective_last_active
+                FROM chain c
+                JOIN sessions cs ON cs.id = c.cur_id
+                LEFT JOIN activity a ON a.session_id = c.cur_id
+                GROUP BY c.root_id
+            ),
+            ordered AS MATERIALIZED (
+                SELECT
+                    l.id,
+                    l.source,
+                    l.started_at,
+                    COALESCE(cm.effective_last_active, l.started_at) AS effective_last_active
+                FROM listable l
+                LEFT JOIN chain_max cm ON cm.root_id = l.id
+            ),
+            categorized AS MATERIALIZED (
+                SELECT
+                    o.*,
+                    (? AND {recents_clause}) AS is_recents,
+                    (o.source = 'cron') AS is_cron,
+                    ({messaging_clause}) AS is_messaging
+                FROM ordered o
+            ),
+            counted AS MATERIALIZED (
+                SELECT c.*, SUM(c.is_recents) OVER () AS recents_total
+                FROM categorized c
+            ),
+            recents AS (
+                SELECT * FROM counted
+                WHERE is_recents
+                ORDER BY effective_last_active DESC, started_at DESC, id DESC
+                LIMIT ?
+            ),
+            cron AS (
+                SELECT * FROM counted
+                WHERE is_cron
+                ORDER BY effective_last_active DESC, started_at DESC, id DESC
+                LIMIT ?
+            ),
+            messaging AS (
+                SELECT * FROM counted
+                WHERE is_messaging
+                ORDER BY effective_last_active DESC, started_at DESC, id DESC
+                LIMIT ?
+            ),
+            selected AS (
+                SELECT 'recents' AS slice_name, 0 AS slice_rank, * FROM recents
+                UNION ALL
+                SELECT 'cron' AS slice_name, 1 AS slice_rank, * FROM cron
+                UNION ALL
+                SELECT 'messaging' AS slice_name, 2 AS slice_rank, * FROM messaging
+            )
+            SELECT
+                selected.slice_name AS _slice_name,
+                selected.recents_total AS _recents_total,
+                selected.effective_last_active AS _effective_last_active,
+                {selected_columns},
+                COALESCE(
+                    (SELECT SUBSTR(REPLACE(REPLACE(m.content, X'0A', ' '), X'0D', ' '), 1, 63)
+                     FROM messages m
+                     WHERE m.session_id = s.id AND m.role = 'user' AND m.content IS NOT NULL
+                     ORDER BY m.timestamp, m.id LIMIT 1),
+                    ''
+                ) AS _preview_raw,
+                COALESCE(a.last_active, s.started_at) AS last_active
+            FROM selected
+            JOIN sessions s ON s.id = selected.id
+            LEFT JOIN activity a ON a.session_id = s.id
+            ORDER BY
+                selected.slice_rank,
+                selected.effective_last_active DESC,
+                selected.started_at DESC,
+                selected.id DESC
+        """
+        params: List[Any] = [
+            1 if include_recents else 0,
+            *recents_params,
+            *messaging_params,
+            recents_limit,
+            cron_limit,
+            messaging_limit,
+        ]
+        with self._lock:
+            rows = self._conn.execute(query, params).fetchall()
+
+        slices: Dict[str, List[Dict[str, Any]]] = {
+            "recents": [],
+            "cron": [],
+            "messaging": [],
+        }
+        recents_total = 0
+        for row in rows:
+            session = dict(row)
+            slice_name = session.pop("_slice_name")
+            recents_total = int(session.pop("_recents_total") or 0)
+            session.pop("_effective_last_active", None)
+            raw = session.pop("_preview_raw", "").strip()
+            if raw:
+                text = raw[:60]
+                session["preview"] = text + ("..." if len(raw) > 60 else "")
+            else:
+                session["preview"] = ""
+            slices[slice_name].append(session)
+
+        for name, sessions in slices.items():
+            slices[name] = self._project_compression_tip_rows(
+                sessions, compact_rows=True
+            )
+        return {**slices, "recents_total": recents_total}
+
+    def _project_compression_tip_rows(
+        self, sessions: List[Dict[str, Any]], *, compact_rows: bool
+    ) -> List[Dict[str, Any]]:
+        """Project already-selected compression roots using list semantics."""
+        projected = []
+        for session in sessions:
+            if session.get("end_reason") != "compression":
+                projected.append(session)
+                continue
+            tip_id = self.get_compression_tip(session["id"])
+            if tip_id == session["id"]:
+                projected.append(session)
+                continue
+            tip_row = self._get_session_rich_row(tip_id, compact_rows=compact_rows)
+            if not tip_row:
+                projected.append(session)
+                continue
+            merged = dict(session)
+            for key in (
+                "id", "ended_at", "end_reason", "message_count",
+                "tool_call_count", "title", "last_active", "preview",
+                "model", "system_prompt", "cwd", "git_branch", "git_repo_root",
+            ):
+                if key in tip_row:
+                    merged[key] = tip_row[key]
+            merged["_lineage_root_id"] = session["id"]
+            projected.append(merged)
+        return projected
+
     def list_cron_job_runs(
         self,
         job_id: str,
