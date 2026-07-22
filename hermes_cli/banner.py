@@ -191,10 +191,15 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+def _check_via_local_git(repo_dir: Path, target=None) -> Optional[int]:
+    """Count commits behind a validated update target in a local checkout."""
+    from hermes_cli.update_channel import UpdateTarget
+
+    target = target or UpdateTarget(remote="origin", branch="main")
+    remote = target.remote
+    branch = target.branch
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    if remote == "origin" and branch == "main" and _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
         if checked == UPDATE_AVAILABLE_NO_COUNT:
@@ -213,9 +218,17 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
+        if remote == "origin" and branch == "main":
+            # Preserve the established generic-check argv, including its
+            # shallow-clone ordering.
+            fetch_args = ["git", "fetch", "origin"]
+            if is_shallow:
+                fetch_args += ["--depth", "1"]
+        else:
+            fetch_args = ["git", "fetch"]
+            if is_shallow:
+                fetch_args += ["--depth", "1"]
+            fetch_args += [remote, branch]
         fetch_args.append("--quiet")
         subprocess.run(
             fetch_args,
@@ -232,7 +245,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", f"{remote}/{branch}"], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -240,7 +253,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{remote}/{branch}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -293,7 +306,7 @@ def check_via_pypi() -> Optional[int]:
         return 1 if latest != VERSION else 0
 
 
-def check_for_updates() -> Optional[int]:
+def check_for_updates(target=None) -> Optional[int]:
     """Check whether a Hermes update is available.
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
@@ -307,6 +320,9 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    target_key = (
+        f"{target.remote}/{target.branch}" if target is not None else None
+    )
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
@@ -340,6 +356,7 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("target") == target_key
             ):
                 return cached.get("behind")
     except Exception:
@@ -357,11 +374,19 @@ def check_for_updates() -> Optional[int]:
         if not (repo_dir / ".git").exists():
             behind = check_via_pypi()
         else:
-            behind = _check_via_local_git(repo_dir)
+            behind = _check_via_local_git(repo_dir, target=target)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "target": target_key,
+                }
+            )
         )
     except Exception:
         pass

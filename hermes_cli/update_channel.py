@@ -10,6 +10,7 @@ remote must be configured and fails closed rather than silently deploying
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -24,6 +25,14 @@ class UpdateChannelError(ValueError):
 
 _MISSING = object()
 STIG_TESTED_RELEASE_BRANCH = "release/stig-tested"
+
+
+@dataclass(frozen=True)
+class UpdateTarget:
+    """Validated git remote and branch selected for an update."""
+
+    remote: str
+    branch: str
 
 
 def _load_config(config_path: Path) -> Mapping[str, Any]:
@@ -54,6 +63,30 @@ def _configured_channel(config: Mapping[str, Any]) -> Optional[str]:
     return raw.strip()
 
 
+def _validate_branch(branch: Any, *, source: str) -> str:
+    """Validate a branch name without invoking git or changing the checkout."""
+    if not isinstance(branch, str) or not branch.strip():
+        raise UpdateChannelError(f"{source} must be a non-empty branch name")
+    value = branch.strip()
+    if (
+        value.startswith(("-", "/"))
+        or value.endswith(("/", "."))
+        or value in {".", "..", "@"}
+        or ".." in value
+        or "@{" in value
+        or "//" in value
+        or any(char.isspace() or ord(char) < 0x20 for char in value)
+        or any(char in value for char in "~^:?*[\\")
+        or any(
+            part.startswith(".")
+            or part.endswith((".", ".lock"))
+            for part in value.split("/")
+        )
+    ):
+        raise UpdateChannelError(f"{source} is not a valid branch name: {value!r}")
+    return value
+
+
 def _has_remote(project_root: Path, name: str) -> bool:
     dot_git = project_root / ".git"
     try:
@@ -80,23 +113,25 @@ def _has_remote(project_root: Path, name: str) -> bool:
     return re.search(pattern, text, flags=re.MULTILINE) is not None
 
 
-def resolve_update_branch(
+def resolve_update_target(
     explicit_branch: Optional[str] = None,
     *,
     project_root: Path,
     config: Any = _MISSING,
     config_path: Optional[Path] = None,
-) -> str:
-    """Resolve the update branch with explicit > config > safe-default precedence.
+) -> UpdateTarget:
+    """Resolve the validated update remote and branch.
 
     ``main`` remains the generic upstream default only for checkouts without the
     Stig deployment remote. A checkout carrying a remote literally named
     ``stig`` must declare ``updates.release_channel`` or pass an explicit branch.
     """
     if explicit_branch is not None:
-        if not isinstance(explicit_branch, str) or not explicit_branch.strip():
-            raise UpdateChannelError("--branch must be a non-empty branch name")
-        return explicit_branch.strip()
+        branch = _validate_branch(explicit_branch, source="--branch")
+        remote = "stig" if branch == STIG_TESTED_RELEASE_BRANCH and _has_remote(
+            Path(project_root), "stig"
+        ) else "origin"
+        return UpdateTarget(remote=remote, branch=branch)
 
     if config is _MISSING:
         path = config_path or (get_hermes_home() / "config.yaml")
@@ -118,6 +153,23 @@ def resolve_update_branch(
                 f"{detail}; expected {STIG_TESTED_RELEASE_BRANCH} or pass "
                 "--branch explicitly"
             )
-        return configured
+        return UpdateTarget(remote="stig", branch=STIG_TESTED_RELEASE_BRANCH)
 
-    return configured or "main"
+    branch = _validate_branch(configured or "main", source="updates.release_channel")
+    return UpdateTarget(remote="origin", branch=branch)
+
+
+def resolve_update_branch(
+    explicit_branch: Optional[str] = None,
+    *,
+    project_root: Path,
+    config: Any = _MISSING,
+    config_path: Optional[Path] = None,
+) -> str:
+    """Backward-compatible branch-only adapter for existing callers."""
+    return resolve_update_target(
+        explicit_branch,
+        project_root=project_root,
+        config=config,
+        config_path=config_path,
+    ).branch

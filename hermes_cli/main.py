@@ -6607,7 +6607,7 @@ def _update_via_zip(args):
     # if the user asked for something else — exactly the silent-divergence
     # bug --branch was added to prevent. Refuse to proceed in that case
     # rather than lie.
-    branch = _resolve_update_branch(args)
+    branch = _resolve_update_target(args).branch
     if branch != "main":
         print(
             f"✗ --branch={branch} is not supported on the Windows ZIP-fallback "
@@ -8948,16 +8948,23 @@ def _finalize_update_output(state):
             pass
 
 
-def _resolve_update_branch(args) -> str:
-    """Resolve explicit/configured update policy for every CLI update path."""
-    from hermes_cli.update_channel import resolve_update_branch
+def _resolve_update_target(args):
+    """Resolve the validated remote and branch for every CLI update path."""
+    from hermes_cli.update_channel import resolve_update_target
 
-    return resolve_update_branch(
+    return resolve_update_target(
         getattr(args, "branch", None), project_root=PROJECT_ROOT
     )
 
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _resolve_update_branch(args) -> str:
+    """Backward-compatible branch-only adapter for existing CLI callers."""
+    return _resolve_update_target(args).branch
+
+
+def _cmd_update_check(
+    branch: str = "main", *, branch_explicit: bool = False, target=None
+):
     """Implement ``hermes update --check``: fetch and report without installing.
 
     ``branch`` selects which branch the check compares against. Default is
@@ -8974,6 +8981,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
         format_unsupported_install_warning,
         is_unsupported_install_method,
     )
+    from hermes_cli.update_channel import UpdateTarget
+
+    if target is None:
+        target = UpdateTarget(remote="origin", branch=branch)
+    branch = target.branch
+    remote = target.remote
     method = detect_install_method(PROJECT_ROOT)
     if is_unsupported_install_method(method):
         print(f"⚠ {format_unsupported_install_warning(method)}")
@@ -9032,7 +9045,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
+    if remote == "origin" and branch == "main":
         print("→ Fetching from upstream...")
         fetch_result = subprocess.run(
             git_cmd + ["fetch"] + depth_args + ["upstream", branch],
@@ -9055,16 +9068,18 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             upstream_exists = True
             compare_branch = f"upstream/{branch}"
     else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
+        # A selected non-default target, including Stig's tested release, is
+        # fetched directly. Never probe upstream for an explicitly selected
+        # remote.
+        print(f"→ Fetching from {remote}...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch"] + depth_args + [remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
         )
         upstream_exists = False
-        compare_branch = f"origin/{branch}"
+        compare_branch = f"{remote}/{branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
@@ -9962,18 +9977,28 @@ def cmd_update(args):
     if getattr(args, "check", False):
         # --check honors --branch so the "any new commits?" answer matches
         # what a subsequent `hermes update --branch=<x>` would actually pull.
-        branch = _resolve_update_branch(args)
+        target = (
+            _resolve_update_target(args)
+            if _install_method_for_warning == "git"
+            else None
+        )
+        branch = (
+            target.branch
+            if target is not None
+            else getattr(args, "branch", None) or "main"
+        )
         _cmd_update_check(
             branch=branch,
             branch_explicit=bool(getattr(args, "branch", None)),
+            target=target,
         )
         return
 
     # Resolve git release policy before the apply path installs signal/stdio
     # protection or performs any backup, marker, process, or repository action.
     # Non-git installs retain their package-manager update behavior.
-    branch = (
-        _resolve_update_branch(args)
+    target = (
+        _resolve_update_target(args)
         if _install_method_for_warning == "git"
         else None
     )
@@ -9984,7 +10009,7 @@ def cmd_update(args):
     # _install_hangup_protection for rationale.
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     try:
-        _cmd_update_impl(args, gateway_mode=gateway_mode, branch=branch)
+        _cmd_update_impl(args, gateway_mode=gateway_mode, target=target)
     finally:
         _finalize_update_output(_update_io_state)
 
@@ -10050,11 +10075,26 @@ def _cmd_update_pip(args):
     print("✓ Update complete! Restart hermes to use the new version.")
 
 
-def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
+def _cmd_update_impl(
+    args, gateway_mode: bool, branch: str | None = None, target=None
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
-    if branch is None and (PROJECT_ROOT / ".git").exists():
-        branch = _resolve_update_branch(args)
+    from hermes_cli.update_channel import UpdateTarget
+
+    if target is None:
+        if branch is not None:
+            # Keep the internal helper's historical direct-call contract for
+            # tests and non-wrapper callers. Normal CLI paths pass a resolver
+            # result above, so they retain the selected remote as well.
+            target = UpdateTarget(remote="origin", branch=branch)
+        elif (PROJECT_ROOT / ".git").exists():
+            target = _resolve_update_target(args)
+    if target is not None:
+        branch = target.branch
+        remote = target.remote
+    else:
+        remote = "origin"
 
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
@@ -10215,7 +10255,7 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
         # against.
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", remote, branch],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -10232,7 +10272,7 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
             else:
-                print("✗ Failed to fetch updates from origin.")
+                print(f"✗ Failed to fetch updates from {remote}.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -10269,11 +10309,11 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
+                # it up as a tracking branch of <remote>/<branch>. This is
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-B", branch, f"{remote}/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
@@ -10289,7 +10329,9 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
                             prompt_user=False,
                             input_fn=gw_input_fn,
                         )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                    print(
+                        f"✗ Branch '{branch}' does not exist locally or on {remote}."
+                    )
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
@@ -10304,7 +10346,7 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{remote}/{branch}", "--count"],
             cwd=PROJECT_ROOT,
             capture_output=True,
             text=True,
@@ -10316,7 +10358,7 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
+            if remote == "origin" and is_fork and branch == "main":
                 _sync_with_upstream_if_needed(git_cmd, PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved
@@ -10402,7 +10444,7 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
             pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
+                git_cmd + ["pull", "--ff-only", remote, branch],
                 cwd=PROJECT_ROOT,
                 capture_output=True,
                 text=True,
@@ -10415,17 +10457,18 @@ def _cmd_update_impl(args, gateway_mode: bool, branch: str | None = None):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", f"{remote}/{branch}"],
                     cwd=PROJECT_ROOT,
                     capture_output=True,
                     text=True,
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {remote} {branch} && "
+                        f"git reset --hard {remote}/{branch}"
                     )
                     sys.exit(1)
 

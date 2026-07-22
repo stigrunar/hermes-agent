@@ -64,6 +64,8 @@ class TestHandleUpdateCommand:
 
     @pytest.mark.asyncio
     async def test_stig_release_channel_is_forwarded_to_detached_update(self, tmp_path):
+        from hermes_cli.update_channel import UpdateTarget
+
         runner = _make_runner()
         event = _make_event()
         root = tmp_path / "project"
@@ -77,7 +79,10 @@ class TestHandleUpdateCommand:
 
         with patch("gateway.run._hermes_home", home), \
              patch("gateway.slash_commands.__file__", fake_file), \
-             patch("hermes_cli.update_channel.resolve_update_branch", return_value="release/stig-tested"), \
+             patch(
+                 "hermes_cli.update_channel.resolve_update_target",
+                 return_value=UpdateTarget("stig", "release/stig-tested"),
+             ), \
              patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
              patch("subprocess.Popen", popen):
             result = await runner._handle_update_command(event)
@@ -100,7 +105,7 @@ class TestHandleUpdateCommand:
 
         with patch("gateway.slash_commands.__file__", fake_file), \
              patch("gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]), \
-             patch("hermes_cli.update_channel.resolve_update_branch", side_effect=UpdateChannelError("missing channel")), \
+             patch("hermes_cli.update_channel.resolve_update_target", side_effect=UpdateChannelError("missing channel")), \
              patch("subprocess.Popen") as popen:
             result = await runner._handle_update_command(event)
 
