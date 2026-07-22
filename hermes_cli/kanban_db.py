@@ -6855,7 +6855,10 @@ def block_task(
             else 0
         )
 
-        if review_required and not _after_reap:
+        # Phase one returns above after persisting the prevalidated terminal
+        # intent. The same atomic handoff must run during phase-B finalization,
+        # after the worker identity has been reaped and fenced.
+        if review_required:
             handoff = _review_handoff_row(conn, source_task_id=task_id)
             if handoff is not None:
                 if handoff["state"] == "active":

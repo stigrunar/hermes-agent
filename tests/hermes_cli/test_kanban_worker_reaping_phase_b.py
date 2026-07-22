@@ -166,6 +166,63 @@ def test_normal_terminal_request_waits_for_worker_exit_before_finalization(
             assert kb.get_task(conn, child).status == "todo"
 
 
+def test_review_required_block_releases_registered_gate_after_worker_reap(
+    kanban_home, process_harness, trusted_scope,
+):
+    states, signals, send = process_harness
+    with kb.connect() as conn:
+        source, run_id, identity = _active_worker(conn, title="review source")
+        review = kb.create_task(
+            conn, title="review gate", assignee="reviewer", parents=[source],
+        )
+        successor = kb.create_task(conn, title="approved-only successor")
+        kb.register_review_handoff(
+            conn, source, review, next_task_id=successor,
+        )
+
+        assert kb.block_task(
+            conn,
+            source,
+            reason="review-required: inspect the real worker result",
+            kind="needs_input",
+            expected_run_id=run_id,
+        )
+        assert kb.get_task(conn, source).status == "running"
+        assert kb.get_task(conn, review).status == "todo"
+        assert kb.get_task(conn, successor).status == "todo"
+        assert kb.get_run(conn, run_id).reap_state == "terminal_requested"
+        assert kb._review_handoff_row(conn, source_task_id=source)["state"] == "waiting"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (source, review),
+        ).fetchone() is not None
+
+        states[identity.pid] = "gone"
+        trusted_scope()
+        decision = kb.reconcile_worker_reaps(
+            conn, now=1002, signal_fn=send, protected_pid_fn=lambda: set(),
+        )
+
+        assert decision[0]["state"] == "finalized"
+        assert signals == []
+        assert kb.get_task(conn, source).status == "blocked"
+        assert kb.get_task(conn, source).worker_pid is None
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.get_task(conn, successor).status == "todo"
+        assert kb._review_handoff_row(conn, source_task_id=source)["state"] == "active"
+        assert conn.execute(
+            "SELECT 1 FROM task_links WHERE parent_id=? AND child_id=?",
+            (source, review),
+        ).fetchone() is None
+        release_events = [
+            event for event in kb.list_events(conn, review)
+            if event.kind == "review_handoff_released"
+        ]
+        assert len(release_events) == 1
+        assert release_events[0].payload["source_task_id"] == source
+        assert release_events[0].payload["review_task_id"] == review
+
+
 def test_acknowledged_scope_with_gone_root_stops_and_finalizes_without_pid_fallback(
     kanban_home,
     process_harness,
