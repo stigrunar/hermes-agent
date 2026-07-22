@@ -4074,10 +4074,10 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
-    from hermes_cli.update_channel import UpdateChannelError, resolve_update_branch
+    from hermes_cli.update_channel import UpdateChannelError, resolve_update_target
 
     try:
-        branch = resolve_update_branch(project_root=PROJECT_ROOT)
+        target = resolve_update_target(project_root=PROJECT_ROOT)
     except UpdateChannelError as exc:
         message = f"Hermes update blocked by release-channel policy: {exc}"
         _record_completed_action("hermes-update", message, exit_code=1)
@@ -4091,7 +4091,7 @@ async def update_hermes():
 
     try:
         proc = _spawn_hermes_action(
-            ["update", "--branch", branch], "hermes-update"
+            ["update", "--branch", target.branch], "hermes-update"
         )
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
@@ -4103,18 +4103,22 @@ async def update_hermes():
     }
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(n: int = 20, target=None) -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind its update target by, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
+    Logs the SAME range the behind-count uses (normally ``HEAD..origin/main`` — see
     ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
     feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
     commits), which would leave the changelog empty even though the count is
-    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+    non-zero. Pinning to the resolved target keeps count and changelog consistent.
 
     Best-effort: returns [] if not a git checkout, origin/main is unreachable,
     or git is unavailable. Never raises into the request path.
     """
+    if target is None:
+        from hermes_cli.update_channel import UpdateTarget
+
+        target = UpdateTarget(remote="origin", branch="main")
     try:
         out = subprocess.run(
             [
@@ -4123,7 +4127,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..{target.remote}/{target.branch}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -4208,6 +4212,18 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = format_docker_update_message()
         return payload
 
+    target = None
+    if install_method == "git":
+        from hermes_cli.update_channel import UpdateChannelError, resolve_update_target
+
+        try:
+            target = resolve_update_target(project_root=PROJECT_ROOT)
+        except UpdateChannelError as exc:
+            payload["can_apply"] = False
+            payload["error"] = "update_channel_unconfigured"
+            payload["message"] = f"Hermes update blocked by release-channel policy: {exc}"
+            return payload
+
     # banner.check_for_updates() handles git / pypi / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
     # button reflects reality immediately.
@@ -4220,7 +4236,13 @@ async def check_hermes_update(force: bool = False):
             except OSError:
                 pass
 
-        behind = await asyncio.to_thread(check_for_updates)
+        if target is None or (target.remote == "origin" and target.branch == "main"):
+            # Keep the historical no-argument call for generic main checks;
+            # this also preserves compatibility with lightweight checker
+            # adapters used by dashboard integrations.
+            behind = await asyncio.to_thread(check_for_updates)
+        else:
+            behind = await asyncio.to_thread(check_for_updates, target=target)
     except Exception:
         _log.exception("Update check failed")
         behind = None
@@ -4236,7 +4258,12 @@ async def check_hermes_update(force: bool = False):
         # remote update overlay can show "what's changed". git/pip only;
         # best-effort (empty list on any failure).
         if install_method in ("git", "pip"):
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            if target is None or (target.remote == "origin" and target.branch == "main"):
+                payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            else:
+                payload["commits"] = await asyncio.to_thread(
+                    _recent_upstream_commits, target=target
+                )
 
     return payload
 

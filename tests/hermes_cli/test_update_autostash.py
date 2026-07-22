@@ -704,6 +704,50 @@ def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
     assert ["git", "fetch", "origin"] not in recorded
 
 
+def test_cmd_update_stig_release_uses_only_validated_stig_target(monkeypatch, tmp_path):
+    """Apply fetch, comparison, and pull must agree on stig/release/stig-tested."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    (tmp_path / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/NousResearch/hermes-agent.git\n'
+        '[remote "stig"]\n\turl = git@github.com:stigrunar/hermes-agent.git\n',
+        encoding="utf-8",
+    )
+    hermes_home = tmp_path / "home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "updates:\n  release_channel: release/stig-tested\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="release/stig-tested"
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace(branch=None))
+
+    fetch_calls = [command for command in recorded if "fetch" in command]
+    assert fetch_calls == [["git", "fetch", "stig", "release/stig-tested"]]
+    assert [
+        "git",
+        "rev-list",
+        "HEAD..stig/release/stig-tested",
+        "--count",
+    ] in recorded
+    assert [
+        "git",
+        "pull",
+        "--ff-only",
+        "stig",
+        "release/stig-tested",
+    ] in recorded
+    assert not any("origin/release/stig-tested" in command for command in recorded)
+
+
 # ---------------------------------------------------------------------------
 # Fetch failure — friendly error messages
 # ---------------------------------------------------------------------------

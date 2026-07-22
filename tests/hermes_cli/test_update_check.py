@@ -37,6 +37,21 @@ def test_check_for_updates_uses_cache(tmp_path, monkeypatch):
     mock_run.assert_not_called()
 
 
+def test_targeted_check_does_not_reuse_generic_cache(tmp_path, monkeypatch):
+    import hermes_cli.banner as banner
+    from hermes_cli.update_channel import UpdateTarget
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    target = UpdateTarget("stig", "release/stig-tested")
+    with patch.object(banner, "_check_via_local_git", return_value=4) as check:
+        assert banner.check_for_updates(target=target) == 4
+        check.assert_called_once()
+
+    with patch.object(banner, "_check_via_local_git", return_value=9) as check:
+        assert banner.check_for_updates(target=target) == 4
+        check.assert_not_called()
+
+
 def test_check_for_updates_invalidates_on_version_change(tmp_path, monkeypatch):
     """A fresh cache from a different installed version must be re-checked, not reused.
 

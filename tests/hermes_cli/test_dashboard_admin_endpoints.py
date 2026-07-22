@@ -1082,6 +1082,59 @@ class TestUpdateCheckEndpoint:
         assert body["behind"] == 0
         assert body["update_available"] is False
 
+    def test_stig_target_is_forwarded_to_dashboard_checker(self, monkeypatch):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+        from hermes_cli.update_channel import UpdateTarget
+
+        target = UpdateTarget("stig", "release/stig-tested")
+        seen = {}
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(
+            "hermes_cli.update_channel.resolve_update_target",
+            lambda **_kwargs: target,
+        )
+
+        def _check_for_updates(*, target):
+            seen["check"] = target
+            return 0
+
+        monkeypatch.setattr(banner, "check_for_updates", _check_for_updates)
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["behind"] == 0
+        assert seen["check"] == target
+
+    def test_unconfigured_stig_target_blocks_dashboard_check_before_fetch(
+        self, monkeypatch
+    ):
+        import hermes_cli.banner as banner
+        import hermes_cli.web_server as ws
+        from hermes_cli.update_channel import UpdateChannelError
+
+        monkeypatch.setattr(ws, "detect_install_method", lambda *a, **k: "git")
+        monkeypatch.setattr(
+            "hermes_cli.update_channel.resolve_update_target",
+            lambda **_kwargs: (_ for _ in ()).throw(
+                UpdateChannelError("missing channel")
+            ),
+        )
+        check_calls = []
+
+        def check_for_updates():
+            check_calls.append(True)
+            raise AssertionError("blocked check must not fetch")
+
+        monkeypatch.setattr(banner, "check_for_updates", check_for_updates)
+
+        body = self.client.get("/api/hermes/update/check").json()
+
+        assert body["behind"] is None
+        assert body["can_apply"] is False
+        assert body["error"] == "update_channel_unconfigured"
+        assert "missing channel" in body["message"]
+        assert check_calls == []
+
     def test_docker_is_not_applyable(self, monkeypatch):
         import hermes_cli.web_server as ws
 

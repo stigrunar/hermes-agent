@@ -87,11 +87,15 @@ def create_verified_recovery_ref(
 
 
 def pull_with_divergence_recovery(
-    git_cmd: Sequence[str], cwd: Path, branch: str, pre_pull_sha: str | None
+    git_cmd: Sequence[str],
+    cwd: Path,
+    branch: str,
+    pre_pull_sha: str | None,
+    remote: str = "origin",
 ) -> PullRecoveryResult:
     """Pull fast-forward-only, recovering divergence only after ref proof."""
     pull = subprocess.run(
-        list(git_cmd) + ["pull", "--ff-only", "origin", branch],
+        list(git_cmd) + ["pull", "--ff-only", remote, branch],
         cwd=cwd,
         capture_output=True,
         text=True,
@@ -110,7 +114,7 @@ def pull_with_divergence_recovery(
         return PullRecoveryResult(succeeded=False, error=error)
 
     reset = subprocess.run(
-        list(git_cmd) + ["reset", "--hard", f"origin/{branch}"],
+        list(git_cmd) + ["reset", "--hard", f"{remote}/{branch}"],
         cwd=cwd,
         capture_output=True,
         text=True,

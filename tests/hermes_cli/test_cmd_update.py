@@ -998,6 +998,36 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
+    def test_check_stig_target_fetches_and_compares_only_stig_release(
+        self, mock_run, _mock_method, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli.update_channel import UpdateTarget
+
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="release/stig-tested", commit_count="0"
+        )
+        monkeypatch.setattr(
+            hm,
+            "_resolve_update_target",
+            lambda _args: UpdateTarget("stig", "release/stig-tested"),
+        )
+
+        cmd_update(SimpleNamespace(check=True, branch=None))
+
+        commands = [list(c.args[0]) for c in mock_run.call_args_list]
+        fetches = [cmd for cmd in commands if "fetch" in cmd]
+        assert fetches == [["git", "fetch", "stig", "release/stig-tested"]]
+        assert not any("upstream" in cmd for cmd in commands)
+        assert [
+            "git", "rev-parse", "--verify", "--quiet", "stig/release/stig-tested"
+        ] in commands
+        assert [
+            "git", "rev-list", "HEAD..stig/release/stig-tested", "--count"
+        ] in commands
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
     def test_check_branch_missing_on_origin_exits_cleanly(
         self, mock_run, _mock_method, capsys
     ):

@@ -2395,7 +2395,7 @@ class TestWebServerEndpoints:
 
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
         monkeypatch.setattr(
-            "hermes_cli.update_channel.resolve_update_branch",
+            "hermes_cli.update_channel.resolve_update_target",
             lambda **_kwargs: (_ for _ in ()).throw(UpdateChannelError("missing channel")),
         )
         monkeypatch.setattr(
