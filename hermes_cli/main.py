@@ -4726,6 +4726,13 @@ def _capture_head_sha(git_cmd, cwd) -> str | None:
         return None
 
 
+def _pull_with_divergence_recovery(git_cmd, cwd, branch, pre_pull_sha):
+    """Run the managed update pull with verified recovery before reset."""
+    from hermes_cli.git_recovery import pull_with_divergence_recovery
+
+    return pull_with_divergence_recovery(git_cmd, cwd, branch, pre_pull_sha)
+
+
 def _validate_critical_files_syntax(root) -> tuple[bool, str | None, str | None]:
     """Compile each file in ``_UPDATE_CRITICAL_FILES`` to catch SyntaxErrors.
 
@@ -10680,33 +10687,41 @@ def _cmd_update_impl(args, gateway_mode: bool):
         # the bad commit and the fix landing).
         pre_pull_sha = _capture_head_sha(git_cmd, PROJECT_ROOT)
         try:
-            pull_result = subprocess.run(
-                git_cmd + ["pull", "--ff-only", "origin", branch],
-                cwd=PROJECT_ROOT,
-                capture_output=True,
-                text=True,
+            recovery_result = _pull_with_divergence_recovery(
+                git_cmd, PROJECT_ROOT, branch, pre_pull_sha
             )
-            if pull_result.returncode != 0:
-                # ff-only failed — local and remote have diverged (e.g. upstream
-                # force-pushed or rebase).  Since local changes are already
-                # stashed, reset to match the remote exactly.
-                print(
-                    "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
-                )
-                reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
-                    cwd=PROJECT_ROOT,
-                    capture_output=True,
-                    text=True,
-                )
-                if reset_result.returncode != 0:
+            if not recovery_result.succeeded:
+                if recovery_result.recovery_ref:
                     print(f"✗ Failed to reset to origin/{branch}.")
-                    if reset_result.stderr.strip():
-                        print(f"  {reset_result.stderr.strip()}")
+                    if recovery_result.error:
+                        print(f"  {recovery_result.error}")
+                    print(
+                        f"  Recovery ref remains available: {recovery_result.recovery_ref}"
+                    )
+                else:
+                    print("✗ Could not create and verify the pre-update recovery ref.")
+                    if recovery_result.error:
+                        print(f"  {recovery_result.error}")
+                    print("  No reset performed; the current HEAD is unchanged.")
+                if recovery_result.recovery_ref:
+                    print(
+                        f"  Manual recovery: git reset --hard {recovery_result.recovery_ref}"
+                    )
+                else:
                     print(
                         f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
                     )
-                    sys.exit(1)
+                sys.exit(1)
+
+            if recovery_result.recovery_ref:
+                print(
+                    "  ⚠ Fast-forward not possible (history diverged); "
+                    "recovery ref verified before resetting."
+                )
+                print(f"  Recovery ref: {recovery_result.recovery_ref}")
+                print(
+                    f"  Manual recovery: git reset --hard {recovery_result.recovery_ref}"
+                )
 
             # Post-pull syntax guard: validate critical-path files actually
             # parse before declaring the update successful. If a bad commit

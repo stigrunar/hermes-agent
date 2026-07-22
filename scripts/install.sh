@@ -233,6 +233,47 @@ log_error() {
     echo -e "${RED}✗${NC} $1"
 }
 
+# Create and independently verify the recovery ref required before a
+# divergence reset. The full pre-update SHA makes the name deterministic and
+# collision-safe: an existing ref is usable only when it already points at
+# this exact SHA. Errors go to stderr because callers capture the success ref.
+create_verified_pre_update_ref() {
+    local head_sha="$1"
+    local recovery_ref="refs/hermes/recovery/pre-update/$head_sha"
+    local existing_sha=""
+    local old_sha=""
+    local readback=""
+
+    if [[ ! "$head_sha" =~ ^[0-9a-f]{40}$ ]]; then
+        log_error "Cannot create recovery ref: invalid pre-update HEAD '$head_sha'." >&2
+        return 1
+    fi
+
+    if existing_sha="$(git rev-parse --verify "$recovery_ref" 2>/dev/null)"; then
+        existing_sha="${existing_sha//$'\n'/}"
+        if [ "$existing_sha" != "$head_sha" ]; then
+            log_error "Recovery ref $recovery_ref already points to $existing_sha, not $head_sha." >&2
+            return 1
+        fi
+        old_sha="$existing_sha"
+    else
+        old_sha="0000000000000000000000000000000000000000"
+    fi
+
+    if ! git update-ref "$recovery_ref" "$head_sha" "$old_sha"; then
+        log_error "git update-ref failed for $recovery_ref." >&2
+        return 1
+    fi
+
+    if ! readback="$(git rev-parse --verify "$recovery_ref" 2>/dev/null)" \
+        || [ "$readback" != "$head_sha" ]; then
+        log_error "Recovery ref readback failed for $recovery_ref." >&2
+        return 1
+    fi
+
+    printf '%s\n' "$recovery_ref"
+}
+
 json_escape() {
     # Enough for short installer status strings; avoids requiring jq during
     # pre-install bootstrap.
@@ -1227,7 +1268,20 @@ clone_repo() {
             # cannot succeed — mirror ``hermes update`` and reset to the
             # fetched remote so bootstrap/install can recover.
             if ! git pull --ff-only origin "$BRANCH"; then
-                log_warn "Fast-forward not possible; resetting managed install to origin/$BRANCH..."
+                pre_update_sha="$(git rev-parse --verify HEAD 2>/dev/null || true)"
+                recovery_ref=""
+                if [ -z "$pre_update_sha" ]; then
+                    log_error "Cannot resolve pre-update HEAD; no reset performed."
+                    exit 1
+                fi
+                if ! recovery_ref="$(create_verified_pre_update_ref "$pre_update_sha")"; then
+                    log_error "Recovery ref creation/readback failed; no reset performed."
+                    log_info "Current HEAD is unchanged: $pre_update_sha"
+                    exit 1
+                fi
+                log_warn "Fast-forward not possible; recovery ref verified before resetting managed install..."
+                log_info "Recovery ref: $recovery_ref"
+                log_info "Manual recovery: git reset --hard $recovery_ref"
                 git reset --hard "origin/$BRANCH"
             fi
 
