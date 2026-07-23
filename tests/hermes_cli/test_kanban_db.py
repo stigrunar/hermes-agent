@@ -5447,10 +5447,10 @@ def test_dispatch_review_dry_run(kanban_home, all_assignees_spawnable):
         assert kb.get_task(conn, t).status == "review"
 
 
-def test_dispatch_review_spawns_with_correct_skills(
+def test_dispatch_review_preserves_configured_skills(
     kanban_home, all_assignees_spawnable,
 ):
-    """Review tasks get sdlc-review skill set before spawning."""
+    """Review dispatch passes persisted task skills to the worker unchanged."""
     spawned_tasks = []
 
     def capture_spawn(task, workspace, board=None):
@@ -5458,12 +5458,39 @@ def test_dispatch_review_spawns_with_correct_skills(
         return 42  # fake PID
 
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="review me", assignee="alice")
+        t = kb.create_task(
+            conn,
+            title="review me",
+            assignee="alice",
+            skills=["context-first-qa-review", "ui-discipline-flow"],
+        )
         _set_task_status(conn, t, "review")
         res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
     assert len(res.spawned) == 1
     assert len(spawned_tasks) == 1
-    assert spawned_tasks[0].skills == ["sdlc-review"]
+    assert spawned_tasks[0].skills == ["context-first-qa-review", "ui-discipline-flow"]
+
+
+@pytest.mark.parametrize("skills", [None, []], ids=["missing", "empty"])
+def test_dispatch_review_without_extra_skills_uses_profile_context(
+    kanban_home, all_assignees_spawnable, skills,
+):
+    """Review dispatch does not invent extra skills when none are configured."""
+    spawned_tasks = []
+
+    def capture_spawn(task, workspace, board=None):
+        spawned_tasks.append(task)
+        return 42
+
+    with kb.connect() as conn:
+        t = kb.create_task(
+            conn, title="review me", assignee="alice", skills=skills,
+        )
+        _set_task_status(conn, t, "review")
+        res = kb.dispatch_once(conn, spawn_fn=capture_spawn)
+    assert len(res.spawned) == 1
+    assert len(spawned_tasks) == 1
+    assert spawned_tasks[0].skills == skills
 
 
 def test_dispatch_review_skips_unassigned(kanban_home):

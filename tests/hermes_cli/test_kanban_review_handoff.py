@@ -566,5 +566,5 @@ def test_temp_db_dispatch_canary_spawns_one_review_worker(
         second = kb.dispatch_once(conn, spawn_fn=capture, max_spawn=1)
         assert [item[0] for item in first.spawned] == [review]
         assert second.spawned == []
-        assert spawned == [(review, ["sdlc-review"])]
+        assert spawned == [(review, [])]
         assert kb.get_task(conn, source).status == "blocked"
