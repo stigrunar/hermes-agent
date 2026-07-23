@@ -139,7 +139,15 @@ def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
     """Dependency waits never enter the human 'blocked' bucket."""
     with kb.connect_closing() as conn:
         tid = _running_task(conn)
-        assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
+        dependency = kb.create_task(conn, title="unfinished dependency", assignee="worker")
+        kb.link_tasks(conn, parent_id=dependency, child_id=tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="need X first",
+            kind="dependency",
+            dependency_task_id=dependency,
+        )
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"

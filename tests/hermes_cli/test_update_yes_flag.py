@@ -71,7 +71,7 @@ class TestUpdateYesConfigMigration:
         )
         mock_migrate.return_value = {"env_added": [], "config_added": []}
 
-        args = SimpleNamespace(yes=True)
+        args = SimpleNamespace(yes=True, branch="main")
 
         with patch("builtins.input") as mock_input:
             cmd_update(args)
@@ -111,7 +111,7 @@ class TestUpdateYesConfigMigration:
         )
         mock_migrate.return_value = {"env_added": [], "config_added": []}
 
-        args = SimpleNamespace(yes=False)
+        args = SimpleNamespace(yes=False, branch="main")
 
         # Patch ``sys.stdin.isatty`` and ``sys.stdout.isatty`` directly on the
         # real ``sys`` module instead of replacing ``hermes_cli.main.sys`` with
@@ -134,4 +134,3 @@ class TestUpdateYesConfigMigration:
 
 class TestUpdateYesStashRestore:
     """--yes auto-restores the pre-update autostash without prompting."""
-

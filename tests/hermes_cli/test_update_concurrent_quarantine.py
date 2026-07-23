@@ -726,6 +726,7 @@ def test_cmd_update_aborts_on_concurrent_instance(_winp, tmp_path, capsys):
     args = SimpleNamespace(
         check=False,
         gateway=False,
+        branch="main",
         yes=False,
         force=False,
         backup=False,
@@ -768,6 +769,7 @@ def test_cmd_update_force_bypasses_concurrent_check(_winp, tmp_path):
     args = SimpleNamespace(
         check=False,
         gateway=False,
+        branch="main",
         yes=False,
         force=True,  # ← the bypass
         backup=False,
