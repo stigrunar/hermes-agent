@@ -59,6 +59,22 @@ describe('Hermes REST session helpers', () => {
     )
   })
 
+  it('includes origin source filters for messaging continuations', async () => {
+    await listAllProfileSessions(50, 1, 'exclude', 'recent', 'all', {
+      excludeSources: ['cron', 'cli'],
+      includeOriginSources: ['telegram', 'discord']
+    })
+
+    expect(api).toHaveBeenCalledWith(
+      expect.objectContaining({
+        path:
+          '/api/profiles/sessions?limit=50&offset=0&min_messages=1&archived=exclude&order=recent&profile=all' +
+          '&exclude_sources=cron%2Ccli&include_origin_sources=telegram%2Cdiscord',
+        timeoutMs: 60_000
+      })
+    )
+  })
+
   it('uses a longer timeout for profile listing during desktop startup', async () => {
     api.mockResolvedValue({ profiles: [] })
 

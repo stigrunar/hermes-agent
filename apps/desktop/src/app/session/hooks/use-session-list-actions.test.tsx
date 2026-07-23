@@ -2,7 +2,14 @@ import { act, renderHook } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import type { SessionInfo } from '@/hermes'
-import { $sessions, $sessionsLoading, setSessions, setSessionsLoading } from '@/store/session'
+import {
+  $messagingSessions,
+  $sessions,
+  $sessionsLoading,
+  setMessagingSessions,
+  setSessions,
+  setSessionsLoading
+} from '@/store/session'
 
 import { useSessionListActions } from './use-session-list-actions'
 
@@ -39,11 +46,13 @@ vi.mock('@/hermes', async importOriginal => ({
 
 beforeEach(() => {
   listAllProfileSessions.mockReset()
+  setMessagingSessions([])
   setSessions([])
   setSessionsLoading(false)
 })
 
 afterEach(() => {
+  setMessagingSessions([])
   setSessions([])
   setSessionsLoading(false)
 })
@@ -133,5 +142,45 @@ describe('refreshSessions identity + loading hygiene', () => {
 
     off()
     expect(loadingStates).toEqual([false, true, false])
+  })
+
+  it('selects an externally-originated local continuation into the messaging slice', async () => {
+    const handoff = row('handoff', {
+      source: 'tui',
+      origin_json: JSON.stringify({ platform: 'telegram', chat_id: 'chat', thread_id: 'topic' })
+    })
+    listAllProfileSessions.mockResolvedValue({ sessions: [handoff], total: 1 })
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.refreshMessagingSessions()
+    })
+
+    expect(listAllProfileSessions).toHaveBeenCalledWith(expect.any(Number), 1, 'exclude', 'recent', 'all', {
+      excludeSources: expect.any(Array),
+      includeOriginSources: expect.arrayContaining(['telegram', 'discord'])
+    })
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['handoff'])
+  })
+
+  it('pages a platform through direct and externally-originated local rows', async () => {
+    const direct = row('direct', { source: 'telegram' })
+    const handoff = row('handoff', {
+      source: 'desktop',
+      origin_json: JSON.stringify({ platform: 'telegram', chat_id: 'chat', thread_id: 'topic' })
+    })
+    setMessagingSessions([direct])
+    listAllProfileSessions.mockResolvedValue({ sessions: [direct, handoff], total: 2 })
+    const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
+
+    await act(async () => {
+      await result.current.loadMoreMessagingForPlatform('telegram')
+    })
+
+    expect(listAllProfileSessions).toHaveBeenCalledWith(expect.any(Number), 1, 'exclude', 'recent', 'all', {
+      source: 'telegram',
+      includeOriginSources: ['telegram']
+    })
+    expect($messagingSessions.get().map(s => s.id)).toEqual(['direct', 'handoff'])
   })
 })

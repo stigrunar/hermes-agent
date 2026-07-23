@@ -1469,6 +1469,30 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
 
+    def test_profiles_sessions_includes_local_continuation_by_origin(self):
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="origin-local", source="tui")
+            db.append_message(session_id="origin-local", role="user", content="handoff")
+            db.record_gateway_session_peer(
+                "origin-local",
+                session_key="telegram:chat:topic",
+                source="tui",
+                origin_json=json.dumps({"platform": "telegram", "chat_id": "chat", "thread_id": "topic"}),
+            )
+            db.create_session(session_id="plain-local", source="tui")
+            db.append_message(session_id="plain-local", role="user", content="plain")
+        finally:
+            db.close()
+
+        response = self.client.get(
+            "/api/profiles/sessions?limit=20&min_messages=1&source=telegram&include_origin_sources=telegram"
+        )
+        assert response.status_code == 200
+        assert [row["id"] for row in response.json()["sessions"]] == ["origin-local"]
+
     def test_profiles_sessions_rejects_unknown_archived_value(self):
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400

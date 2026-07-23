@@ -4149,6 +4149,7 @@ def get_profiles_sessions(
     profile: str = "all",
     source: str = None,
     exclude_sources: str = None,
+    include_origin_sources: str = None,
     full: bool = False,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
@@ -4193,6 +4194,7 @@ def get_profiles_sessions(
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    include_origin_list = [s for s in (include_origin_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -4218,6 +4220,7 @@ def get_profiles_sessions(
             rows = db.list_sessions_rich(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
+                include_origin_sources=include_origin_list or None,
                 limit=per_profile,
                 offset=0,
                 min_message_count=min_message_count,
@@ -4230,6 +4233,7 @@ def get_profiles_sessions(
             profile_total = db.session_count(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
+                include_origin_sources=include_origin_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
