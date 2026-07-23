@@ -537,6 +537,8 @@ def _make_update_side_effect(
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
+    head_sha = "a" * 40
+    recovery_refs = {}
 
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
@@ -547,6 +549,19 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "--verify" in joined:
+            ref = str(cmd[-1])
+            sha = recovery_refs.get(ref)
+            return SimpleNamespace(
+                stdout=f"{sha}\n" if sha else "",
+                stderr="" if sha else "fatal: Needed a single revision\n",
+                returncode=0 if sha else 128,
+            )
+        if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+            return SimpleNamespace(stdout=f"{head_sha}\n", stderr="", returncode=0)
+        if "update-ref" in joined:
+            recovery_refs[str(cmd[-3])] = str(cmd[-2])
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -568,8 +583,10 @@ def _make_update_side_effect(
     return side_effect, recorded
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+def test_cmd_update_preserves_head_before_reset_when_ff_only_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A diverged update proves a recovery ref before resetting the checkout."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -581,6 +598,10 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
     assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    recovery_ref = f"refs/hermes/recovery/pre-update/{'a' * 40}"
+    update_ref_call = ["git", "update-ref", recovery_ref, "a" * 40, "0" * 40]
+    assert update_ref_call in recorded
+    assert recorded.index(update_ref_call) < recorded.index(reset_calls[0])
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out

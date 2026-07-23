@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_worker_process as kp
 from hermes_cli.kanban import run_slash
 
 
@@ -49,6 +50,68 @@ def kanban_home(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_CRASH_GRACE_SECONDS", "0")
     kb.init_db()
     return home
+
+
+@pytest.fixture
+def process_harness(monkeypatch):
+    states: dict[int, str] = {}
+    signals: list[tuple[int, int]] = []
+    monkeypatch.setattr(
+        kp, "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture(
+            "captured", tuple(dict.fromkeys((root, *previous)))
+        ),
+    )
+    monkeypatch.setattr(kp, "identity_state", lambda identity: states.get(identity.pid, "alive"))
+    monkeypatch.setattr(
+        kp, "protected_process_identities",
+        lambda extra=(): ({int(pid) for pid in extra}, set()),
+    )
+    monkeypatch.setattr(
+        kb, "_worker_scope_state",
+        lambda *_args, **_kwargs: kb._WorkerScopeStatus(
+            None, "not-applicable", None, "direct",
+        ),
+    )
+
+    def send(pid: int, sig: int) -> None:
+        signals.append((pid, sig))
+
+    return states, signals, send
+
+
+@pytest.fixture
+def trusted_scope(monkeypatch):
+    def activate() -> None:
+        monkeypatch.setattr(
+            kb,
+            "_worker_scope_state",
+            lambda *_args, **_kwargs: kb._WorkerScopeStatus(
+                "hermes-test-worker.scope", "inactive", "test-manager",
+                "systemd-user-scope", True,
+            ),
+        )
+
+    return activate
+
+
+def _active_worker(
+    conn, *, title="exact worker", pid=42420, assignee="worker", **task_options,
+):
+    task_id = kb.create_task(
+        conn, title=title, assignee=assignee, **task_options,
+    )
+    claimed = kb.claim_task(conn, task_id)
+    assert claimed is not None and claimed.current_run_id is not None
+    run_id = claimed.current_run_id
+    identity = kp.ProcessIdentity(pid, 100.25)
+    conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (pid, task_id))
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+        (pid, json.dumps(identity.to_dict()), json.dumps([identity.to_dict()]), run_id),
+    )
+    conn.commit()
+    return task_id, run_id, identity
 
 
 # ---------------------------------------------------------------------------
@@ -940,28 +1003,33 @@ def test_run_slash_every_verb_returns_sensible_output(kanban_home, tmp_path):
 # Max-runtime enforcement (item 1 from the Multica audit)
 # ---------------------------------------------------------------------------
 
-def test_max_runtime_terminates_overrun_worker(kanban_home):
+def test_max_runtime_terminates_overrun_worker(
+    kanban_home, process_harness, trusted_scope,
+):
     """A running task whose elapsed time exceeds max_runtime_seconds gets
     SIGTERM'd, emits a ``timed_out`` event, and goes back to ready."""
     killed = []
     def _signal_fn(pid, sig):
         killed.append((pid, sig))
 
-    # We bypass _pid_alive by stubbing it so the grace-poll exits fast.
-    import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False  # pretend SIGTERM worked immediately
-
+    conn = kb.connect()
     try:
-        conn = kb.connect()
-        try:
             tid = kb.create_task(
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,  # one second cap
             )
-            # Spawn by hand: claim + set pid + set active run start to the past.
-            kb.claim_task(conn, tid)
-            kb._set_worker_pid(conn, tid, os.getpid())   # any live pid works
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None and claimed.current_run_id is not None
+            run_id = claimed.current_run_id
+            identity = kp.ProcessIdentity(50001, 101.25)
+            conn.execute(
+                "UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, tid),
+            )
+            conn.execute(
+                "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+                (identity.pid, json.dumps(identity.to_dict()),
+                 json.dumps([identity.to_dict()]), run_id),
+            )
             # Backdate both the task-level first-start timestamp and the active
             # run timestamp so elapsed > limit under the per-run runtime model.
             old_started = int(time.time()) - 30
@@ -978,7 +1046,17 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
 
             timed_out = kb.enforce_max_runtime(conn, signal_fn=_signal_fn)
             assert tid in timed_out
-            assert killed and killed[0][0] == os.getpid()
+            assert kb.get_task(conn, tid).status == "running"
+            assert kb.get_run(conn, run_id).reap_state == "terminal_requested"
+            assert killed == []
+
+            trusted_scope()
+            process_harness[0][identity.pid] = "gone"
+            assert kb.reconcile_worker_reaps(
+                conn, now=2000, signal_fn=_signal_fn,
+                protected_pid_fn=lambda: set(),
+            )[0]["state"] == "finalized"
+            assert kb.get_task(conn, tid).status == "ready"
 
             task = kb.get_task(conn, tid)
             assert task.status == "ready",                 f"timed-out task should reset to ready, got {task.status}"
@@ -990,18 +1068,14 @@ def test_max_runtime_terminates_overrun_worker(kanban_home):
             to_event = next(e for e in events if e.kind == "timed_out")
             assert to_event.payload["limit_seconds"] == 1
             assert to_event.payload["elapsed_seconds"] >= 30
-        finally:
-            conn.close()
     finally:
-        _kb._pid_alive = original_alive
+        conn.close()
 
 
-def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
+def test_repeated_timeouts_auto_block_at_default_limit(
+    kanban_home, process_harness, trusted_scope,
+):
     """Two timed_out outcomes on the same task/profile trip the retry guard."""
-    import hermes_cli.kanban_db as _kb
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda pid: False
-
     def _age_active_run(conn, tid):
         old_started = int(time.time()) - 30
         with kb.write_txn(conn):
@@ -1011,19 +1085,38 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
                 (old_started, tid),
             )
 
+    conn = kb.connect()
     try:
-        conn = kb.connect()
-        try:
             tid = kb.create_task(
                 conn, title="long job", assignee="worker",
                 max_runtime_seconds=1,
             )
             for expected_failures in (1, 2):
-                kb.claim_task(conn, tid)
-                kb._set_worker_pid(conn, tid, os.getpid())
+                claimed = kb.claim_task(conn, tid)
+                assert claimed is not None and claimed.current_run_id is not None
+                run_id = claimed.current_run_id
+                identity = kp.ProcessIdentity(50100 + expected_failures, 102.25)
+                conn.execute(
+                    "UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, tid),
+                )
+                conn.execute(
+                    "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+                    (identity.pid, json.dumps(identity.to_dict()),
+                     json.dumps([identity.to_dict()]), run_id),
+                )
+                conn.commit()
                 _age_active_run(conn, tid)
                 timed_out = kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
                 assert tid in timed_out
+                task = kb.get_task(conn, tid)
+                assert task.status == "running"
+                process_harness[0][identity.pid] = "gone"
+                trusted_scope()
+                assert kb.reconcile_worker_reaps(
+                    conn, now=2001 + expected_failures,
+                    signal_fn=lambda pid, sig: None,
+                    protected_pid_fn=lambda: set(),
+                )[0]["state"] == "finalized"
                 task = kb.get_task(conn, tid)
                 assert task.consecutive_failures == expected_failures
             task = kb.get_task(conn, tid)
@@ -1032,10 +1125,8 @@ def test_repeated_timeouts_auto_block_at_default_limit(kanban_home):
             assert [e.kind for e in events].count("timed_out") == 2
             gave_up = [e for e in events if e.kind == "gave_up"]
             assert gave_up and gave_up[-1].payload["trigger_outcome"] == "timed_out"
-        finally:
-            conn.close()
     finally:
-        _kb._pid_alive = original_alive
+        conn.close()
 
 
 def test_max_runtime_none_means_no_cap(kanban_home):
@@ -1070,31 +1161,30 @@ def test_create_task_persists_max_runtime(kanban_home):
         conn.close()
 
 
-def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
+def test_enforce_max_runtime_integrates_with_dispatch(
+    kanban_home, process_harness, trusted_scope, monkeypatch,
+):
     """enforce_max_runtime + dispatch_once integrate cleanly — a timed-out
     task goes through ``timed_out`` → ``ready`` and dispatch_once can then
     re-spawn it without re-reporting the timeout."""
-    import hermes_cli.kanban_db as _kb
-    # Leave _pid_alive=True so the crash detector doesn't steal the task
-    # before timeout enforcement runs. After SIGTERM in enforce_max_runtime,
-    # pretend the worker died so the grace wait exits fast.
-    state = {"sent_term": False}
-    def _alive(pid):
-        return not state["sent_term"]
-    def _signal(pid, sig):
-        import signal as _sig
-        if sig == _sig.SIGTERM:
-            state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
-
     conn = kb.connect()
     try:
         tid = kb.create_task(
             conn, title="timeout-me", assignee="worker",
             max_runtime_seconds=1,
         )
-        kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, os.getpid())
+        claimed = kb.claim_task(conn, tid)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        identity = kp.ProcessIdentity(50200, 103.25)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, tid),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
+            (identity.pid, json.dumps(identity.to_dict()),
+             json.dumps([identity.to_dict()]), run_id),
+        )
         old_started = int(time.time()) - 30
         with kb.write_txn(conn):
             conn.execute(
@@ -1111,8 +1201,16 @@ def test_enforce_max_runtime_integrates_with_dispatch(kanban_home, monkeypatch):
         # enforce_max_runtime directly proves the kernel wiring. For the
         # dispatch_once assertion, rely on its own code path by calling it
         # after forcing SIGTERM via enforce_max_runtime.
-        before = kb.enforce_max_runtime(conn, signal_fn=_signal)
+        before = kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None)
         assert tid in before, "kernel enforce_max_runtime should catch the overrun"
+        assert kb.get_task(conn, tid).status == "running"
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2003, signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
+        assert kb.get_task(conn, tid).status == "ready"
 
         # Now a second dispatch_once run should be a no-op on this task
         # (already released). Confirm the loop doesn't re-report it.
@@ -1495,15 +1593,9 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
             )
         kb.release_stale_claims(conn)
 
-        # Attempt 2: claim then crash (simulated: pid dead).
-        kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, 98765)
-        original_alive = _kb._pid_alive
-        _kb._pid_alive = lambda pid: False
-        try:
-            kb.detect_crashed_workers(conn)
-        finally:
-            _kb._pid_alive = original_alive
+        # Attempt 2: an exact worker identity exits non-zero and the leased
+        # reaper finalizes it before the retry becomes claimable.
+        _drive_nonzero_crash(conn, tid, 98765)
 
         # Attempt 3: claim then complete.
         kb.claim_task(conn, tid)
@@ -1518,7 +1610,7 @@ def test_multiple_attempts_preserved_as_runs(kanban_home):
         conn.close()
 
 
-def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
+def test_stale_run_cannot_complete_new_attempt(kanban_home):
     """A worker from an earlier attempt cannot close a later retry."""
     import hermes_cli.kanban_db as _kb
 
@@ -1526,11 +1618,8 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
     try:
         tid = kb.create_task(conn, title="retry guarded", assignee="worker")
 
-        kb.claim_task(conn, tid)
+        _drive_nonzero_crash(conn, tid, 98765)
         run1 = kb.latest_run(conn, tid)
-        kb._set_worker_pid(conn, tid, 98765)
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
-        assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
@@ -1559,7 +1648,7 @@ def test_stale_run_cannot_complete_new_attempt(kanban_home, monkeypatch):
         conn.close()
 
 
-def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatch):
+def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home):
     """Stale retry attempts cannot mutate the active run lifecycle."""
     import hermes_cli.kanban_db as _kb
 
@@ -1567,11 +1656,8 @@ def test_stale_run_cannot_block_or_heartbeat_new_attempt(kanban_home, monkeypatc
     try:
         tid = kb.create_task(conn, title="retry heartbeat guarded", assignee="worker")
 
-        kb.claim_task(conn, tid)
+        _drive_nonzero_crash(conn, tid, 98765)
         run1 = kb.latest_run(conn, tid)
-        kb._set_worker_pid(conn, tid, 98765)
-        monkeypatch.setattr(_kb, "_pid_alive", lambda pid: False)
-        assert kb.detect_crashed_workers(conn) == [tid]
 
         kb.claim_task(conn, tid)
         run2 = kb.latest_run(conn, tid)
@@ -4111,47 +4197,37 @@ def test_complete_prose_scan_ignores_existing_ids(kanban_home):
 # Recovery helpers (reclaim + reassign)
 # ---------------------------------------------------------------------------
 
-def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
+def test_reclaim_task_resets_running_to_ready(
+    kanban_home, process_harness, trusted_scope,
+):
     """Manual reclaim releases the claim, resets status, and emits a
     ``reclaimed`` event even when claim_expires has not passed."""
-    import signal
-    import time
-    import secrets
-    import hermes_cli.kanban_db as _kb
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="stuck", assignee="broken")
-        # Simulate a live claim (not expired).
-        lock = f"{_kb._claimer_id().split(':', 1)[0]}:{secrets.token_hex(8)}"
-        future = int(time.time()) + 3600
+        t, run_id, identity = _active_worker(
+            conn, title="stuck", assignee="broken", pid=50500,
+        )
         killed: list[int] = []
-        state = {"alive": True}
 
         def _signal(pid, sig):
             killed.append(sig)
-            if sig == signal.SIGTERM:
-                state["alive"] = False
-
-        monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: state["alive"])
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 12345, t),
-        )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 12345, int(time.time())),
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
-        conn.commit()
 
         # release_stale_claims should NOT reclaim (not expired).
         assert kb.release_stale_claims(conn) == 0
 
-        # reclaim_task should work immediately.
+        # Phase one accepts the request but retains ownership until the exact
+        # worker tree and trusted scope are terminal.
         assert kb.reclaim_task(conn, t, reason="test reason", signal_fn=_signal) is True
+        task = kb.get_task(conn, t)
+        run = kb.get_run(conn, run_id)
+        assert task is not None and task.status == "running"
+        assert run is not None and run.reap_state == "terminal_requested"
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2200, signal_fn=_signal,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
 
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
@@ -4172,9 +4248,7 @@ def test_reclaim_task_resets_running_to_ready(kanban_home, monkeypatch):
         assert len(reclaim_evs) == 1
         assert reclaim_evs[0].get("manual") is True
         assert reclaim_evs[0].get("reason") == "test reason"
-        assert reclaim_evs[0].get("termination_attempted") is True
-        assert reclaim_evs[0].get("terminated") is True
-        assert killed == [signal.SIGTERM]
+        assert killed == []
     finally:
         conn.close()
 
@@ -4211,34 +4285,31 @@ def test_reassign_task_refuses_running_without_reclaim_first(kanban_home):
         conn.close()
 
 
-def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
+def test_reassign_task_with_reclaim_first_switches_profile(
+    kanban_home, process_harness, trusted_scope,
+):
     """With ``reclaim_first=True``, a running task is reclaimed and
     reassigned in one operation."""
-    import time
-    import secrets
     conn = kb.connect()
     try:
-        t = kb.create_task(conn, title="switch me", assignee="orig")
-        lock = secrets.token_hex(8)
-        future = int(time.time()) + 3600
-        conn.execute(
-            "UPDATE tasks SET status='running', claim_lock=?, claim_expires=?, "
-            "worker_pid=? WHERE id=?",
-            (lock, future, 99999, t),
+        t, run_id, identity = _active_worker(
+            conn, title="switch me", assignee="orig", pid=50501,
         )
-        conn.execute(
-            "INSERT INTO task_runs (task_id, status, claim_lock, claim_expires, "
-            "worker_pid, started_at) VALUES (?, 'running', ?, ?, ?, ?)",
-            (t, lock, future, 99999, int(time.time())),
-        )
-        run_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-        conn.execute("UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, t))
-        conn.commit()
 
         assert kb.reassign_task(
             conn, t, "new-profile",
             reclaim_first=True, reason="switch model",
         ) is True
+        task = kb.get_task(conn, t)
+        assert task is not None and task.assignee == "orig"
+        run = kb.get_run(conn, run_id)
+        assert run is not None and run.reap_state == "terminal_requested"
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2201, signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
 
         row = conn.execute(
             "SELECT assignee, status FROM tasks WHERE id=?", (t,),
@@ -4255,27 +4326,18 @@ def test_reassign_task_with_reclaim_first_switches_profile(kanban_home):
 # failures regardless of which outcome caused them.
 # ---------------------------------------------------------------------------
 
-def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkeypatch):
+def test_enforce_max_runtime_increments_consecutive_failures(
+    kanban_home, process_harness, trusted_scope,
+):
     """A single timeout increments consecutive_failures by 1 (was the
     infinite-respawn gap before unification)."""
-    import hermes_cli.kanban_db as _kb
-    state = {"sent_term": False}
-    def _alive(pid):
-        return not state["sent_term"]
-    def _signal(pid, sig):
-        import signal as _sig
-        if sig == _sig.SIGTERM:
-            state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
-
     conn = kb.connect()
     try:
-        tid = kb.create_task(
+        tid, run_id, identity = _active_worker(
             conn, title="overrun", assignee="worker",
+            pid=50300,
             max_runtime_seconds=1,
         )
-        kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, os.getpid())
         # Since PR #19473 (salvaged) changed enforce_max_runtime to read
         # from task_runs.started_at (per-attempt) rather than
         # tasks.started_at (lifetime), we need to backdate BOTH to
@@ -4295,7 +4357,15 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         before = kb.get_task(conn, tid)
         assert before.consecutive_failures == 0
 
-        kb.enforce_max_runtime(conn, signal_fn=_signal)
+        assert kb.enforce_max_runtime(conn, signal_fn=lambda pid, sig: None) == [tid]
+        assert kb.get_task(conn, tid).status == "running"
+        assert kb.get_run(conn, run_id).reap_state == "terminal_requested"
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2100, signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
 
         after = kb.get_task(conn, tid)
         assert after.consecutive_failures == 1
@@ -4306,21 +4376,13 @@ def test_enforce_max_runtime_increments_consecutive_failures(kanban_home, monkey
         conn.close()
 
 
-def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
+def test_repeated_timeouts_trip_the_circuit_breaker(
+    kanban_home, process_harness, trusted_scope, monkeypatch,
+):
     """N consecutive timeouts with the unified counter should eventually
     hit the failure_limit threshold and auto-block the task. This closes
     the Forbidden-Seeds-reported gap where timeout loops never capped.
     """
-    import hermes_cli.kanban_db as _kb
-    state = {"sent_term": False}
-    def _alive(pid):
-        return not state["sent_term"]
-    def _signal(pid, sig):
-        import signal as _sig
-        if sig == _sig.SIGTERM:
-            state["sent_term"] = True
-    monkeypatch.setattr(_kb, "_pid_alive", _alive)
-
     conn = kb.connect()
     try:
         tid = kb.create_task(
@@ -4330,42 +4392,36 @@ def test_repeated_timeouts_trip_the_circuit_breaker(kanban_home, monkeypatch):
         # Drop the failure_limit to 3 so we don't need 5 timeouts.
         # This uses the module-level DEFAULT; we simulate by calling
         # _record_task_failure directly with a tight limit.
-        for _ in range(3):
-            # Fresh claim + "started long ago" each iteration.
+        for attempt in range(3):
+            claimed = kb.claim_task(conn, tid)
+            assert claimed is not None and claimed.current_run_id is not None
+            rid = claimed.current_run_id
+            identity = kp.ProcessIdentity(50400 + attempt, 104.25)
             with kb.write_txn(conn):
                 conn.execute(
-                    "UPDATE tasks SET status='running', claim_lock=?, "
-                    "claim_expires=?, worker_pid=?, started_at=? "
-                    "WHERE id=?",
-                    (
-                        f"{_kb._claimer_id().split(':', 1)[0]}:lock",
-                        int(time.time()) + 3600,
-                        os.getpid(),
-                        int(time.time()) - 30,
-                        tid,
-                    ),
+                    "UPDATE tasks SET worker_pid=?, started_at=? WHERE id=?",
+                    (identity.pid, int(time.time()) - 30, tid),
                 )
                 conn.execute(
-                    "INSERT INTO task_runs (task_id, status, claim_lock, "
-                    "claim_expires, worker_pid, started_at) "
-                    "VALUES (?, 'running', ?, ?, ?, ?)",
-                    (
-                        tid,
-                        f"{_kb._claimer_id().split(':', 1)[0]}:lock",
-                        int(time.time()) + 3600,
-                        os.getpid(),
-                        int(time.time()) - 30,
-                    ),
+                    "UPDATE task_runs SET worker_pid=?, worker_identity=?, "
+                    "worker_tree=?, started_at=? WHERE id=?",
+                    (identity.pid, json.dumps(identity.to_dict()),
+                     json.dumps([identity.to_dict()]),
+                     int(time.time()) - 30, rid),
                 )
-                rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-                conn.execute(
-                    "UPDATE tasks SET current_run_id=? WHERE id=?",
-                    (rid, tid),
-                )
-            state["sent_term"] = False
             # Lower the threshold by monkeypatching the default.
-            monkeypatch.setattr(_kb, "DEFAULT_FAILURE_LIMIT", 3)
-            kb.enforce_max_runtime(conn, signal_fn=_signal)
+            monkeypatch.setattr(kb, "DEFAULT_FAILURE_LIMIT", 3)
+            assert kb.enforce_max_runtime(
+                conn, signal_fn=lambda pid, sig: None,
+            ) == [tid]
+            assert kb.get_task(conn, tid).status == "running"
+            process_harness[0][identity.pid] = "gone"
+            trusted_scope()
+            assert kb.reconcile_worker_reaps(
+                conn, now=2101 + attempt,
+                signal_fn=lambda pid, sig: None,
+                protected_pid_fn=lambda: set(),
+            )[0]["state"] == "finalized"
 
         final = kb.get_task(conn, tid)
         # After 3 consecutive timeouts with failure_limit=3, task should
@@ -4391,10 +4447,7 @@ def test_detect_crashed_workers_increments_counter(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
-        kb.claim_task(conn, tid)
-        kb._set_worker_pid(conn, tid, 99999)  # fake pid — not alive
-
-        kb.detect_crashed_workers(conn)
+        _drive_nonzero_crash(conn, tid, 99999)
 
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 1
@@ -4417,15 +4470,40 @@ def _drive_worker_exit(conn, tid, fake_pid, raw_status):
     import hermes_cli.kanban_db as _kb
     host_prefix = _kb._claimer_id().split(":", 1)[0]
     claimed = _kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
-    assert claimed is not None, "task was not claimable for the next attempt"
-    _kb._set_worker_pid(conn, tid, fake_pid)
+    assert claimed is not None and claimed.current_run_id is not None, \
+        "task was not claimable for the next attempt"
+    identity = kp.ProcessIdentity(fake_pid, 300.25)
+    with _kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (fake_pid, tid))
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? "
+            "WHERE id=?",
+            (fake_pid, json.dumps(identity.to_dict()),
+             json.dumps([identity.to_dict()]), claimed.current_run_id),
+        )
     _kb._record_worker_exit(fake_pid, raw_status)
-    original_alive = _kb._pid_alive
-    _kb._pid_alive = lambda p: False
+    original_identity_state = kp.identity_state
+    original_scope_state = _kb._worker_scope_state
+    kp.identity_state = lambda value: (
+        "gone" if value.pid == fake_pid else original_identity_state(value)
+    )
+    _kb._worker_scope_state = lambda *_args, **_kwargs: _kb._WorkerScopeStatus(
+        "hermes-test-worker.scope", "inactive", "test-manager",
+        "systemd-user-scope", True,
+    )
     try:
-        return _kb.detect_crashed_workers(conn)
+        detected = _kb.detect_crashed_workers(conn)
+        assert tid in detected
+        decisions = _kb.reconcile_worker_reaps(
+            conn, now=2300 + fake_pid,
+            signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )
+        assert decisions and decisions[0]["state"] == "finalized"
+        return detected
     finally:
-        _kb._pid_alive = original_alive
+        kp.identity_state = original_identity_state
+        _kb._worker_scope_state = original_scope_state
 
 
 def _drive_protocol_violation(conn, tid, fake_pid):
@@ -4660,19 +4738,7 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
     conn = kb.connect()
     try:
         tid = kb.create_task(conn, title="crashy", assignee="worker")
-        host_prefix = _kb._claimer_id().split(":", 1)[0]
-        kb.claim_task(conn, tid, claimer=f"{host_prefix}:mock")
-        fake_pid = 999997
-        kb._set_worker_pid(conn, tid, fake_pid)
-
-        # W_EXITCODE(1, 0) == 256 — WIFEXITED True, WEXITSTATUS == 1.
-        _kb._record_worker_exit(fake_pid, 256)
-        original_alive = _kb._pid_alive
-        _kb._pid_alive = lambda p: False
-        try:
-            kb.detect_crashed_workers(conn)
-        finally:
-            _kb._pid_alive = original_alive
+        _drive_nonzero_crash(conn, tid, 999997)
 
         task = kb.get_task(conn, tid)
         assert task.status == "ready", (
@@ -4687,35 +4753,33 @@ def test_detect_crashed_workers_nonzero_exit_uses_default_limit(kanban_home):
         conn.close()
 
 
-def test_reclaim_task_clears_failure_counter(kanban_home):
+def test_reclaim_task_clears_failure_counter(
+    kanban_home, process_harness, trusted_scope,
+):
     """Operator reclaim wipes the counter so the next retry gets a fresh
     budget."""
-    import secrets
     conn = kb.connect()
     try:
-        tid = kb.create_task(conn, title="stuck", assignee="worker")
-        lock = secrets.token_hex(4)
+        tid, run_id, identity = _active_worker(
+            conn, title="stuck", assignee="worker", pid=50502,
+        )
         with kb.write_txn(conn):
             conn.execute(
-                "UPDATE tasks SET status='running', claim_lock=?, "
-                "claim_expires=?, worker_pid=?, consecutive_failures=4, "
+                "UPDATE tasks SET consecutive_failures=4, "
                 "last_failure_error='prior issue' WHERE id=?",
-                (lock, int(time.time()) + 3600, 12345, tid),
-            )
-            conn.execute(
-                "INSERT INTO task_runs (task_id, status, claim_lock, "
-                "claim_expires, worker_pid, started_at) "
-                "VALUES (?, 'running', ?, ?, ?, ?)",
-                (tid, lock, int(time.time()) + 3600, 12345, int(time.time())),
-            )
-            rid = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
-            conn.execute(
-                "UPDATE tasks SET current_run_id=? WHERE id=?",
-                (rid, tid),
+                (tid,),
             )
 
         ok = kb.reclaim_task(conn, tid, reason="operator fixed config")
         assert ok
+        before = kb.get_task(conn, tid)
+        assert before is not None and before.consecutive_failures == 4
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2202, signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
 
         task = kb.get_task(conn, tid)
         assert task.consecutive_failures == 0
@@ -4725,16 +4789,14 @@ def test_reclaim_task_clears_failure_counter(kanban_home):
         conn.close()
 
 
-def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
+def test_dispatch_once_integrates_stale_detection(
+    kanban_home, process_harness, trusted_scope,
+):
     """dispatch_once with stale_timeout_seconds reclaims stale running tasks."""
-    import hermes_cli.kanban_db as _kb
-
-    monkeypatch.setattr(_kb, "_pid_alive", lambda _pid: False)
-
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="stale-dispatch", assignee="worker")
-        kb.claim_task(conn, t)
-        kb._set_worker_pid(conn, t, 99999)  # fake PID — avoid killing test
+        t, run_id, identity = _active_worker(
+            conn, title="stale-dispatch", assignee="worker", pid=50503,
+        )
 
         five_hours_ago = int(time.time()) - (5 * 3600)
         with kb.write_txn(conn):
@@ -4753,7 +4815,18 @@ def test_dispatch_once_integrates_stale_detection(kanban_home, monkeypatch):
             stale_timeout_seconds=14400,
         )
         assert t in res.stale, "Stale task should appear in result.stale"
-        assert kb.get_task(conn, t).status == "ready"
+        task = kb.get_task(conn, t)
+        assert task is not None and task.status == "running"
+        run = kb.get_run(conn, run_id)
+        assert run is not None and run.reap_state == "terminal_requested"
+        process_harness[0][identity.pid] = "gone"
+        trusted_scope()
+        assert kb.reconcile_worker_reaps(
+            conn, now=2203, signal_fn=lambda pid, sig: None,
+            protected_pid_fn=lambda: set(),
+        )[0]["state"] == "finalized"
+        task = kb.get_task(conn, t)
+        assert task is not None and task.status == "ready"
 
 
 def test_dispatch_once_stale_disabled_when_timeout_zero(kanban_home, monkeypatch):

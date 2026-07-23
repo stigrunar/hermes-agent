@@ -1041,7 +1041,11 @@ class TestUpdateCheckEndpoint:
     """
 
     @pytest.fixture(autouse=True)
-    def _setup(self, _isolate_hermes_home):
+    def _setup(self, _isolate_hermes_home, monkeypatch):
+        monkeypatch.setattr(
+            "hermes_cli.update_channel._has_remote",
+            lambda _project_root, _name: False,
+        )
         self.client, _ = _client()
 
     def test_git_install_reports_behind_count(self, monkeypatch):

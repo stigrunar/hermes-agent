@@ -71,6 +71,15 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update_remote_topology(monkeypatch):
+    """Generic updater tests must not inherit remotes from the developer checkout."""
+    monkeypatch.setattr(
+        "hermes_cli.update_channel._has_remote",
+        lambda _project_root, _name: False,
+    )
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
@@ -356,7 +365,10 @@ class TestCmdUpdateBranchFallback:
         self, config_text, tmp_path, monkeypatch
     ):
         from hermes_cli import main as hm
+        from hermes_cli import update_channel
         from hermes_cli.update_channel import UpdateChannelError
+
+        monkeypatch.setattr(update_channel, "_has_remote", lambda _root, name: name == "stig")
 
         project_root = tmp_path / "checkout"
         git_dir = project_root / ".git"

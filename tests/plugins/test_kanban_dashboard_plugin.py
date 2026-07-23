@@ -26,8 +26,8 @@ from hermes_cli import kanban_db as kb
 # ---------------------------------------------------------------------------
 
 
-def _load_plugin_router():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py and return its router."""
+def _load_plugin_module():
+    """Dynamically load the dashboard plugin module for router/constants."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -39,7 +39,11 @@ def _load_plugin_router():
     mod = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = mod
     spec.loader.exec_module(mod)
-    return mod.router
+    return mod
+
+
+def _load_plugin_router():
+    return _load_plugin_module().router
 
 
 @pytest.fixture
@@ -69,9 +73,12 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # All canonical columns present (triage + the rest), each empty.
+    # The board exposes the plugin's visible columns, not every DB status:
+    # audit-only terminal lanes remain queryable but are not board columns.
     names = [c["name"] for c in data["columns"]]
-    assert set(names) == kb.VALID_STATUSES - {"archived"}
+    plugin_api = _load_plugin_module()
+    assert names == plugin_api.BOARD_COLUMNS
+    assert "archived" not in names
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
@@ -2014,14 +2021,17 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["ok"] is True
     assert body["task_id"] == t
 
-    # Confirm the task is back to ready.
+    # Exact-worker recovery is two phase: the endpoint accepts the durable
+    # request and retains ownership until the leased reaper proves exit.
     conn2 = kb.connect()
     try:
         row = conn2.execute(
             "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["claim_lock"] is None
+        assert body["state"] == "pending_reap"
+        assert body["reap_state"] == "identity_unverifiable"
+        assert row["status"] == "running"
+        assert row["claim_lock"] is not None
     finally:
         conn2.close()
 
@@ -2116,15 +2126,19 @@ def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
         json={"profile": "new", "reclaim_first": True, "reason": "switch"},
     )
     assert r.status_code == 200, r.text
-    assert r.json()["assignee"] == "new"
+    body = r.json()
+    assert body["assignee"] == "orig"
+    assert body["requested_assignee"] == "new"
+    assert body["state"] == "pending_reap"
+    assert body["reap_state"] == "identity_unverifiable"
 
     conn2 = kb.connect()
     try:
         row = conn2.execute(
             "SELECT status, assignee FROM tasks WHERE id=?", (t,),
         ).fetchone()
-        assert row["status"] == "ready"
-        assert row["assignee"] == "new"
+        assert row["status"] == "running"
+        assert row["assignee"] == "orig"
     finally:
         conn2.close()
 

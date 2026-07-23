@@ -37,6 +37,15 @@ def _make_runner():
     return runner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update_remote_topology(monkeypatch):
+    """Gateway tests must not inherit remotes from the developer checkout."""
+    monkeypatch.setattr(
+        "hermes_cli.update_channel._has_remote",
+        lambda _project_root, _name: False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _handle_update_command
 # ---------------------------------------------------------------------------

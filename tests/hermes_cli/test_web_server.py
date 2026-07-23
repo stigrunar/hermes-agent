@@ -2701,6 +2701,7 @@ class TestWebServerEndpoints:
 
     def test_update_hermes_spawns_on_non_docker_install(self, monkeypatch):
         import hermes_cli.web_server as web_server
+        from hermes_cli.update_channel import UpdateTarget
 
         class Proc:
             pid = 12345
@@ -2715,6 +2716,10 @@ class TestWebServerEndpoints:
             return Proc()
 
         monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            "hermes_cli.update_channel.resolve_update_target",
+            lambda **_kwargs: UpdateTarget("origin", "main"),
+        )
         monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
         web_server._ACTION_PROCS.pop("hermes-update", None)
         web_server._ACTION_RESULTS.pop("hermes-update", None)
