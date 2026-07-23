@@ -55,6 +55,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
+from agent.secret_scope import current_secret_scope, is_multiplex_active
+
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
 # openai SDK pulls a large type tree (~240 ms cold, including responses/*,
 # graders/*). We expose `OpenAI` here as a thin proxy that imports the SDK on
@@ -5861,6 +5863,27 @@ class _CallableCacheDiscriminator:
         return "<callable-api-key>"
 
 
+class _ScopeCacheDiscriminator:
+    """Keep the active profile scope alive while a client is cached."""
+
+    __slots__ = ("_scope",)
+
+    def __init__(self, scope: Any) -> None:
+        self._scope = scope
+
+    def __hash__(self) -> int:
+        return id(self._scope)
+
+    def __eq__(self, other: object) -> bool:
+        return (
+            isinstance(other, _ScopeCacheDiscriminator)
+            and self._scope is other._scope
+        )
+
+    def __repr__(self) -> str:
+        return "<profile-scope>"
+
+
 def _runtime_cache_discriminator(field: str, value: Any) -> Any:
     """Return a hashable, secret-safe runtime cache-key component."""
     if field == "api_key" and callable(value):
@@ -5883,6 +5906,12 @@ def _client_cache_key(
     task: Optional[str] = None,
     model: Optional[str] = None,
 ) -> tuple:
+    scope = current_secret_scope()
+    scope_key = (
+        _ScopeCacheDiscriminator(scope)
+        if scope is not None
+        else ("unscoped", is_multiplex_active())
+    )
     runtime = _normalize_main_runtime(main_runtime)
     runtime_key = tuple(
         _runtime_cache_discriminator(field, runtime.get(field, ""))
@@ -5904,7 +5933,12 @@ def _client_cache_key(
     # model its own client, so concurrent fan-out calls never cross-close.
     model_key = model or runtime.get("model", "")
     api_key_key = _runtime_cache_discriminator("api_key", api_key or "")
-    return (provider, async_mode, base_url or "", api_key_key, api_mode or "", runtime_key, is_vision, task_key, pool_hint, model_key)
+    # Retain the mapping through the cache key so a reset ContextVar cannot
+    # allow object-id reuse to alias another profile.
+    return (
+        provider, async_mode, base_url or "", api_key_key, api_mode or "",
+        runtime_key, is_vision, task_key, pool_hint, model_key, scope_key,
+    )
 
 
 def _store_cached_client(cache_key: tuple, client: Any, default_model: Optional[str], *, bound_loop: Any = None) -> None:

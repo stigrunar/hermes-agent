@@ -26,7 +26,8 @@ Configuration in config.yaml::
         auth: oauth
         oauth:                                  # all fields optional
           client_id: "pre-registered-id"        # skip dynamic registration
-          client_secret: "secret"               # confidential clients only
+          client_secret: "secret"               # pre-registered confidential clients only
+          dynamic_client_auth_method: client_secret_post  # DCR returned a secret but omitted its auth method
           scope: "read write"                   # default: server-provided
           redirect_port: 0                      # 0 = auto-pick free port
           redirect_uri: "https://proxy/callback"  # default: loopback callback
@@ -50,7 +51,7 @@ import webbrowser
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 from hermes_constants import secure_parent_dir
 
@@ -388,9 +389,20 @@ class HermesTokenStorage:
         HERMES_HOME/mcp-tokens/<server_name>.meta.json     -- oauth server metadata
     """
 
-    def __init__(self, server_name: str, *, hermes_home: str | Path | None = None):
+    def __init__(
+        self,
+        server_name: str,
+        *,
+        hermes_home: str | Path | None = None,
+        dynamic_client_auth_method: Literal["client_secret_basic", "client_secret_post"] | None = None,
+    ):
+        if dynamic_client_auth_method not in (None, "client_secret_basic", "client_secret_post"):
+            raise ValueError(
+                "dynamic_client_auth_method must be client_secret_basic or client_secret_post"
+            )
         self._server_name = _safe_filename(server_name)
         self._hermes_home = Path(hermes_home) if hermes_home is not None else None
+        self._dynamic_client_auth_method = dynamic_client_auth_method
 
     def _tokens_path(self) -> Path:
         return _get_token_dir(self._hermes_home) / f"{self._server_name}.json"
@@ -475,6 +487,22 @@ class HermesTokenStorage:
             return None
 
     async def set_client_info(self, client_info: "OAuthClientInformationFull") -> None:
+        # A few OAuth servers return a dynamic-registration client_secret but
+        # omit token_endpoint_auth_method in their registration response. The
+        # MCP SDK correctly uses the response field, so it otherwise sends no
+        # secret and the token endpoint rejects the authorization-code grant.
+        # Keep this per-server and opt-in; a missing response field is not
+        # enough to infer a confidential-client method safely by itself.
+        if (
+            self._dynamic_client_auth_method
+            and client_info.client_secret
+            and client_info.token_endpoint_auth_method in (None, "none")
+        ):
+            # Mutate the instance rather than replacing it: the MCP SDK stores
+            # this same instance in its live OAuth context before it calls
+            # TokenStorage.set_client_info(), so a model_copy would only fix a
+            # later process while leaving this token exchange unauthenticated.
+            client_info.token_endpoint_auth_method = self._dynamic_client_auth_method
         _write_json(self._client_info_path(), client_info.model_dump(mode="json", exclude_none=True))
         logger.debug("OAuth client info saved for %s", self._server_name)
 
@@ -1092,7 +1120,9 @@ def _build_client_metadata(cfg: dict) -> "OAuthClientMetadata":
     }
     if scope:
         metadata_kwargs["scope"] = scope
-    if cfg.get("client_secret"):
+    if cfg.get("dynamic_client_auth_method"):
+        metadata_kwargs["token_endpoint_auth_method"] = cfg["dynamic_client_auth_method"]
+    elif cfg.get("client_secret"):
         metadata_kwargs["token_endpoint_auth_method"] = "client_secret_post"
 
     return OAuthClientMetadata.model_validate(metadata_kwargs)
@@ -1158,7 +1188,10 @@ def build_oauth_auth(
         return None
 
     cfg = dict(oauth_config or {})  # copy — we mutate _resolved_port
-    storage = HermesTokenStorage(server_name)
+    storage = HermesTokenStorage(
+        server_name,
+        dynamic_client_auth_method=cfg.get("dynamic_client_auth_method"),
+    )
 
     if not _is_interactive() and not storage.has_cached_tokens():
         raise OAuthNonInteractiveError(

@@ -10864,7 +10864,10 @@ def dispatch_once(
         )
         # Still under the dispatch lock: opportunistically truncate the WAL
         # at a coarse interval so it cannot grow unbounded between restarts.
-        _maybe_checkpoint_wal(conn, db_path)
+        # A dry-run is a strict read-only preview, including no PRAGMA with
+        # write-side checkpoint effects.
+        if not dry_run:
+            _maybe_checkpoint_wal(conn, db_path)
         return result
 
 

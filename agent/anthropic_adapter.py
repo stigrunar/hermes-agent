@@ -22,6 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
@@ -1308,10 +1309,14 @@ def resolve_anthropic_token() -> Optional[str]:
 
     Returns the token string or None.
     """
-    creds = read_claude_code_credentials()
+    # Host-global Claude Code files cannot override an active profile's
+    # scoped credential authority. Preserve the legacy fallback only when no
+    # multiplex scope is active.
+    scoped = current_secret_scope() is not None
+    creds = None if (scoped or is_multiplex_active()) else read_claude_code_credentials()
 
     # 1. Hermes-managed OAuth/setup token env var
-    token = os.getenv("ANTHROPIC_TOKEN", "").strip()
+    token = (get_secret("ANTHROPIC_TOKEN", "") or "").strip()
     if token:
         preferred = _prefer_refreshable_claude_code_token(token, creds)
         if preferred:
@@ -1319,7 +1324,7 @@ def resolve_anthropic_token() -> Optional[str]:
         return token
 
     # 2. CLAUDE_CODE_OAUTH_TOKEN (used by Claude Code for setup-tokens)
-    cc_token = os.getenv("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+    cc_token = (get_secret("CLAUDE_CODE_OAUTH_TOKEN", "") or "").strip()
     if cc_token:
         preferred = _prefer_refreshable_claude_code_token(cc_token, creds)
         if preferred:
@@ -1327,7 +1332,10 @@ def resolve_anthropic_token() -> Optional[str]:
         return cc_token
 
     # 3. Claude Code credential file
-    resolved_claude_token = _resolve_claude_code_token_from_credentials(creds)
+    resolved_claude_token = (
+        _resolve_claude_code_token_from_credentials(creds)
+        if creds is not None else None
+    )
     if resolved_claude_token:
         return resolved_claude_token
 
@@ -1338,7 +1346,7 @@ def resolve_anthropic_token() -> Optional[str]:
 
     # 5. Regular API key, or a legacy OAuth token saved in ANTHROPIC_API_KEY.
     # This remains as a compatibility fallback for pre-migration Hermes configs.
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = (get_secret("ANTHROPIC_API_KEY", "") or "").strip()
     if api_key:
         return api_key
 

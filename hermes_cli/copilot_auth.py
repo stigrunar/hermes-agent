@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_cli._subprocess_compat import IS_WINDOWS, windows_hide_flags
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 
 logger = logging.getLogger(__name__)
 
@@ -80,7 +81,7 @@ def resolve_copilot_token() -> tuple[str, str]:
     """
     # 1. Check env vars in priority order
     for env_var in COPILOT_ENV_VARS:
-        val = os.getenv(env_var, "").strip()
+        val = (get_secret(env_var, "") or "").strip()
         if val:
             valid, msg = validate_copilot_token(val)
             if not valid:
@@ -90,7 +91,13 @@ def resolve_copilot_token() -> tuple[str, str]:
                 continue
             return val, env_var
 
-    # 2. Fall back to gh auth token
+    # Host ``gh`` credentials are not profile-scoped. An active profile scope
+    # (including an intentionally empty one) must fail closed instead of
+    # borrowing the host account.
+    if current_secret_scope() is not None or is_multiplex_active():
+        return "", ""
+
+    # 2. Fall back to gh auth token for unprofiled legacy callers only.
     token = _try_gh_cli_token()
     if token:
         valid, msg = validate_copilot_token(token)
@@ -132,7 +139,7 @@ def _try_gh_cli_token() -> Optional[str]:
     subprocess environment so ``gh`` reads from its own credential store
     (hosts.yml) instead of just echoing the env var back.
     """
-    hostname = os.getenv("COPILOT_GH_HOST", "").strip()
+    hostname = (get_secret("COPILOT_GH_HOST", "") or "").strip()
 
     # Build a clean env so gh doesn't short-circuit on GITHUB_TOKEN / GH_TOKEN
     clean_env = {k: v for k, v in os.environ.items()
