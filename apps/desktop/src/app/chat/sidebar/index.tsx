@@ -62,7 +62,14 @@ import {
   toggleSidebarMessagingOpen,
   unpinSession
 } from '@/store/layout'
-import { $newChatProfile, $profiles, $profileScope, ALL_PROFILES, normalizeProfileKey } from '@/store/profile'
+import {
+  $newChatProfile,
+  $profiles,
+  $profileScope,
+  ALL_PROFILES,
+  normalizeProfileKey,
+  setShowAllProfiles
+} from '@/store/profile'
 import {
   $activeProjectId,
   $projects,
@@ -1358,22 +1365,31 @@ export function ChatSidebar({
                         </Button>
                       ) : null}
                       <div className="grid size-6 place-items-center">
-                        {!showAllProfiles && agentSessions.length > 0 ? (
+                        {agentSessions.length > 0 ? (
                           <Button
-                            aria-label={agentsGrouped ? s.showSessions : s.showProjects}
+                            aria-label={worktreeGroupingActive ? s.showSessions : s.showProjects}
                             className={cn(
                               HEADER_NAV_BTN,
-                              agentsGrouped && 'bg-(--ui-control-active-background) text-foreground opacity-100'
+                              worktreeGroupingActive &&
+                                'bg-(--ui-control-active-background) text-foreground opacity-100'
                             )}
                             onClick={event => {
                               event.stopPropagation()
                               setSidebarRecentsOpen(true)
-                              setSidebarAgentsGrouped(!agentsGrouped)
+
+                              if (showAllProfiles) {
+                                setShowAllProfiles(false)
+                              }
+
+                              setSidebarAgentsGrouped(!worktreeGroupingActive)
                             }}
                             size="icon-xs"
                             variant="ghost"
                           >
-                            <Codicon name={agentsGrouped ? 'list-unordered' : 'root-folder'} size="0.75rem" />
+                            <Codicon
+                              name={worktreeGroupingActive ? 'list-unordered' : 'root-folder'}
+                              size="0.75rem"
+                            />
                           </Button>
                         ) : null}
                       </div>
