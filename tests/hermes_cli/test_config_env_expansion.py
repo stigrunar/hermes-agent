@@ -54,43 +54,6 @@ class TestExpandEnvVars:
             result = _expand_env_vars({"${KEY}": "no-expand-key"})
             assert "${KEY}" in result
 
-    def test_profile_scope_is_authoritative_over_ambient(self, monkeypatch):
-        from agent import secret_scope as ss
-
-        monkeypatch.setenv(
-            "SYNTHETIC_CONFIG_ENDPOINT",
-            "https://synthetic-hostile-config.invalid/v1",
-        )
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope(
-            {
-                "SYNTHETIC_CONFIG_ENDPOINT": (
-                    "https://synthetic-profile-config.invalid/v1"
-                )
-            }
-        )
-        try:
-            assert _expand_env_vars("${SYNTHETIC_CONFIG_ENDPOINT}") == (
-                "https://synthetic-profile-config.invalid/v1"
-            )
-        finally:
-            ss.reset_secret_scope(token)
-            ss.set_multiplex_active(False)
-
-    def test_unscoped_multiplex_expansion_fails_closed(self, monkeypatch):
-        from agent import secret_scope as ss
-
-        monkeypatch.setenv(
-            "SYNTHETIC_CONFIG_ENDPOINT",
-            "https://synthetic-hostile-config.invalid/v1",
-        )
-        ss.set_multiplex_active(True)
-        try:
-            with pytest.raises(ss.UnscopedSecretError):
-                _expand_env_vars("${SYNTHETIC_CONFIG_ENDPOINT}")
-        finally:
-            ss.set_multiplex_active(False)
-
 
 class TestLoadConfigExpansion:
     def test_load_config_expands_env_vars(self, tmp_path, monkeypatch):

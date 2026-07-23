@@ -91,9 +91,9 @@ def resolve_copilot_token() -> tuple[str, str]:
                 continue
             return val, env_var
 
-    # 2. Host ``gh`` credentials are not profile-scoped. An active profile
-    # scope (including an intentionally empty one) is authoritative and must
-    # fail closed instead of borrowing the host account.
+    # Host ``gh`` credentials are not profile-scoped. An active profile scope
+    # (including an intentionally empty one) must fail closed instead of
+    # borrowing the host account.
     if current_secret_scope() is not None or is_multiplex_active():
         return "", ""
 

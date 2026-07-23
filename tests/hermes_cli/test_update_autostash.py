@@ -537,6 +537,8 @@ def _make_update_side_effect(
 ):
     """Build a subprocess.run side_effect for cmd_update tests."""
     recorded = []
+    head_sha = "a" * 40
+    recovery_refs = {}
 
     def side_effect(cmd, **kwargs):
         recorded.append(cmd)
@@ -547,6 +549,19 @@ def _make_update_side_effect(
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-parse" in joined and "--abbrev-ref" in joined:
             return SimpleNamespace(stdout=f"{current_branch}\n", stderr="", returncode=0)
+        if "rev-parse" in joined and "--verify" in joined:
+            ref = str(cmd[-1])
+            sha = recovery_refs.get(ref)
+            return SimpleNamespace(
+                stdout=f"{sha}\n" if sha else "",
+                stderr="" if sha else "fatal: Needed a single revision\n",
+                returncode=0 if sha else 128,
+            )
+        if "rev-parse" in joined and str(cmd[-1]) == "HEAD":
+            return SimpleNamespace(stdout=f"{head_sha}\n", stderr="", returncode=0)
+        if "update-ref" in joined:
+            recovery_refs[str(cmd[-3])] = str(cmd[-2])
+            return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "checkout" in joined and "main" in joined:
             return SimpleNamespace(stdout="", stderr="", returncode=0)
         if "rev-list" in joined:
@@ -568,8 +583,10 @@ def _make_update_side_effect(
     return side_effect, recorded
 
 
-def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path, capsys):
-    """When --ff-only fails (diverged history), update resets to origin/{branch}."""
+def test_cmd_update_preserves_head_before_reset_when_ff_only_fails(
+    monkeypatch, tmp_path, capsys
+):
+    """A diverged update proves a recovery ref before resetting the checkout."""
     _setup_update_mocks(monkeypatch, tmp_path)
     monkeypatch.setattr("shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None)
 
@@ -581,6 +598,10 @@ def test_cmd_update_falls_back_to_reset_when_ff_only_fails(monkeypatch, tmp_path
     reset_calls = [c for c in recorded if "reset" in c and "--hard" in c]
     assert len(reset_calls) == 1
     assert reset_calls[0] == ["git", "reset", "--hard", "origin/main"]
+    recovery_ref = f"refs/hermes/recovery/pre-update/{'a' * 40}"
+    update_ref_call = ["git", "update-ref", recovery_ref, "a" * 40, "0" * 40]
+    assert update_ref_call in recorded
+    assert recorded.index(update_ref_call) < recorded.index(reset_calls[0])
 
     out = capsys.readouterr().out
     assert "Fast-forward not possible" in out
@@ -702,6 +723,50 @@ def test_cmd_update_fetch_is_scoped_to_target_branch(monkeypatch, tmp_path):
     fetch_calls = [c for c in recorded if "fetch" in c]
     assert fetch_calls == [["git", "fetch", "origin", "main"]]
     assert ["git", "fetch", "origin"] not in recorded
+
+
+def test_cmd_update_stig_release_uses_only_validated_stig_target(monkeypatch, tmp_path):
+    """Apply fetch, comparison, and pull must agree on stig/release/stig-tested."""
+    _setup_update_mocks(monkeypatch, tmp_path)
+    (tmp_path / ".git" / "config").write_text(
+        '[remote "origin"]\n\turl = https://github.com/NousResearch/hermes-agent.git\n'
+        '[remote "stig"]\n\turl = git@github.com:stigrunar/hermes-agent.git\n',
+        encoding="utf-8",
+    )
+    hermes_home = tmp_path / "home"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text(
+        "updates:\n  release_channel: release/stig-tested\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr(
+        "shutil.which", lambda name: "/usr/bin/uv" if name == "uv" else None
+    )
+
+    side_effect, recorded = _make_update_side_effect(
+        current_branch="release/stig-tested"
+    )
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace(branch=None))
+
+    fetch_calls = [command for command in recorded if "fetch" in command]
+    assert fetch_calls == [["git", "fetch", "stig", "release/stig-tested"]]
+    assert [
+        "git",
+        "rev-list",
+        "HEAD..stig/release/stig-tested",
+        "--count",
+    ] in recorded
+    assert [
+        "git",
+        "pull",
+        "--ff-only",
+        "stig",
+        "release/stig-tested",
+    ] in recorded
+    assert not any("origin/release/stig-tested" in command for command in recorded)
 
 
 # ---------------------------------------------------------------------------
@@ -901,3 +966,53 @@ def test_bootstrap_marker_not_autostashed_by_update(tmp_path):
         ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
     ).stdout
     assert ".hermes-bootstrap-complete" not in status
+
+
+def test_install_method_marker_not_autostashed_by_update(tmp_path):
+    """#66189: the installer ``.install_method`` stamp must be git-ignored so
+    ``hermes update``'s ``git stash push --include-untracked`` does not sweep it
+    into an autostash on every run.
+
+    ``scripts/install.sh`` writes ``$INSTALL_DIR/.install_method`` as runtime
+    metadata; it is a sibling of ``.hermes-bootstrap-complete`` /
+    ``.update-incomplete`` and must be ignored the same way. Behavioral +
+    hermetic: adopt the project's real ``.gitignore`` (the contract under test),
+    drop the marker, and confirm the exact stash invocation the updater uses
+    leaves it untouched.
+    """
+    import shutil
+    import subprocess
+
+    if shutil.which("git") is None:
+        pytest.skip("git not available")
+
+    repo_gitignore = Path(hermes_main.__file__).resolve().parents[1] / ".gitignore"
+
+    def git(*args):
+        return subprocess.run(
+            ["git", *args], cwd=tmp_path, capture_output=True, text=True, check=True
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / ".gitignore").write_text(repo_gitignore.read_text())
+    (tmp_path / "tracked.txt").write_text("x\n")
+    git("add", "-A")
+    git("commit", "-qm", "init")
+
+    marker = tmp_path / ".install_method"
+    marker.write_text("managed\n")
+
+    # Exact flags used by hermes update (hermes_cli/main.py).
+    git("stash", "push", "--include-untracked", "-m", "hermes-update-autostash")
+
+    assert marker.exists(), (
+        ".install_method was swept into the update autostash — it must be listed "
+        "in .gitignore so `git stash -u` skips it (#66189)."
+    )
+    # It must not even register as a dirty/untracked change.
+    status = subprocess.run(
+        ["git", "status", "--porcelain"], cwd=tmp_path, capture_output=True, text=True
+    ).stdout
+    assert ".install_method" not in status

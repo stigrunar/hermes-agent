@@ -1,99 +1,191 @@
-"""Functional Kanban handoffs preserve caller payloads exactly.
+"""Tests: redact_sensitive_text is applied in kanban tool handlers.
 
-Credential-shaped strings, signed URLs, and continuation tokens can be real
-task output. Redaction belongs only on typed diagnostic sinks, not comments,
-completion results/summaries/metadata, or human-readable blocker reasons.
+Verifies that secrets embedded in kanban_comment body, kanban_complete
+summary/result/metadata, and kanban_block reason are masked before the
+values reach the DB.  Uses the same worker_env fixture pattern as
+test_kanban_tools.py.
 """
 from __future__ import annotations
 
 import json
-from pathlib import Path
 
 import pytest
 
 
+# ---------------------------------------------------------------------------
+# Shared fixture — mirrors test_kanban_tools.py
+# ---------------------------------------------------------------------------
+
 @pytest.fixture
 def worker_env(monkeypatch, tmp_path):
+    """Isolated HERMES_HOME with a running task; returns the task id."""
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_PROFILE", "test-worker")
     monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
-    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    from pathlib import Path as _Path
+    monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
-
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    with kb.connect_closing() as conn:
-        task_id = kb.create_task(
-            conn,
-            title="worker-test",
-            assignee="test-worker",
-        )
-        kb.claim_task(conn, task_id)
-    monkeypatch.setenv("HERMES_KANBAN_TASK", task_id)
-    return task_id
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
+        kb.claim_task(conn, tid)
+    finally:
+        conn.close()
+    monkeypatch.setenv("HERMES_KANBAN_TASK", tid)
+    return tid
 
 
-def _functional_marker() -> str:
-    return (
-        "sk-syntheticfunctionalvalue123456789 "
-        "https://demo-user:demo-pass@example.invalid/private/report"
-        "?token=functional-token&code=resume-code résumé 日本語 🔐"
-    )
+# ---------------------------------------------------------------------------
+# Positive tests — secrets are masked
+# ---------------------------------------------------------------------------
 
-
-def test_kanban_comment_preserves_functional_payload(worker_env):
-    from hermes_cli import kanban_db as kb
+def test_kanban_comment_body_scrubbed_github_pat(worker_env):
+    """ghp_ PAT in comment body must be masked before DB write."""
     from tools import kanban_tools as kt
-
-    body = f"comment::{_functional_marker()}\r\ntrailing  "
-    result = kt._handle_comment({"task_id": worker_env, "body": body})
-    assert json.loads(result)["ok"] is True
-
-    with kb.connect_closing() as conn:
-        stored = kb.list_comments(conn, worker_env)[-1].body
-    assert stored == body
-
-
-def test_kanban_complete_preserves_result_summary_and_metadata(worker_env):
     from hermes_cli import kanban_db as kb
+    secret = "ghp_" + "A" * 40
+    kt._handle_comment({"task_id": worker_env, "body": f"token: {secret}"})
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+    finally:
+        conn.close()
+    assert comments, "expected at least one comment"
+    stored = comments[-1].body
+    assert secret not in stored
+    assert stored  # something was stored
+
+
+def test_kanban_comment_body_scrubbed_openai_key(worker_env):
+    """sk- key in comment body must be masked before DB write."""
     from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    secret = "sk-" + "A" * 48
+    kt._handle_comment({"task_id": worker_env, "body": f"key={secret}"})
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+    finally:
+        conn.close()
+    stored = comments[-1].body
+    assert secret not in stored
 
-    marker = _functional_marker()
-    summary = f"summary::{marker}\r\n"
-    result_payload = f"result::{marker}\n  "
-    metadata = {
-        "signed": marker,
-        "nested": ["token=functional-token", "résumé 日本語 🔐"],
-    }
-    result = kt._handle_complete(
-        {
-            "summary": summary,
-            "result": result_payload,
-            "metadata": metadata,
-        }
-    )
-    assert json.loads(result)["ok"] is True
 
-    with kb.connect_closing() as conn:
-        task = kb.get_task(conn, worker_env)
+def test_kanban_complete_summary_scrubbed(worker_env):
+    """sk-ant- key in summary must be masked before DB write."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    secret = "sk-ant-" + "A" * 40
+    kt._handle_complete({"summary": f"done, key={secret}"})
+    conn = kb.connect()
+    try:
         run = kb.latest_run(conn, worker_env)
-    assert task.result == result_payload
-    assert run.summary == summary
-    assert run.metadata["signed"] == metadata["signed"]
-    assert run.metadata["nested"] == metadata["nested"]
+    finally:
+        conn.close()
+    assert run is not None
+    stored = run.summary or ""
+    assert secret not in stored
 
 
-def test_kanban_block_preserves_human_reason(worker_env):
-    from hermes_cli import kanban_db as kb
+def test_kanban_complete_metadata_scrubbed(worker_env):
+    """Token in metadata dict must be masked in JSON stored in DB."""
     from tools import kanban_tools as kt
-
-    reason = f"blocked::{_functional_marker()}\r\nkeep trailing  "
-    result = kt._handle_block({"reason": reason, "kind": "needs_input"})
-    assert json.loads(result)["ok"] is True
-
-    with kb.connect_closing() as conn:
+    from hermes_cli import kanban_db as kb
+    secret = "ghp_" + "B" * 40
+    metadata = {"token": secret, "count": 5}
+    kt._handle_complete({"summary": "done", "metadata": metadata})
+    conn = kb.connect()
+    try:
         run = kb.latest_run(conn, worker_env)
-    assert run.summary == reason
+    finally:
+        conn.close()
+    assert run is not None
+    # metadata is stored on the run; serialize to catch any nesting
+    meta_raw = json.dumps(run.metadata) if run.metadata else "{}"
+    assert secret not in meta_raw
+
+
+def test_kanban_block_reason_scrubbed_jwt(worker_env):
+    """JWT in block reason must be masked before DB write."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    # Minimal valid-ish JWT (header.payload.sig)
+    jwt = (
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"
+        ".eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dozjgNryP4J3jVmNHl0w5N_5NjP1-iXkpHgcth826Iw"
+    )
+    kt._handle_block({"reason": f"Bearer {jwt}"})
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+    finally:
+        conn.close()
+    # block_task stores reason as run.summary
+    assert run is not None
+    stored = run.summary or ""
+    assert jwt not in stored
+
+
+# ---------------------------------------------------------------------------
+# Negative test — plain text passes through unchanged
+# ---------------------------------------------------------------------------
+
+def test_kanban_comment_no_secret_passthrough(worker_env):
+    """Plain text without credential patterns must pass through unchanged."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    plain = "hello from the pipeline — no secrets here"
+    kt._handle_comment({"task_id": worker_env, "body": plain})
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+    finally:
+        conn.close()
+    stored = comments[-1].body
+    assert stored == plain
+
+
+# ---------------------------------------------------------------------------
+# Negative test — force=True bypasses HERMES_REDACT_SECRETS=false
+# ---------------------------------------------------------------------------
+
+def test_scrub_respects_force_flag_regardless_of_config(worker_env, monkeypatch):
+    """force=True must fire even when HERMES_REDACT_SECRETS=false is set."""
+    monkeypatch.setenv("HERMES_REDACT_SECRETS", "false")
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    secret = "ghp_" + "C" * 40
+    kt._handle_comment({"task_id": worker_env, "body": f"token: {secret}"})
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+    finally:
+        conn.close()
+    stored = comments[-1].body
+    assert secret not in stored
+
+
+# ---------------------------------------------------------------------------
+# Negative test — legacy result field is also scrubbed
+# ---------------------------------------------------------------------------
+
+def test_kanban_complete_result_field_scrubbed(worker_env):
+    """Legacy result field must be scrubbed just like summary."""
+    from tools import kanban_tools as kt
+    from hermes_cli import kanban_db as kb
+    secret = "sk-" + "D" * 48
+    kt._handle_complete({"result": f"finished with key={secret}"})
+    conn = kb.connect()
+    try:
+        run = kb.latest_run(conn, worker_env)
+    finally:
+        conn.close()
+    assert run is not None
+    stored = run.summary or run.result if hasattr(run, "result") else run.summary or ""
+    assert secret not in (stored or "")

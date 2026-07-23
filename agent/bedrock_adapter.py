@@ -28,15 +28,11 @@ Requires: ``boto3`` (optional dependency — only needed when using the Bedrock 
 """
 
 import json
-import hashlib
 import logging
 import os
 import re
-from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
-
-from agent.secret_scope import UnscopedSecretError
 
 logger = logging.getLogger(__name__)
 
@@ -58,8 +54,8 @@ except Exception:
 # This keeps startup fast for users who don't use Bedrock.
 # ---------------------------------------------------------------------------
 
-_bedrock_runtime_client_cache: Dict[Any, Any] = {}
-_bedrock_control_client_cache: Dict[Any, Any] = {}
+_bedrock_runtime_client_cache: Dict[str, Any] = {}
+_bedrock_control_client_cache: Dict[str, Any] = {}
 
 
 _MIN_BOTO3_VERSION = (1, 34, 59)
@@ -92,137 +88,27 @@ def _require_boto3():
     return boto3
 
 
-class BedrockCredentialScopeError(RuntimeError):
-    """Bedrock cannot safely select an AWS identity for this profile."""
-
-
-@dataclass(frozen=True)
-class BedrockCredentialConfig:
-    """Explicit AWS identity passed to SDK clients in multiplex mode."""
-
-    access_key_id: str = field(default="", repr=False)
-    secret_access_key: str = field(default="", repr=False)
-    session_token: str = field(default="", repr=False)
-    profile_name: str = ""
-    source: str = "aws-sdk-default-chain"
-    allow_default_chain: bool = False
-
-    @property
-    def fingerprint(self) -> str:
-        material = "\0".join(
-            (
-                self.access_key_id,
-                self.secret_access_key,
-                self.session_token,
-                self.profile_name,
-                self.source,
-                str(self.allow_default_chain),
-            )
-        ).encode("utf-8", errors="replace")
-        return hashlib.blake2b(material, digest_size=16).hexdigest()
-
-    def boto3_client(self, service_name: str, region: str):
-        boto3 = _require_boto3()
-        if self.access_key_id and self.secret_access_key:
-            kwargs = {
-                "region_name": region,
-                "aws_access_key_id": self.access_key_id,
-                "aws_secret_access_key": self.secret_access_key,
-            }
-            if self.session_token:
-                kwargs["aws_session_token"] = self.session_token
-            return boto3.client(service_name, **kwargs)
-        if self.profile_name:
-            return boto3.Session(profile_name=self.profile_name).client(
-                service_name, region_name=region
-            )
-        if self.allow_default_chain:
-            return boto3.client(service_name, region_name=region)
-        raise BedrockCredentialScopeError(
-            "Bedrock requires profile-owned AWS credentials in multiplex mode"
-        )
-
-
-def resolve_bedrock_credentials(
-    env: Optional[Dict[str, str]] = None,
-) -> BedrockCredentialConfig:
-    """Resolve an AWS identity without consulting ambient state in multiplex mode."""
-    from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-    multiplex = is_multiplex_active()
-    if env is None and multiplex:
-        scope = current_secret_scope()
-        if scope is None:
-            from agent.secret_scope import get_secret
-
-            get_secret("AWS_ACCESS_KEY_ID")  # raises the boundary signal
-        env = dict(scope or {})
-
-    if env is None:
-        return BedrockCredentialConfig(allow_default_chain=True)
-
-    access_key = str(env.get("AWS_ACCESS_KEY_ID") or "").strip()
-    secret_key = str(env.get("AWS_SECRET_ACCESS_KEY") or "").strip()
-    session_token = str(env.get("AWS_SESSION_TOKEN") or "").strip()
-    profile_name = str(env.get("AWS_PROFILE") or "").strip()
-    bearer = str(env.get("AWS_BEARER_TOKEN_BEDROCK") or "").strip()
-    if access_key and secret_key:
-        return BedrockCredentialConfig(
-            access_key_id=access_key,
-            secret_access_key=secret_key,
-            session_token=session_token,
-            source="AWS_ACCESS_KEY_ID",
-        )
-    if profile_name:
-        return BedrockCredentialConfig(
-            profile_name=profile_name,
-            source="AWS_PROFILE",
-        )
-    if bearer and multiplex:
-        raise BedrockCredentialScopeError(
-            "AWS_BEARER_TOKEN_BEDROCK cannot be injected explicitly into the "
-            "installed boto3 client; use profile-owned AWS access keys or AWS_PROFILE"
-        )
-    if multiplex:
-        raise BedrockCredentialScopeError(
-            "Bedrock multiplex profiles must configure profile-owned "
-            "AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY or AWS_PROFILE"
-        )
-    return BedrockCredentialConfig(allow_default_chain=True)
-
-
 def _get_bedrock_runtime_client(region: str):
     """Get or create a cached ``bedrock-runtime`` client for the given region.
 
-    Multiplex profiles use only an explicit owner-scoped identity. Classic
-    single-profile processes retain the AWS default credential chain.
+    Uses the default AWS credential chain (env vars → profile → instance role).
     """
-    from agent.secret_scope import is_multiplex_active
-
-    if not is_multiplex_active() and region in _bedrock_runtime_client_cache:
-        return _bedrock_runtime_client_cache[region]
-    credentials = resolve_bedrock_credentials()
-    cache_key = (region, credentials.fingerprint)
-    if cache_key not in _bedrock_runtime_client_cache:
-        _bedrock_runtime_client_cache[cache_key] = credentials.boto3_client(
-            "bedrock-runtime", region
+    if region not in _bedrock_runtime_client_cache:
+        boto3 = _require_boto3()
+        _bedrock_runtime_client_cache[region] = boto3.client(
+            "bedrock-runtime", region_name=region,
         )
-    return _bedrock_runtime_client_cache[cache_key]
+    return _bedrock_runtime_client_cache[region]
 
 
 def _get_bedrock_control_client(region: str):
     """Get or create a cached ``bedrock`` control-plane client for model discovery."""
-    from agent.secret_scope import is_multiplex_active
-
-    if not is_multiplex_active() and region in _bedrock_control_client_cache:
-        return _bedrock_control_client_cache[region]
-    credentials = resolve_bedrock_credentials()
-    cache_key = (region, credentials.fingerprint)
-    if cache_key not in _bedrock_control_client_cache:
-        _bedrock_control_client_cache[cache_key] = credentials.boto3_client(
-            "bedrock", region
+    if region not in _bedrock_control_client_cache:
+        boto3 = _require_boto3()
+        _bedrock_control_client_cache[region] = boto3.client(
+            "bedrock", region_name=region,
         )
-    return _bedrock_control_client_cache[cache_key]
+    return _bedrock_control_client_cache[region]
 
 
 def reset_client_cache():
@@ -242,14 +128,9 @@ def invalidate_runtime_client(region: str) -> bool:
     Returns True if a cached entry was evicted, False if the region was not
     cached.
     """
-    matching = [
-        key
-        for key in _bedrock_runtime_client_cache
-        if key == region or (isinstance(key, tuple) and key and key[0] == region)
-    ]
-    for key in matching:
-        _bedrock_runtime_client_cache.pop(key, None)
-    return bool(matching)
+    existed = region in _bedrock_runtime_client_cache
+    _bedrock_runtime_client_cache.pop(region, None)
+    return existed
 
 
 # ---------------------------------------------------------------------------
@@ -409,16 +290,7 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
     whether the user has any AWS credentials configured without actually
     attempting to authenticate.
     """
-    if env is None:
-        from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
-
-        if is_multiplex_active():
-            scope = current_secret_scope()
-            if scope is None:
-                get_secret("AWS_ACCESS_KEY_ID")
-            env = dict(scope or {})
-    supplied_env = env is not None
-    env = env if supplied_env else os.environ
+    env = env if env is not None else os.environ
     # Bearer token takes highest priority
     if env.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
         return "AWS_BEARER_TOKEN_BEDROCK"
@@ -437,10 +309,6 @@ def resolve_aws_auth_env_var(env: Optional[Dict[str, str]] = None) -> Optional[s
         return "AWS_WEB_IDENTITY_TOKEN_FILE"
     # No env vars — check if boto3 can resolve credentials via IMDS or other
     # implicit sources (EC2 instance role, ECS task role, Lambda, etc.)
-    from agent.secret_scope import is_multiplex_active
-
-    if supplied_env and is_multiplex_active():
-        return None
     try:
         import botocore.session
         session = botocore.session.get_session()
@@ -467,21 +335,8 @@ def has_aws_credentials(env: Optional[Dict[str, str]] = None) -> bool:
     metadata, not environment variables. The env-var check is a fast path
     for local development; the boto3 fallback covers all cloud deployments.
     """
-    if env is None:
-        from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
-
-        if is_multiplex_active():
-            scope = current_secret_scope()
-            if scope is None:
-                get_secret("AWS_ACCESS_KEY_ID")
-            env = dict(scope or {})
-    supplied_env = env is not None
     if resolve_aws_auth_env_var(env) is not None:
         return True
-    from agent.secret_scope import is_multiplex_active
-
-    if supplied_env and is_multiplex_active():
-        return False
     # Fall back to boto3's credential resolver — this covers EC2 instance
     # metadata (IMDS), ECS container credentials, and other implicit sources
     # that don't set environment variables.
@@ -512,26 +367,13 @@ def resolve_bedrock_region(env: Optional[Dict[str, str]] = None) -> str:
     live model discovery would always return us.* profile IDs regardless of
     the user's actual region.
     """
-    if env is None:
-        from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
-
-        if is_multiplex_active():
-            scope = current_secret_scope()
-            if scope is None:
-                get_secret("AWS_REGION")
-            env = dict(scope or {})
-    supplied_env = env is not None
-    env = env if supplied_env else os.environ
+    env = env if env is not None else os.environ
     explicit = (
         env.get("AWS_REGION", "").strip()
         or env.get("AWS_DEFAULT_REGION", "").strip()
     )
     if explicit:
         return explicit
-    from agent.secret_scope import is_multiplex_active
-
-    if supplied_env and is_multiplex_active():
-        return ""
     try:
         import botocore.session
         region = botocore.session.get_session().get_config_variable("region")
@@ -554,17 +396,9 @@ def bedrock_model_ids_or_none() -> Optional[List[str]]:
     ``list_authenticated_providers`` section 2, and section 3.
     """
     try:
-        from hermes_cli.config import load_config
-
-        configured = str(load_config().get("bedrock", {}).get("region") or "").strip()
-        region = configured or resolve_bedrock_region()
-        if not region:
-            return None
-        discovered = discover_bedrock_models(region)
+        discovered = discover_bedrock_models(resolve_bedrock_region())
         if discovered:
             return [m["id"] for m in discovered]
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
     return None

@@ -17,9 +17,9 @@ import time -> no import cycle. The lazy import preserves the exact logger name
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
-from agent.secret_scope import get_secret
 from gateway.config import Platform
 from gateway.session import SessionSource
 from gateway.whatsapp_identity import (
@@ -32,8 +32,30 @@ def _auth_env(name: str, default: str = "") -> str:
     """Read allowlist/auth env; prefer profile secret_scope under multiplex."""
     if not name:
         return default
-    val = get_secret(name)
-    return str(val).strip() if val is not None and str(val).strip() else default
+    try:
+        from agent.secret_scope import get_secret
+
+        val = get_secret(name)
+        if val is not None and str(val).strip():
+            return str(val).strip()
+    except Exception:
+        pass
+    return (os.getenv(name) or default).strip()
+
+
+def _coerce_allow_set(raw) -> set[str]:
+    """Parse allowlist values from config or env var into a set of strings.
+
+    Handles both list inputs (YAML sequences) and comma-separated string
+    inputs (env vars or scalar YAML values).  A scalar string is split on
+    commas so ``allow_from: "123,456"`` yields ``{"123", "456"}``, not
+    ``{"1", "2", "3", ",", ...}``.
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, list):
+        return {str(part).strip() for part in raw if str(part).strip()}
+    return {part.strip() for part in str(raw).split(",") if part.strip()}
 
 
 class GatewayAuthorizationMixin:
@@ -70,12 +92,52 @@ class GatewayAuthorizationMixin:
         """Resolve the live adapter for an inbound ``SessionSource``."""
         if source is None:
             return None
+        transport_adapter = self._registered_transport_adapter(source)
+        if transport_adapter is not None:
+            return transport_adapter
         # ``getattr`` guards test fixtures that build a bare source via
         # SimpleNamespace and omit ``profile`` (see AGENTS.md pitfall #17).
         return self._authorization_adapter(
             getattr(source, "platform", None),
             getattr(source, "profile", None),
         )
+
+    def _registered_transport_adapter(self, source: SessionSource):
+        """Return the registered adapter that created *source*, if retained.
+
+        ``source.profile`` is the runtime/session namespace. A chat-based
+        profile route can therefore differ from the adapter profile when one
+        shared credential serves several routed runtimes. ``build_source``
+        keeps the receiving adapter as in-process provenance so replies and
+        intake-policy checks stay on that transport without weakening the
+        fail-closed fallback for restored or hand-built sources.
+        """
+        adapter_ref = getattr(source, "_transport_adapter_ref", None)
+        adapter = adapter_ref() if callable(adapter_ref) else None
+        platform = getattr(source, "platform", None)
+        if adapter is None or platform is None:
+            return None
+        if adapter is (getattr(self, "adapters", None) or {}).get(platform):
+            return adapter
+        profile_maps = getattr(self, "_profile_adapters", None) or {}
+        for profile_adapters in profile_maps.values():
+            if adapter is profile_adapters.get(platform):
+                return adapter
+        return None
+
+    def _adapter_profile_for_source(self, source: SessionSource) -> Optional[str]:
+        """Resolve the transport-owning profile for adapter policy lookups."""
+        adapter = self._registered_transport_adapter(source)
+        platform = getattr(source, "platform", None)
+        if adapter is not None:
+            if adapter is (getattr(self, "adapters", None) or {}).get(platform):
+                return None
+            for profile, profile_adapters in (
+                getattr(self, "_profile_adapters", None) or {}
+            ).items():
+                if adapter is profile_adapters.get(platform):
+                    return profile
+        return getattr(source, "profile", None)
 
     def _adapter_authorization_is_upstream(
         self,
@@ -289,6 +351,8 @@ class GatewayAuthorizationMixin:
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
+        adapter_profile = self._adapter_profile_for_source(source)
+
         # Relay (and any adapter whose authorization is enforced by a trusted
         # authenticated upstream): the Team Gateway connector authenticates this
         # gateway's WS with a per-instance secret and resolves owner-only author
@@ -318,7 +382,7 @@ class GatewayAuthorizationMixin:
         # tests) — defensive against accidental fail-open.
         if source.delivered_via_upstream_relay is True or self._adapter_authorization_is_upstream(
             source.platform,
-            profile=source.profile,
+            profile=adapter_profile,
         ):
             return True
 
@@ -340,7 +404,7 @@ class GatewayAuthorizationMixin:
                 Platform.QQBOT: "QQ_GROUP_ALLOWED_USERS",
             }.get(source.platform, "")
             if chat_allowlist_env:
-                raw_chat_allowlist = _auth_env(chat_allowlist_env)
+                raw_chat_allowlist = os.getenv(chat_allowlist_env, "").strip()
                 if raw_chat_allowlist:
                     allowed_group_ids = {
                         cid.strip()
@@ -349,6 +413,24 @@ class GatewayAuthorizationMixin:
                     }
                     if "*" in allowed_group_ids or source.chat_id in allowed_group_ids:
                         return True
+
+            # Fallback: also check adapter-level config (config.yaml)
+            # for platforms.<platform>.extra.group_allowed_chats.
+            # The Telegram observe-unmentioned mode strips user_id from
+            # triggered group messages (_apply_telegram_group_observe_attribution),
+            # so the env-var-only check above misses config.yaml-configured
+            # allowlists.  Read the live adapter's config.extra as a fallback.
+            try:
+                adapter = self._adapter_for_source(source)
+                if adapter is not None:
+                    extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                    adapter_group_allowed = extra.get("group_allowed_chats")
+                    if adapter_group_allowed:
+                        allowed = _coerce_allow_set(adapter_group_allowed)
+                        if "*" in allowed or source.chat_id in allowed:
+                            return True
+            except Exception:
+                pass
 
         # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
         # Checked before the no-user-id guard below: some platforms deliver
@@ -364,10 +446,7 @@ class GatewayAuthorizationMixin:
         }
         if getattr(source, "is_bot", False):
             allow_bots_var = platform_allow_bots_map.get(source.platform)
-            if allow_bots_var and _auth_env(allow_bots_var, "none").lower() in {
-                "mentions",
-                "all",
-            }:
+            if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True
 
         if not user_id:
@@ -501,26 +580,41 @@ class GatewayAuthorizationMixin:
             # fail-open.)
             if self._adapter_enforces_own_access_policy(
                 source.platform,
-                profile=source.profile,
+                profile=adapter_profile,
             ):
                 if source.chat_type in {"group", "forum", "channel"}:
                     effective_policy = self._adapter_group_policy(
                         source.platform,
-                        profile=source.profile,
+                        profile=adapter_profile,
                     )
                     if self._adapter_group_has_sender_allowlist(
                         source.platform,
                         source.chat_id,
-                        profile=source.profile,
+                        profile=adapter_profile,
                     ):
                         return True
                 else:
                     effective_policy = self._adapter_dm_policy(
                         source.platform,
-                        profile=source.profile,
+                        profile=adapter_profile,
                     )
                 if effective_policy == "allowlist":
                     return True
+            # Some adapters (e.g. Telegram) gate access via config.extra.allow_from /
+            # group_allow_from at intake but do not override enforces_own_access_policy.
+            # Check their allowlist here so config.yaml-configured allow_from works
+            # without requiring a separate {PLATFORM}_ALLOWED_USERS env var.
+            adapter = self._adapter_for_source(source)
+            if adapter is not None:
+                extra = getattr(getattr(adapter, "config", None), "extra", None) or {}
+                if source.chat_type in {"group", "forum", "channel"}:
+                    adapter_allow = extra.get("group_allow_from")
+                else:
+                    adapter_allow = extra.get("allow_from")
+                if adapter_allow:
+                    allowed = _coerce_allow_set(adapter_allow)
+                    if user_id in allowed or "*" in allowed:
+                        return True
             # No allowlists configured -- check global allow-all flag
             return _auth_env("GATEWAY_ALLOW_ALL_USERS").lower() in {"true", "1", "yes"}
 
@@ -709,13 +803,13 @@ class GatewayAuthorizationMixin:
                 ),
                 Platform.QQBOT: ("QQ_GROUP_ALLOWED_USERS",),
             }
-            if _auth_env(platform_env_map.get(platform, "")):
+            if os.getenv(platform_env_map.get(platform, ""), "").strip():
                 return "ignore"
             for env_key in platform_group_env_map.get(platform, ()):
-                if _auth_env(env_key):
+                if os.getenv(env_key, "").strip():
                     return "ignore"
 
-        if _auth_env("GATEWAY_ALLOWED_USERS"):
+        if os.getenv("GATEWAY_ALLOWED_USERS", "").strip():
             return "ignore"
 
         return "pair"

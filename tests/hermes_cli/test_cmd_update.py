@@ -71,6 +71,15 @@ def _patch_managed_uv(request):
         yield
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update_remote_topology(monkeypatch):
+    """Generic updater tests must not inherit remotes from the developer checkout."""
+    monkeypatch.setattr(
+        "hermes_cli.update_channel._has_remote",
+        lambda _project_root, _name: False,
+    )
+
+
 class TestCmdUpdateNpmLockfileCache:
     @staticmethod
     def _cache_file(hermes_root, project_root):
@@ -255,45 +264,6 @@ class TestCmdUpdateNpmLockfileCache:
         assert cache_roots == [shared_root, shared_root]
 
 
-class TestCmdUpdatePip:
-    """Regression tests for pip-install update flows."""
-
-    @patch("shutil.which", return_value="/usr/bin/uv")
-    @patch("subprocess.run")
-    def test_update_pip_exports_virtualenv_from_sys_prefix(
-        self, mock_run, _mock_which, mock_args, monkeypatch
-    ):
-        from hermes_cli import main as hm
-
-        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-        monkeypatch.setattr(hm.sys, "prefix", "/tmp/hermes-launcher-venv")
-        monkeypatch.setattr(hm.sys, "base_prefix", "/usr")
-
-        hm._cmd_update_pip(mock_args)
-
-        assert mock_run.call_count == 1
-        assert mock_run.call_args.args[0] == ["/usr/bin/uv", "pip", "install", "--upgrade", "hermes-agent"]
-        assert mock_run.call_args.kwargs["env"]["VIRTUAL_ENV"] == "/tmp/hermes-launcher-venv"
-
-    @patch("shutil.which", return_value="/usr/bin/uv")
-    @patch("subprocess.run")
-    def test_update_pip_does_not_export_virtualenv_for_system_python(
-        self, mock_run, _mock_which, mock_args, monkeypatch
-    ):
-        from hermes_cli import main as hm
-
-        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
-        monkeypatch.delenv("VIRTUAL_ENV", raising=False)
-        monkeypatch.setattr(hm.sys, "prefix", "/usr")
-        monkeypatch.setattr(hm.sys, "base_prefix", "/usr")
-
-        hm._cmd_update_pip(mock_args)
-
-        assert mock_run.call_count == 1
-        assert "env" not in mock_run.call_args.kwargs
-
-
 class TestCmdUpdateTermuxUvBootstrap:
     """Regression tests for Termux-specific uv bootstrap behavior."""
 
@@ -343,6 +313,66 @@ class TestCmdUpdateTermuxUvBootstrap:
 
 class TestCmdUpdateBranchFallback:
     """cmd_update falls back to main when current branch has no remote counterpart."""
+
+    @pytest.mark.parametrize(
+        "config_text",
+        [
+            None,
+            "updates:\n  release_channel: main\n",
+        ],
+        ids=["channel-absent", "channel-invalid"],
+    )
+    def test_stig_channel_rejection_precedes_all_apply_mutation(
+        self, config_text, tmp_path, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli import update_channel
+        from hermes_cli.update_channel import UpdateChannelError
+
+        monkeypatch.setattr(update_channel, "_has_remote", lambda _root, name: name == "stig")
+
+        project_root = tmp_path / "checkout"
+        git_dir = project_root / ".git"
+        git_dir.mkdir(parents=True)
+        (git_dir / "config").write_text(
+            '[remote "origin"]\n\turl = https://example.invalid/hermes.git\n'
+            '[remote "stig"]\n\turl = https://example.invalid/stig.git\n',
+            encoding="utf-8",
+        )
+        lockfile = project_root / "package-lock.json"
+        lockfile.write_text('{"sentinel": "unchanged"}\n', encoding="utf-8")
+
+        hermes_home = tmp_path / "hermes-home"
+        hermes_home.mkdir()
+        if config_text is not None:
+            (hermes_home / "config.yaml").write_text(config_text, encoding="utf-8")
+
+        monkeypatch.setattr(hm, "PROJECT_ROOT", project_root)
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+        with patch("hermes_cli.config.detect_install_method", return_value="git"), \
+             patch("hermes_cli.config.is_managed", return_value=False), \
+             patch.object(hm, "_install_hangup_protection") as protect_io, \
+             patch.object(hm, "_run_pre_update_backup") as backup, \
+             patch.object(hm, "_pause_windows_gateways_for_update") as pause_gateways, \
+             patch.object(hm, "_discard_lockfile_churn") as discard_churn, \
+             patch.object(hm, "_write_update_incomplete_marker") as write_marker, \
+             patch.object(hm.subprocess, "run") as run_process, \
+             patch.object(hm.subprocess, "Popen") as spawn_process:
+            with pytest.raises(UpdateChannelError, match="release/stig-tested"):
+                cmd_update(SimpleNamespace(branch=None))
+
+        protect_io.assert_not_called()
+        backup.assert_not_called()
+        pause_gateways.assert_not_called()
+        discard_churn.assert_not_called()
+        write_marker.assert_not_called()
+        run_process.assert_not_called()
+        spawn_process.assert_not_called()
+        assert lockfile.read_text(encoding="utf-8") == '{"sentinel": "unchanged"}\n'
+        assert not (project_root / ".update-incomplete").exists()
+        expected_home_entries = {"config.yaml"} if config_text is not None else set()
+        assert {path.name for path in hermes_home.iterdir()} == expected_home_entries
 
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
@@ -940,6 +970,36 @@ class TestCmdUpdateCheckBranchFlag:
 
     @patch("hermes_cli.config.detect_install_method", return_value="git")
     @patch("subprocess.run")
+    def test_check_stig_target_fetches_and_compares_only_stig_release(
+        self, mock_run, _mock_method, monkeypatch
+    ):
+        from hermes_cli import main as hm
+        from hermes_cli.update_channel import UpdateTarget
+
+        mock_run.side_effect = self._check_side_effect(
+            target_branch="release/stig-tested", commit_count="0"
+        )
+        monkeypatch.setattr(
+            hm,
+            "_resolve_update_target",
+            lambda _args: UpdateTarget("stig", "release/stig-tested"),
+        )
+
+        cmd_update(SimpleNamespace(check=True, branch=None))
+
+        commands = [list(c.args[0]) for c in mock_run.call_args_list]
+        fetches = [cmd for cmd in commands if "fetch" in cmd]
+        assert fetches == [["git", "fetch", "stig", "release/stig-tested"]]
+        assert not any("upstream" in cmd for cmd in commands)
+        assert [
+            "git", "rev-parse", "--verify", "--quiet", "stig/release/stig-tested"
+        ] in commands
+        assert [
+            "git", "rev-list", "HEAD..stig/release/stig-tested", "--count"
+        ] in commands
+
+    @patch("hermes_cli.config.detect_install_method", return_value="git")
+    @patch("subprocess.run")
     def test_check_branch_missing_on_origin_exits_cleanly(
         self, mock_run, _mock_method, capsys
     ):
@@ -988,21 +1048,6 @@ class TestCmdUpdateCheckBranchFlag:
         # Compare ref is upstream/main (upstream fetch succeeded).
         rev_list_cmds = [c for c in commands if "rev-list" in c]
         assert any("upstream/main" in c for c in rev_list_cmds), rev_list_cmds
-
-    @patch("hermes_cli.config.detect_install_method", return_value="pip")
-    @patch("hermes_cli.banner.check_via_pypi", return_value=0)
-    @patch("subprocess.run")
-    def test_check_branch_warns_on_pypi_install(
-        self, mock_run, _mock_pypi, _mock_method, capsys
-    ):
-        """PyPI install + --branch=<non-main> surfaces a warning instead of silent drop."""
-        args = SimpleNamespace(check=True, branch="bb/gui")
-
-        cmd_update(args)
-
-        out = capsys.readouterr().out
-        assert "--branch is ignored for PyPI installs" in out
-        assert "bb/gui" in out
 
 
 class TestCmdUpdateZipBranchRefusal:

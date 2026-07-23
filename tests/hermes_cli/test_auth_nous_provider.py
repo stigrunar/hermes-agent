@@ -977,43 +977,6 @@ def test_managed_access_token_refresh_failure_quarantines_tokens(
     assert refresh_calls == ["refresh-old"]
 
 
-def test_nous_quarantine_diagnostics_and_receipt_are_value_free(
-    tmp_path,
-    monkeypatch,
-    caplog,
-):
-    from hermes_cli import auth as auth_mod
-
-    hermes_home = tmp_path / "hermes"
-    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
-    marker = "sk-syntheticquarantinevalue123456789"
-    state = {
-        "client_id": "hermes-cli",
-        "access_token": marker,
-        "refresh_token": marker,
-    }
-    error = AuthError(
-        f"Authorization: Bearer {marker}",
-        provider="nous",
-        code="invalid_grant",
-        relogin_required=True,
-    )
-
-    caplog.set_level("WARNING", logger="hermes_cli.auth")
-    monkeypatch.setattr(auth_mod, "_clear_shared_nous_state", lambda _reason: None)
-    monkeypatch.setattr(auth_mod, "invalidate_nous_auth_status_cache", lambda: None)
-    auth_mod._quarantine_nous_oauth_state(
-        state,
-        error,
-        reason="synthetic_test",
-    )
-
-    assert marker not in caplog.text
-    assert "refresh_token_fp" not in caplog.text
-    assert str(hermes_home) not in caplog.text
-    assert marker not in state["last_auth_error"]["message"]
-
-
 def test_unusable_access_token_refresh_uses_latest_rotated_refresh_token(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_nous_auth(

@@ -6,12 +6,10 @@ profiles with different keys never see each other's, and an unscoped read in
 multiplex mode fails closed instead of leaking.
 """
 import pytest
-from types import SimpleNamespace
 
 from pathlib import Path
 
 from agent import secret_scope as ss
-from gateway.run import _profile_runtime_scope
 
 
 @pytest.fixture(autouse=True)
@@ -63,80 +61,6 @@ class TestRuntimeProviderUsesScope:
         ss.set_multiplex_active(True)
         # global var: no scope needed, no raise
         assert _getenv("HERMES_MAX_ITERATIONS") == "42"
-
-
-class TestGatewayAuthorizationUsesScope:
-    """Gateway allowlist reads cannot fall back to another owner's ambient value."""
-
-    def test_auth_env_uses_owner_scope_and_fails_closed(self, monkeypatch):
-        from gateway.authz_mixin import _auth_env
-
-        monkeypatch.setenv("SYNTHETIC_ALLOWED_USERS", "ambient-other-owner")
-        ss.set_multiplex_active(True)
-        token = ss.set_secret_scope(
-            {"SYNTHETIC_ALLOWED_USERS": "profile-owner"}
-        )
-        try:
-            assert _auth_env("SYNTHETIC_ALLOWED_USERS") == "profile-owner"
-        finally:
-            ss.reset_secret_scope(token)
-
-        with pytest.raises(ss.UnscopedSecretError):
-            _auth_env("SYNTHETIC_ALLOWED_USERS")
-
-
-class TestProfileScopedSlashCommands:
-    """Credential-sensitive slash workers execute as the routed owner."""
-
-    @pytest.mark.asyncio
-    async def test_two_profile_slash_workers_ignore_hostile_ambient(
-        self, monkeypatch, tmp_path
-    ):
-        import asyncio
-
-        from gateway.slash_commands import GatewaySlashCommandsMixin
-        monkeypatch.setenv("OPENAI_API_KEY", "synthetic-hostile-openai-key")
-        monkeypatch.setenv("DEEPSEEK_API_KEY", "synthetic-hostile-deepseek-key")
-        monkeypatch.setenv(
-            "DEEPSEEK_BASE_URL", "https://synthetic-hostile-endpoint.invalid/v1"
-        )
-
-        homes = {}
-        expected = {}
-        for suffix in ("a", "b"):
-            home = tmp_path / f"synthetic-profile-{suffix}"
-            home.mkdir()
-            key = f"synthetic-profile-{suffix}-deepseek-key"
-            endpoint = f"https://synthetic-profile-{suffix}.invalid/v1"
-            (home / ".env").write_text(
-                f"DEEPSEEK_API_KEY={key}\nDEEPSEEK_BASE_URL={endpoint}\n",
-                encoding="utf-8",
-            )
-            homes[suffix] = home
-            expected[suffix] = ("deepseek", key, endpoint)
-
-        runner = SimpleNamespace(
-            config=SimpleNamespace(multiplex_profiles=True),
-            _resolve_profile_home_for_source=lambda source: homes[source.profile],
-        )
-
-        async def handler(_event):
-            def resolve():
-                return (
-                    "deepseek",
-                    ss.get_secret("DEEPSEEK_API_KEY"),
-                    ss.get_secret("DEEPSEEK_BASE_URL"),
-                )
-
-            return await asyncio.to_thread(resolve)
-
-        ss.set_multiplex_active(True)
-        for suffix in ("a", "b"):
-            event = SimpleNamespace(source=SimpleNamespace(profile=suffix))
-            result = await GatewaySlashCommandsMixin._run_profile_scoped_slash_command(
-                runner, event, handler
-            )
-            assert result == expected[suffix]
 
 
 class TestMcpInterpolationUsesScope:

@@ -6,7 +6,7 @@
 
 1. 在 Bitwarden Secrets Manager 中创建一个**机器账户**，授予其对某个项目的读取权限，并生成一个**访问令牌**。
 2. Hermes 将该单一令牌以 `BWS_ACCESS_TOKEN` 的形式存储在 `~/.hermes/.env` 中。
-3. 每次 `hermes`（或 gateway，或 cron 任务）启动时，在加载 `~/.hermes/.env` 之后，Hermes 会从受保护的 TTL 缓存解析项目，或调用 `bws secret list <project_id>`，然后将返回的密钥写入 `os.environ`。
+3. 每次 `hermes`（或 gateway，或 cron 任务）启动时，在加载 `~/.hermes/.env` 之后，Hermes 会调用 `bws secret list <project_id>` 并将返回的密钥写入 `os.environ`。
 4. 默认情况下，Hermes **覆盖**环境中已有的值，因此 Bitwarden 是唯一可信来源——在 Web 应用中轮换一次密钥，每个 Hermes 进程在下次启动时即可获取最新值。如果希望 `.env` 优先，可在配置中将 `override_existing: false`。
 
 `bws` 二进制文件在首次使用时会自动下载到 `~/.hermes/bin/`，无需 `apt`、`brew` 或 `sudo`。
@@ -46,10 +46,11 @@ hermes secrets bitwarden setup
 5. 测试拉取该项目的 secret，并显示将解析出哪些环境变量。
 6. 将 `secrets.bitwarden.enabled` 设置为 `true`。
 
-非交互式设置只从配置的环境变量（默认 `BWS_ACCESS_TOKEN`）读取访问令牌，绝不从命令行参数读取。请通过进程管理器/CI 的 secret 机制注入令牌，或将其存入当前 profile 的 `.env`，然后只传递非敏感参数：
+也支持通过参数进行非交互式设置：
 
 ```bash
 hermes secrets bitwarden setup \
+  --access-token "$BWS_ACCESS_TOKEN" \
   --server-url https://vault.bitwarden.eu \
   --project-id <project-uuid>
 ```
@@ -60,14 +61,14 @@ hermes secrets bitwarden setup \
 hermes secrets bitwarden status
 ```
 
-此后，每次调用 `hermes` 都会在启动时解析 secret。在配置的 TTL 内复用受保护的缓存，过期后再从 Bitwarden 拉取。进程中首次应用 secret 时，stderr 会显示一行摘要信息。
+此后，每次调用 `hermes` 都会在启动时拉取最新 secret。进程中首次应用 secret 时，stderr 会显示一行摘要信息。
 
 ## CLI
 
 | 命令 | 功能 |
 |---|---|
 | `hermes secrets bitwarden setup` | 交互式向导（安装二进制文件、提示输入令牌、选择项目、测试拉取） |
-| `hermes secrets bitwarden status` | 显示配置、二进制版本及令牌是否存在 |
+| `hermes secrets bitwarden status` | 显示配置、二进制版本，以及令牌是否存在/是否通过校验 |
 | `hermes secrets bitwarden token` | 轮换访问令牌：先向 Bitwarden 验证新令牌，验证通过后再写入 `.env` |
 | `hermes secrets bitwarden sync` | 演习模式：立即拉取 secret 并显示将应用的内容 |
 | `hermes secrets bitwarden sync --apply` | 拉取并导出到当前 shell 的环境中 |
@@ -107,7 +108,7 @@ secrets:
 | `access_token_env` | `BWS_ACCESS_TOKEN` | 存储引导令牌的环境变量名。如果你已将 `BWS_ACCESS_TOKEN` 用于其他用途，可修改此项。 |
 | `project_id` | `""` | 要同步的项目 UUID。 |
 | `server_url` | `""` | Bitwarden 区域或自托管端点。为空时使用 `bws` 默认值（US Cloud，`https://vault.bitwarden.com`）。欧盟云设为 `https://vault.bitwarden.eu`，自托管则填写自己的 URL。以 `BWS_SERVER_URL` 形式传递给 `bws` 子进程。 |
-| `cache_ttl_seconds` | `300` | 内存和 profile 本地受保护磁盘缓存的复用时长。设为 `0` 可禁用缓存。新的 `hermes` 调用在 TTL 内可能复用磁盘缓存。 |
+| `cache_ttl_seconds` | `300` | 进程内拉取结果的复用时长。设为 `0` 可禁用缓存。缓存按进程隔离；新的 `hermes` 调用从头开始。 |
 | `override_existing` | `true` | 为 true 时，Bitwarden 的值会覆盖环境中已有的任何值（使 Web 应用中的轮换真正生效）。如果希望本地 `.env` / shell 导出优先，设为 `false`。 |
 | `auto_install` | `true` | 为 true 时，首次使用时自动将 `bws` 下载到 `~/.hermes/bin/`。 |
 
@@ -118,8 +119,8 @@ Bitwarden 永远不会阻塞 Hermes 启动。如果出现任何问题，stderr �
 | 现象 | 原因 | 修复方法 |
 |---|---|---|
 | `BWS_ACCESS_TOKEN is not set` | 配置中已启用，但令牌已从 `.env` 中清除 | 重新运行 `hermes secrets bitwarden setup` |
-| `Bitwarden rejected the machine-account access token … bws authentication failed` | 令牌已吊销、过期或有误 | 运行 `hermes secrets bitwarden token` 提供新令牌 |
-| `Bitwarden rejected the machine-account access token … bws authentication failed for the configured Bitwarden region` | 令牌所属的 Bitwarden 区域与 `bws` 调用的区域不匹配 | 重新运行 setup 并选择正确区域，或将 `secrets.bitwarden.server_url` 设为 `https://vault.bitwarden.eu`（或自托管 URL） |
+| `Bitwarden rejected the machine-account access token … invalid_client` | 令牌已吊销、过期、机器账户被删除——或令牌属于其他区域（例如欧盟令牌访问了美国 identity 端点） | 运行 `hermes secrets bitwarden token` 粘贴新令牌；区域不匹配时重新运行 setup 选择欧盟/自托管（或设置 `secrets.bitwarden.server_url`） |
+| `bws exited 1: invalid access token` | 令牌已吊销或有误 | 运行 `hermes secrets bitwarden token` 提供新令牌 |
 | `bws timed out` | 网络受阻或 Bitwarden API 响应缓慢 | 检查到 `api.bitwarden.com`（或你的 `server_url`）的连通性 |
 | `bws binary not available` | `auto_install: false` 且 `bws` 不在 PATH 中 | 从 [github.com/bitwarden/sdk-sm/releases](https://github.com/bitwarden/sdk-sm/releases) 手动安装，或重新开启 `auto_install` |
 | `Checksum mismatch` | 下载内容损坏或被篡改 | 重新运行，将自动重试；如持续出现，请提交 issue |
@@ -129,9 +130,6 @@ Bitwarden 永远不会阻塞 Hermes 启动。如果出现任何问题，stderr �
 ## 安全说明
 
 - 引导令牌（`BWS_ACCESS_TOKEN`）本身是敏感信息——任何持有它的人都可以读取机器账户有权访问的所有 secret。请与其他 API 密钥同等对待。
-- 注入范围是整个项目，而不是逐个 secret 的允许列表：除受保护的引导令牌外，名称符合环境变量语法的所有返回 secret 都会提供给 Hermes 进程。请使用只包含 Hermes 所需 secret 的专用最小权限项目和机器账户。
-- setup 不接受命令行中的引导令牌，避免令牌进入进程列表或 shell 历史。交互输入会被隐藏；自动化必须使用配置的令牌环境变量。
-- TTL 缓存会在 profile 缓存目录中保存等同明文的 secret 值，并以仅所有者可读写的权限原子写入。如不适合磁盘持久化，请设置 `cache_ttl_seconds: 0`。
 - 即使 `override_existing: true`，Hermes 也会拒绝让 Bitwarden 覆盖引导令牌本身。如果你将 `BWS_ACCESS_TOKEN` 作为 secret 存储在项目中，应用时会静默跳过。
 - `bws` 二进制文件的下载会与同一 GitHub release 中发布的 SHA-256 校验和进行验证。不匹配时将中止安装。
 - 固定版本（撰写本文时为 `bws v2.0.0`）通过向本仓库提交 PR 的方式更新——Hermes 不会将 `bws` 自动升级到"最新版本"，因为上游 release 的结构可能发生变化。

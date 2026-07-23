@@ -43,7 +43,7 @@ def test_update_via_zip_rejects_symlink_member(tmp_path, monkeypatch):
 
     from hermes_cli.main import _update_via_zip
 
-    args = type("Args", (), {})()
+    args = type("Args", (), {"branch": "main"})()
 
     # Patch urlretrieve to "download" our pre-built malicious ZIP into the
     # _update_via_zip tempdir. Capture the tempdir so we can prove no

@@ -71,42 +71,52 @@ class TestMultiplexActiveFailClosed:
         ss.set_multiplex_active(True)
         assert ss.get_secret("HERMES_KANBAN_DB") == "/x/kanban.db"
 
-    def test_unknown_legacy_prefix_name_is_not_implicitly_global(self, monkeypatch):
-        monkeypatch.setenv(
-            "HERMES_TELEGRAM_FUTURE_TOKEN", "synthetic-hostile-future-token"
-        )
+
+class TestScopedSingleProfile:
+    """Multiplex OFF with a scope installed: the scope is an overlay, not a
+    blindfold. The cron scheduler installs a ``<home>/.env`` scope around every
+    job unconditionally, and single-profile deployments legitimately supply
+    credentials via the process environment only (systemd ``Environment=``,
+    ``pass-cli run`` / ``op run`` wrappers) — those must keep resolving."""
+
+    def test_scope_hit_wins_over_environ(self, monkeypatch):
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-from-environ")
+        token = ss.set_secret_scope({"ANTHROPIC_API_KEY": "sk-from-env-file"})
+        try:
+            assert ss.get_secret("ANTHROPIC_API_KEY") == "sk-from-env-file"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_scope_miss_falls_back_to_environ(self, monkeypatch):
+        # Regression: provider key injected into the process env but absent
+        # from <home>/.env made every cron job send a placeholder API key
+        # (401) while interactive turns kept working.
+        monkeypatch.setenv("GLM_VOOY_API_KEY", "sk-from-process-env")
+        token = ss.set_secret_scope({"UNRELATED_KEY": "x"})
+        try:
+            assert ss.get_secret("GLM_VOOY_API_KEY") == "sk-from-process-env"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_scope_miss_absent_everywhere_returns_default(self, monkeypatch):
+        monkeypatch.delenv("NOPE_KEY", raising=False)
+        token = ss.set_secret_scope({})
+        try:
+            assert ss.get_secret("NOPE_KEY") is None
+            assert ss.get_secret("NOPE_KEY", "d") == "d"
+        finally:
+            ss.reset_secret_scope(token)
+
+    def test_multiplex_on_still_authoritative(self, monkeypatch):
+        # The fallthrough is strictly multiplex-off behavior: turning
+        # multiplexing on must restore scope-authoritative semantics.
+        monkeypatch.setenv("OPENAI_API_KEY", "sk-other-profile")
         ss.set_multiplex_active(True)
-
-        with pytest.raises(ss.UnscopedSecretError):
-            ss.get_secret("HERMES_TELEGRAM_FUTURE_TOKEN")
-
-    @pytest.mark.parametrize(
-        ("name", "value"),
-        (
-            ("HTTPS_PROXY", "https://synthetic-proxy.invalid:8443"),
-            ("NO_PROXY", "synthetic-internal.invalid"),
-            ("HERMES_CA_BUNDLE", "/synthetic/ca-bundle.pem"),
-            ("REQUESTS_CA_BUNDLE", "/synthetic/requests-ca.pem"),
-            ("CURL_CA_BUNDLE", "/synthetic/curl-ca.pem"),
-            ("HERMES_PORTAL_BASE_URL", "https://synthetic-deployment-portal.invalid"),
-        ),
-    )
-    def test_explicit_deployment_globals_remain_available(
-        self, monkeypatch, name, value
-    ):
-        monkeypatch.setenv(name, value)
-        ss.set_multiplex_active(True)
-
-        assert ss.get_deployment_env(name) == value
-        assert ss.get_secret(name) == value
-
-    def test_deployment_accessor_rejects_profile_values(self, monkeypatch):
-        monkeypatch.setenv(
-            "OPENAI_API_KEY", "synthetic-hostile-global-accessor-key"
-        )
-
-        with pytest.raises(ValueError, match="profile-scoped"):
-            ss.get_deployment_env("OPENAI_API_KEY")
+        token = ss.set_secret_scope({})
+        try:
+            assert ss.get_secret("OPENAI_API_KEY") is None
+        finally:
+            ss.reset_secret_scope(token)
 
 
 class TestScopeIsolation:
@@ -166,46 +176,36 @@ class TestEnvFileParsing:
             "ANTHROPIC_API_KEY": "sk-profile"
         }
 
-    def test_build_scope_resolves_external_sources_without_global_mutation(
+    def test_build_profile_secret_scope_includes_home_external_secrets(
         self, tmp_path, monkeypatch
     ):
-        from agent.secret_sources import registry as reg
-        from agent.secret_sources.base import FetchResult, SecretSource
+        (tmp_path / ".env").write_text("XIAOMI_API_KEY=placeholder\n")
+        from hermes_cli import env_loader
 
-        class ScopedSource(SecretSource):
-            name = "scoped_test"
-            label = "Scoped test source"
-
-            def fetch(self, cfg, home_path):
-                bootstrap = ss.get_secret("SCOPE_BOOTSTRAP_TOKEN", "")
-                return FetchResult(
-                    secrets={"PROFILE_FETCHED_SECRET": f"resolved:{bootstrap}"}
-                )
-
-        (tmp_path / ".env").write_text(
-            "SCOPE_BOOTSTRAP_TOKEN=profile-bootstrap\n", encoding="utf-8"
-        )
-        (tmp_path / "config.yaml").write_text(
-            "secrets:\n  scoped_test:\n    enabled: true\n", encoding="utf-8"
-        )
-        monkeypatch.setenv("SCOPE_BOOTSTRAP_TOKEN", "global-wrong-bootstrap")
-        monkeypatch.delenv("PROFILE_FETCHED_SECRET", raising=False)
-        reg._reset_registry_for_tests()
-        reg.register_source(ScopedSource())
-        try:
-            scope = ss.build_profile_secret_scope(tmp_path)
-        finally:
-            reg._reset_registry_for_tests()
-
-        assert scope["SCOPE_BOOTSTRAP_TOKEN"] == "profile-bootstrap"
-        assert scope["PROFILE_FETCHED_SECRET"] == "resolved:profile-bootstrap"
-        assert "PROFILE_FETCHED_SECRET" not in __import__("os").environ
-
-    def test_build_scope_includes_profile_op_bootstrap_file(self, tmp_path):
-        (tmp_path / ".op.env").write_text(
-            "OP_SERVICE_ACCOUNT_TOKEN=profile-op-bootstrap\n", encoding="utf-8"
+        home_key = str(tmp_path.resolve())
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+            home_key,
+            {"XIAOMI_API_KEY": "sk-from-bitwarden"},
         )
 
-        scope = ss.build_profile_secret_scope(tmp_path)
+        assert ss.build_profile_secret_scope(tmp_path) == {
+            "XIAOMI_API_KEY": "sk-from-bitwarden"
+        }
 
-        assert scope["OP_SERVICE_ACCOUNT_TOKEN"] == "profile-op-bootstrap"
+    def test_build_profile_secret_scope_ignores_other_home_external_secrets(
+        self, tmp_path, monkeypatch
+    ):
+        profile = tmp_path / "profile"
+        other = tmp_path / "other"
+        profile.mkdir()
+        other.mkdir()
+        from hermes_cli import env_loader
+
+        monkeypatch.setitem(
+            env_loader._SECRET_SOURCE_VALUES_BY_HOME,
+            str(other.resolve()),
+            {"XIAOMI_API_KEY": "sk-other-profile"},
+        )
+
+        assert ss.build_profile_secret_scope(profile) == {}

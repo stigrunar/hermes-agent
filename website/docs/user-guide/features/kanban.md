@@ -59,14 +59,14 @@ They coexist: a kanban worker may call `delegate_task` internally during its run
   (e.g. one per project, repo, or domain); see [Boards (multi-project)](#boards-multi-project)
   below. Single-project users stay on the `default` board and never see the
   word "board" outside this docs section.
-- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | review | done | archived | superseded | stale_continuity_only`), optional tenant namespace, optional idempotency key (dedup for retried automation). `superseded` and `stale_continuity_only` are terminal, non-actionable history and are hidden from normal lists unless archived/history rows are requested.
-- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are terminal (`done`, `archived`, `superseded`, or `stale_continuity_only`).
+- **Task** — a row with title, optional body, one assignee (a profile name), status (`triage | todo | ready | running | blocked | done | archived`), optional tenant namespace, optional idempotency key (dedup for retried automation).
+- **Link** — `task_links` row recording a parent → child dependency. The dispatcher promotes `todo → ready` when all parents are `done`.
 - **Comment** — the inter-agent protocol. Agents and humans append comments; when a worker is (re-)spawned it reads the full comment thread as part of its context.
 - **Workspace** — the directory a worker operates in. Three kinds:
   - `scratch` (default) — fresh tmp dir under `~/.hermes/kanban/workspaces/<id>/` (or `~/.hermes/kanban/boards/<slug>/workspaces/<id>/` on non-default boards). **Deleted when the task completes** — scratch is ephemeral by design. Files explicitly declared through `kanban_complete(artifacts=[...])` are copied into durable per-task attachment storage before cleanup; existing deliverable paths in legacy completion summaries receive the same treatment. Other scratch files are removed. A missing declared scratch artifact keeps the task in-flight so the worker can correct the path and retry. Use `worktree:` or `dir:<path>` when the whole workspace should remain available. The first time a scratch workspace is created on an install, the dispatcher logs a warning and emits a `tip_scratch_workspace` event on the task (visible via `hermes kanban show <id>`).
   - `dir:<path>` — an existing shared directory (Obsidian vault, mail ops dir, per-account folder). **Must be an absolute path.** Relative paths like `dir:../tenants/foo/` are rejected at dispatch because they'd resolve against whatever CWD the dispatcher happens to be in, which is ambiguous and a confused-deputy escape vector. The path is otherwise trusted — it's your box, your filesystem, the worker runs with your uid. This is the trusted-local-user threat model; kanban is single-host by design. **Preserved on completion.**
-  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. A worktree task must have a resolvable absolute target at creation time: an absolute `worktree:<path>`, a project with an absolute primary repo, or an absolute board `default_workdir` inside a git repo. Invalid/relative contracts are rejected before a task can become runnable. Worker-side `git worktree add` creates a missing linked worktree, using `--branch` when provided. **Preserved on completion.**
-- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, preflights workspaces and declared capabilities, atomically claims, and spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. Deterministic workspace/config/capability failures block immediately with a machine-readable classification and fingerprint; recoverable worker failures still use `kanban.failure_limit` (default: 2).
+  - `worktree` — a git worktree under `.worktrees/<id>/` for coding tasks. Use `worktree:<path>` to pin the exact target path. Worker-side `git worktree add` creates it, using `--branch` when provided. **Preserved on completion.**
+- **Dispatcher** — a long-lived loop that, every N seconds (default 60): reclaims stale claims, reclaims crashed workers (PID gone but TTL not yet expired), promotes ready tasks, atomically claims, spawns assigned profiles. Runs **inside the gateway** by default (`kanban.dispatch_in_gateway: true`). One dispatcher sweeps all boards per tick; workers are spawned with `HERMES_KANBAN_BOARD` pinned so they can't see other boards. After `kanban.failure_limit` consecutive spawn failures on the same task (default: 2) the dispatcher auto-blocks it with the last error as the reason — prevents thrashing on tasks whose profile doesn't exist, workspace can't mount, etc.
 - **Tenant** — optional string namespace *within* a board. One specialist fleet can serve multiple businesses (`--tenant business-a`) with data isolation by workspace path and memory key prefix. Tenants are a soft filter; boards are the hard isolation boundary.
 
 ## Boards (multi-project)
@@ -283,56 +283,6 @@ unblocked task in the work pool, resolve *why it keeps re-blocking* (unfinished
 parent, missing input, unmet capability) before unblocking, or raise
 `BLOCK_RECURRENCE_LIMIT` if the loop is expected.
 :::
-
-### Control-plane hardening commands
-
-Tasks can declare dispatch requirements at creation time. The dispatcher
-checks the selected profile's enabled toolsets before spawning and blocks with
-actionable diagnostics when a capability is missing:
-
-```bash
-hermes kanban create "browser QA" --assignee qa \
-    --requires browser --requires network
-```
-
-The supported public requirements are `terminal`, `file`, `file_patch`,
-`process`, `browser`, and `network`. Use `private:<toolset>` when a task needs a
-specific non-public toolset.
-
-Controllers have explicit, audited operations for review/dependency recovery:
-
-```bash
-# Make a detached review task the live path and park parent-gated mirrors.
-hermes kanban detached-live-path <blocked-source> <detached-review> \
-    --reason "review-required handoff"
-
-# Close a helper from a positive host/controller acceptance receipt.
-hermes kanban controller-closeout <task-id> \
-    --receipt '{"accepted_by":"controller","accepted_at":"2026-01-01T00:00:00Z","verdict":"approved","evidence":["review task t_example approved"]}'
-
-# Validate an explicit reconciliation mapping without mutation (default).
-hermes kanban reconcile-live-path --mapping mapping.json --json
-
-# Historical cleanup only: accept a done task as terminal evidence.
-hermes kanban reconcile-live-path --source <blocked-source> --detached <done-evidence> \
-    --allow-terminal-evidence --json
-
-# Apply only after reviewing the dry-run output and taking a DB backup.
-hermes kanban reconcile-live-path --mapping mapping.json --apply --json
-```
-
-Only positive closeout verdicts (`accepted`, `approved`,
-`approved_not_live`) satisfy dependencies. `detached-live-path` accepts only
-actionable detached tasks (`ready`, `running`, or `review`); blocked, triage,
-todo, and terminal rows are rejected. Reconciliation validates every mapping
-before any write and applies the batch transactionally. Historical terminal
-cleanup must opt in per entry with `allow_terminal_evidence: true` (or the CLI
-flag above), only accepts `done` detached tasks, and requires auditable positive
-completion or controller-acceptance evidence.
-
-Worker-launched terminal subprocesses do not inherit Kanban task ownership by
-default. Set `HERMES_KANBAN_PROPAGATE_CONTEXT=1` only for a deliberate nested
-worker process that must retain the parent's Kanban context.
 
 ## How workers interact with the board
 

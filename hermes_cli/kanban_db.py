@@ -71,7 +71,6 @@ new locking.
 from __future__ import annotations
 
 import contextlib
-import errno
 import hashlib
 import json
 import os
@@ -81,7 +80,6 @@ import secrets
 import shutil
 import sqlite3
 import stat
-import stat as stat_module
 import subprocess
 import sys
 import threading
@@ -91,9 +89,9 @@ import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Iterable, Optional
 
-from agent.redact import redact_for_persistence as _redact_diagnostic
+from agent.redact import redact_sensitive_text as _redact_sensitive_text
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
 
@@ -105,97 +103,17 @@ _REAL_SUBPROCESS_POPEN = subprocess.Popen
 _log = logging.getLogger(__name__)
 
 
-# Profile-owned ambient inputs that a cross-profile Hermes worker must never
-# inherit from its dispatcher. Keep this worker-specific: the general terminal
-# subprocess policy intentionally preserves the user's AWS/tool shell access.
-_WORKER_PROFILE_AMBIENT_KEYS = frozenset({
-    "CUSTOM_API_KEY",
-    "CUSTOM_BASE_URL",
-    "OPENROUTER_BASE_URL",
-    "HERMES_CODEX_BASE_URL",
-    "HERMES_QWEN_BASE_URL",
-    "HERMES_XAI_BASE_URL",
-    "HERMES_TUI_PROVIDER",
-    "HERMES_TUI_MODEL",
-    "HERMES_TUI_API_KEY",
-    "HERMES_TUI_BASE_URL",
-    "HERMES_MODEL",
-    "HERMES_API_KEY",
-    "HERMES_BASE_URL",
-    "HERMES_INFERENCE_PROVIDER",
-    "HERMES_INFERENCE_MODEL",
-    "COPILOT_GH_HOST",
-    "NOUS_INFERENCE_BASE_URL",
-    "NOUS_PORTAL_BASE_URL",
-    "MINIMAX_PORTAL_BASE_URL",
-    "HERMES_SPOTIFY_CLIENT_ID",
-    "SPOTIFY_CLIENT_ID",
-    "HERMES_SPOTIFY_REDIRECT_URI",
-    "SPOTIFY_REDIRECT_URI",
-    "HERMES_SPOTIFY_API_BASE_URL",
-    "SPOTIFY_API_BASE_URL",
-    "HERMES_SPOTIFY_ACCOUNTS_BASE_URL",
-    "SPOTIFY_ACCOUNTS_BASE_URL",
-    "BWS_ACCESS_TOKEN",
-    "BWS_SERVER_URL",
-    "OP_SERVICE_ACCOUNT_TOKEN",
-    "OP_ACCOUNT",
-    "OP_CONNECT_HOST",
-    "OP_CONNECT_TOKEN",
-    "WEIXIN_TOKEN",
-    "WEIXIN_ACCOUNT_ID",
-    "WEIXIN_BASE_URL",
-    "WEIXIN_CDN_BASE_URL",
-    "LANGFUSE_PUBLIC_KEY",
-    "LANGFUSE_SECRET_KEY",
-    "LANGFUSE_BASE_URL",
-    "AWS_BEARER_TOKEN_BEDROCK",
-    "AWS_ACCESS_KEY_ID",
-    "AWS_SECRET_ACCESS_KEY",
-    "AWS_SESSION_TOKEN",
-    "AWS_PROFILE",
-    "AWS_DEFAULT_PROFILE",
-    "AWS_REGION",
-    "AWS_DEFAULT_REGION",
-    "AWS_SHARED_CREDENTIALS_FILE",
-    "AWS_CONFIG_FILE",
-    "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-    "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN",
-    "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
-    "AWS_WEB_IDENTITY_TOKEN_FILE",
-    "AWS_ROLE_ARN",
-    "AWS_ROLE_SESSION_NAME",
-    "AWS_EC2_METADATA_SERVICE_ENDPOINT",
-    "AWS_EC2_METADATA_SERVICE_ENDPOINT_MODE",
-    "AWS_ENDPOINT_URL",
-    "AWS_CA_BUNDLE",
-    "AZURE_TENANT_ID",
-    "AZURE_CLIENT_ID",
-    "AZURE_CLIENT_SECRET",
-    "AZURE_ANTHROPIC_KEY",
-    "AZURE_FEDERATED_TOKEN_FILE",
-    "AZURE_AUTHORITY_HOST",
-    "AZURE_CLIENT_CERTIFICATE_PATH",
-    "AZURE_CLIENT_CERTIFICATE_PASSWORD",
-    "AZURE_USERNAME",
-    "AZURE_PASSWORD",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "IDENTITY_ENDPOINT",
-    "IDENTITY_HEADER",
-    "MSI_ENDPOINT",
-    "IMDS_ENDPOINT",
-    "VERTEX_CREDENTIALS_PATH",
-    "GOOGLE_APPLICATION_CREDENTIALS",
-    "VERTEX_PROJECT_ID",
-    "VERTEX_REGION",
-    "TERMINAL_SSH_HOST",
-    "TERMINAL_SSH_USER",
-    "TERMINAL_SSH_PORT",
-    "TERMINAL_SSH_KEY",
-    "SUDO_PASSWORD",
-})
-_WORKER_PROFILE_AMBIENT_PREFIXES = ("OP_SESSION_", "AWS_ENDPOINT_URL_")
+def _redact_diagnostic(value: Any) -> Any:
+    """Recursively mask secrets before persisting diagnostic-only fields."""
+    if isinstance(value, str):
+        return _redact_sensitive_text(value)
+    if isinstance(value, dict):
+        return {key: _redact_diagnostic(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_diagnostic(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_redact_diagnostic(item) for item in value)
+    return value
 
 
 # ---------------------------------------------------------------------------
@@ -210,9 +128,19 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 NON_ACTIONABLE_STATUSES = {
     "archived", "cancelled", "superseded", "stale_continuity_only",
 }
-TERMINAL_STATUSES = {"done", "archived", "cancelled", "superseded", "stale_continuity_only"}
-CONTROLLER_ACCEPT_VERDICTS = {"accepted", "approved", "approved_not_live"}
-DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
+TERMINAL_STATUSES = {
+    "done", "archived", "cancelled", "superseded", "stale_continuity_only",
+}
+
+
+def _terminal_status_sql() -> tuple[str, tuple[str, ...]]:
+    """Return SQL placeholders and values derived from the canonical set."""
+    values = tuple(sorted(TERMINAL_STATUSES))
+    return ",".join("?" for _ in values), values
+
+
+REVIEW_REQUIRED_PREFIX = "review-required:"
+VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -236,29 +164,6 @@ DETACHED_LIVE_PATH_STATUSES = {"ready", "running", "review"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 
-
-def _terminal_status_sql() -> tuple[str, tuple[str, ...]]:
-    """Return SQL placeholders and values derived from the canonical set."""
-    values = tuple(sorted(TERMINAL_STATUSES))
-    return ",".join("?" for _ in values), values
-
-
-REVIEW_REQUIRED_PREFIX = "review-required:"
-VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
-AUTONOMOUS_CONTINUATION_BLOCK_KINDS = frozenset({"capability", "transient"})
-DEFAULT_BLOCKER_CONTINUATION_SLA_SECONDS = 15 * 60
-_AUTONOMOUS_CONTINUATION_HUMAN_REASON_TOKENS = (
-    "needs_input",
-    "needs input",
-    "human input",
-    "human decision",
-    "human approval",
-    "human signoff",
-    "maintenance window",
-    "maintenance-window",
-    "scheduled:",
-)
-
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
 # unblocker (usually a cron) and routes the task to ``triage`` instead of back
@@ -268,10 +173,6 @@ _AUTONOMOUS_CONTINUATION_HUMAN_REASON_TOKENS = (
 # not dispatcher spawn/crash/timeout failures.
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
-PUBLIC_REQUIRED_CAPABILITIES = {
-    "terminal", "file", "file_patch", "process", "browser", "network",
-}
-NETWORK_CAPABLE_TOOLSETS = {"web", "search", "web_search", "browser", "firecrawl"}
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
@@ -1058,12 +959,6 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
-    superseded_by: Optional[str] = None
-    live_path_task_id: Optional[str] = None
-    canonical_live_path: Optional[str] = None
-    required_capabilities: Optional[list[str]] = None
-    failure_classification: Optional[str] = None
-    failure_fingerprint: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1077,14 +972,6 @@ class Task:
                     skills_value = [str(s) for s in parsed if s]
             except Exception:
                 skills_value = None
-        required_capabilities_value: Optional[list[str]] = None
-        if "required_capabilities" in keys and row["required_capabilities"]:
-            try:
-                parsed = json.loads(row["required_capabilities"])
-                if isinstance(parsed, list):
-                    required_capabilities_value = [str(s) for s in parsed if s]
-            except Exception:
-                required_capabilities_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1155,16 +1042,6 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
-            ),
-            superseded_by=row["superseded_by"] if "superseded_by" in keys else None,
-            live_path_task_id=row["live_path_task_id"] if "live_path_task_id" in keys else None,
-            canonical_live_path=row["canonical_live_path"] if "canonical_live_path" in keys else None,
-            required_capabilities=required_capabilities_value,
-            failure_classification=(
-                row["failure_classification"] if "failure_classification" in keys else None
-            ),
-            failure_fingerprint=(
-                row["failure_fingerprint"] if "failure_fingerprint" in keys else None
             ),
         )
 
@@ -1410,16 +1287,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0,
-    -- First-class non-actionable history / live-path routing fields.
-    superseded_by        TEXT,
-    live_path_task_id    TEXT,
-    canonical_live_path  TEXT,
-    -- JSON array of normalized capability names required before dispatch.
-    required_capabilities TEXT,
-    -- Machine-readable deterministic failure bookkeeping.
-    failure_classification TEXT,
-    failure_fingerprint   TEXT
+    block_recurrences    INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1541,26 +1409,6 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
--- Durable, bounded reconciliation work.  The dispatcher records controller
--- decisions here; it never creates follow-up cards or performs product
--- actions (merge/deploy/restart/notification).  ``lock_identity`` is derived
--- from the task id, action, and stable failure fingerprint, so duplicate
--- controller ticks collapse onto one row.
-CREATE TABLE IF NOT EXISTS kanban_continuations (
-    lock_identity       TEXT PRIMARY KEY,
-    task_id             TEXT NOT NULL,
-    classification      TEXT NOT NULL,
-    action              TEXT NOT NULL,
-    state               TEXT NOT NULL,
-    source_fingerprint  TEXT NOT NULL,
-    failure_fingerprint TEXT NOT NULL,
-    next_retry_at       INTEGER,
-    attempts            INTEGER NOT NULL DEFAULT 0,
-    payload             TEXT,
-    created_at          INTEGER NOT NULL,
-    updated_at          INTEGER NOT NULL
-);
-
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1572,8 +1420,6 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
-CREATE INDEX IF NOT EXISTS idx_continuations_due     ON kanban_continuations(state, next_retry_at, created_at);
-CREATE INDEX IF NOT EXISTS idx_continuations_task    ON kanban_continuations(task_id, updated_at);
 """
 
 
@@ -1585,6 +1431,14 @@ _INITIALIZED_PATHS: set[str] = set()
 _INIT_LOCK = threading.RLock()
 _SQLITE_HEADER = b"SQLite format 3\x00"
 DEFAULT_BUSY_TIMEOUT_MS = 120_000
+
+# Maximum number of ``<db>.corrupt.<hash>.bak`` quarantine files retained per
+# board DB. Content-addressing already dedupes identical corrupt bytes, but
+# repeatedly-mutating corruption (partial repairs, further damage between
+# dispatcher retries) mints a new fingerprint each time; without a cap a user
+# accumulated 124 backups. Oldest-by-mtime files beyond the cap are pruned
+# right after each new backup is created.
+_CORRUPT_BACKUP_RETENTION = 10
 
 # Bounded acquire for the cross-process init lock (#36644). The original bare
 # blocking flock had no timeout, so a wedged holder blocked the dispatcher's
@@ -1625,44 +1479,6 @@ def _sqlite_connect(path: Path) -> sqlite3.Connection:
     # the PRAGMA explicitly so it is observable and survives future wrapper
     # changes. Parameter binding is not supported for PRAGMA assignments.
     conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    return conn
-
-
-def _sqlite_connect_readonly_existing(path: Path) -> sqlite3.Connection:
-    """Open a sidecar-free copied Kanban DB as an immutable snapshot."""
-    try:
-        resolved = path.expanduser().resolve(strict=True)
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"kanban DB does not exist: {path}") from exc
-    if not resolved.is_file():
-        raise RuntimeError(f"kanban DB path is not a file: {resolved}")
-
-    # This API is intentionally limited to copied reconciliation snapshots.
-    # Accepting a live WAL-backed DB would either ignore committed frames in
-    # immutable mode or let SQLite coordinate through the SHM sidecar in
-    # ordinary read-only mode. Require callers to checkpoint/copy first so the
-    # integrity pass is byte-stable and cannot touch live board state.
-    sidecars = [
-        Path(f"{resolved}{suffix}")
-        for suffix in ("-wal", "-shm")
-        if Path(f"{resolved}{suffix}").exists()
-    ]
-    if sidecars:
-        raise RuntimeError(
-            "copied kanban DB must be checkpointed and have no WAL/SHM sidecars"
-        )
-
-    busy_timeout_ms = _resolve_busy_timeout_ms()
-    try:
-        conn = sqlite3.connect(
-            f"{resolved.as_uri()}?mode=ro&immutable=1",
-            isolation_level=None,
-            timeout=busy_timeout_ms / 1000.0,
-            uri=True,
-        )
-        conn.execute(f"PRAGMA busy_timeout={busy_timeout_ms}")
-    except sqlite3.Error as exc:
-        raise RuntimeError(f"could not open kanban DB read-only: {resolved}: {exc}") from exc
     return conn
 
 
@@ -1750,59 +1566,13 @@ def _cross_process_init_lock(path: Path):
             handle.close()
 
 
-@dataclass(frozen=True)
-class _DispatchLockOutcome:
-    """Value-safe outcome from attempting one board's dispatch lock."""
-
-    acquired: bool
-    reason: Optional[str] = None
-
-
-def _dispatch_effective_uid() -> Optional[int]:
-    """Return the POSIX effective uid when that identity is available."""
-    getter = getattr(os, "geteuid", None)
-    return getter() if getter is not None else None
-
-
-def _open_dispatch_lock_fd(lock_path: Path) -> int:
-    """Open a dispatch lock without following its final path component."""
-    flags = os.O_RDWR | os.O_CREAT
-    flags |= getattr(os, "O_CLOEXEC", 0)
-    flags |= getattr(os, "O_NOFOLLOW", 0)
-    if _IS_WINDOWS:
-        flags |= getattr(os, "O_BINARY", 0)
-        flags |= getattr(os, "O_NOINHERIT", 0)
-    return os.open(lock_path, flags, 0o600)
-
-
-def _inspect_dispatch_lock_fd(
-    fd: int,
-) -> tuple[os.stat_result, Optional[str]]:
-    """Classify an opened lock descriptor and return ``(stat, error)``."""
-    fd_stat = os.fstat(fd)
-    if not stat_module.S_ISREG(fd_stat.st_mode):
-        return fd_stat, "untrusted_type"
-    if not _IS_WINDOWS:
-        effective_uid = _dispatch_effective_uid()
-        if effective_uid is not None and fd_stat.st_uid != effective_uid:
-            return fd_stat, "untrusted_owner"
-        if fd_stat.st_mode & (stat_module.S_IWGRP | stat_module.S_IWOTH):
-            return fd_stat, "unsafe_permissions"
-    return fd_stat, None
-
-
-def _is_dispatch_lock_contention(exc: OSError) -> bool:
-    return exc.errno in {errno.EACCES, errno.EAGAIN}
-
-
 @contextlib.contextmanager
 def _dispatch_tick_lock(db_path: Path):
     """Non-blocking single-writer guard around one dispatcher tick.
 
-    Yields a :class:`_DispatchLockOutcome` whose ``acquired`` flag is true
-    only when this process may proceed. ``reason="contention"`` identifies
-    the ordinary losing-dispatcher case; every other bounded reason is a
-    trust/setup failure and must fail the tick closed.
+    Yields ``True`` when this process holds the board's dispatch lock and
+    may proceed with the tick, or ``False`` when another process already
+    holds it (the caller should skip the tick this round).
 
     Motivation (issue #35240): a ``hermes gateway run --replace`` /
     ``gateway restart`` invoked from a shell on a systemd/launchd host can
@@ -1822,150 +1592,112 @@ def _dispatch_tick_lock(db_path: Path):
     again next interval.
 
     Board-scoped: the lock file is a ``.dispatch.lock`` sibling of the
-    board's ``kanban.db``, so unrelated boards tick independently. On a
-    platform that genuinely lacks its native locking primitive the guard
-    retains the documented no-op fallback after safely opening and
-    classifying the path. Setup, trust, identity, and acquisition failures
-    on supported platforms never degrade to an unguarded dispatch.
+    board's ``kanban.db``, so unrelated boards tick independently. On
+    platforms without ``fcntl``/``msvcrt`` the guard degrades to a no-op
+    (yields ``True``) — single-writer enforcement is best-effort and the
+    orphan-dispatcher scenario is specific to POSIX service managers.
     """
-    canonical_db_path = _canonical_db_path(db_path)
-    if canonical_db_path is None:
-        yield _DispatchLockOutcome(False, "path_resolution_failed")
-        return
-    db_path = canonical_db_path
-    lock_path = None
-    fd = None
-    lock_held = False
-    unlock_fn = None
-    outcome = _DispatchLockOutcome(False, "path_setup_failed")
+    lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
+    handle = None
+    acquired = False
     try:
-        try:
-            lock_path = db_path.with_name(db_path.name + ".dispatch.lock")
-            lock_path.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                existing_stat = os.stat(lock_path, follow_symlinks=False)
-            except FileNotFoundError:
-                existing_stat = None
-            if existing_stat is not None and not stat_module.S_ISREG(
-                existing_stat.st_mode
-            ):
-                outcome = _DispatchLockOutcome(False, "untrusted_type")
-            else:
-                try:
-                    fd = _open_dispatch_lock_fd(lock_path)
-                except Exception:
-                    outcome = _DispatchLockOutcome(False, "open_failed")
-                else:
-                    try:
-                        _, inspection_error = _inspect_dispatch_lock_fd(fd)
-                    except Exception:
-                        outcome = _DispatchLockOutcome(False, "classification_failed")
-                    else:
-                        if inspection_error is not None:
-                            outcome = _DispatchLockOutcome(False, inspection_error)
-                        else:
-                            outcome = _DispatchLockOutcome(True)
-        except Exception:
-            outcome = _DispatchLockOutcome(False, "path_setup_failed")
-
-        if outcome.acquired and _IS_WINDOWS:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        if _IS_WINDOWS:
             try:
                 import msvcrt
 
+                handle.seek(0)
                 locking = getattr(msvcrt, "locking")
+                # LK_NBLCK = non-blocking exclusive byte-range lock.
                 nb_lock = getattr(msvcrt, "LK_NBLCK")
-                unlock_mode = getattr(msvcrt, "LK_UNLCK")
-            except (ImportError, AttributeError):
-                # The native primitive is genuinely unavailable. Preserve the
-                # documented compatibility fallback, but only after the path
-                # itself has passed descriptor-based trust checks.
-                pass
-            else:
-                try:
-                    os.lseek(fd, 0, os.SEEK_SET)
-                    locking(fd, nb_lock, 1)
-                except OSError as exc:
-                    reason = (
-                        "contention"
-                        if _is_dispatch_lock_contention(exc)
-                        else "acquisition_failed"
-                    )
-                    outcome = _DispatchLockOutcome(False, reason)
-                except Exception:
-                    outcome = _DispatchLockOutcome(False, "acquisition_failed")
-                else:
-                    lock_held = True
-
-                    def _unlock_windows():
-                        os.lseek(fd, 0, os.SEEK_SET)
-                        locking(fd, unlock_mode, 1)
-
-                    unlock_fn = _unlock_windows
-        elif outcome.acquired:
+                locking(handle.fileno(), nb_lock, 1)
+                acquired = True
+            except (OSError, AttributeError):
+                acquired = False
+        else:
             try:
                 import fcntl
 
-                flock_fn = getattr(fcntl, "flock")
-            except (ImportError, AttributeError):
-                # See the Windows fallback above.
-                pass
-            else:
-                try:
-                    flock_fn(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except OSError as exc:
-                    reason = (
-                        "contention"
-                        if _is_dispatch_lock_contention(exc)
-                        else "acquisition_failed"
-                    )
-                    outcome = _DispatchLockOutcome(False, reason)
-                except Exception:
-                    outcome = _DispatchLockOutcome(False, "acquisition_failed")
-                else:
-                    lock_held = True
-                    unlock_fn = lambda: flock_fn(fd, fcntl.LOCK_UN)
-
-        if outcome.acquired:
-            # Reclassify after acquisition, then bind the pathname to the
-            # descriptor. A replaced/unlinked file is not a usable board lock:
-            # another dispatcher could otherwise lock the replacement and race.
-            try:
-                post_fd_stat, inspection_error = _inspect_dispatch_lock_fd(fd)
-            except Exception:
-                outcome = _DispatchLockOutcome(False, "classification_failed")
-            else:
-                if inspection_error is not None:
-                    outcome = _DispatchLockOutcome(False, inspection_error)
-                else:
-                    try:
-                        path_stat = os.stat(lock_path, follow_symlinks=False)
-                    except Exception:
-                        outcome = _DispatchLockOutcome(False, "identity_failed")
-                    else:
-                        if (
-                            not stat_module.S_ISREG(path_stat.st_mode)
-                            or (post_fd_stat.st_dev, post_fd_stat.st_ino)
-                            != (path_stat.st_dev, path_stat.st_ino)
-                        ):
-                            outcome = _DispatchLockOutcome(False, "identity_mismatch")
-
-        lock_token = None
-        if outcome.acquired:
-            lock_token = _DISPATCH_LOCK_HELD.set(True)
-        try:
-            yield outcome
-        finally:
-            if lock_token is not None:
-                _DISPATCH_LOCK_HELD.reset(lock_token)
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except (BlockingIOError, OSError):
+                acquired = False
+    except OSError:
+        # Could not even open the lock file (permissions, read-only FS).
+        # Degrade to a no-op so a probe failure never blocks dispatch.
+        acquired = True
+        handle = None
+    lock_token = _DISPATCH_LOCK_HELD.set(True) if acquired else None
+    try:
+        yield acquired
     finally:
-        if fd is not None:
+        if lock_token is not None:
+            _DISPATCH_LOCK_HELD.reset(lock_token)
+        if handle is not None:
             try:
-                if lock_held and unlock_fn is not None:
-                    unlock_fn()
-            except (OSError, AttributeError, ValueError):
+                if acquired:
+                    if _IS_WINDOWS:
+                        import msvcrt
+
+                        handle.seek(0)
+                        locking = getattr(msvcrt, "locking")
+                        unlock_mode = getattr(msvcrt, "LK_UNLCK")
+                        locking(handle.fileno(), unlock_mode, 1)
+                    else:
+                        import fcntl
+
+                        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+            except (OSError, AttributeError):
                 pass
             finally:
-                os.close(fd)
+                handle.close()
+
+
+# Periodic WAL checkpoint state for the dispatcher tick path. The kanban
+# connections run with ``wal_autocheckpoint=100``, but a passive
+# autocheckpoint can be starved forever on a busy multi-process board (any
+# reader with an open snapshot blocks the WAL reset), letting the -wal file
+# grow without bound between gateway restarts. Once per coarse interval the
+# dispatcher — the board's single writer during a tick, and holding the
+# dispatch flock — issues an explicit ``wal_checkpoint(TRUNCATE)``.
+# Best-effort: a busy/locked checkpoint is logged at DEBUG and retried next
+# interval. Keyed per resolved DB path so multi-board dispatchers checkpoint
+# each board on its own clock.
+_WAL_CHECKPOINT_INTERVAL_SECONDS = 300.0
+_LAST_WAL_CHECKPOINT: dict[str, float] = {}
+_WAL_CHECKPOINT_LOCK = threading.Lock()
+
+
+def _maybe_checkpoint_wal(conn: sqlite3.Connection, db_path: Path) -> None:
+    """Run ``PRAGMA wal_checkpoint(TRUNCATE)`` at a coarse interval.
+
+    Called from the dispatcher tick while the board's dispatch lock is
+    held. No-ops (cheaply) until ``_WAL_CHECKPOINT_INTERVAL_SECONDS`` has
+    elapsed since this process last checkpointed this board. Never raises:
+    the checkpoint is pure hygiene and must not fail a dispatch tick.
+    """
+    try:
+        key = str(db_path.resolve())
+    except OSError:
+        key = str(db_path)
+    now = time.monotonic()
+    with _WAL_CHECKPOINT_LOCK:
+        last = _LAST_WAL_CHECKPOINT.get(key)
+        if last is not None and (now - last) < _WAL_CHECKPOINT_INTERVAL_SECONDS:
+            return
+        # Claim the slot before doing the work so concurrent ticks (other
+        # threads in this process) don't double-checkpoint on the boundary.
+        _LAST_WAL_CHECKPOINT[key] = now
+    try:
+        row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        _log.debug(
+            "kanban WAL checkpoint (TRUNCATE) on %s -> %s "
+            "(busy, wal_frames, checkpointed_frames)",
+            key, tuple(row) if row is not None else None,
+        )
+    except sqlite3.Error as exc:
+        _log.debug("kanban WAL checkpoint on %s skipped: %s", key, exc)
 
 
 def _looks_like_tls_record_at(data: bytes, offset: int) -> bool:
@@ -2038,6 +1770,54 @@ class KanbanDbCorruptError(RuntimeError):
         )
 
 
+def _prune_corrupt_backups(
+    parent: Path, base_name: str, keep: Optional[Path] = None,
+) -> None:
+    """Cap the number of retained ``<db>.corrupt.<hash>.bak`` files.
+
+    Content-addressed backups dedupe identical corrupt bytes, but a board
+    whose file keeps changing between corruption events (partial repairs,
+    ongoing damage, fleets of retrying dispatchers) can still accumulate
+    backups without bound — a user reported 124 of them. After creating a
+    new backup we keep only the ``_CORRUPT_BACKUP_RETENTION`` most recent
+    (by mtime) and delete the rest, including their copied ``-wal``/``-shm``
+    sidecars. ``keep`` (the just-created backup) is never pruned regardless
+    of its mtime — ``shutil.copy2`` preserves the source file's timestamp,
+    which may be older than existing backups. Best-effort: prune failures
+    never mask the corruption error the caller is about to raise.
+    """
+    try:
+        backups = [
+            candidate
+            for candidate in parent.glob(f"{base_name}.corrupt.*.bak")
+            if candidate.is_file() and candidate != keep
+        ]
+    except OSError:
+        return
+    budget = _CORRUPT_BACKUP_RETENTION - (1 if keep is not None else 0)
+    budget = max(budget, 0)
+    if len(backups) <= budget:
+        return
+
+    def _mtime(item: Path) -> float:
+        try:
+            return item.stat().st_mtime
+        except OSError:
+            return 0.0
+
+    backups.sort(key=_mtime, reverse=True)
+    for stale in backups[budget:]:
+        for victim in (
+            stale,
+            stale.with_name(stale.name + "-wal"),
+            stale.with_name(stale.name + "-shm"),
+        ):
+            try:
+                victim.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
 def _backup_corrupt_db(path: Path) -> Optional[Path]:
     """Copy a corrupt DB (and its WAL/SHM sidecars) to a content-addressed backup.
 
@@ -2078,6 +1858,9 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
             shutil.copy2(resolved, candidate)
         except OSError:
             return None
+        # A NEW backup landed on disk — enforce the retention cap so
+        # mutating-corruption loops can't accumulate quarantines forever.
+        _prune_corrupt_backups(parent, base_name, keep=candidate)
     for suffix in ("-wal", "-shm"):
         sidecar = parent / (base_name + suffix)
         if sidecar.parent != parent or not sidecar.exists():
@@ -2092,15 +1875,111 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     return candidate
 
 
+# Repairable integrity_check error classes. Both shapes are *index-scoped*:
+# the table b-tree is intact and only a secondary index disagrees with it,
+# which REINDEX rebuilds losslessly from the table data. The index name is
+# parsed generically from the message — no hardcoded index list. Any other
+# integrity_check message (page corruption, "database disk image is
+# malformed", freelist damage, …) is NOT repairable this way and keeps the
+# fail-closed behavior.
+_REPAIRABLE_INDEX_ERROR_PATTERNS = (
+    re.compile(r"^wrong # of entries in index (?P<index>.+)$"),
+    re.compile(r"^row \d+ missing from index (?P<index>.+)$"),
+)
+
+
+def _integrity_messages_ok(messages: list[str]) -> bool:
+    """True iff ``PRAGMA integrity_check`` output is the single ``ok`` row."""
+    return len(messages) == 1 and messages[0].strip().lower() == "ok"
+
+
+def _run_integrity_check(conn: sqlite3.Connection) -> list[str]:
+    """Return all ``PRAGMA integrity_check`` message rows as strings."""
+    rows = conn.execute("PRAGMA integrity_check").fetchall()
+    return [str(row[0]) for row in rows if row is not None and row[0] is not None]
+
+
+def _repairable_index_names(messages: list[str]) -> Optional[list[str]]:
+    """Return the distinct index names iff EVERY message is index-repairable.
+
+    ``None`` when any line falls outside the repairable index-class errors
+    (or when there are no messages at all) — the caller must then fail
+    closed exactly as before. Order of first appearance is preserved so the
+    REINDEX pass is deterministic.
+    """
+    names: list[str] = []
+    saw_any = False
+    for raw in messages:
+        message = (raw or "").strip()
+        if not message:
+            continue
+        for pattern in _REPAIRABLE_INDEX_ERROR_PATTERNS:
+            match = pattern.match(message)
+            if match:
+                break
+        else:
+            return None
+        saw_any = True
+        name = match.group("index").strip()
+        if name and name not in names:
+            names.append(name)
+    if not saw_any or not names:
+        return None
+    return names
+
+
+def _attempt_index_reindex_repair(
+    path: Path, index_names: list[str],
+) -> tuple[bool, list[str]]:
+    """REINDEX the named indexes, then re-run ``PRAGMA integrity_check``.
+
+    Tries a per-index ``REINDEX "<name>"`` first (cheapest, most targeted);
+    if any per-index statement fails — e.g. the parsed name does not resolve
+    because integrity_check reported an internal/auto index — falls back to
+    a bare ``REINDEX`` of the whole database. Returns
+    ``(clean, post_repair_messages)``; never raises. Callers must hold the
+    board's cross-process init flock so no other process connects mid-repair.
+    """
+    try:
+        conn = _sqlite_connect(path)
+    except sqlite3.Error as exc:
+        return False, [f"could not reopen for REINDEX: {exc}"]
+    try:
+        try:
+            for name in index_names:
+                escaped = name.replace('"', '""')
+                conn.execute(f'REINDEX "{escaped}"')
+        except sqlite3.Error:
+            # Per-index rebuild failed (unresolvable parsed name, auto
+            # index, …) — bare REINDEX rebuilds every index in the DB.
+            conn.execute("REINDEX")
+        messages = _run_integrity_check(conn)
+    except sqlite3.Error as exc:
+        return False, [f"REINDEX failed: {exc}"]
+    finally:
+        conn.close()
+    return _integrity_messages_ok(messages), messages
+
+
 def _guard_existing_db_is_healthy(path: Path) -> None:
     """Run ``PRAGMA integrity_check`` on an existing non-empty DB file.
 
     Opens the probe in read/write mode so SQLite can recover or
     checkpoint a healthy WAL/hot-journal DB before we declare it
-    corrupt. If the file is malformed, copy it (and any WAL/SHM
-    sidecars) to a timestamped backup and raise
-    :class:`KanbanDbCorruptError` so callers cannot silently recreate
-    the schema on top of a damaged DB.
+    corrupt.
+
+    **Narrow auto-repair:** when the integrity failure consists *only* of
+    index-scoped errors (``wrong # of entries in index <name>`` / ``row N
+    missing from index <name>``), the table b-trees are intact and REINDEX
+    rebuilds the damaged indexes losslessly. In that case we take the
+    corrupt backup FIRST (same content-addressed quarantine as the
+    fail-closed path), run REINDEX under the caller-held init flock,
+    re-run ``integrity_check``, and proceed only if it comes back clean.
+    Anything else — page corruption, ``malformed`` images, a REINDEX that
+    does not produce a clean re-check — fails closed exactly as before:
+    copy the file (and any WAL/SHM sidecars) to a backup and raise
+    :class:`KanbanDbCorruptError` so callers cannot silently recreate the
+    schema on top of a damaged DB.
 
     Transient lock/busy errors (``sqlite3.OperationalError``) are NOT
     treated as corruption; they propagate raw so the caller sees a
@@ -2131,14 +2010,18 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
     if str(resolved) in _INITIALIZED_PATHS:
         return
     reason: Optional[str] = None
+    messages: list[str] = []
     try:
         probe = _sqlite_connect(resolved)
         try:
-            row = probe.execute("PRAGMA integrity_check").fetchone()
+            messages = _run_integrity_check(probe)
         finally:
             probe.close()
-        if not row or (row[0] or "").lower() != "ok":
-            reason = f"integrity_check returned {row[0] if row else '<no row>'!r}"
+        if not _integrity_messages_ok(messages):
+            reason = (
+                f"integrity_check returned "
+                f"{messages[0] if messages else '<no row>'!r}"
+            )
     except sqlite3.OperationalError:
         # Lock contention, busy, transient IO — not corruption. Let it propagate.
         raise
@@ -2146,8 +2029,137 @@ def _guard_existing_db_is_healthy(path: Path) -> None:
         reason = f"sqlite refused to open file: {exc}"
     if reason is None:
         return
+    # Quarantine FIRST — both the repair path and the fail-closed path
+    # preserve the pre-touch bytes before anything mutates the file.
     backup = _backup_corrupt_db(resolved)
+    index_names = _repairable_index_names(messages)
+    if index_names:
+        _log.warning(
+            "kanban DB %s failed integrity_check with index-only errors "
+            "(%s); pre-repair backup at %s — attempting REINDEX auto-repair.",
+            resolved, ", ".join(index_names),
+            backup if backup is not None else "<backup failed>",
+        )
+        repaired, post = _attempt_index_reindex_repair(resolved, index_names)
+        if repaired:
+            _log.warning(
+                "kanban DB %s auto-repaired via REINDEX (%s); "
+                "integrity_check now clean. Pre-repair copy kept at %s.",
+                resolved, ", ".join(index_names),
+                backup if backup is not None else "<backup failed>",
+            )
+            return
+        reason = (
+            f"{reason}; REINDEX auto-repair attempted but integrity_check "
+            f"still returned {post[0] if post else '<no row>'!r}"
+        )
     raise KanbanDbCorruptError(resolved, backup, reason)
+
+
+@dataclass
+class RepairResult:
+    """Outcome of :func:`repair_db` for CLI/status reporting.
+
+    ``status`` is one of:
+
+    * ``"ok"``        — integrity_check was already clean; nothing done.
+    * ``"repaired"``  — index-only errors found, REINDEX applied, re-check
+      clean. ``backup_path`` holds the pre-repair quarantine copy.
+    * ``"corrupt"``   — still corrupt: either a non-index error class
+      (fail-closed, no repair attempted) or a REINDEX whose re-check did
+      not come back clean.
+    * ``"missing"``   — no DB file (or zero-byte placeholder); nothing to do.
+    """
+
+    status: str
+    db_path: Path
+    messages: list[str] = field(default_factory=list)
+    post_repair_messages: list[str] = field(default_factory=list)
+    backup_path: Optional[Path] = None
+    reindexed: list[str] = field(default_factory=list)
+
+
+def repair_db(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> RepairResult:
+    """Probe a kanban DB and apply the narrow index-REINDEX repair if needed.
+
+    Shares the exact policy of :func:`_guard_existing_db_is_healthy`: only
+    integrity failures composed *entirely* of index-scoped errors are
+    repairable; the corrupt bytes are quarantined via
+    :func:`_backup_corrupt_db` BEFORE any mutation; the REINDEX runs under
+    the board's cross-process init flock; and anything else stays corrupt
+    (fail-closed) for the caller to surface. Unlike the guard this never
+    raises :class:`KanbanDbCorruptError` — it returns a structured
+    :class:`RepairResult` so ``hermes kanban repair`` can report and choose
+    its own exit code.
+
+    Transient ``sqlite3.OperationalError`` (locked/busy) still propagates
+    raw, exactly like the guard: a locked healthy DB is not corruption and
+    must not be quarantined.
+    """
+    if db_path is not None:
+        path = db_path
+    else:
+        path = kanban_db_path(board=board)
+    try:
+        resolved = path.resolve()
+    except OSError:
+        resolved = path
+    try:
+        if not resolved.exists() or resolved.stat().st_size == 0:
+            return RepairResult(status="missing", db_path=resolved)
+    except OSError:
+        return RepairResult(status="missing", db_path=resolved)
+
+    with _cross_process_init_lock(resolved):
+        messages: list[str] = []
+        try:
+            probe = _sqlite_connect(resolved)
+            try:
+                messages = _run_integrity_check(probe)
+            finally:
+                probe.close()
+        except sqlite3.OperationalError:
+            # Locked/busy — not corruption; let the caller report it raw.
+            raise
+        except sqlite3.DatabaseError as exc:
+            # Same quarantine the connect-time guard takes for a file
+            # sqlite refuses to open at all (e.g. malformed page 1).
+            return RepairResult(
+                status="corrupt",
+                db_path=resolved,
+                messages=[f"sqlite refused to open file: {exc}"],
+                backup_path=_backup_corrupt_db(resolved),
+            )
+        if _integrity_messages_ok(messages):
+            return RepairResult(status="ok", db_path=resolved, messages=messages)
+
+        # Quarantine FIRST — identical policy to the connect-time guard.
+        backup = _backup_corrupt_db(resolved)
+        index_names = _repairable_index_names(messages)
+        if not index_names:
+            return RepairResult(
+                status="corrupt",
+                db_path=resolved,
+                messages=messages,
+                backup_path=backup,
+            )
+        repaired, post = _attempt_index_reindex_repair(resolved, index_names)
+        # The file changed on disk; force the next connect() in this process
+        # to re-probe instead of trusting the stale healthy-path cache.
+        with _INIT_LOCK:
+            _INITIALIZED_PATHS.discard(str(resolved))
+        return RepairResult(
+            status="repaired" if repaired else "corrupt",
+            db_path=resolved,
+            messages=messages,
+            post_repair_messages=post,
+            backup_path=backup,
+            reindexed=index_names,
+        )
 
 
 def connect(
@@ -2282,54 +2294,6 @@ def connect_closing(
     callers) continue to work.
     """
     conn = connect(db_path=db_path, board=board)
-    try:
-        yield conn
-    finally:
-        try:
-            conn.close()
-        except Exception:
-            pass
-
-
-def connect_readonly_existing(
-    db_path: Optional[Path] = None,
-    *,
-    board: Optional[str] = None,
-) -> sqlite3.Connection:
-    """Open and integrity-check an existing DB without writing its contents.
-
-    This path is used for copied-board reconciliation previews.  It must not
-    invoke the normal read/write corruption guard because that guard may
-    recover WAL state or create a ``.corrupt`` backup.  Header validation and
-    ``PRAGMA integrity_check`` runs against an immutable connection for a
-    sidecar-free copied/checkpointed DB, preserving that snapshot byte-for-byte
-    without creating artifacts. Live WAL-backed databases are rejected.
-    """
-    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
-    _validate_sqlite_header(path)
-    conn = _sqlite_connect_readonly_existing(path)
-    try:
-        conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA query_only=ON")
-        conn.execute("PRAGMA foreign_keys=ON")
-        conn.execute("PRAGMA cell_size_check=ON")
-        rows = conn.execute("PRAGMA integrity_check").fetchall()
-        if len(rows) != 1 or str(rows[0][0] or "").casefold() != "ok":
-            raise sqlite3.DatabaseError("kanban DB failed read-only integrity_check")
-    except Exception:
-        conn.close()
-        raise
-    return conn
-
-
-@contextlib.contextmanager
-def connect_readonly_closing(
-    db_path: Optional[Path] = None,
-    *,
-    board: Optional[str] = None,
-):
-    """Open an existing read-only kanban DB connection and close it on exit."""
-    conn = connect_readonly_existing(db_path=db_path, board=board)
     try:
         yield conn
     finally:
@@ -2505,18 +2469,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
-    if "superseded_by" not in cols:
-        _add_column_if_missing(conn, "tasks", "superseded_by", "superseded_by TEXT")
-    if "live_path_task_id" not in cols:
-        _add_column_if_missing(conn, "tasks", "live_path_task_id", "live_path_task_id TEXT")
-    if "canonical_live_path" not in cols:
-        _add_column_if_missing(conn, "tasks", "canonical_live_path", "canonical_live_path TEXT")
-    if "required_capabilities" not in cols:
-        _add_column_if_missing(conn, "tasks", "required_capabilities", "required_capabilities TEXT")
-    if "failure_classification" not in cols:
-        _add_column_if_missing(conn, "tasks", "failure_classification", "failure_classification TEXT")
-    if "failure_fingerprint" not in cols:
-        _add_column_if_missing(conn, "tasks", "failure_fingerprint", "failure_fingerprint TEXT")
 
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
@@ -2531,12 +2483,6 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     )
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_tasks_session_id ON tasks(session_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_live_path ON tasks(live_path_task_id)"
-    )
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_tasks_superseded_by ON tasks(superseded_by)"
     )
 
     # task_events gained a run_id column; back-fill it as NULL for
@@ -2965,119 +2911,6 @@ def _canonical_assignee(assignee: Optional[str]) -> Optional[str]:
     return normalize_profile_name(assignee)
 
 
-def normalize_required_capabilities(
-    required_capabilities: Optional[Iterable[str]],
-) -> Optional[list[str]]:
-    """Normalize and validate the small Kanban capability vocabulary."""
-    if required_capabilities is None:
-        return None
-    out: list[str] = []
-    seen: set[str] = set()
-    for raw in required_capabilities:
-        if raw is None:
-            continue
-        cap = str(raw).strip().lower()
-        if not cap:
-            continue
-        if cap.startswith("toolset:"):
-            cap = "private:" + cap.split(":", 1)[1].strip().lower()
-        if cap in PUBLIC_REQUIRED_CAPABILITIES:
-            normalized = cap
-        elif cap.startswith("private:") and cap.split(":", 1)[1].strip():
-            normalized = "private:" + cap.split(":", 1)[1].strip()
-        else:
-            raise ValueError(
-                "required_capabilities must contain only "
-                f"{sorted(PUBLIC_REQUIRED_CAPABILITIES)} plus private:<toolset>"
-            )
-        if normalized in seen:
-            continue
-        seen.add(normalized)
-        out.append(normalized)
-    return out or None
-
-
-def _validate_worktree_create_contract(
-    *,
-    workspace_path: Optional[str],
-    project_repo: Optional[str],
-    board: Optional[str],
-) -> None:
-    """Validate that a worktree task has an absolute, resolvable git anchor.
-
-    This is intentionally validation-only. It may inspect existing parents and
-    run ``git rev-parse`` but never creates directories or materializes a
-    linked worktree; dispatch remains responsible for the actual worktree add.
-    """
-    candidate: Optional[Path] = None
-    source = "workspace_path"
-    if workspace_path:
-        candidate = Path(workspace_path).expanduser()
-        if not candidate.is_absolute():
-            raise ValueError("worktree workspace_path must be absolute")
-    elif project_repo:
-        candidate = Path(project_repo).expanduser()
-        source = "project primary_path"
-        if not candidate.is_absolute():
-            raise ValueError("project primary_path for worktree task must be absolute")
-    else:
-        board_slug = board if board else get_current_board()
-        board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
-        if board_default:
-            candidate = Path(board_default).expanduser()
-            source = f"board {board_slug!r} default_workdir"
-            if not candidate.is_absolute():
-                raise ValueError(
-                    f"{source} must be absolute for worktree tasks"
-                )
-    if candidate is None:
-        raise ValueError(
-            "workspace_kind=worktree requires an explicit absolute workspace_path, "
-            "a project primary_path, or an absolute board default_workdir inside a git repo"
-        )
-
-    resolved = candidate.resolve(strict=False)
-    if candidate.exists() and _is_linked_worktree_checkout(candidate):
-        return
-    repo_root = _git_toplevel(candidate)
-    if repo_root is not None:
-        return
-    nearest_parent = resolved if resolved.exists() else resolved.parent
-    if _repo_root_for_worktree_target(nearest_parent) is not None:
-        return
-    raise ValueError(f"{source} {str(candidate)!r} is not inside a git repo")
-
-
-def _validate_persistent_workspace_create_contract(
-    *,
-    workspace_kind: str,
-    workspace_path: Optional[str],
-    project_repo: Optional[str],
-    board: Optional[str],
-) -> None:
-    """Reject persistent workspaces that could fall back to dispatcher CWD."""
-    if workspace_kind == "worktree":
-        _validate_worktree_create_contract(
-            workspace_path=workspace_path,
-            project_repo=project_repo,
-            board=board,
-        )
-        return
-    if workspace_kind != "dir":
-        return
-    candidate = workspace_path or project_repo
-    if not candidate:
-        board_slug = board if board else get_current_board()
-        candidate = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
-    if not candidate:
-        raise ValueError(
-            "workspace_kind=dir requires an explicit absolute workspace_path, "
-            "a project primary_path, or an absolute board default_workdir"
-        )
-    if not Path(candidate).expanduser().is_absolute():
-        raise ValueError("dir workspace anchor must be absolute")
-
-
 def create_task(
     conn: sqlite3.Connection,
     *,
@@ -3102,7 +2935,6 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
-    required_capabilities: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3139,13 +2971,10 @@ def create_task(
             f"workspace_kind must be one of {sorted(VALID_WORKSPACE_KINDS)}, "
             f"got {workspace_kind!r}"
         )
-    if workspace_path is not None:
-        workspace_path = str(workspace_path).strip() or None
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
-    required_capabilities_list = normalize_required_capabilities(required_capabilities)
 
     # Resolve an optional first-class Project link. A project-linked task is
     # anchored to the project's primary repo as a git worktree, so its branch
@@ -3186,12 +3015,6 @@ def create_task(
             ):
                 # Defer the concrete path to the insert loop: it's a fresh
                 # ``<repo>/.worktrees/<task-id>`` dir keyed on the new task id.
-                project_repo = str(project_obj.primary_path)
-            elif (
-                workspace_kind == "dir"
-                and workspace_path is None
-                and project_obj.primary_path
-            ):
                 project_repo = str(project_obj.primary_path)
 
     parents = tuple(p for p in parents if p)
@@ -3249,7 +3072,7 @@ def create_task(
     if idempotency_key:
         row = conn.execute(
             "SELECT id FROM tasks WHERE idempotency_key = ? "
-            "AND status NOT IN ('archived', 'cancelled', 'superseded', 'stale_continuity_only') "
+            "AND status != 'archived' "
             "ORDER BY created_at DESC LIMIT 1",
             (idempotency_key,),
         ).fetchone()
@@ -3277,16 +3100,6 @@ def create_task(
         board_default = board_meta.get("default_workdir")
         if board_default:
             workspace_path = str(board_default)
-
-    if workspace_kind == "dir" and workspace_path is None and project_repo:
-        workspace_path = project_repo
-
-    _validate_persistent_workspace_create_contract(
-        workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
-        project_repo=project_repo,
-        board=board,
-    )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -3316,7 +3129,7 @@ def create_task(
                             "(" + ",".join("?" * len(parents)) + ")",
                             parents,
                         ).fetchall()
-                        if any(r["status"] not in TERMINAL_STATUSES for r in rows):
+                        if any(r["status"] != "done" for r in rows):
                             task_status = "todo"
                 # Even in triage mode we still need to validate parent ids
                 # so the eventual link rows don't dangle.
@@ -3350,9 +3163,8 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id,
-                        required_capabilities
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3375,10 +3187,6 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
-                        (
-                            json.dumps(required_capabilities_list)
-                            if required_capabilities_list is not None else None
-                        ),
                     ),
                 )
                 for pid in parents:
@@ -3398,7 +3206,6 @@ def create_task(
                         "branch_name": branch_name,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
-                        "required_capabilities": required_capabilities_list,
                     },
                 )
             return task_id
@@ -3477,8 +3284,8 @@ def list_tasks(
     if current_step_key is not None:
         query += " AND current_step_key = ?"
         params.append(current_step_key)
-    if not include_archived and status not in NON_ACTIONABLE_STATUSES:
-        query += " AND status NOT IN ('archived', 'cancelled', 'superseded', 'stale_continuity_only')"
+    if not include_archived and status != "archived":
+        query += " AND status != 'archived'"
     if order_by is not None:
         order_by = order_by.strip().lower()
         if order_by not in VALID_SORT_ORDERS:
@@ -3518,8 +3325,7 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
             # new profile should not inherit the previous profile's streak.
             conn.execute(
                 "UPDATE tasks SET assignee = ?, consecutive_failures = 0, "
-                "last_failure_error = NULL, failure_classification = NULL, "
-                "failure_fingerprint = NULL WHERE id = ?",
+                "last_failure_error = NULL WHERE id = ?",
                 (profile, task_id),
             )
         else:
@@ -3819,7 +3625,7 @@ def link_tasks(
         parent_status = conn.execute(
             "SELECT status FROM tasks WHERE id = ?", (parent_id,)
         ).fetchone()["status"]
-        if parent_status not in TERMINAL_STATUSES:
+        if parent_status != "done":
             conn.execute(
                 "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
                 (child_id,),
@@ -3936,7 +3742,7 @@ def add_comment(
         cur = conn.execute(
             "INSERT INTO task_comments (task_id, author, body, created_at) "
             "VALUES (?, ?, ?, ?)",
-            (task_id, author.strip(), body, now),
+            (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
         return int(cur.lastrowid or 0)
@@ -4223,10 +4029,6 @@ def _append_event(
     events by attempt. For events that aren't scoped to a single run
     (task created/edited/archived, dependency promotion) leave it None
     and the row carries NULL.
-
-    Event payloads are general functional/audit data and are stored without
-    content-based rewriting. Callers persisting machine-generated failure text
-    must use :func:`_append_diagnostic_event` instead.
     """
     now = int(time.time())
     pl = json.dumps(payload, ensure_ascii=False) if payload else None
@@ -4255,8 +4057,6 @@ def _append_diagnostic_event(
     )
 
 
-
-
 def _end_run(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4276,34 +4076,13 @@ def _end_run(
     existed (e.g. a CLI user calling ``hermes kanban complete`` on a
     task that was never claimed).
     """
-    error = _redact_diagnostic(error)
     now = int(time.time())
     row = conn.execute(
-        "SELECT t.current_run_id, r.metadata AS run_metadata "
-        "FROM tasks t LEFT JOIN task_runs r ON r.id = t.current_run_id "
-        "WHERE t.id = ?",
-        (task_id,),
+        "SELECT current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row or not row["current_run_id"]:
         return None
     run_id = int(row["current_run_id"])
-    # Reconciliation is a continuity receipt, not an outcome detail. Failure,
-    # timeout, reclaim, and retry close the active run through this helper and
-    # must not erase a receipt the worker already persisted on that same run.
-    # Other metadata keeps the historical replacement semantics expected by
-    # completion callers; only this reserved namespace is carried forward.
-    merged_metadata = dict(metadata or {})
-    try:
-        previous_metadata = json.loads(row["run_metadata"] or "{}")
-    except (TypeError, ValueError):
-        previous_metadata = {}
-    if (
-        isinstance(previous_metadata, dict)
-        and isinstance(previous_metadata.get("reconciliation"), dict)
-        and previous_metadata["reconciliation"]
-        and "reconciliation" not in merged_metadata
-    ):
-        merged_metadata["reconciliation"] = previous_metadata["reconciliation"]
     conn.execute(
         """
         UPDATE task_runs
@@ -4336,7 +4115,7 @@ def _end_run(
             outcome,
             summary,
             error,
-            json.dumps(merged_metadata, ensure_ascii=False) if merged_metadata else None,
+            json.dumps(metadata, ensure_ascii=False) if metadata else None,
             now,
             now,
             run_id,
@@ -4379,7 +4158,6 @@ def _synthesize_ended_run(
     (or for clearing it elsewhere in the same txn) since this
     function does NOT touch the tasks row.
     """
-    error = _redact_diagnostic(error)
     now = int(time.time())
     trow = conn.execute(
         "SELECT assignee, current_step_key FROM tasks WHERE id = ?",
@@ -4449,63 +4227,6 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
-def _dependency_fingerprint(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
-    """Fingerprint relevant dependency state without volatile timestamps."""
-    task = conn.execute("SELECT status, result FROM tasks WHERE id = ?", (task_id,)).fetchone()
-    if task is None:
-        return None
-    run = conn.execute(
-        "SELECT outcome, summary, metadata FROM task_runs WHERE task_id = ? "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    state = {"status": task["status"], "result": task["result"], "run": (
-        {"outcome": run["outcome"], "summary": run["summary"], "metadata": run["metadata"]}
-        if run else None)}
-    encoded = json.dumps(state, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
-
-
-def _dependency_wait_payload(conn, task_id, reason, dependency_task_id) -> dict:
-    candidates = [str(dependency_task_id)] if dependency_task_id else []
-    candidates.extend(_TASK_ID_PROSE_RE.findall(reason or ""))
-    candidates.extend(row["parent_id"] for row in conn.execute(
-        "SELECT parent_id FROM task_links WHERE child_id = ? ORDER BY parent_id", (task_id,)
-    ).fetchall())
-    dependency_ids = list(dict.fromkeys(candidates))
-    fingerprints = {}
-    for dep_id in dependency_ids:
-        fingerprint = _dependency_fingerprint(conn, dep_id)
-        if fingerprint is not None:
-            fingerprints[dep_id] = fingerprint
-    return {"reason": reason, "kind": "dependency", "dependency_ids": dependency_ids,
-            "dependency_fingerprints": fingerprints}
-
-
-def _dependency_wait_changed(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Wake only when a persisted dependency state/verdict changes."""
-    event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'dependency_wait' "
-        "ORDER BY id DESC LIMIT 1", (task_id,),
-    ).fetchone()
-    if event is None:
-        return False
-    try:
-        payload = json.loads(event["payload"]) if event["payload"] else {}
-    except (TypeError, ValueError):
-        payload = {}
-    observed = payload.get("dependency_fingerprints")
-    if isinstance(observed, dict) and observed:
-        return any(_dependency_fingerprint(conn, dep_id) != fingerprint
-                   for dep_id, fingerprint in observed.items())
-    parents = conn.execute(
-        "SELECT t.status FROM tasks t JOIN task_links l ON l.parent_id = t.id "
-        "WHERE l.child_id = ?", (task_id,),
-    ).fetchall()
-    return bool(parents) and all(
-        parent["status"] in TERMINAL_STATUSES for parent in parents
-    )
-
-
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
@@ -4548,14 +4269,6 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
-            if _protected_review_handoff_for_task(conn, task_id, role="next"):
-                continue
-            block_kind = conn.execute(
-                "SELECT block_kind FROM tasks WHERE id = ?", (task_id,)
-            ).fetchone()["block_kind"]
-            if (cur_status == "todo" and block_kind == "dependency"
-                    and not _dependency_wait_changed(conn, task_id)):
-                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4586,7 +4299,7 @@ def recompute_ready(
                 "WHERE l.child_id = ?",
                 (task_id,),
             ).fetchall()
-            if all(p["status"] in TERMINAL_STATUSES for p in parents):
+            if all(p["status"] in ("done", "archived") for p in parents):
                 if cur_status == "blocked":
                     # Don't auto-recover tasks that have hit the
                     # circuit-breaker failure limit.  Without this
@@ -4611,194 +4324,12 @@ def recompute_ready(
                     )
                 else:
                     conn.execute(
-                        "UPDATE tasks SET status = 'ready', block_kind = NULL "
-                        "WHERE id = ? AND status = 'todo'", (task_id,),
+                        "UPDATE tasks SET status = 'ready' WHERE id = ? AND status = 'todo'",
+                        (task_id,),
                     )
                 _append_event(conn, task_id, "promoted", None)
                 promoted += 1
     return promoted
-
-
-def _reconciliation_data_version(conn: sqlite3.Connection) -> int:
-    """Return SQLite's external-commit generation for reconciliation CAS."""
-    return int(conn.execute("PRAGMA data_version").fetchone()[0])
-
-
-def _load_reconciliation_context(
-    conn: sqlite3.Connection,
-) -> tuple[list[Any], dict[str, list[Any]], Mapping[str, Any]]:
-    """Load one board snapshot used by every report in a dispatch tick."""
-    from hermes_cli import kanban_diagnostics as _kd
-
-    rows = conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
-    runs_by_task: dict[str, list[Any]] = {str(row["id"]): [] for row in rows}
-    for run in conn.execute("SELECT * FROM task_runs ORDER BY id"):
-        runs_by_task.setdefault(str(run["task_id"]), []).append(run)
-    context = _kd.build_reconciliation_context({
-        str(row["id"]): {
-            "task": row,
-            "_runs": runs_by_task.get(str(row["id"]), []),
-        }
-        for row in rows
-    })
-    return rows, runs_by_task, context
-
-
-def _reconciliation_context_token(context: Mapping[str, Any]) -> str:
-    """Hash the DB-backed reconciliation inputs for snapshot stability."""
-    material = []
-    for task_id, item in sorted(context.items()):
-        task = item["task"]
-        runs = item["_runs"]
-        material.append({
-            "task": {
-                key: task[key]
-                for key in (
-                    "id", "status", "assignee", "workspace_kind",
-                    "workspace_path", "branch_name", "current_run_id",
-                    "claim_lock",
-                )
-            },
-            "runs": [
-                {
-                    "id": int(run["id"]),
-                    "status": run["status"],
-                    "metadata": run["metadata"],
-                    "ended_at": run["ended_at"],
-                }
-                for run in runs
-            ],
-        })
-    return hashlib.sha256(
-        json.dumps(material, sort_keys=True, default=str).encode("utf-8")
-    ).hexdigest()
-
-
-def _reconciliation_reports_from_context(
-    rows: list[Any],
-    runs_by_task: dict[str, list[Any]],
-    context: Mapping[str, Any],
-    wanted: set[str],
-    *,
-    git_probe: Any,
-    profile_roster: Any,
-) -> dict[str, Any]:
-    from hermes_cli import kanban_diagnostics as _kd
-
-    return {
-        task_id: _kd.reconcile_task(
-            row,
-            runs_by_task.get(task_id, []),
-            tasks=context,
-            git_probe=git_probe,
-            profile_roster=profile_roster,
-        )
-        for row in rows
-        if (task_id := str(row["id"])) in wanted
-    }
-
-
-def _reconciliation_reports(
-    conn: sqlite3.Connection,
-    task_ids: Optional[Iterable[str]] = None,
-    *,
-    git_probe=None,
-    profile_roster=None,
-) -> dict[str, Any]:
-    """Probe once against a stable read snapshot, retrying one raced read.
-
-    Git/network work happens outside a write transaction.  A request-scoped
-    probe cache prevents N identical exact-ref calls.  The before/after board
-    token plus ``PRAGMA data_version`` detects both same-connection and
-    cross-connection mutations during the sensor window.
-    """
-    from hermes_cli import kanban_diagnostics as _kd
-
-    probe = (
-        git_probe
-        if isinstance(git_probe, _kd.GitProbeSession)
-        else _kd.cached_git_probe(git_probe)
-    )
-    last_reports: dict[str, Any] = {}
-    for _attempt in range(2):
-        version_before = _reconciliation_data_version(conn)
-        rows, runs_by_task, context = _load_reconciliation_context(conn)
-        wanted = (
-            {str(item) for item in task_ids}
-            if task_ids is not None
-            else {str(row["id"]) for row in rows}
-        )
-        token_before = _reconciliation_context_token(context)
-        reports = _reconciliation_reports_from_context(
-            rows,
-            runs_by_task,
-            context,
-            wanted,
-            git_probe=probe,
-            profile_roster=profile_roster,
-        )
-        version_after = _reconciliation_data_version(conn)
-        _rows_after, _runs_after, context_after = _load_reconciliation_context(conn)
-        token_after = _reconciliation_context_token(context_after)
-        stable = version_before == version_after and token_before == token_after
-        for report in reports.values():
-            report.data_version = version_after
-            report.snapshot_stable = stable
-        if stable:
-            return reports
-        last_reports = reports
-
-    now = int(time.time())
-    for report in last_reports.values():
-        report.snapshot_stable = False
-        report.findings.insert(0, _kd.Diagnostic(
-            kind="reconciliation_changed",
-            severity="warning",
-            title="Reconciliation inputs changed during probe",
-            detail="The board changed twice while the exact-head sensor was running.",
-            actions=[_kd.DiagnosticAction(
-                kind="cli_hint",
-                label="retry the bounded reconciliation probe",
-                suggested=True,
-            )],
-            first_seen_at=now,
-            last_seen_at=now,
-            data={
-                "finding_code": "reconciliation_changed",
-                "dispatch_blocked": True,
-                "blocker_class": "transient",
-                "sla_seconds": 900,
-                "next_owner": "retry",
-            },
-        ))
-    return last_reports
-
-
-def _reconciliation_claim_allowed(
-    conn: sqlite3.Connection,
-    task_id: str,
-    report: Any,
-) -> bool:
-    """Validate the pre-probe fingerprint inside the claim transaction."""
-    if report is None or not report.opted_in:
-        return True
-    if not report.snapshot_stable or not report.actionable:
-        return False
-    if (
-        report.data_version is not None
-        and _reconciliation_data_version(conn) != report.data_version
-    ):
-        return False
-    from hermes_cli import kanban_diagnostics as _kd
-
-    _rows, runs_by_task, context = _load_reconciliation_context(conn)
-    item = context.get(str(task_id))
-    if item is None:
-        return False
-    current = _kd.reconciliation_state_fingerprint(
-        item["task"], runs_by_task.get(str(task_id), []), tasks=context,
-    )
-    return current == report.db_fingerprint
 
 
 # ---------------------------------------------------------------------------
@@ -4811,57 +4342,16 @@ def claim_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-    reconciliation_probe=None,
-    profile_roster=None,
-    reconciliation_report=None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
-    if reconciliation_report is None:
-        if profile_roster is None:
-            try:
-                from hermes_cli.profiles import profile_exists as profile_roster
-            except Exception:
-                profile_roster = None
-        reconciliation_report = _reconciliation_reports(
-            conn,
-            [task_id],
-            git_probe=reconciliation_probe,
-            profile_roster=profile_roster,
-        ).get(str(task_id))
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if not _reconciliation_claim_allowed(
-            conn, task_id, reconciliation_report,
-        ):
-            return None
-        wait = conn.execute(
-            "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
-        ).fetchone()
-        if _protected_review_handoff_for_task(conn, task_id, role="next"):
-            if wait and wait["status"] == "ready":
-                conn.execute(
-                    "UPDATE tasks SET status='todo', block_kind=NULL "
-                    "WHERE id=? AND status='ready'", (task_id,),
-                )
-                _append_event(
-                    conn, task_id, "claim_rejected",
-                    {"reason": "review_successor_protected"},
-                )
-            return None
-        if (wait and wait["status"] == "ready" and wait["block_kind"] == "dependency"
-                and not _dependency_wait_changed(conn, task_id)):
-            conn.execute(
-                "UPDATE tasks SET status = 'todo' WHERE id = ? AND status = 'ready'",
-                (task_id,),
-            )
-            _append_event(conn, task_id, "claim_rejected", {"reason": "dependency_unchanged"})
-            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -4874,8 +4364,8 @@ def claim_task(
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
-            (task_id, *terminal_statuses),
+            "WHERE l.child_id = ? AND p.status NOT IN ('done', 'archived') LIMIT 1",
+            (task_id,),
         ).fetchone()
         if undone:
             conn.execute(
@@ -4887,54 +4377,6 @@ def claim_task(
                 conn, task_id, "claim_rejected",
                 {"reason": "parents_not_done"},
             )
-            return None
-        # Defensive duplicate-execution fence. Normal creation-time
-        # idempotency already prevents this state, but imported/legacy/manual
-        # rows may violate it. Never let a second task with the same explicit
-        # scope key enter the same workspace while the first is running.
-        duplicate = conn.execute(
-            """
-            SELECT other.id, other.current_run_id
-              FROM tasks candidate
-              JOIN tasks other
-                ON other.id != candidate.id
-               AND other.status = 'running'
-               AND other.workspace_path = candidate.workspace_path
-               AND other.idempotency_key = candidate.idempotency_key
-             WHERE candidate.id = ?
-               AND candidate.workspace_path IS NOT NULL
-               AND candidate.workspace_path != ''
-               AND candidate.idempotency_key IS NOT NULL
-               AND candidate.idempotency_key != ''
-             LIMIT 1
-            """,
-            (task_id,),
-        ).fetchone()
-        if duplicate:
-            _append_event(
-                conn, task_id, "claim_rejected",
-                {
-                    "reason": "duplicate_active_execution_requires_fence",
-                    "conflicting_task_id": duplicate["id"],
-                    "conflicting_run_id": duplicate["current_run_id"],
-                },
-            )
-            return None
-        active_review = conn.execute(
-            "SELECT 1 FROM review_handoffs "
-            "WHERE review_task_id=? AND state='active'",
-            (task_id,),
-        ).fetchone()
-        if active_review:
-            # A review gate is claimed through claim_review_task and must not
-            # enter the ordinary ready -> running worker lane if stale state
-            # or a manual writer left it marked ready.
-            conn.execute(
-                "UPDATE tasks SET status='review', block_kind=NULL "
-                "WHERE id=? AND status='ready'",
-                (task_id,),
-            )
-            _append_event(conn, task_id, "review_lane_restored", None)
             return None
         # Defensive: if a prior run somehow leaked (invariant violation from
         # an unknown code path), close it as 'reclaimed' so we don't strand
@@ -5023,9 +4465,6 @@ def claim_review_task(
     *,
     ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
-    reconciliation_probe=None,
-    profile_roster=None,
-    reconciliation_report=None,
 ) -> Optional[Task]:
     """Atomically transition ``review -> running``.
 
@@ -5039,26 +4478,10 @@ def claim_review_task(
     Creates a new run entry so the review agent's lifecycle is tracked
     independently from the original worker run.
     """
-    if reconciliation_report is None:
-        if profile_roster is None:
-            try:
-                from hermes_cli.profiles import profile_exists as profile_roster
-            except Exception:
-                profile_roster = None
-        reconciliation_report = _reconciliation_reports(
-            conn,
-            [task_id],
-            git_probe=reconciliation_probe,
-            profile_roster=profile_roster,
-        ).get(str(task_id))
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
-        if not _reconciliation_claim_allowed(
-            conn, task_id, reconciliation_report,
-        ):
-            return None
         cur = conn.execute(
             """
             UPDATE tasks
@@ -5810,6 +5233,60 @@ def _verify_created_cards(
 _TASK_ID_PROSE_RE = re.compile(r"\bt_[a-f0-9]{8,}\b")
 
 
+def _dependency_fingerprint(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> Optional[str]:
+    task = conn.execute(
+        "SELECT status, result FROM tasks WHERE id=?", (task_id,),
+    ).fetchone()
+    if task is None:
+        return None
+    run = conn.execute(
+        "SELECT outcome, summary, metadata FROM task_runs WHERE task_id=? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    state = {
+        "status": task["status"],
+        "result": task["result"],
+        "run": dict(run) if run else None,
+    }
+    encoded = json.dumps(
+        state, sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _dependency_wait_payload(
+    conn: sqlite3.Connection,
+    task_id: str,
+    reason: Optional[str],
+    dependency_task_id: Optional[str],
+) -> dict[str, Any]:
+    candidates = [str(dependency_task_id)] if dependency_task_id else []
+    candidates.extend(_TASK_ID_PROSE_RE.findall(reason or ""))
+    candidates.extend(
+        row["parent_id"]
+        for row in conn.execute(
+            "SELECT parent_id FROM task_links WHERE child_id=? ORDER BY parent_id",
+            (task_id,),
+        ).fetchall()
+    )
+    dependency_ids = list(dict.fromkeys(candidates))
+    fingerprints = {
+        dep_id: fingerprint
+        for dep_id in dependency_ids
+        if (fingerprint := _dependency_fingerprint(conn, dep_id)) is not None
+    }
+    return {
+        "reason": reason,
+        "kind": "dependency",
+        "dependency_ids": dependency_ids,
+        "dependency_fingerprints": fingerprints,
+    }
+
+
 def _scan_prose_for_phantom_ids(
     conn: sqlite3.Connection,
     text: str,
@@ -6470,7 +5947,7 @@ def _cleanup_workspace(conn: sqlite3.Connection, task_id: str) -> None:
         _active_children = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks t ON t.id = l.child_id "
-            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only', 'failed', 'cancelled') "
+            "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
             "LIMIT 1",
             (task_id,),
         ).fetchone()
@@ -6534,7 +6011,7 @@ def _try_cleanup_parent_workspaces(conn: sqlite3.Connection, task_id: str) -> No
             active = conn.execute(
                 "SELECT 1 FROM task_links l "
                 "JOIN tasks t ON t.id = l.child_id "
-                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'superseded', 'stale_continuity_only', 'failed', 'cancelled') "
+                "WHERE l.parent_id = ? AND t.status NOT IN ('done', 'archived', 'failed', 'cancelled') "
                 "LIMIT 1",
                 (parent_id,),
             ).fetchone()
@@ -6957,19 +6434,6 @@ def block_task(
                     conn, task_id, reason, dependency_task_id,
                 )
             )
-            # A dependency wait without a stable unfinished dependency has no
-            # valid release condition. Explicit dependency ids, task ids in
-            # the reason, and linked parents are all compatibility-supported
-            # identity sources; at least one must resolve to a non-terminal
-            # task. Validate before the CAS/update and all run/event writes so
-            # rejection is completely mutation-free.
-            unfinished_dependency = any(
-                (dependency := get_task(conn, dep_id)) is not None
-                and dependency.status not in TERMINAL_STATUSES
-                for dep_id in dependency_payload["dependency_ids"]
-            )
-            if not unfinished_dependency and not _after_reap:
-                raise ValueError("dependency_wait_requires_unfinished_parent")
             cur = conn.execute(
                 """
                 UPDATE tasks
@@ -7387,7 +6851,7 @@ def promote_task(
         ).fetchall()
         unsatisfied = [
             p["id"] for p in parents
-            if p["status"] not in TERMINAL_STATUSES
+            if p["status"] not in ("done", "archived")
         ]
         if unsatisfied:
             return False, (
@@ -7425,7 +6889,7 @@ def promote_task(
                 "unblock/reclaim handling instead of ordinary promotion"
             )
         upd = conn.execute(
-            "UPDATE tasks SET status = 'ready', block_kind = NULL "
+            "UPDATE tasks SET status = 'ready' "
             "WHERE id = ? AND status IN ('todo', 'blocked')",
             (task_id,),
         )
@@ -7493,8 +6957,8 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         undone_parents = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
-            f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
-            (task_id, *terminal_statuses),
+            "WHERE l.child_id = ? AND p.status != 'done' LIMIT 1",
+            (task_id,),
         ).fetchone()
         new_status = "review" if active_review else ("todo" if undone_parents else "ready")
         # NOTE: deliberately does NOT touch ``block_recurrences`` or
@@ -7509,8 +6973,7 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
         # start for the dispatcher's retry budget.
         cur = conn.execute(
             "UPDATE tasks SET status = ?, current_run_id = NULL, "
-            "consecutive_failures = 0, last_failure_error = NULL, "
-            "failure_classification = NULL, failure_fingerprint = NULL "
+            "consecutive_failures = 0, last_failure_error = NULL "
             "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (new_status, task_id),
         )
@@ -7858,712 +7321,31 @@ def _protected_review_handoff_for_task(
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    db_path = _connection_main_db_path(conn)
-    if db_path is None:
-        return False
-    # Serialize the reclaim-to-archive handoff with dispatch. Otherwise the
-    # task could be briefly ready after scope collection and get claimed again
-    # before the archive CAS.
-    with _dispatch_tick_lock(db_path) as lock_outcome:
-        if not getattr(lock_outcome, "acquired", bool(lock_outcome)):
-            return False
+    with write_txn(conn):
         if _protected_review_handoff_for_task(conn, task_id):
             return False
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, current_run_id "
-            "FROM tasks WHERE id = ?",
+        cur = conn.execute(
+            "UPDATE tasks SET status = 'archived', "
+            "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL "
+            "WHERE id = ? AND status != 'archived'",
             (task_id,),
-        ).fetchone()
-        if row is None or row["status"] in NON_ACTIONABLE_STATUSES:
+        )
+        if cur.rowcount != 1:
             return False
-        if (
-            row["status"] == "running"
-            or row["claim_lock"] is not None
-            or row["worker_pid"] is not None
-            or row["current_run_id"] is not None
-        ):
-            if not _reclaim_task_locked(
-                conn,
-                task_id,
-                reason="archive",
-            ):
-                # Scope active/unknown or failed stop: retain the full claim.
-                return False
-        with write_txn(conn):
-            cur = conn.execute(
-                "UPDATE tasks SET status = 'archived' "
-                "WHERE id = ? AND status NOT IN "
-                "('running', 'archived', 'superseded', 'stale_continuity_only') "
-                "AND claim_lock IS NULL AND worker_pid IS NULL "
-                "AND current_run_id IS NULL",
-                (task_id,),
-            )
-            if cur.rowcount != 1:
-                return False
-            _append_event(conn, task_id, "archived")
+        # If archive happened while a run was still in flight (e.g. user
+        # archived a running task from the dashboard), close that run with
+        # outcome='reclaimed' so attempt history isn't orphaned.
+        run_id = _end_run(
+            conn, task_id,
+            outcome="reclaimed", status="reclaimed",
+            summary="task archived with run still active",
+        )
+        _append_event(conn, task_id, "archived", None, run_id=run_id)
     # ``archived`` parents no longer block children, same as ``done``.
     # Promote newly-unblocked dependents immediately instead of waiting
     # for a later dispatcher tick.
     recompute_ready(conn)
     return True
-
-
-def _close_run_for_control_plane(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    outcome: str,
-    summary: str,
-    metadata: Optional[dict] = None,
-) -> Optional[int]:
-    run_id = _end_run(
-        conn,
-        task_id,
-        outcome=outcome,
-        status=outcome,
-        summary=summary,
-        metadata=metadata,
-    )
-    if run_id is None:
-        run_id = _synthesize_ended_run(
-            conn,
-            task_id,
-            outcome=outcome,
-            summary=summary,
-            metadata=metadata,
-        )
-    return run_id
-
-
-def mark_task_non_actionable(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    status: str,
-    actor: str,
-    reason: Optional[str] = None,
-    superseded_by: Optional[str] = None,
-    live_path_task_id: Optional[str] = None,
-    canonical_live_path: Optional[str] = None,
-) -> bool:
-    """Mark a historical row as explicit non-actionable board history."""
-    if status not in {"superseded", "stale_continuity_only"}:
-        raise ValueError("status must be 'superseded' or 'stale_continuity_only'")
-    actor = (actor or "").strip()
-    if not actor:
-        raise ValueError("actor is required")
-    target_ids = [t for t in (superseded_by, live_path_task_id) if t]
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, current_run_id "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown task {task_id}")
-        if (
-            row["status"] == "running"
-            or row["claim_lock"] is not None
-            or row["worker_pid"] is not None
-            or row["current_run_id"] is not None
-        ):
-            raise ValueError("cannot mark a task non-actionable while its run is active")
-        if target_ids:
-            missing = _find_missing_parents(conn, target_ids)
-            if missing:
-                raise ValueError(f"unknown target task(s): {', '.join(missing)}")
-        current = row["status"]
-        if current == status:
-            existing = conn.execute(
-                "SELECT superseded_by, live_path_task_id, canonical_live_path "
-                "FROM tasks WHERE id = ?",
-                (task_id,),
-            ).fetchone()
-            if (
-                (existing["superseded_by"] or None) == (superseded_by or None)
-                and (existing["live_path_task_id"] or None) == (live_path_task_id or None)
-                and (existing["canonical_live_path"] or None) == (canonical_live_path or None)
-            ):
-                _append_event(
-                    conn,
-                    task_id,
-                    "non_actionable_noop",
-                    {"status": status, "actor": actor, "reason": reason},
-                )
-                return True
-        run_id = _close_run_for_control_plane(
-            conn,
-            task_id,
-            outcome=status,
-            summary=reason or f"task marked {status}",
-            metadata={
-                "actor": actor,
-                "superseded_by": superseded_by,
-                "live_path_task_id": live_path_task_id,
-                "canonical_live_path": canonical_live_path,
-            },
-        )
-        conn.execute(
-            """
-            UPDATE tasks
-               SET status = ?,
-                   superseded_by = ?,
-                   live_path_task_id = ?,
-                   canonical_live_path = ?,
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
-             WHERE id = ?
-            """,
-            (status, superseded_by, live_path_task_id, canonical_live_path, task_id),
-        )
-        _append_event(
-            conn,
-            task_id,
-            status,
-            {
-                "actor": actor,
-                "reason": reason,
-                "superseded_by": superseded_by,
-                "live_path_task_id": live_path_task_id,
-                "canonical_live_path": canonical_live_path,
-            },
-            run_id=run_id,
-        )
-    recompute_ready(conn)
-    return True
-
-
-def _task_has_ancestor(
-    conn: sqlite3.Connection,
-    task_id: str,
-    ancestor_id: str,
-) -> bool:
-    seen: set[str] = set()
-    stack = parent_ids(conn, task_id)
-    while stack:
-        cur = stack.pop()
-        if cur == ancestor_id:
-            return True
-        if cur in seen:
-            continue
-        seen.add(cur)
-        stack.extend(parent_ids(conn, cur))
-    return False
-
-
-def validate_detached_live_path_mapping(
-    conn: sqlite3.Connection,
-    *,
-    source_task_id: str,
-    detached_task_id: str,
-    allow_terminal_evidence: bool = False,
-) -> dict[str, Any]:
-    source = conn.execute(
-        "SELECT id, status FROM tasks WHERE id = ?",
-        (source_task_id,),
-    ).fetchone()
-    detached = conn.execute(
-        "SELECT id, status, workspace_path FROM tasks WHERE id = ?",
-        (detached_task_id,),
-    ).fetchone()
-    if source is None:
-        raise ValueError(f"unknown source task {source_task_id}")
-    if detached is None:
-        raise ValueError(f"unknown detached task {detached_task_id}")
-    if source["status"] != "blocked":
-        raise ValueError(f"source task {source_task_id} must be blocked")
-    terminal_evidence: Optional[dict[str, Any]] = None
-    if allow_terminal_evidence:
-        if detached["status"] != "done":
-            raise ValueError(
-                "allow_terminal_evidence mappings only accept detached tasks "
-                f"with status=done; got {detached['status']!r}"
-            )
-        terminal_evidence = _validated_terminal_evidence(conn, detached_task_id)
-    elif detached["status"] not in DETACHED_LIVE_PATH_STATUSES:
-        raise ValueError(
-            f"detached task {detached_task_id} is not an actionable live path "
-            f"(status={detached['status']})"
-        )
-    if _task_has_ancestor(conn, detached_task_id, source_task_id):
-        raise ValueError(
-            f"detached task {detached_task_id} is parent-gated behind {source_task_id}"
-        )
-    terminal_placeholders, terminal_statuses = _terminal_status_sql()
-    children = conn.execute(
-        f"""
-        SELECT t.id, t.status, t.claim_lock, t.worker_pid, t.current_run_id
-          FROM tasks t
-          JOIN task_links l ON l.child_id = t.id
-         WHERE l.parent_id = ?
-           AND t.status NOT IN ({terminal_placeholders})
-         ORDER BY t.id
-        """,
-        (source_task_id, *terminal_statuses),
-    ).fetchall()
-    active_children = [
-        row["id"]
-        for row in children
-        if (
-            row["status"] == "running"
-            or row["claim_lock"] is not None
-            or row["worker_pid"] is not None
-            or row["current_run_id"] is not None
-        )
-    ]
-    if active_children:
-        raise ValueError(
-            "cannot park an active child before its worker scope is collected"
-        )
-    validation = {
-        "source_task_id": source_task_id,
-        "source_status": source["status"],
-        "detached_task_id": detached_task_id,
-        "detached_status": detached["status"],
-        "canonical_live_path": detached["workspace_path"] or detached_task_id,
-        "children_to_park": [{"id": r["id"], "status": r["status"]} for r in children],
-        "mapping_kind": "terminal_evidence" if allow_terminal_evidence else "live_runnable_path",
-    }
-    if terminal_evidence is not None:
-        validation["terminal_evidence"] = terminal_evidence
-    return validation
-
-
-def _validated_terminal_evidence(
-    conn: sqlite3.Connection,
-    task_id: str,
-) -> dict[str, Any]:
-    task = conn.execute(
-        "SELECT id, status, completed_at, result FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if task is None:
-        raise ValueError(f"unknown detached task {task_id}")
-    if task["status"] != "done":
-        raise ValueError(f"terminal evidence task {task_id} must be done")
-
-    evidence: dict[str, Any] = {"task_completed_at": task["completed_at"]}
-    completed_event = conn.execute(
-        """
-        SELECT id, payload
-          FROM task_events
-         WHERE task_id = ?
-           AND kind = 'completed'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (task_id,),
-    ).fetchone()
-    if completed_event is not None:
-        payload: dict[str, Any] = {}
-        if completed_event["payload"]:
-            try:
-                parsed = json.loads(completed_event["payload"])
-                if isinstance(parsed, dict):
-                    payload = parsed
-            except Exception:
-                payload = {}
-        evidence["completed_event_id"] = int(completed_event["id"])
-        if payload.get("summary"):
-            evidence["summary"] = str(payload["summary"])[:400]
-        if payload.get("verified_cards"):
-            evidence["verified_cards"] = payload["verified_cards"]
-
-    closeout_event = conn.execute(
-        """
-        SELECT id, payload
-          FROM task_events
-         WHERE task_id = ?
-           AND kind = 'controller_closeout'
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (task_id,),
-    ).fetchone()
-    if closeout_event is not None:
-        payload = {}
-        if closeout_event["payload"]:
-            try:
-                parsed = json.loads(closeout_event["payload"])
-                if isinstance(parsed, dict):
-                    payload = parsed
-            except Exception:
-                payload = {}
-        receipt = payload.get("receipt") if isinstance(payload, dict) else None
-        verdict = str((receipt or {}).get("verdict") or "").strip().lower()
-        if verdict in CONTROLLER_ACCEPT_VERDICTS:
-            evidence["controller_closeout_event_id"] = int(closeout_event["id"])
-            evidence["acceptance_verdict"] = verdict
-
-    completed_run = conn.execute(
-        """
-        SELECT id, outcome, summary, metadata
-          FROM task_runs
-         WHERE task_id = ?
-           AND ended_at IS NOT NULL
-           AND outcome IN ('completed', 'controller_closeout')
-         ORDER BY id DESC
-         LIMIT 1
-        """,
-        (task_id,),
-    ).fetchone()
-    if completed_run is not None:
-        evidence["run_id"] = int(completed_run["id"])
-        evidence["run_outcome"] = completed_run["outcome"]
-        if completed_run["summary"]:
-            evidence.setdefault("summary", str(completed_run["summary"])[:400])
-
-    if not (
-        evidence.get("completed_event_id")
-        or evidence.get("controller_closeout_event_id")
-        or evidence.get("run_id")
-    ):
-        raise ValueError(
-            f"detached terminal task {task_id} lacks positive completion/acceptance evidence"
-        )
-    return evidence
-
-
-def _park_detached_live_path_locked(
-    conn: sqlite3.Connection,
-    *,
-    validation: dict[str, Any],
-    actor: str,
-    reason: Optional[str],
-) -> dict[str, Any]:
-    source_task_id = validation["source_task_id"]
-    detached_task_id = validation["detached_task_id"]
-    canonical = validation["canonical_live_path"]
-    parked: list[str] = []
-    conn.execute(
-        """
-        UPDATE tasks
-           SET live_path_task_id = ?,
-               canonical_live_path = ?
-         WHERE id = ?
-        """,
-        (detached_task_id, canonical, source_task_id),
-    )
-    _append_event(
-        conn,
-        source_task_id,
-        (
-            "detached_terminal_evidence"
-            if validation.get("mapping_kind") == "terminal_evidence"
-            else "detached_live_path"
-        ),
-        {
-            "actor": actor,
-            "detached_task_id": detached_task_id,
-            "canonical_live_path": canonical,
-            "reason": reason,
-            "mapping_kind": validation.get("mapping_kind", "live_runnable_path"),
-            "terminal_evidence": validation.get("terminal_evidence"),
-        },
-    )
-    for child in validation["children_to_park"]:
-        cid = child["id"]
-        run_id = _close_run_for_control_plane(
-            conn,
-            cid,
-            outcome="stale_continuity_only",
-            summary=reason or f"parked behind detached live path {detached_task_id}",
-            metadata={
-                "actor": actor,
-                "source_task_id": source_task_id,
-                "live_path_task_id": detached_task_id,
-            },
-        )
-        conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'stale_continuity_only',
-                   superseded_by = ?,
-                   live_path_task_id = ?,
-                   canonical_live_path = ?,
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
-             WHERE id = ?
-            """,
-            (detached_task_id, detached_task_id, canonical, cid),
-        )
-        _append_event(
-            conn,
-            cid,
-            "stale_continuity_only",
-            {
-                "actor": actor,
-                "source_task_id": source_task_id,
-                "live_path_task_id": detached_task_id,
-                "reason": reason,
-            },
-            run_id=run_id,
-        )
-        parked.append(cid)
-    return {
-        "source_task_id": source_task_id,
-        "live_path_task_id": detached_task_id,
-        "mapping_kind": validation.get("mapping_kind", "live_runnable_path"),
-        "terminal_evidence": validation.get("terminal_evidence"),
-        "parked_children": parked,
-    }
-
-
-def park_blocked_source_detached_path(
-    conn: sqlite3.Connection,
-    *,
-    source_task_id: str,
-    detached_task_id: str,
-    actor: str,
-    reason: Optional[str] = None,
-) -> dict[str, Any]:
-    """Record an explicit detached live path and stale parent-gated mirrors."""
-    actor = (actor or "").strip()
-    if not actor:
-        raise ValueError("actor is required")
-    with write_txn(conn):
-        # Keep validation and mutation under one write lock so another
-        # controller cannot change either task between the two phases.
-        validation = validate_detached_live_path_mapping(
-            conn,
-            source_task_id=source_task_id,
-            detached_task_id=detached_task_id,
-        )
-        result = _park_detached_live_path_locked(
-            conn,
-            validation=validation,
-            actor=actor,
-            reason=reason,
-        )
-    recompute_ready(conn)
-    return result
-
-
-def reconcile_detached_live_paths(
-    conn: sqlite3.Connection,
-    entries: Iterable[dict[str, Any]],
-    *,
-    actor: str,
-    reason: Optional[str] = None,
-    apply: bool = False,
-) -> dict[str, Any]:
-    actor = (actor or "").strip()
-    if not actor:
-        raise ValueError("actor is required")
-    normalized_entries: list[tuple[str, str, bool]] = []
-    for item in entries:
-        source = str(item.get("source_task_id") or item.get("source") or "").strip()
-        detached = str(item.get("detached_task_id") or item.get("detached") or "").strip()
-        if not source or not detached:
-            raise ValueError("each entry requires source_task_id and detached_task_id")
-        allow_terminal_evidence = bool(item.get("allow_terminal_evidence"))
-        normalized_entries.append((source, detached, allow_terminal_evidence))
-    validations: list[dict[str, Any]] = []
-    applied: list[dict[str, Any]] = []
-    if apply:
-        with write_txn(conn):
-            # Validate every mapping while holding the write lock and before
-            # the first mutation, preserving the all-or-nothing contract even
-            # when another controller is active.
-            validations = [
-                validate_detached_live_path_mapping(
-                    conn,
-                    source_task_id=source,
-                    detached_task_id=detached,
-                    allow_terminal_evidence=allow_terminal_evidence,
-                )
-                for source, detached, allow_terminal_evidence in normalized_entries
-            ]
-            for validation in validations:
-                applied.append(
-                    _park_detached_live_path_locked(
-                        conn,
-                        validation=validation,
-                        actor=actor,
-                        reason=reason,
-                    )
-                )
-        recompute_ready(conn)
-    else:
-        validations = [
-            validate_detached_live_path_mapping(
-                conn,
-                source_task_id=source,
-                detached_task_id=detached,
-                allow_terminal_evidence=allow_terminal_evidence,
-            )
-            for source, detached, allow_terminal_evidence in normalized_entries
-        ]
-    return {"preview": validations, "applied": applied}
-
-
-def _validate_controller_receipt(
-    conn: sqlite3.Connection,
-    task_id: str,
-    receipt: dict[str, Any],
-) -> dict[str, Any]:
-    if not isinstance(receipt, dict):
-        raise ValueError("receipt must be a JSON object")
-    required = ("accepted_by", "accepted_at", "verdict", "evidence")
-    missing = [k for k in required if not receipt.get(k)]
-    if missing:
-        raise ValueError(f"receipt missing required field(s): {', '.join(missing)}")
-    verdict = str(receipt.get("verdict") or "").strip().lower()
-    verdict = verdict.replace("-", "_").replace(" ", "_")
-    if verdict not in CONTROLLER_ACCEPT_VERDICTS:
-        raise ValueError(
-            "receipt.verdict must be an explicit acceptance verdict "
-            f"({', '.join(sorted(CONTROLLER_ACCEPT_VERDICTS))}); got {receipt.get('verdict')!r}"
-        )
-    evidence = receipt.get("evidence")
-    if isinstance(evidence, str):
-        if not evidence.strip():
-            raise ValueError("receipt.evidence must be nonempty")
-    elif isinstance(evidence, (list, tuple)):
-        if not [x for x in evidence if str(x).strip()]:
-            raise ValueError("receipt.evidence must be nonempty")
-    else:
-        raise ValueError("receipt.evidence must be a nonempty string or list")
-    live_path_task_id = receipt.get("live_path_task_id")
-    row = conn.execute(
-        "SELECT live_path_task_id FROM tasks WHERE id = ?",
-        (task_id,),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"unknown task {task_id}")
-    expected_live = row["live_path_task_id"]
-    if expected_live and not live_path_task_id:
-        raise ValueError("receipt.live_path_task_id is required for this task")
-    if live_path_task_id:
-        target = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (str(live_path_task_id),),
-        ).fetchone()
-        if target is None:
-            raise ValueError(f"receipt.live_path_task_id {live_path_task_id} does not exist")
-        receipt = dict(receipt)
-        receipt["live_path_task_id"] = str(live_path_task_id)
-    normalized = dict(receipt)
-    normalized["verdict"] = verdict
-    return normalized
-
-
-def controller_closeout_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    receipt: dict[str, Any],
-    actor: str,
-    result: Optional[str] = None,
-) -> bool:
-    """Controller-only acceptance closeout for helper/source tasks."""
-    actor = (actor or "").strip()
-    if not actor:
-        raise ValueError("actor is required")
-    with write_txn(conn):
-        normalized_receipt = _validate_controller_receipt(conn, task_id, receipt)
-        row = conn.execute(
-            "SELECT status, claim_lock, worker_pid, current_run_id "
-            "FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError(f"unknown task {task_id}")
-        if row["status"] in NON_ACTIONABLE_STATUSES:
-            raise ValueError(f"cannot controller-closeout non-actionable task {task_id}")
-        if (
-            row["status"] == "running"
-            or row["claim_lock"] is not None
-            or row["worker_pid"] is not None
-            or row["current_run_id"] is not None
-        ):
-            raise ValueError("cannot controller-closeout while the task run is active")
-        now = int(time.time())
-        summary = result or f"controller accepted: {normalized_receipt['verdict']}"
-        run_id = _close_run_for_control_plane(
-            conn,
-            task_id,
-            outcome="controller_closeout",
-            summary=summary,
-            metadata={"actor": actor, "receipt": normalized_receipt},
-        )
-        conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'done',
-                   result = ?,
-                   completed_at = ?,
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL,
-                   block_kind = NULL,
-                   block_recurrences = 0,
-                   consecutive_failures = 0,
-                   last_failure_error = NULL
-             WHERE id = ?
-            """,
-            (summary, now, task_id),
-        )
-        _append_event(
-            conn,
-            task_id,
-            "controller_closeout",
-            {"actor": actor, "receipt": normalized_receipt},
-            run_id=run_id,
-        )
-    recompute_ready(conn)
-    return True
-
-
-
-
-def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
-    """Hard-delete a task and cascade to all related rows.
-
-    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
-    we explicitly delete from child tables first, then the task row.
-    This keeps the operation atomic (single ``write_txn``).
-
-    Returns ``True`` if the task existed and was deleted, ``False``
-    if the task was not found.
-    """
-    with write_txn(conn):
-        if _protected_review_handoff_for_task(conn, task_id):
-            return False
-        conn.execute(
-            "DELETE FROM review_handoffs WHERE source_task_id=? "
-            "OR review_task_id=? OR next_task_id=?",
-            (task_id, task_id, task_id),
-        )
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
-        if cur.rowcount != 1:
-            return False
-        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
-        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
-    recompute_ready(conn)
-    return True
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -8595,11 +7377,38 @@ def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
         conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
-        conn.execute("DELETE FROM kanban_continuations WHERE task_id = ?", (task_id,))
         cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
         return cur.rowcount == 1
 
 
+def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Hard-delete a task and cascade to all related rows.
+
+    Because the schema does not use ``ON DELETE CASCADE`` foreign keys,
+    we explicitly delete from child tables first, then the task row.
+    This keeps the operation atomic (single ``write_txn``).
+
+    Returns ``True`` if the task existed and was deleted, ``False``
+    if the task was not found.
+    """
+    with write_txn(conn):
+        if _protected_review_handoff_for_task(conn, task_id):
+            return False
+        conn.execute(
+            "DELETE FROM review_handoffs WHERE source_task_id=? "
+            "OR review_task_id=? OR next_task_id=?",
+            (task_id, task_id, task_id),
+        )
+        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        if cur.rowcount != 1:
+            return False
+        conn.execute("DELETE FROM task_links WHERE parent_id = ? OR child_id = ?", (task_id, task_id))
+        conn.execute("DELETE FROM task_comments WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_events WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM task_runs WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM kanban_notify_subs WHERE task_id = ?", (task_id,))
+    recompute_ready(conn)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -8927,11 +7736,6 @@ def schedule_task(
                 "explicit review successor gate remains protected until the review "
                 "handoff is approved"
             )
-        if _active_review_handoff_for_task(conn, task_id) is not None:
-            raise ValueError(
-                "active review lifecycle tasks cannot be scheduled; submit or "
-                "reclaim the explicit review verdict first"
-            )
         params: list[Any] = [task_id]
         sql = """
             UPDATE tasks
@@ -9024,6 +7828,8 @@ class DispatchResult:
     """Outcome of a single ``dispatch`` pass."""
 
     reclaimed: int = 0
+    worker_reaps: list[dict[str, Any]] = field(default_factory=list)
+    """Phase-B terminal worker-reap decisions made before maintenance."""
     promoted: int = 0
     spawned: list[tuple[str, str, str]] = field(default_factory=list)
     """List of ``(task_id, assignee, workspace_path)`` triples."""
@@ -9071,42 +7877,15 @@ class DispatchResult:
     (EX_TEMPFAIL sentinel exit) and were released back to ``ready`` WITHOUT
     counting a failure. These never trip the circuit breaker — a long quota
     window just makes the task bounce cheaply until the window clears."""
-    capability_blocked: list[tuple[str, list[str], list[str]]] = field(default_factory=list)
-    """Tasks blocked/skipped by capability preflight as
-    ``(task_id, required, missing)``. In dry-run these are reported without
-    mutating the task; in apply mode they become capability-blocked before any
-    claim/run/spawn is created."""
-    skipped_reconciliation: list[tuple[str, str]] = field(default_factory=list)
-    """Task ids skipped by the repo/ref/worktree/claim reconciliation guard."""
-    reconciliation: dict[str, dict[str, Any]] = field(default_factory=dict)
-    """Machine-readable reports from the single bounded sensor snapshot."""
-    continuations: list[dict[str, Any]] = field(default_factory=list)
-    """Bounded classified controller decisions (never product actions)."""
     skipped_locked: bool = False
     """True when this tick was skipped because another process already held
     the board's dispatch lock (issue #35240). A losing dispatcher does no
     DB writes this tick — the lock holder is making progress on the same
     board. This is the steady-state signal that a single-writer guard is
     actively preventing two dispatchers from racing on ``kanban.db``."""
-    dispatch_lock_error: Optional[str] = None
-    """Bounded, value-safe lock trust/setup failure category, or ``None``.
-
-    Unlike ``skipped_locked``, this means no verified competing dispatcher
-    exists to make progress. Values are internal literals and never include
-    paths, exception text, task data, or secrets."""
-
-    continuation_decisions: list[dict[str, Any]] = field(default_factory=list)
-    worker_reaps: list[dict[str, Any]] = field(default_factory=list)
-    """Bounded exact-identity terminal reaper decisions for this tick."""
-    scope_cleanup: list[dict[str, Any]] = field(default_factory=list)
-    """Bounded ended-run scope reconciliation decisions.
-
-    Entries contain only task/run ids plus fixed action/reason literals. Scope
-    unit names, user-bus paths, receipt payloads, and manager addresses are
-    deliberately excluded from this operator-facing surface.
-    """
     maintenance_conflicts: list[dict[str, Any]] = field(default_factory=list)
     """Terminal-intent CAS conflicts observed by maintenance sensors."""
+
 
 # Bounded registry of recently-reaped worker child exits, populated by the
 # reap loop at the top of ``dispatch_once`` and consulted by
@@ -9235,23 +8014,9 @@ def _pid_alive(pid: Optional[int]) -> bool:
     """
     if not pid or pid <= 0:
         return False
-    if _IS_WINDOWS:
-        from gateway.status import _pid_exists
-
-        if not _pid_exists(int(pid)):
-            return False
-    else:
-        # Use the kernel's PID-namespace-aware probe directly. psutil reads
-        # /proc and can report a false negative in nested PID namespaces even
-        # though signal delivery to the same numeric PID is valid there.
-        try:
-            os.kill(int(pid), 0)
-        except ProcessLookupError:
-            return False
-        except PermissionError:
-            pass  # Exists, but belongs to another local identity.
-        except OSError:
-            return False
+    from gateway.status import _pid_exists
+    if not _pid_exists(int(pid)):
+        return False
     # Still here → process exists. Check for zombie on platforms
     # where we have a cheap, deterministic process-state probe.
     if sys.platform == "linux":
@@ -9330,18 +8095,13 @@ def _terminate_reclaimed_worker(
 
     # A systemd scope has no main process: a dead leader PID does not mean its
     # descendants are gone. Prefer the reconstructed unit identity whenever
-    # this dispatcher could have launched one, including the legacy name while
-    # pre-upgrade workers drain.
+    # this dispatcher could have launched one.
     if conn is not None and task_id is not None and run_id is not None:
         resolved_scope = scope_status or _worker_scope_state(conn, task_id, run_id)
         unit, scope_state = resolved_scope
         manager_target = getattr(resolved_scope, "manager_target", None)
         launch_mode = getattr(resolved_scope, "launch_mode", "legacy")
-        launch_acknowledged = getattr(
-            resolved_scope,
-            "launch_acknowledged",
-            None,
-        )
+        launch_acknowledged = getattr(resolved_scope, "launch_acknowledged", None)
         info["scope_unit"] = unit
         info["scope_state"] = scope_state
         if scope_state == "unknown":
@@ -9349,19 +8109,9 @@ def _terminate_reclaimed_worker(
             return info
         if scope_state == "not-found" and launch_mode == "systemd-user-scope":
             if launch_acknowledged is True:
-                # The acknowledged payload entered this exact authenticated
-                # unit and that unit is now collected. Its numeric leader PID
-                # may already have been reused, so never signal it.
                 info["terminated"] = True
                 return info
-            # Candidate-era receipts did not record acknowledgement, and a new
-            # explicitly uncertain receipt may still name a live systemd-run
-            # client that has not created its unit yet. ``not-found`` alone is
-            # therefore insufficient. A dead original PID closes that gap; a
-            # live (or possibly reused) PID must be retained without signaling.
-            if pid and pid > 0 and (
-                not pid_known_dead and _pid_alive(pid)
-            ):
+            if not pid_known_dead and _pid_alive(pid):
                 info["scope_unknown"] = True
                 info["scope_state"] = "unknown"
                 return info
@@ -9371,8 +8121,6 @@ def _terminate_reclaimed_worker(
             info["termination_attempted"] = True
             info["scope_stop_attempted"] = True
             if manager_target is None:
-                # Compatibility for narrow tests that monkeypatch the historical
-                # two-tuple result. Production resolutions always carry a target.
                 stopped = _stop_systemd_user_scope(unit)
             else:
                 stopped = _stop_systemd_user_scope(
@@ -9387,8 +8135,6 @@ def _terminate_reclaimed_worker(
                 info["scope_state"] = "unknown"
             return info
 
-    if not pid or pid <= 0:
-        return info
     if pid_known_dead:
         info["terminated"] = True
         return info
@@ -9432,7 +8178,7 @@ def _terminate_reclaimed_worker(
 
 
 def _worker_survived_termination(termination: dict) -> bool:
-    """True when a host-local worker survived or its scope state is unknown.
+    """True when we tried to kill our own host-local worker and it is still alive.
 
     Reclaiming in this state would release the claim and let the dispatcher
     spawn a second worker while the first is still running — the duplication
@@ -9441,11 +8187,8 @@ def _worker_survived_termination(termination: dict) -> bool:
     to the normal release path, since we cannot manage that worker anyway.
     """
     return bool(
-        termination.get("host_local")
-        and (
-            termination.get("termination_attempted")
-            or termination.get("scope_unknown")
-        )
+        termination.get("termination_attempted")
+        and termination.get("host_local")
         and not termination.get("terminated")
     )
 
@@ -9458,8 +8201,6 @@ def _defer_reclaim_for_live_worker(
     termination: dict,
     *,
     reason: str,
-    expected_run_id: Optional[int],
-    expected_pid: Optional[int],
 ) -> None:
     """Hold a claim whose worker survived termination instead of releasing it.
 
@@ -9473,9 +8214,8 @@ def _defer_reclaim_for_live_worker(
     with write_txn(conn):
         cur = conn.execute(
             "UPDATE tasks SET claim_expires = ? "
-            "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-            "  AND current_run_id IS ? AND worker_pid IS ?",
-            (grace, task_id, claim_lock, expected_run_id, expected_pid),
+            "WHERE id = ? AND status = 'running' AND claim_lock IS ?",
+            (grace, task_id, claim_lock),
         )
         if cur.rowcount != 1:
             return
@@ -9491,28 +8231,7 @@ def _defer_reclaim_for_live_worker(
             "claim_expires_now": grace,
         }
         payload.update(termination)
-        # Max-runtime, stale, and crash checks can all run in one dispatcher
-        # tick and may supply different reasons for the same surviving unit.
-        # Keep one visible diagnostic per grace window regardless of reason;
-        # otherwise alternating checks defeat the bound and grow the event/WAL
-        # stream for as long as a user manager remains unavailable.
-        latest = conn.execute(
-            "SELECT payload, created_at FROM task_events "
-            "WHERE task_id = ? AND run_id IS ? AND kind = 'reclaim_deferred' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, run_id),
-        ).fetchone()
-        emit = latest is None or int(latest["created_at"]) < (
-            now - RECLAIM_DEFER_GRACE_SECONDS
-        )
-        if emit:
-            _append_event(
-                conn,
-                task_id,
-                "reclaim_deferred",
-                payload,
-                run_id=run_id,
-            )
+        _append_event(conn, task_id, "reclaim_deferred", payload, run_id=run_id)
 
 
 # ---------------------------------------------------------------------------
@@ -9776,6 +8495,532 @@ def phase_b_rollback_preflight(conn: sqlite3.Connection) -> dict[str, Any]:
     return {"ok": True, "drained_run_ids": drained}
 
 
+def _canonical_db_path(
+    db_path: Optional[os.PathLike[str] | str],
+) -> Optional[Path]:
+    """Resolve one on-disk SQLite identity without consulting board state."""
+    if db_path is None:
+        return None
+    try:
+        raw = str(db_path).strip()
+        if not raw or raw == ":memory:":
+            return None
+        return Path(raw).expanduser().resolve(strict=False)
+    except (OSError, TypeError, ValueError):
+        return None
+
+
+def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return the connection's main on-disk DB path, if it has one."""
+    try:
+        for row in conn.execute("PRAGMA database_list").fetchall():
+            if row[1] == "main" and row[2]:
+                return _canonical_db_path(row[2])
+    except (sqlite3.Error, IndexError, TypeError):
+        return None
+    return None
+
+
+_SYSTEMD_WORKER_SCOPE_PREFIX = "hermes-kanban-worker-"
+_SYSTEMD_WORKER_SCOPE_RE = re.compile(
+    rf"^{re.escape(_SYSTEMD_WORKER_SCOPE_PREFIX)}[0-9a-f]{{32}}\.scope$"
+)
+_SYSTEMD_WORKER_SCOPE_LEGACY_RE = re.compile(
+    rf"^{re.escape(_SYSTEMD_WORKER_SCOPE_PREFIX)}[A-Za-z0-9_.-]+\.scope$"
+)
+_SYSTEMD_USER_MANAGER_KIND = "systemd-user"
+_SYSTEMD_USER_RUNTIME_ROOT = Path("/run/user")
+_SYSTEMD_SCOPE_MIN_VERSION = 236
+_SYSTEMD_PROBE_TIMEOUT_SECONDS = 2.0
+_SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
+
+
+class _WorkerLaunchUncertain(RuntimeError):
+    """A scoped launcher could not be acknowledged or safely stopped."""
+
+    def __init__(self, pid: int, message: str):
+        super().__init__(message)
+        self.pid = int(pid)
+
+
+@dataclass(frozen=True)
+class _SystemdUserManagerTarget:
+    manager_kind: str
+    manager_uid: int
+    runtime_dir: Path = field(repr=False)
+    bus_path: Path = field(repr=False)
+
+
+class _WorkerLaunchPid(int):
+    """Integer-compatible PID carrying the authenticated launch receipt."""
+
+    def __new__(
+        cls,
+        pid: int,
+        *,
+        scope_unit: Optional[str] = None,
+        manager_kind: Optional[str] = None,
+        manager_uid: Optional[int] = None,
+        launch_acknowledged: Optional[bool] = None,
+    ):
+        value = int.__new__(cls, int(pid))
+        value.scope_unit = scope_unit
+        value.manager_kind = manager_kind
+        value.manager_uid = manager_uid
+        value.launch_acknowledged = launch_acknowledged
+        return value
+
+
+def _resolve_systemd_user_manager_target(
+    manager_kind: object,
+    manager_uid: object,
+    *,
+    platform: Optional[str] = None,
+    runtime_root: Optional[os.PathLike[str] | str] = None,
+    real_uid: Optional[int] = None,
+    effective_uid: Optional[int] = None,
+    lstat_fn=None,
+) -> Optional[_SystemdUserManagerTarget]:
+    """Accept only the current real/effective UID and its private user bus."""
+    if not (platform if platform is not None else sys.platform).startswith("linux"):
+        return None
+    if manager_kind != _SYSTEMD_USER_MANAGER_KIND:
+        return None
+    if isinstance(manager_uid, bool) or not isinstance(manager_uid, int) or manager_uid < 0:
+        return None
+    getuid = getattr(os, "getuid", None)
+    geteuid = getattr(os, "geteuid", None)
+    if getuid is None or geteuid is None:
+        return None
+    uid = int(getuid()) if real_uid is None else int(real_uid)
+    euid = int(geteuid()) if effective_uid is None else int(effective_uid)
+    if manager_uid != uid or manager_uid != euid:
+        return None
+    root = Path(runtime_root) if runtime_root is not None else _SYSTEMD_USER_RUNTIME_ROOT
+    runtime_dir = root / str(manager_uid)
+    bus_path = runtime_dir / "bus"
+    inspect = lstat_fn or os.lstat
+    try:
+        runtime_stat, bus_stat = inspect(runtime_dir), inspect(bus_path)
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        not stat.S_ISDIR(runtime_stat.st_mode)
+        or runtime_stat.st_uid != manager_uid
+        or stat.S_IMODE(runtime_stat.st_mode) & 0o077
+        or not stat.S_ISSOCK(bus_stat.st_mode)
+        or bus_stat.st_uid != manager_uid
+    ):
+        return None
+    return _SystemdUserManagerTarget(
+        _SYSTEMD_USER_MANAGER_KIND, manager_uid, runtime_dir, bus_path,
+    )
+
+
+def _current_systemd_user_manager_target() -> Optional[_SystemdUserManagerTarget]:
+    getuid = getattr(os, "getuid", None)
+    return (
+        _resolve_systemd_user_manager_target(
+            _SYSTEMD_USER_MANAGER_KIND, int(getuid())
+        )
+        if getuid is not None else None
+    )
+
+
+def _systemd_user_manager_environment(target: _SystemdUserManagerTarget) -> dict[str, str]:
+    return {
+        "XDG_RUNTIME_DIR": str(target.runtime_dir),
+        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={target.bus_path}",
+    }
+
+
+def _current_cgroup_path() -> Optional[str]:
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
+            hierarchy, controllers, path = line.split(":", 2)
+            if (hierarchy == "0" and not controllers) or "name=systemd" in controllers.split(","):
+                return path
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def _systemd_service_manager(cgroup_path: Optional[str]) -> Optional[str]:
+    if not cgroup_path:
+        return None
+    path = cgroup_path.rstrip("/")
+    if not path.rsplit("/", 1)[-1].endswith(".service"):
+        return None
+    if re.search(r"/user@\d+\.service(?:/|$)", path):
+        return "user"
+    if path.startswith("/system.slice/"):
+        return "system"
+    return None
+
+
+def _systemd_user_manager_target_for_cgroup(
+    cgroup_path: Optional[str],
+) -> Optional[_SystemdUserManagerTarget]:
+    if _systemd_service_manager(cgroup_path) != "user":
+        return None
+    match = re.search(r"/user@(\d+)\.service(?:/|$)", cgroup_path or "")
+    if match is None:
+        return None
+    return _resolve_systemd_user_manager_target(
+        _SYSTEMD_USER_MANAGER_KIND, int(match.group(1)),
+    )
+
+
+def _systemd_run_major_version(runner: str, *, run_fn=None) -> Optional[int]:
+    run = run_fn or subprocess.run
+    try:
+        result = run(
+            [runner, "--version"], stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL, text=True,
+            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS, check=False,
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return None
+    match = re.search(r"\bsystemd\s+(\d+)\b", result.stdout or "")
+    return int(match.group(1)) if result.returncode == 0 and match else None
+
+
+def _systemd_user_manager_reachable(
+    *, manager_target=None, systemctl: Optional[str] = None, run_fn=None,
+) -> bool:
+    controller = systemctl or shutil.which("systemctl")
+    target = manager_target or _current_systemd_user_manager_target()
+    if not controller or target is None:
+        return False
+    run = run_fn or subprocess.run
+    try:
+        result = run(
+            [controller, "--user", "show", "--property=Version", "--value"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS, check=False,
+            env=_systemd_user_manager_environment(target),
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return False
+    return result.returncode == 0
+
+
+def _systemd_user_scope_available(
+    runner: str, *, manager_target=None, run_fn=None, systemctl=None,
+) -> bool:
+    version = _systemd_run_major_version(runner, run_fn=run_fn)
+    return bool(
+        version is not None and version >= _SYSTEMD_SCOPE_MIN_VERSION
+        and _systemd_user_manager_reachable(
+            manager_target=manager_target, systemctl=systemctl, run_fn=run_fn,
+        )
+    )
+
+
+_REAL_SYSTEMD_USER_SCOPE_AVAILABLE = _systemd_user_scope_available
+
+
+def _worker_scope_unit_name(
+    task_id: str,
+    run_id: int,
+    *, board: Optional[str] = None,
+    db_path: Optional[os.PathLike[str] | str] = None,
+) -> str:
+    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
+    identity = os.path.normcase(str(path.expanduser().resolve(strict=False)))
+    digest = hashlib.blake2s(
+        f"v1\0{identity}\0{task_id}\0{int(run_id)}".encode("utf-8"),
+        digest_size=16,
+    ).hexdigest()
+    return f"{_SYSTEMD_WORKER_SCOPE_PREFIX}{digest}.scope"
+
+
+def _scope_exec_ack_argv(cmd: list[str], ready_fd: int) -> list[str]:
+    code = (
+        "import os,sys;fd=int(sys.argv[1]);os.write(fd,b'1');"
+        "os.close(fd);os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+    )
+    return [sys.executable, "-c", code, str(int(ready_fd)), *cmd]
+
+
+def _await_scope_exec_ack(
+    proc: subprocess.Popen,
+    ready_fd: int,
+    *,
+    timeout: float = _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS,
+) -> None:
+    import select
+
+    readable, _, _ = select.select([ready_fd], [], [], max(0.0, float(timeout)))
+    if readable:
+        if os.read(ready_fd, 1) == b"1":
+            return
+        try:
+            returncode = proc.wait(timeout=0.5)
+        except (subprocess.TimeoutExpired, AttributeError):
+            returncode = proc.poll()
+        if returncode is None:
+            raise _WorkerLaunchUncertain(
+                proc.pid,
+                "scope acknowledgement pipe closed while systemd-run remained alive",
+            )
+        raise RuntimeError(
+            "systemd-run exited before the Kanban worker exec acknowledgement "
+            f"(status {returncode})"
+        )
+
+    # A timed-out client may be wedged in manager setup. Release the DB claim
+    # only after proving that exact process stopped; otherwise retain its PID
+    # as an untrusted receipt so a later tick cannot launch a duplicate.
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
+    except OSError as exc:
+        raise _WorkerLaunchUncertain(
+            proc.pid,
+            "systemd-run launch acknowledgement timed out and could not be stopped",
+        ) from exc
+    try:
+        proc.wait(timeout=1.0)
+    except subprocess.TimeoutExpired as exc:
+        raise _WorkerLaunchUncertain(
+            proc.pid,
+            "systemd-run launch acknowledgement timed out and the client remained alive",
+        ) from exc
+    raise RuntimeError("systemd-run launch acknowledgement timed out before worker exec")
+
+
+def _valid_worker_scope_unit(unit: str) -> bool:
+    return bool(
+        isinstance(unit, str) and len(unit) <= 255
+        and (
+            _SYSTEMD_WORKER_SCOPE_RE.fullmatch(unit)
+            or _SYSTEMD_WORKER_SCOPE_LEGACY_RE.fullmatch(unit)
+        )
+    )
+
+
+def _systemd_worker_scope_argv(
+    cmd: list[str],
+    task: Task,
+    *,
+    board: Optional[str] = None,
+    db_path: Optional[os.PathLike[str] | str] = None,
+    cgroup_path: Optional[str] = None,
+    manager_target: Optional[_SystemdUserManagerTarget] = None,
+    systemd_run: Optional[str] = None,
+    platform: Optional[str] = None,
+    user_manager_ready: Optional[bool] = None,
+) -> list[str]:
+    """Use an authenticated sibling user scope only for user services."""
+    active_platform = platform if platform is not None else sys.platform
+    if not active_platform.startswith("linux"):
+        return cmd
+    current = cgroup_path if cgroup_path is not None else _current_cgroup_path()
+    if _systemd_service_manager(current) != "user":
+        return cmd
+    target = manager_target or _systemd_user_manager_target_for_cgroup(current)
+    runner = systemd_run or shutil.which("systemd-run")
+    if target is None or runner is None or task.current_run_id is None:
+        return cmd
+    if (
+        user_manager_ready is None
+        and subprocess.Popen is not _REAL_SUBPROCESS_POPEN
+        and _systemd_user_scope_available is _REAL_SYSTEMD_USER_SCOPE_AVAILABLE
+    ):
+        return cmd
+    ready = (
+        _systemd_user_scope_available(runner, manager_target=target)
+        if user_manager_ready is None else bool(user_manager_ready)
+    )
+    if not ready:
+        return cmd
+    try:
+        unit = _worker_scope_unit_name(
+            task.id, int(task.current_run_id), board=board, db_path=db_path,
+        )
+    except (OSError, TypeError, ValueError):
+        return cmd
+    return [
+        runner, "--user", "--scope", "--quiet", "--collect", f"--unit={unit}",
+        "--", *cmd,
+    ]
+
+
+def _systemd_user_scope_state(
+    unit: str, *, manager_target=None, systemctl=None, run_fn=None,
+) -> str:
+    if not _valid_worker_scope_unit(unit):
+        return "unknown"
+    controller = systemctl or shutil.which("systemctl")
+    target = manager_target or _current_systemd_user_manager_target()
+    if not controller or target is None:
+        return "unknown"
+    run = run_fn or subprocess.run
+    try:
+        result = run(
+            [controller, "--user", "show", unit, "--property=LoadState",
+             "--property=ActiveState", "--no-pager"],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS, check=False,
+            env=_systemd_user_manager_environment(target),
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        return "unknown"
+    if result.returncode != 0:
+        return "unknown"
+    props = dict(
+        line.split("=", 1) for line in (result.stdout or "").splitlines()
+        if "=" in line
+    )
+    if props.get("LoadState") == "not-found":
+        return "not-found"
+    if props.get("ActiveState") in {"inactive", "failed"}:
+        return "inactive"
+    return "active" if props.get("ActiveState") else "unknown"
+
+
+def _stop_systemd_user_scope(
+    unit: str, *, manager_target=None, systemctl=None, run_fn=None,
+) -> Optional[bool]:
+    if not _valid_worker_scope_unit(unit):
+        return None
+    controller = systemctl or shutil.which("systemctl")
+    target = manager_target or _current_systemd_user_manager_target()
+    if not controller or target is None:
+        return None
+    run = run_fn or subprocess.run
+    try:
+        run(
+            [controller, "--user", "stop", unit], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, timeout=7.0, check=False,
+            env=_systemd_user_manager_environment(target),
+        )
+    except (OSError, subprocess.SubprocessError, TimeoutError):
+        pass
+    for _ in range(10):
+        state = _systemd_user_scope_state(
+            unit, manager_target=target, systemctl=controller, run_fn=run,
+        )
+        if state == "not-found":
+            return True
+        if state == "unknown":
+            return None
+        time.sleep(0.1)
+    return False
+
+
+@dataclass(frozen=True)
+class _WorkerScopeStatus:
+    """Resolved worker-scope state and the manager evidence behind it."""
+
+    unit: Optional[str]
+    state: str
+    manager_target: Any
+    launch_mode: str
+    launch_acknowledged: Optional[bool] = None
+
+    def __iter__(self):
+        yield self.unit
+        yield self.state
+
+
+def _scope_status_fields(
+    scope: Any,
+) -> tuple[Any, str, Any, str, Optional[bool]]:
+    """Read modern scope receipts and legacy two-tuple test seams alike."""
+    if isinstance(scope, _WorkerScopeStatus):
+        return (
+            scope.unit,
+            scope.state,
+            scope.manager_target,
+            scope.launch_mode,
+            scope.launch_acknowledged,
+        )
+    try:
+        unit, state = scope
+    except (TypeError, ValueError):
+        return None, "unknown", None, "invalid", None
+    return unit, state, None, "legacy", None
+
+
+def _trusted_worker_scope_evidence(scope: Any) -> tuple[bool, bool]:
+    """Return authenticated scope-boundary and scope-gone evidence."""
+    unit, state, manager_target, launch_mode, launch_acknowledged = (
+        _scope_status_fields(scope)
+    )
+    authenticated_receipt = bool(
+        unit
+        and (manager_target is not None or launch_mode == "legacy")
+        and launch_mode in {"systemd-user-scope", "legacy"}
+    )
+    trusted = authenticated_receipt and (
+        state in {"active", "inactive"}
+        or (state == "not-found" and launch_acknowledged is True)
+    )
+    proves_gone = trusted and (
+        state == "inactive"
+        or (state == "not-found" and launch_acknowledged is True)
+    )
+    return trusted, proves_gone
+
+
+def _worker_scope_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    run_id: Optional[int],
+    *,
+    db_path: Optional[os.PathLike[str] | str] = None,
+) -> _WorkerScopeStatus:
+    """Resolve only the exact scope and manager recorded for this run."""
+    if run_id is None:
+        return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
+    try:
+        event = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND run_id=? "
+            "AND kind='spawned' ORDER BY id DESC LIMIT 1",
+            (task_id, int(run_id)),
+        ).fetchone()
+        payload = json.loads(event["payload"]) if event and event["payload"] else None
+    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+    if not isinstance(payload, dict):
+        return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
+    launch_mode = payload.get("launch_mode", "direct")
+    if launch_mode == "direct" and not any(
+        key in payload
+        for key in ("scope_unit", "manager_kind", "manager_uid", "launch_acknowledged")
+    ):
+        return _WorkerScopeStatus(None, "not-applicable", None, "direct")
+    if launch_mode != "systemd-user-scope":
+        return _WorkerScopeStatus(None, "unknown", None, "invalid")
+    ack = payload.get("launch_acknowledged")
+    if type(ack) is not bool:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
+    target = _resolve_systemd_user_manager_target(
+        payload.get("manager_kind"), payload.get("manager_uid"),
+    )
+    if target is None:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode, ack)
+    resolved_db = (
+        _canonical_db_path(db_path)
+        if db_path is not None else _connection_main_db_path(conn)
+    )
+    if resolved_db is None:
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode, ack)
+    expected_unit = _worker_scope_unit_name(
+        task_id, int(run_id), db_path=resolved_db,
+    )
+    unit = payload.get("scope_unit")
+    if unit != expected_unit or not _valid_worker_scope_unit(unit):
+        return _WorkerScopeStatus(None, "unknown", None, launch_mode, ack)
+    state = _systemd_user_scope_state(unit, manager_target=target)
+    return _WorkerScopeStatus(unit, state, target, launch_mode, ack)
+
+
 def _request_terminal_transition(
     conn: sqlite3.Connection,
     task_id: str,
@@ -9789,7 +9034,7 @@ def _request_terminal_transition(
         db_path = _connection_main_db_path(conn)
         if db_path is not None:
             with _dispatch_tick_lock(db_path) as lock_outcome:
-                if not lock_outcome.acquired:
+                if not lock_outcome:
                     active = conn.execute(
                         "SELECT status, current_run_id FROM tasks WHERE id=?",
                         (task_id,),
@@ -9799,13 +9044,17 @@ def _request_terminal_transition(
                             "dispatch_lock_busy"
                         )
                     return False
-                return _request_terminal_transition(
-                    conn,
-                    task_id,
-                    action=action,
-                    payload=payload,
-                    expected_run_id=expected_run_id,
-                )
+                lock_token = _DISPATCH_LOCK_HELD.set(True)
+                try:
+                    return _request_terminal_transition(
+                        conn,
+                        task_id,
+                        action=action,
+                        payload=payload,
+                        expected_run_id=expected_run_id,
+                    )
+                finally:
+                    _DISPATCH_LOCK_HELD.reset(lock_token)
     intent = _normalize_terminal_intent(action, payload)
     row = conn.execute(
         "SELECT t.status, t.current_run_id, t.worker_pid, r.worker_identity, r.worker_tree, "
@@ -10194,8 +9443,7 @@ def _finalize_reassignment_terminal(
             cur = conn.execute(
                 "UPDATE tasks SET assignee=?, status=?, claim_lock=NULL, "
                 "claim_expires=NULL, worker_pid=NULL, last_heartbeat_at=NULL, "
-                "consecutive_failures=0, last_failure_error=NULL, "
-                "failure_classification=NULL, failure_fingerprint=NULL "
+                "consecutive_failures=0, last_failure_error=NULL "
                 "WHERE id=? AND current_run_id=?",
                 (assignee, task_status, task_id, int(run_id)),
             )
@@ -10307,8 +9555,8 @@ def _finalize_generic_terminal(
         _append_event(conn, task_id, emitted_event_kind, event_payload, run_id=run_id)
         if is_current and payload.get("clear_failure_counter"):
             conn.execute(
-                "UPDATE tasks SET consecutive_failures=0, last_failure_error=NULL, "
-                "failure_classification=NULL, failure_fingerprint=NULL WHERE id=?",
+                "UPDATE tasks SET consecutive_failures=0, last_failure_error=NULL "
+                "WHERE id=?",
                 (task_id,),
             )
         if is_current and payload.get("last_failure_error"):
@@ -11005,15 +10253,22 @@ def enforce_max_runtime(
             continue
         try:
             requested = _request_terminal_transition(
-                conn, tid, action="timed_out",
+                conn,
+                tid,
+                action="timed_out",
                 payload={
-                "task_status": _claim_retry_status(conn, tid),
-                "run_status": "timed_out", "outcome": "timed_out",
-                "event_kind": "timed_out", "error": error,
-                "event_payload": {"pid": pid, "elapsed_seconds": int(elapsed),
-                                  "limit_seconds": int(row["max_runtime_seconds"])},
-                "record_failure": True,
-            },
+                    "task_status": _claim_retry_status(conn, tid),
+                    "run_status": "timed_out",
+                    "outcome": "timed_out",
+                    "event_kind": "timed_out",
+                    "error": error,
+                    "event_payload": {
+                        "pid": pid,
+                        "elapsed_seconds": int(elapsed),
+                        "limit_seconds": int(row["max_runtime_seconds"]),
+                    },
+                    "record_failure": True,
+                },
                 expected_run_id=row["current_run_id"],
             )
         except TerminalTransitionConflict as exc:
@@ -11487,8 +10742,6 @@ def _record_task_failure(
     end_run: bool = False,
     expected_run_id: Optional[int] = None,
     event_payload_extra: Optional[dict] = None,
-    failure_classification: Optional[str] = None,
-    failure_fingerprint: Optional[str] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -11589,13 +10842,10 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "failure_classification = ?, failure_fingerprint = ? "
+                    "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('running', 'ready')",
                     (
-                        failures, error[:500],
-                        failure_classification, failure_fingerprint,
-                        task_id,
+                        failures, error[:500], task_id,
                     ),
                 )
             else:
@@ -11604,13 +10854,10 @@ def _record_task_failure(
                 # counter fields.
                 conn.execute(
                     "UPDATE tasks SET status = 'blocked', "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "failure_classification = ?, failure_fingerprint = ? "
+                    "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status IN ('ready', 'running')",
                     (
-                        failures, error[:500],
-                        failure_classification, failure_fingerprint,
-                        task_id,
+                        failures, error[:500], task_id,
                     ),
                 )
             run_id = None
@@ -11633,8 +10880,6 @@ def _record_task_failure(
                 "limit_source": limit_source,
                 "error": error[:500],
                 "trigger_outcome": outcome,
-                "failure_classification": failure_classification,
-                "failure_fingerprint": failure_fingerprint,
             }
             if event_payload_extra:
                 payload.update(event_payload_extra)
@@ -11650,13 +10895,10 @@ def _record_task_failure(
                 conn.execute(
                     "UPDATE tasks SET status = ?, claim_lock = NULL, "
                     "claim_expires = NULL, worker_pid = NULL, "
-                    "consecutive_failures = ?, last_failure_error = ?, "
-                    "failure_classification = ?, failure_fingerprint = ? "
+                    "consecutive_failures = ?, last_failure_error = ? "
                     "WHERE id = ? AND status = 'running'",
                     (
-                        retry_status, failures, error[:500],
-                        failure_classification, failure_fingerprint,
-                        task_id,
+                        retry_status, failures, error[:500], task_id,
                     ),
                 )
             else:
@@ -11664,12 +10906,9 @@ def _record_task_failure(
                 # its own UPDATE. Just bookkeep the counter + last error.
                 conn.execute(
                     "UPDATE tasks SET consecutive_failures = ?, "
-                    "last_failure_error = ?, failure_classification = ?, "
-                    "failure_fingerprint = ? WHERE id = ?",
+                    "last_failure_error = ? WHERE id = ?",
                     (
-                        failures, error[:500],
-                        failure_classification, failure_fingerprint,
-                        task_id,
+                        failures, error[:500], task_id,
                     ),
                 )
             if end_run:
@@ -11715,13 +10954,7 @@ def _set_worker_pid(
     expected_run_id: Optional[int] = None,
     expected_claim_lock: Optional[str] = None,
 ) -> bool:
-    """CAS-record the spawned child's pid and emit a ``spawned`` event.
-
-    The event's payload carries the PID plus a separate launch handle. Custom
-    ``spawn_fn -> int`` results are explicitly direct; the built-in scoped
-    launcher returns an int-compatible value carrying its opaque unit. Returns
-    ``False`` when the worker completed or lost its claim before persistence.
-    """
+    """CAS-record the PID and the private managed-scope launch receipt."""
     from hermes_cli.kanban_worker_process import read_identity
 
     worker_identity = read_identity(int(pid))
@@ -11735,106 +10968,66 @@ def _set_worker_pid(
     )
     with write_txn(conn):
         row = conn.execute(
-            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id = ?",
+            "SELECT status, current_run_id, claim_lock FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
         if row is None or row["status"] != "running":
             return False
-        run_id = (
-            int(expected_run_id)
-            if expected_run_id is not None
-            else row["current_run_id"]
-        )
-        claim_lock = (
-            expected_claim_lock
-            if expected_claim_lock is not None
-            else row["claim_lock"]
-        )
+        run_id = int(expected_run_id) if expected_run_id is not None else row["current_run_id"]
+        claim_lock = expected_claim_lock if expected_claim_lock is not None else row["claim_lock"]
         cur = conn.execute(
-            "UPDATE tasks SET worker_pid = ? "
-            "WHERE id = ? AND status = 'running' "
-            "  AND current_run_id IS ? AND claim_lock IS ?",
+            "UPDATE tasks SET worker_pid=? WHERE id=? AND status='running' "
+            "AND current_run_id IS ? AND claim_lock IS ?",
             (int(pid), task_id, run_id, claim_lock),
         )
         if cur.rowcount != 1:
             return False
         if run_id is not None:
             conn.execute(
-                "UPDATE task_runs SET worker_pid = ?, worker_identity = ?, "
-                "worker_tree = ? "
-                "WHERE id = ? AND status = 'running' AND ended_at IS NULL "
-                "  AND claim_lock IS ?",
+                "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? "
+                "WHERE id=? AND status='running' AND ended_at IS NULL "
+                "AND claim_lock IS ?",
                 (int(pid), identity_json, tree_json, int(run_id), claim_lock),
             )
-        # Only the exact private handle returned by ``_default_spawn`` may
-        # declare a scoped launch. A custom ``spawn_fn`` is allowed to return
-        # any int-like value, including an int subclass with arbitrary
-        # attributes; treating those attributes as receipt data would turn a
-        # plugin object into an unbounded persistence channel.
         launch_handle = pid if type(pid) is _WorkerLaunchPid else None
-        declared_scope = (
-            launch_handle.scope_unit if launch_handle is not None else None
-        )
-        scoped_launch = launch_handle is not None and declared_scope is not None
-        payload: dict[str, Any] = {
-            "pid": int(pid),
-            "launch_mode": "systemd-user-scope" if scoped_launch else "direct",
-            "identity_verified": worker_identity is not None,
-        }
+        scoped_launch = launch_handle is not None and launch_handle.scope_unit is not None
+        # Preserve the historical custom/direct receipt shape exactly. Only
+        # the private scoped launcher receives extra durable fields.
+        payload: dict[str, Any] = {"pid": int(pid)}
         if scoped_launch:
+            payload.update({
+                "launch_mode": "systemd-user-scope",
+                "identity_verified": worker_identity is not None,
+            })
             db_path = _connection_main_db_path(conn)
             expected_unit = None
             if db_path is not None and run_id is not None:
-                try:
-                    expected_unit = _worker_scope_unit_name(
-                        task_id,
-                        int(run_id),
-                        db_path=db_path,
-                    )
-                except (OSError, TypeError, ValueError):
-                    pass
+                expected_unit = _worker_scope_unit_name(
+                    task_id, int(run_id), db_path=db_path,
+                )
             if (
-                isinstance(declared_scope, str)
-                and declared_scope == expected_unit
-                and _valid_worker_scope_unit(declared_scope)
+                isinstance(launch_handle.scope_unit, str)
+                and launch_handle.scope_unit == expected_unit
+                and _valid_worker_scope_unit(launch_handle.scope_unit)
             ):
                 payload["scope_unit"] = expected_unit
-
-            manager_kind = launch_handle.manager_kind
-            manager_uid = launch_handle.manager_uid
-            getuid = getattr(os, "getuid", None)
-            geteuid = getattr(os, "geteuid", None)
             manager_identity_valid = (
-                manager_kind == _SYSTEMD_USER_MANAGER_KIND
-                and isinstance(manager_uid, int)
-                and not isinstance(manager_uid, bool)
-                and manager_uid >= 0
-                and getuid is not None
-                and geteuid is not None
-                and manager_uid == int(getuid())
-                and manager_uid == int(geteuid())
+                launch_handle.manager_kind == _SYSTEMD_USER_MANAGER_KIND
+                and type(launch_handle.manager_uid) is int
+                and launch_handle.manager_uid >= 0
+                and getattr(os, "getuid", None) is not None
+                and getattr(os, "geteuid", None) is not None
+                and launch_handle.manager_uid == int(os.getuid())
+                and launch_handle.manager_uid == int(os.geteuid())
             )
             if manager_identity_valid:
-                # Persist only the fixed kind and authenticated numeric kernel
-                # identity. Runtime paths and bus addresses are reconstructed
-                # locally and never enter the receipt.
                 payload["manager_kind"] = _SYSTEMD_USER_MANAGER_KIND
-                payload["manager_uid"] = manager_uid
-            elif manager_kind is not None or manager_uid is not None:
-                # A prior candidate legitimately supplied neither manager
-                # field, so the all-None shape remains backward compatible.
-                # A partially supplied or invalid identity is different: omit
-                # the unit too, producing a bounded receipt the reader treats
-                # as unknown instead of silently retargeting the current bus.
+                payload["manager_uid"] = launch_handle.manager_uid
+            elif launch_handle.manager_kind is not None or launch_handle.manager_uid is not None:
                 payload.pop("scope_unit", None)
-
-            launch_acknowledged = launch_handle.launch_acknowledged
-            if type(launch_acknowledged) is bool:
-                payload["launch_acknowledged"] = launch_acknowledged
-            elif launch_acknowledged is not None:
-                # As with an invalid manager identity, persist no arbitrary
-                # value and force the bounded receipt into the reader's
-                # fail-closed invalid-unit path.
+            if type(launch_handle.launch_acknowledged) is bool:
+                payload["launch_acknowledged"] = launch_handle.launch_acknowledged
+            elif launch_handle.launch_acknowledged is not None:
                 payload.pop("scope_unit", None)
         _append_event(conn, task_id, "spawned", payload, run_id=run_id)
         return True
@@ -11853,83 +11046,13 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
     with write_txn(conn):
         conn.execute(
             "UPDATE tasks SET consecutive_failures = 0, "
-            "last_failure_error = NULL, failure_classification = NULL, "
-            "failure_fingerprint = NULL WHERE id = ?",
+            "last_failure_error = NULL WHERE id = ?",
             (task_id,),
         )
 
 
 # Legacy alias for test-code and anything else that still imports it.
 _clear_spawn_failures = _clear_failure_counter
-
-
-def _deterministic_fingerprint(reason_code: str, error: str) -> str:
-    return hashlib.sha256(
-        f"{reason_code}\0{(error or '').strip()}".encode("utf-8", "replace")
-    ).hexdigest()[:24]
-
-
-def _block_deterministic_preflight_failure(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    reason_code: str,
-    error: str,
-    payload: Optional[dict] = None,
-) -> str:
-    """Block a deterministic workspace/config/capability failure immediately."""
-    safe_error = str(_redact_diagnostic(error) or "")
-    safe_payload = _redact_diagnostic(payload or {})
-    if not isinstance(safe_payload, dict):
-        safe_payload = {"detail": safe_payload}
-    fp = _deterministic_fingerprint(reason_code, safe_error)
-    with write_txn(conn):
-        row = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
-            (task_id,),
-        ).fetchone()
-        if row is None:
-            return fp
-        if row["status"] in NON_ACTIONABLE_STATUSES or row["status"] == "done":
-            return fp
-        conn.execute(
-            """
-            UPDATE tasks
-               SET status = 'blocked',
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL,
-                   block_kind = 'capability',
-                   last_failure_error = ?,
-                   failure_classification = ?,
-                   failure_fingerprint = ?
-             WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'review', 'blocked')
-            """,
-            (safe_error[:500], reason_code, fp, task_id),
-        )
-        run_id = _end_run(
-            conn,
-            task_id,
-            outcome="preflight_failed",
-            status="preflight_failed",
-            error=safe_error[:500],
-            metadata={"reason_code": reason_code, "fingerprint": fp, **safe_payload},
-        )
-        event_payload = {
-            "reason_code": reason_code,
-            "fingerprint": fp,
-            "error": safe_error[:500],
-        }
-        event_payload.update(safe_payload)
-        _append_diagnostic_event(
-            conn,
-            task_id,
-            "deterministic_preflight_blocked",
-            event_payload,
-            run_id=run_id,
-        )
-    return fp
 
 
 def check_respawn_guard(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
@@ -12124,856 +11247,6 @@ def has_spawnable_review(conn: sqlite3.Connection) -> bool:
     return False
 
 
-DEFAULT_CONTINUATION_LIMIT = 25
-MAX_CONTINUATION_LIMIT = 100
-CONTINUATION_AUDIT_SCAN_LIMIT = 250
-CONTINUATION_RETRY_BASE_SECONDS = 60
-CONTINUATION_RETRY_MAX_SECONDS = 900
-CONTINUATION_BLOCKER_SLA_SECONDS = 900
-
-_CONTINUATION_ACTIONS = frozenset({
-    "record_superseded",
-    "route_repair",
-    "route_review",
-    "route_ops",
-    "retry_probe",
-    "request_proof",
-})
-_FORBIDDEN_CONTINUATION_ACTIONS = frozenset({
-    "merge", "deploy", "restart", "notify", "complete_product",
-})
-
-
-def _stable_continuation_value(value: Any) -> Any:
-    """Remove clock/probe-noise fields from a durable failure identity."""
-    ignored = {
-        "age_seconds", "last_verified_at", "blocked_since", "now",
-        "next_retry_at", "updated_at", "created_at", "first_seen_at",
-        "last_seen_at", "count", "error",
-    }
-    if isinstance(value, dict):
-        return {
-            str(key): _stable_continuation_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
-            if str(key) not in ignored
-        }
-    if isinstance(value, (list, tuple)):
-        return [_stable_continuation_value(item) for item in value]
-    return value
-
-
-def _continuation_route(report: Any) -> Optional[tuple[str, str, dict[str, Any]]]:
-    """Classify one reconciliation report into a controller-only route."""
-    findings = list(report.findings if report is not None else [])
-    by_kind = {finding.kind: finding for finding in findings}
-    routes = (
-        ({"replacement_suppressed"}, "board_hygiene", "record_superseded"),
-        ({"head_superseded", "branch_missing"}, "repair", "route_repair"),
-        ({"review_stale"}, "review", "route_review"),
-        ({
-            "workspace_missing", "workspace_not_git", "workspace_not_linked",
-            "workspace_wrong_repo", "workspace_wrong_head", "workspace_retired",
-            "workspace_unsafe_tmp", "assignee_non_runnable",
-        }, "ops", "route_ops"),
-    )
-    for kinds, classification, action in routes:
-        selected = next((by_kind[kind] for kind in sorted(kinds) if kind in by_kind), None)
-        if selected is not None:
-            return classification, action, selected.to_dict()
-
-    unknown = next((
-        finding for finding in findings
-        if finding.kind in {
-            "branch_unknown", "workspace_unknown", "replacement_unproven",
-            "reconciliation_changed",
-        }
-    ), None)
-    if unknown is None:
-        return None
-    evidence = unknown.data.get("evidence") or {}
-    reason = str(evidence.get("reason") or "").lower()
-    transient = unknown.kind == "reconciliation_changed" or any(
-        marker in reason
-        for marker in ("timeout", "budget", "probe_error", "probe_failed", "remote")
-    )
-    return (
-        ("transient_retry", "retry_probe", unknown.to_dict())
-        if transient
-        else ("proof_needed", "request_proof", unknown.to_dict())
-    )
-
-
-def _blocked_continuation_route(
-    conn: sqlite3.Connection,
-    row: Any,
-    *,
-    now: int,
-) -> Optional[tuple[str, str, dict[str, Any]]]:
-    status = str(row["status"] or "")
-    since = int(row["started_at"] or row["created_at"] or now)
-    if status not in {"blocked", "triage", "todo"} or now - since < CONTINUATION_BLOCKER_SLA_SECONDS:
-        return None
-    event = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? AND kind = 'blocked' "
-        "ORDER BY id DESC LIMIT 1",
-        (row["id"],),
-    ).fetchone()
-    payload: dict[str, Any] = {}
-    if event and event["payload"]:
-        try:
-            payload = json.loads(event["payload"])
-        except (TypeError, ValueError):
-            payload = {}
-    reason = str(payload.get("reason") or payload.get("block_reason") or "")
-    kind = str(row["block_kind"] or "")
-    evidence = {
-        "block_kind": kind or None,
-        "reason": reason,
-        "age_seconds": max(0, now - since),
-        "sla_seconds": CONTINUATION_BLOCKER_SLA_SECONDS,
-    }
-    terminal_placeholders, terminal_statuses = _terminal_status_sql()
-    known_parent_wait = status == "todo" and conn.execute(
-        "SELECT 1 FROM task_links l JOIN tasks p ON p.id = l.parent_id "
-        f"WHERE l.child_id = ? AND p.status NOT IN ({terminal_placeholders}) LIMIT 1",
-        (row["id"], *terminal_statuses),
-    ).fetchone() is not None
-    if kind == "dependency" or known_parent_wait:
-        # Parent-gated work has an exact automatic release condition in the
-        # kernel. It is neither an unknown nor a retry candidate.
-        return None
-    if status == "triage" or kind == "needs_input" or re.search(
-        r"\b(human|approval|credential|secret|policy|privacy|destructive)\b",
-        reason,
-        re.IGNORECASE,
-    ):
-        return "human_required", "", evidence
-    if reason.strip().lower().startswith("review-required:"):
-        return "review", "route_review", evidence
-    if kind == "capability":
-        return "ops", "route_ops", evidence
-    if kind == "transient" or re.search(
-        r"\b(timeout|temporary|transient|rate.?limit|unavailable)\b",
-        reason,
-        re.IGNORECASE,
-    ):
-        return "transient_retry", "retry_probe", evidence
-    if re.search(
-        r"\b(workspace|profile|runner|daemon|checkout|worktree)\b",
-        reason,
-        re.IGNORECASE,
-    ):
-        return "ops", "route_ops", evidence
-    return "proof_needed", "request_proof", evidence
-
-
-def queue_reconciliation_continuations(
-    conn: sqlite3.Connection,
-    reports: dict[str, Any],
-    *,
-    now: Optional[int] = None,
-    limit: int = DEFAULT_CONTINUATION_LIMIT,
-) -> list[dict[str, Any]]:
-    """Classify and durably deduplicate a bounded backlog controller pass.
-
-    Rows describe private, reversible follow-up routing only.  This sensor is
-    deliberately incapable of merging, deploying, restarting services,
-    notifying people, creating cards, or declaring product completion.
-    """
-    now_ts = int(now if now is not None else time.time())
-    bounded = max(1, min(int(limit), MAX_CONTINUATION_LIMIT))
-    rows = conn.execute(
-        "SELECT * FROM tasks "
-        "WHERE status IN ('ready','review','blocked','triage','todo') "
-        "ORDER BY priority DESC, COALESCE(started_at, created_at) ASC, id ASC "
-        "LIMIT ?",
-        (CONTINUATION_AUDIT_SCAN_LIMIT,),
-    ).fetchall()
-    candidates: list[tuple[int, int, int, str, Any, str, str, dict[str, Any]]] = []
-    rank = {
-        "board_hygiene": 0,
-        "repair": 1,
-        "review": 2,
-        "ops": 3,
-        "transient_retry": 4,
-        "proof_needed": 5,
-        "human_required": 6,
-    }
-    for row in rows:
-        task_id = str(row["id"])
-        blocked_route = _blocked_continuation_route(conn, row, now=now_ts)
-        # A structured human/policy boundary always wins over automatic
-        # reconciliation routing, even if sensors also found a repairable
-        # repo/workspace issue on the same card.
-        routed = (
-            blocked_route
-            if blocked_route is not None and blocked_route[0] == "human_required"
-            else (_continuation_route(reports.get(task_id)) or blocked_route)
-        )
-        if routed is None:
-            continue
-        classification, action, evidence = routed
-        candidates.append((
-            rank[classification],
-            -int(row["priority"] or 0),
-            int(row["started_at"] or row["created_at"] or 0),
-            task_id,
-            row,
-            classification,
-            action,
-            evidence,
-        ))
-
-    decisions: list[dict[str, Any]] = []
-    with write_txn(conn):
-        for _rank, _priority, _since, task_id, row, classification, action, evidence in sorted(candidates)[:bounded]:
-            safe_evidence = _redact_diagnostic(evidence)
-            if not isinstance(safe_evidence, dict):
-                safe_evidence = {"detail": safe_evidence}
-            report = reports.get(task_id)
-            source_fingerprint = (
-                str(report.db_fingerprint)
-                if report is not None and report.db_fingerprint
-                else hashlib.sha256(
-                    json.dumps({
-                        "task_id": task_id,
-                        "status": row["status"],
-                        "assignee": row["assignee"],
-                        "block_kind": row["block_kind"],
-                    }, sort_keys=True, default=str).encode("utf-8")
-                ).hexdigest()
-            )
-            failure_material = {
-                "task_id": task_id,
-                "classification": classification,
-                "action": action,
-                "source_fingerprint": source_fingerprint,
-                "evidence": _stable_continuation_value(safe_evidence),
-            }
-            failure_fingerprint = hashlib.sha256(
-                json.dumps(
-                    failure_material, sort_keys=True, separators=(",", ":"), default=str,
-                ).encode("utf-8")
-            ).hexdigest()
-            if classification == "human_required":
-                conn.execute(
-                    "UPDATE kanban_continuations SET state = 'superseded', "
-                    "updated_at = ? WHERE task_id = ? "
-                    "AND state IN ('pending','retry_wait','proof_needed')",
-                    (now_ts, task_id),
-                )
-                decisions.append({
-                    "task_id": task_id,
-                    "classification": classification,
-                    "state": "untouched",
-                    "failure_fingerprint": failure_fingerprint,
-                })
-                continue
-            if action not in _CONTINUATION_ACTIONS or action in _FORBIDDEN_CONTINUATION_ACTIONS:
-                raise ValueError(f"unsafe continuation action: {action}")
-            lock_identity = "kanban-reconcile:v1:" + hashlib.sha256(
-                f"{task_id}\0{action}\0{failure_fingerprint}".encode("utf-8")
-            ).hexdigest()
-            state = "retry_wait" if classification == "transient_retry" else (
-                "proof_needed" if classification == "proof_needed" else "pending"
-            )
-            next_retry_at = (
-                now_ts + CONTINUATION_RETRY_BASE_SECONDS
-                if classification == "transient_retry" else None
-            )
-            conn.execute(
-                "UPDATE kanban_continuations SET state = 'superseded', updated_at = ? "
-                "WHERE task_id = ? AND lock_identity != ? "
-                "AND state IN ('pending','retry_wait','proof_needed')",
-                (now_ts, task_id, lock_identity),
-            )
-            cur = conn.execute(
-                "INSERT OR IGNORE INTO kanban_continuations "
-                "(lock_identity, task_id, classification, action, state, "
-                " source_fingerprint, failure_fingerprint, next_retry_at, payload, "
-                " created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    lock_identity, task_id, classification, action, state,
-                    source_fingerprint, failure_fingerprint, next_retry_at,
-                    json.dumps(safe_evidence, sort_keys=True, default=str), now_ts, now_ts,
-                ),
-            )
-            disposition = "queued" if cur.rowcount == 1 else "duplicate"
-            existing = conn.execute(
-                "SELECT state, attempts, next_retry_at FROM kanban_continuations "
-                "WHERE lock_identity = ?",
-                (lock_identity,),
-            ).fetchone()
-            if (
-                classification == "transient_retry"
-                and existing is not None
-                and int(existing["next_retry_at"] or 0) <= now_ts
-            ):
-                attempts = int(existing["attempts"] or 0) + 1
-                delay = min(
-                    CONTINUATION_RETRY_BASE_SECONDS * (2 ** min(attempts, 4)),
-                    CONTINUATION_RETRY_MAX_SECONDS,
-                )
-                updated = conn.execute(
-                    "UPDATE kanban_continuations SET attempts = ?, next_retry_at = ?, "
-                    "updated_at = ? WHERE lock_identity = ? AND next_retry_at <= ?",
-                    (attempts, now_ts + delay, now_ts, lock_identity, now_ts),
-                )
-                disposition = "retry_due" if updated.rowcount == 1 else "duplicate"
-                existing = conn.execute(
-                    "SELECT state, attempts, next_retry_at FROM kanban_continuations "
-                    "WHERE lock_identity = ?",
-                    (lock_identity,),
-                ).fetchone()
-            decisions.append({
-                "task_id": task_id,
-                "classification": classification,
-                "action": action,
-                "state": existing["state"] if existing else state,
-                "disposition": disposition,
-                "lock_identity": lock_identity,
-                "failure_fingerprint": failure_fingerprint,
-                "next_retry_at": existing["next_retry_at"] if existing else next_retry_at,
-                "attempts": int(existing["attempts"] or 0) if existing else 0,
-            })
-    return decisions
-
-
-def _continuation_marker(body: Optional[str]) -> Optional[dict]:
-    """Extract one narrow JSON marker from a source-thread body."""
-    if not body:
-        return None
-    marker = "controller_continuation_metadata:"
-    start = body.find(marker)
-    if start < 0:
-        return None
-    raw = body[start + len(marker):].lstrip()
-    try:
-        value, _ = json.JSONDecoder().raw_decode(raw)
-    except (TypeError, ValueError):
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def _latest_continuation_metadata(
-    conn: sqlite3.Connection, task_id: str,
-) -> tuple[Optional[dict], Optional[int]]:
-    rows = conn.execute(
-        "SELECT author, body, created_at FROM task_comments WHERE task_id = ? "
-        "ORDER BY created_at ASC, id ASC",
-        (task_id,),
-    ).fetchall()
-    metadata = None
-    metadata_created_at = None
-    for row in rows:
-        # The marker is an operator-control instruction, not task prose. A
-        # worker-authored comment must never authorize a replacement worker.
-        if str(row["author"] or "").strip().casefold() != "controller":
-            continue
-        candidate = _continuation_marker(row["body"])
-        if candidate is not None:
-            metadata = candidate
-            metadata_created_at = int(row["created_at"])
-    return metadata, metadata_created_at
-
-
-def _latest_block_event(
-    conn: sqlite3.Connection, task_id: str,
-) -> Optional[sqlite3.Row]:
-    return conn.execute(
-        "SELECT id, kind, payload, created_at FROM task_events "
-        "WHERE task_id = ? AND kind IN ("
-        "'blocked', 'block_loop_detected', 'unblocked', 'gave_up', "
-        "'crashed', 'timed_out', 'spawn_failed', 'completed'"
-        ") "
-        "ORDER BY id DESC LIMIT 1",
-        (task_id,),
-    ).fetchone()
-
-
-def _continuation_skip(
-    source_task_id: str,
-    reason: str,
-    *,
-    block_event_id: Optional[int] = None,
-    dependency_task_id: Optional[str] = None,
-    observed_dependency_fingerprint: Optional[str] = None,
-    dedup_key: Optional[str] = None,
-) -> dict:
-    return {
-        "decision": "skipped",
-        "reason": reason,
-        "source_task_id": source_task_id,
-        "dependency_task_id": dependency_task_id,
-        "replacement_task_id": None,
-        "observed_dependency_fingerprint": observed_dependency_fingerprint,
-        "observed_dependency_version": (
-            f"block-event:{block_event_id}" if block_event_id is not None else None
-        ),
-        "block_event_id": block_event_id,
-        "dedup_key": dedup_key,
-    }
-
-
-def _continuation_reusable_workspace(
-    task: Task, metadata: dict,
-) -> tuple[Optional[str], Optional[str], Optional[str]]:
-    """Return an existing reusable path, or a reason without creating it."""
-    kind = str(metadata.get("workspace_kind") or task.workspace_kind or "").strip().lower()
-    raw_path = metadata.get("workspace_path") or task.workspace_path
-    if kind not in {"dir", "worktree"}:
-        return None, None, "workspace_not_reusable"
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None, None, "workspace_path_required"
-    path = Path(raw_path).expanduser()
-    if not path.is_absolute():
-        return None, None, "workspace_path_not_absolute"
-    if not path.is_dir():
-        return None, None, "workspace_missing"
-    if kind == "worktree" and not _is_linked_worktree_checkout(path):
-        return None, None, "workspace_not_reusable_worktree"
-    return kind, str(path.resolve()), None
-
-
-def _continuation_target_profile(metadata: dict) -> tuple[Optional[str], Optional[str]]:
-    raw = metadata.get("target_assignee")
-    if not isinstance(raw, str) or not raw.strip():
-        return None, "target_assignee_required"
-    try:
-        target = _canonical_assignee(raw)
-    except (TypeError, ValueError):
-        return None, "target_assignee_invalid"
-    if target in {"worker", "codex", "acp"}:
-        return None, "target_assignee_pseudo_profile"
-    try:
-        from hermes_cli.profiles import profile_exists
-        exists = bool(profile_exists(target))
-    except Exception:
-        exists = False
-    if not exists:
-        return None, "target_assignee_profile_missing"
-    return target, None
-
-
-def _continuation_dependency_ids(
-    metadata: dict, block_payload: dict,
-) -> tuple[list[str], Optional[str]]:
-    ids: list[str] = []
-    explicit = metadata.get("dependency_task_id")
-    if explicit is not None:
-        if not isinstance(explicit, str) or not explicit.strip():
-            return [], "dependency_task_id_invalid"
-        ids.append(explicit.strip())
-    payload_ids = block_payload.get("dependency_ids")
-    if isinstance(payload_ids, list):
-        for value in payload_ids:
-            if isinstance(value, str) and value.strip():
-                ids.append(value.strip())
-    payload_explicit = block_payload.get("dependency_task_id")
-    if isinstance(payload_explicit, str) and payload_explicit.strip():
-        ids.append(payload_explicit.strip())
-    unique = list(dict.fromkeys(ids))
-    if explicit is not None and any(value != explicit.strip() for value in unique):
-        return unique, "dependency_identity_mismatch"
-    if len(unique) > 1:
-        return unique, "dependency_identity_ambiguous"
-    return unique, None
-
-
-def _continuation_dedup_key(
-    *,
-    source_task_id: str,
-    block_event_id: int,
-    classification: str,
-    target_assignee: str,
-    dependency_task_id: Optional[str],
-    observed_dependency_fingerprint: Optional[str],
-) -> str:
-    material = {
-        "version": 1,
-        "source_task_id": source_task_id,
-        "block_event_id": int(block_event_id),
-        "classification": classification,
-        "target_assignee": target_assignee,
-        "dependency_task_id": dependency_task_id,
-        "observed_dependency_fingerprint": observed_dependency_fingerprint,
-    }
-    encoded = json.dumps(material, sort_keys=True, separators=(",", ":"))
-    return "kanban-continuation:v1:" + hashlib.sha256(
-        encoded.encode("utf-8")
-    ).hexdigest()
-
-
-def _continuation_live(status: str) -> bool:
-    return status not in TERMINAL_STATUSES
-
-
-def _continuation_replacement_metadata(row: sqlite3.Row) -> dict[str, Any]:
-    """Return canonical history routing without granting execution authority."""
-    return {
-        "superseded_by": row["superseded_by"],
-        "live_path_task_id": row["live_path_task_id"],
-        "canonical_live_path": row["canonical_live_path"],
-    }
-
-
-def _continuation_provenance(
-    conn: sqlite3.Connection, replacement_task_id: str,
-) -> Optional[dict]:
-    row = conn.execute(
-        "SELECT payload FROM task_events WHERE task_id = ? "
-        "AND kind = 'continuation_created' ORDER BY id DESC LIMIT 1",
-        (replacement_task_id,),
-    ).fetchone()
-    if not row or not row["payload"]:
-        return None
-    try:
-        payload = json.loads(row["payload"])
-    except (TypeError, ValueError):
-        return None
-    return payload if isinstance(payload, dict) else None
-
-
-def continue_blocked_tasks(
-    conn: sqlite3.Connection,
-    *,
-    dry_run: bool = False,
-    now: Optional[int] = None,
-    sla_seconds: int = DEFAULT_BLOCKER_CONTINUATION_SLA_SECONDS,
-) -> list[dict]:
-    """Route explicitly-authorized old capability/transient blockers.
-
-    This pass is intentionally inert unless a caller opts into it. It reads
-    only current blocked rows, their latest block event, and source-thread
-    JSON metadata. It never resolves or creates a workspace during preflight.
-    """
-    now = int(time.time()) if now is None else int(now)
-    decisions: list[dict] = []
-    rows = conn.execute(
-        "SELECT * FROM tasks WHERE status = 'blocked' "
-        "ORDER BY priority DESC, created_at ASC, id ASC"
-    ).fetchall()
-    for row in rows:
-        task = Task.from_row(row)
-        try:
-            source_assignee = _canonical_assignee(task.assignee)
-        except (TypeError, ValueError):
-            source_assignee = None
-        if source_assignee in {"worker", "codex", "acp"}:
-            decisions.append(_continuation_skip(
-                task.id, "source_assignee_pseudo_profile",
-            ))
-            continue
-        event = _latest_block_event(conn, task.id)
-        if event is None:
-            decisions.append(_continuation_skip(task.id, "missing_block_event"))
-            continue
-        if event["kind"] != "blocked":
-            decisions.append(_continuation_skip(
-                task.id, "latest_block_event_not_autonomous", block_event_id=event["id"],
-            ))
-            continue
-        age = now - int(event["created_at"])
-        if age <= int(sla_seconds):
-            decisions.append(_continuation_skip(
-                task.id, "blocker_younger_than_sla", block_event_id=event["id"],
-            ))
-            continue
-        if task.block_kind not in AUTONOMOUS_CONTINUATION_BLOCK_KINDS:
-            decisions.append(_continuation_skip(
-                task.id, "block_kind_not_autonomous", block_event_id=event["id"],
-            ))
-            continue
-        try:
-            block_payload = json.loads(event["payload"]) if event["payload"] else {}
-        except (TypeError, ValueError):
-            block_payload = {}
-        if not isinstance(block_payload, dict):
-            block_payload = {}
-        reason = block_payload.get("reason")
-        if not isinstance(reason, str) or not reason.strip():
-            decisions.append(_continuation_skip(
-                task.id, "missing_block_reason", block_event_id=event["id"],
-            ))
-            continue
-        if block_payload.get("kind") not in (None, task.block_kind):
-            decisions.append(_continuation_skip(
-                task.id, "block_kind_event_mismatch", block_event_id=event["id"],
-            ))
-            continue
-        metadata, metadata_created_at = _latest_continuation_metadata(conn, task.id)
-        if metadata is None:
-            decisions.append(_continuation_skip(
-                task.id, "continuation_metadata_required", block_event_id=event["id"],
-            ))
-            continue
-        if metadata_created_at is None or metadata_created_at < int(event["created_at"]):
-            decisions.append(_continuation_skip(
-                task.id, "continuation_metadata_not_current",
-                block_event_id=event["id"],
-            ))
-            continue
-        classification = metadata.get("classification")
-        if (
-            not isinstance(classification, str)
-            or classification.strip().lower() != task.block_kind
-        ):
-            decisions.append(_continuation_skip(
-                task.id, "continuation_classification_mismatch",
-                block_event_id=event["id"],
-            ))
-            continue
-        classification = classification.strip().lower()
-        forbidden_text = reason.casefold()
-        if "review-required:" in forbidden_text:
-            decisions.append(_continuation_skip(
-                task.id, "review_required", block_event_id=event["id"],
-            ))
-            continue
-        if any(
-            key in metadata and bool(metadata.get(key))
-            for key in ("needs_input", "scheduled", "maintenance_window", "maintenance-window")
-        ):
-            decisions.append(_continuation_skip(
-                task.id, "human_or_scheduled_semantics", block_event_id=event["id"],
-            ))
-            continue
-        if any(
-            token in forbidden_text
-            for token in _AUTONOMOUS_CONTINUATION_HUMAN_REASON_TOKENS
-        ):
-            decisions.append(_continuation_skip(
-                task.id, "human_or_scheduled_reason", block_event_id=event["id"],
-            ))
-            continue
-        parent_rows = conn.execute(
-            "SELECT t.id, t.status FROM tasks t "
-            "JOIN task_links l ON l.parent_id = t.id "
-            "WHERE l.child_id = ? ORDER BY t.id",
-            (task.id,),
-        ).fetchall()
-        unfinished_parents = [
-            r["id"] for r in parent_rows
-            if r["status"] not in TERMINAL_STATUSES
-        ]
-        if unfinished_parents:
-            parent_id = unfinished_parents[0]
-            parent_fingerprint = _dependency_fingerprint(conn, parent_id)
-            decisions.append(_continuation_skip(
-                task.id, "parent_dependency_pending",
-                block_event_id=event["id"],
-                dependency_task_id=parent_id,
-                observed_dependency_fingerprint=parent_fingerprint,
-            ))
-            continue
-        linked_parent_ids = [r["id"] for r in parent_rows]
-        if len(linked_parent_ids) > 1 and "dependency_task_id" not in metadata:
-            decisions.append(_continuation_skip(
-                task.id, "linked_dependency_identity_ambiguous",
-                block_event_id=event["id"],
-            ))
-            continue
-        dependency_ids, dependency_error = _continuation_dependency_ids(
-            metadata, block_payload,
-        )
-        if dependency_error:
-            decisions.append(_continuation_skip(
-                task.id, dependency_error, block_event_id=event["id"],
-            ))
-            continue
-        dependency_task_id = dependency_ids[0] if dependency_ids else None
-        if dependency_task_id is None and linked_parent_ids:
-            dependency_task_id = linked_parent_ids[0]
-        if dependency_task_id == task.id:
-            decisions.append(_continuation_skip(
-                task.id, "dependency_self_reference", block_event_id=event["id"],
-            ))
-            continue
-        if dependency_task_id:
-            dependency = get_task(conn, dependency_task_id)
-            if dependency is None:
-                decisions.append(_continuation_skip(
-                    task.id, "dependency_not_found",
-                    block_event_id=event["id"],
-                    dependency_task_id=dependency_task_id,
-                ))
-                continue
-            observed = _dependency_fingerprint(conn, dependency_task_id)
-            if dependency.status not in TERMINAL_STATUSES:
-                decisions.append(_continuation_skip(
-                    task.id, "dependency_unchanged_or_unfinished",
-                    block_event_id=event["id"],
-                    dependency_task_id=dependency_task_id,
-                    observed_dependency_fingerprint=observed,
-                ))
-                continue
-        else:
-            observed = None
-
-        target_assignee, profile_error = _continuation_target_profile(metadata)
-        if profile_error:
-            decisions.append(_continuation_skip(
-                task.id, profile_error, block_event_id=event["id"],
-                dependency_task_id=dependency_task_id,
-                observed_dependency_fingerprint=observed,
-            ))
-            continue
-        dedup_key = _continuation_dedup_key(
-            source_task_id=task.id,
-            block_event_id=int(event["id"]),
-            classification=classification,
-            target_assignee=target_assignee,
-            dependency_task_id=dependency_task_id,
-            observed_dependency_fingerprint=observed,
-        )
-        base = {
-            "source_task_id": task.id,
-            "dependency_task_id": dependency_task_id,
-            "observed_dependency_fingerprint": observed,
-            "observed_dependency_version": (
-                observed or f"block-event:{event['id']}"
-            ),
-            "block_event_id": int(event["id"]),
-            "dedup_key": dedup_key,
-            "classification": classification,
-            "target_assignee": target_assignee,
-        }
-
-        explicit_replacement = metadata.get("replacement_task_id")
-        if explicit_replacement is not None and (
-            not isinstance(explicit_replacement, str) or not explicit_replacement.strip()
-        ):
-            decisions.append({
-                **base, "decision": "skipped", "reason": "replacement_task_id_invalid",
-                "replacement_task_id": None,
-            })
-            continue
-        explicit_replacement = (
-            explicit_replacement.strip() if isinstance(explicit_replacement, str) else None
-        )
-        existing = None
-        if explicit_replacement:
-            existing = conn.execute(
-                "SELECT id, status, idempotency_key, superseded_by, "
-                "live_path_task_id, canonical_live_path FROM tasks WHERE id = ?",
-                (explicit_replacement,),
-            ).fetchone()
-            if existing is None:
-                decisions.append({
-                    **base, "decision": "skipped",
-                    "reason": "replacement_task_not_found",
-                    "replacement_task_id": explicit_replacement,
-                })
-                continue
-            provenance = _continuation_provenance(conn, existing["id"])
-            current_path = (
-                existing["idempotency_key"] == dedup_key
-                or (
-                    provenance is not None
-                    and provenance.get("source_task_id") == task.id
-                    and provenance.get("dedup_key") == dedup_key
-                )
-            )
-            same_source_path = (
-                provenance is not None
-                and provenance.get("source_task_id") == task.id
-            )
-            if current_path:
-                pass
-            elif _continuation_live(existing["status"]):
-                decisions.append({
-                    **base, "decision": "skipped",
-                    "reason": "replacement_live_dedup_mismatch",
-                    "replacement_task_id": existing["id"],
-                    **_continuation_replacement_metadata(existing),
-                })
-                continue
-            elif not same_source_path:
-                decisions.append({
-                    **base, "decision": "skipped",
-                    "reason": "replacement_dedup_mismatch",
-                    "replacement_task_id": existing["id"],
-                    **_continuation_replacement_metadata(existing),
-                })
-                continue
-            else:
-                existing = None
-        if existing is None:
-            existing = conn.execute(
-                "SELECT id, status, idempotency_key, superseded_by, "
-                "live_path_task_id, canonical_live_path FROM tasks "
-                "WHERE idempotency_key = ? ORDER BY created_at DESC LIMIT 1",
-                (dedup_key,),
-            ).fetchone()
-        if existing is not None:
-            existing_status = str(existing["status"] or "")
-            decisions.append({
-                **base,
-                "decision": (
-                    "existing_non_authorizing"
-                    if existing_status in NON_ACTIONABLE_STATUSES
-                    else (
-                        "existing_live" if _continuation_live(existing_status)
-                        else "existing_terminal"
-                    )
-                ),
-                "reason": "deduplicated_existing_path",
-                "replacement_task_id": existing["id"],
-                **_continuation_replacement_metadata(existing),
-            })
-            continue
-
-        workspace_kind, workspace_path, workspace_error = _continuation_reusable_workspace(
-            task, metadata,
-        )
-        if workspace_error:
-            decisions.append({
-                **base, "decision": "skipped", "reason": workspace_error,
-                "replacement_task_id": None,
-            })
-            continue
-
-        provenance = {
-            **base,
-            "replacement_task_id": None,
-            "source_tenant": task.tenant,
-            "source_priority": task.priority,
-            "workspace_kind": workspace_kind,
-            "workspace_path": workspace_path,
-        }
-        if dry_run:
-            decisions.append({
-                **provenance, "decision": "would_route", "reason": "validated",
-            })
-            continue
-
-        body = (
-            "controller_continuation_provenance: "
-            + json.dumps(provenance, sort_keys=True, separators=(",", ":"))
-        )
-        replacement_id = create_task(
-            conn,
-            title=f"Autonomous continuation for {task.id}",
-            body=body,
-            assignee=target_assignee,
-            created_by="kanban-continuation-guard",
-            workspace_kind=workspace_kind,
-            workspace_path=workspace_path,
-            tenant=task.tenant,
-            priority=task.priority,
-            idempotency_key=dedup_key,
-            initial_status="running",
-        )
-        provenance["replacement_task_id"] = replacement_id
-        with write_txn(conn):
-            _append_event(conn, replacement_id, "continuation_created", provenance)
-            _append_event(conn, task.id, "continuation_routed", provenance)
-        decisions.append({
-            **provenance, "decision": "routed", "reason": "validated",
-        })
-    return decisions
-
-
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -12987,10 +11260,6 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
-    reconciliation_probe=None,
-    profile_roster=None,
-    enable_continuations: bool = False,
-    continuation_limit: int = DEFAULT_CONTINUATION_LIMIT,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -13001,67 +11270,35 @@ def dispatch_once(
     cgroup — can never run a reclaim/spawn/write tick concurrently and
     race on WAL frames. The losing dispatcher returns an empty
     ``DispatchResult`` with ``skipped_locked=True`` and does no DB writes;
-    the holder is already making progress on the same board. Lock trust or
-    setup failures instead populate ``dispatch_lock_error`` with a bounded
-    diagnostic and likewise return before any reclaim, claim, or spawn.
+    the holder is already making progress on the same board.
 
-    The lock is keyed off the active SQLite connection's canonical DB path,
-    so explicit DB callers and board-less ticks cannot drift onto a different
-    lock file. Unrelated boards still tick in parallel. See
-    :func:`_dispatch_tick_lock` for the cross-process / cross-platform
-    mechanics.
+    The lock is keyed off the board's resolved DB path, so unrelated
+    boards tick in parallel. See :func:`_dispatch_tick_lock` for the
+    cross-process / cross-platform mechanics.
     """
-    db_path = _connection_main_db_path(conn)
-    if db_path is None:
-        return DispatchResult(
-            dispatch_lock_error="path_resolution_failed",
+    if dry_run:
+        # Preview never enters the writer lock: opening its sidecar would be a
+        # filesystem effect, and no mutation below needs single-writer
+        # serialization. The active connection remains the read source.
+        return _dispatch_once_locked(
+            conn,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=True,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
         )
     try:
-        # Snapshot the board once. A board switch while a tick is blocked in
-        # spawn must not redirect workspace/log resolution on the same tick.
-        pinned_board = _normalize_board_slug(board) or get_current_board()
+        db_path = kanban_db_path(board=board)
     except Exception:
-        _log.error("kanban dispatch skipped: board_identity_resolution_failed")
-        return DispatchResult(
-            dispatch_lock_error="board_resolution_failed",
-        )
-    if dry_run:
-        # Preview against a private copy.  This avoids every database write,
-        # lockfile touch, signal, waitpid, workspace creation, and spawn while
-        # still exercising the same maintenance/promotion/classification SQL.
-        preview = sqlite3.connect(":memory:", isolation_level=None)
-        preview.row_factory = sqlite3.Row
-        try:
-            conn.backup(preview)
-            return _dispatch_once_locked(
-                preview,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=True,
-                preview_mode=True,
-                max_spawn=max_spawn,
-                max_in_progress=max_in_progress,
-                failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=pinned_board,
-                db_path=db_path,
-                default_assignee=default_assignee,
-                max_in_progress_per_profile=max_in_progress_per_profile,
-                reconciliation_probe=reconciliation_probe,
-                profile_roster=profile_roster,
-                enable_continuations=enable_continuations,
-                continuation_limit=continuation_limit,
-            )
-        finally:
-            preview.close()
-
-    with _dispatch_tick_lock(db_path) as lock_outcome:
-        if not lock_outcome.acquired:
-            if lock_outcome.reason == "contention":
-                return DispatchResult(skipped_locked=True)
-            return DispatchResult(
-                dispatch_lock_error=lock_outcome.reason or "unknown_failure",
-            )
+        # Path resolution should never fail, but if it somehow does we
+        # must not lose the tick — fall through to an unguarded dispatch
+        # rather than dropping work.
         return _dispatch_once_locked(
             conn,
             spawn_fn=spawn_fn,
@@ -13071,15 +11308,120 @@ def dispatch_once(
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
-            board=pinned_board,
+            board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
-            db_path=db_path,
-            reconciliation_probe=reconciliation_probe,
-            profile_roster=profile_roster,
-            enable_continuations=enable_continuations,
-            continuation_limit=continuation_limit,
         )
+    with _dispatch_tick_lock(db_path) as held:
+        if not held:
+            return DispatchResult(skipped_locked=True)
+        result = _dispatch_once_locked(
+            conn,
+            spawn_fn=spawn_fn,
+            ttl_seconds=ttl_seconds,
+            dry_run=dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds,
+            board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
+        # Still under the dispatch lock: opportunistically truncate the WAL
+        # at a coarse interval so it cannot grow unbounded between restarts.
+        # A dry-run is a strict read-only preview, including no PRAGMA with
+        # write-side checkpoint effects.
+        if not dry_run:
+            _maybe_checkpoint_wal(conn, db_path)
+    return result
+
+
+def _preview_dispatch_maintenance(
+    conn: sqlite3.Connection,
+    *,
+    stale_timeout_seconds: int = 0,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+) -> DispatchResult:
+    """Describe maintenance candidates without touching DB or processes.
+
+    The maintenance helpers intentionally own their write transactions and
+    some of them can signal workers.  A dry-run must not call those helpers at
+    all, even with ``process_effects=False``: that mode is useful to their
+    callers, but is not a sufficient whole-tick no-write contract.
+    """
+    result = DispatchResult()
+    now = int(time.time())
+
+    expired = conn.execute(
+        "SELECT id, worker_pid FROM tasks "
+        "WHERE status='running' AND claim_expires IS NOT NULL AND claim_expires < ?",
+        (now,),
+    ).fetchall()
+    # PID-less expiry is deterministic.  PID-bearing rows stay out of the
+    # preview count because deciding ownership would require a process census.
+    result.reclaimed = sum(1 for row in expired if row["worker_pid"] is None)
+
+    if stale_timeout_seconds > 0:
+        rows = conn.execute(
+            "SELECT t.id, t.worker_pid, "
+            "COALESCE(r.started_at, t.started_at) AS started_at, "
+            "t.last_heartbeat_at "
+            "FROM tasks t LEFT JOIN task_runs r ON r.id=t.current_run_id "
+            "WHERE t.status='running'"
+        ).fetchall()
+        for row in rows:
+            if row["started_at"] is None:
+                continue
+            if now - int(row["started_at"]) < stale_timeout_seconds:
+                continue
+            heartbeat_age = (
+                now - int(row["last_heartbeat_at"])
+                if row["last_heartbeat_at"] is not None else None
+            )
+            if heartbeat_age is not None and heartbeat_age < _STALE_HEARTBEAT_GAP_SECONDS:
+                continue
+            if row["worker_pid"] is None:
+                result.stale.append(row["id"])
+
+    timed_out = conn.execute(
+        "SELECT t.id, COALESCE(r.started_at, t.started_at) AS started_at, "
+        "t.max_runtime_seconds FROM tasks t "
+        "LEFT JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.status='running' AND t.max_runtime_seconds IS NOT NULL"
+    ).fetchall()
+    for row in timed_out:
+        if row["started_at"] is not None and (
+            now - int(row["started_at"]) >= int(row["max_runtime_seconds"])
+        ):
+            result.timed_out.append(row["id"])
+
+    candidates = conn.execute(
+        "SELECT id, status, consecutive_failures, max_retries "
+        "FROM tasks WHERE status IN ('todo', 'blocked')"
+    ).fetchall()
+    for row in candidates:
+        if row["status"] == "blocked" and _has_sticky_block(conn, row["id"]):
+            continue
+        active_review = conn.execute(
+            "SELECT 1 FROM review_handoffs WHERE review_task_id=? AND state='active'",
+            (row["id"],),
+        ).fetchone()
+        if active_review:
+            continue
+        unfinished = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+            (row["id"],),
+        ).fetchone()
+        if unfinished:
+            continue
+        if row["status"] == "blocked":
+            limit = int(row["max_retries"] or failure_limit or DEFAULT_FAILURE_LIMIT)
+            if int(row["consecutive_failures"] or 0) >= limit:
+                continue
+        result.promoted += 1
+    return result
 
 
 def _dispatch_once_locked(
@@ -13088,19 +11430,13 @@ def _dispatch_once_locked(
     spawn_fn=None,
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
-    preview_mode: bool = False,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
-    db_path: Optional[Path] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
-    reconciliation_probe=None,
-    profile_roster=None,
-    enable_continuations: bool = False,
-    continuation_limit: int = DEFAULT_CONTINUATION_LIMIT,
 ) -> DispatchResult:
     """Run one dispatcher tick.
 
@@ -13127,149 +11463,60 @@ def _dispatch_once_locked(
     busy board and accumulate without bound.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
-    ``board`` pins workspace/log resolution for this tick to a specific
-    board. ``db_path`` is the canonical identity of the active SQLite
-    connection and is required for the lock/worker/scope/receipt handoff.
+    ``board`` pins workspace/log/db resolution for this tick to a specific
+    board. When omitted, the current-board resolution chain is used.
     """
-    if db_path is None:
-        raise RuntimeError(
-            "_dispatch_once_locked requires the canonical connection DB path"
+    if dry_run:
+        # Strict preview: no transaction-owning maintenance helper and no
+        # waitpid/process-tree census. The rest of this function only issues
+        # reads or records would-be spawn decisions when dry_run is true.
+        result = _preview_dispatch_maintenance(
+            conn,
+            stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit,
         )
-
-    # Reap zombie children from previously spawned workers. See
-    # reap_worker_zombies() for the full rationale.
-    if not preview_mode:
+    else:
+        # Reap zombie children from previously spawned workers. See
+        # reap_worker_zombies() for the full rationale.
         reap_worker_zombies()
 
-    result = DispatchResult()
-    if not preview_mode:
+        result = DispatchResult()
+        # Phase-B terminal intents must be reconciled before stale/crash
+        # maintenance can reclaim the same run or spawn a replacement.
         refresh_worker_process_ownership(conn)
         result.worker_reaps = reconcile_worker_reaps(conn)
-    result.scope_cleanup = _reconcile_ended_worker_scopes(
-        conn,
-        process_effects=not preview_mode,
-        db_path=db_path,
-    )
-    result.reclaimed = release_stale_claims(
-        conn, process_effects=not preview_mode,
-    )
-    result.maintenance_conflicts.extend(
-        getattr(release_stale_claims, "_last_transition_conflicts", [])
-    )
-    result.stale = detect_stale_running(
-        conn, stale_timeout_seconds=stale_timeout_seconds,
-        process_effects=not preview_mode,
-    )
-    result.maintenance_conflicts.extend(
-        getattr(detect_stale_running, "_last_transition_conflicts", [])
-    )
-    crash_attrs = {
-        name: getattr(detect_crashed_workers, name, None)
-        for name in ("_last_auto_blocked", "_last_rate_limited")
-    }
-    result.crashed = detect_crashed_workers(
-        conn,
-        process_effects=not preview_mode,
-    )
-    result.maintenance_conflicts.extend(
-        getattr(detect_crashed_workers, "_last_transition_conflicts", [])
-    )
-    # detect_crashed_workers stashes protocol-violation auto-blocks on
-    # itself so the public list-return stays stable. Pull them into the
-    # DispatchResult here so telemetry / tests see the trip.
-    _crash_auto_blocked = [] if (dry_run and enable_continuations) else getattr(
-        detect_crashed_workers, "_last_auto_blocked", []
-    )
-    if _crash_auto_blocked:
-        result.auto_blocked.extend(_crash_auto_blocked)
-    # Rate-limited requeues (quota wall, no failure counted) — surface for
-    # telemetry / tests. These tasks went back to ``ready`` and the respawn
-    # guard will defer them until the quota window clears.
-    _crash_rate_limited = [] if (dry_run and enable_continuations) else getattr(
-        detect_crashed_workers, "_last_rate_limited", []
-    )
-    if _crash_rate_limited:
-        result.rate_limited.extend(_crash_rate_limited)
-    if preview_mode:
-        for name, value in crash_attrs.items():
-            if value is None:
-                try:
-                    delattr(detect_crashed_workers, name)
-                except AttributeError:
-                    pass
-            else:
-                setattr(detect_crashed_workers, name, value)
-    result.timed_out = enforce_max_runtime(
-        conn, process_effects=not preview_mode,
-    )
-    result.maintenance_conflicts.extend(
-        getattr(enforce_max_runtime, "_last_transition_conflicts", [])
-    )
-    result.promoted = recompute_ready(conn, failure_limit=failure_limit)
-    if enable_continuations:
-        result.continuation_decisions.extend(
-            continue_blocked_tasks(conn, dry_run=dry_run)
+        result.reclaimed = release_stale_claims(conn)
+        result.maintenance_conflicts.extend(
+            getattr(release_stale_claims, "_last_transition_conflicts", [])
         )
-
-    # One bounded sensor session feeds dispatch, review dispatch, CAS, and the
-    # optional controller ledger.  No Git/network probe occurs under a write
-    # transaction, and no claim re-probes the same ref.
-    from hermes_cli import kanban_diagnostics as _kd
-
-    if profile_roster is None:
-        try:
-            from hermes_cli.profiles import profile_exists as profile_roster
-        except Exception:
-            profile_roster = None
-    probe_session = (
-        reconciliation_probe
-        if isinstance(reconciliation_probe, _kd.GitProbeSession)
-        else _kd.cached_git_probe(reconciliation_probe)
-    )
-    report_statuses = (
-        "'ready','review','blocked','triage','todo'"
-        if enable_continuations else "'ready','review'"
-    )
-    report_ids = [
-        str(row["id"])
-        for row in conn.execute(
-            f"SELECT id FROM tasks WHERE status IN ({report_statuses}) "
-            "ORDER BY priority DESC, created_at ASC, id ASC"
+        result.stale = detect_stale_running(
+            conn, stale_timeout_seconds=stale_timeout_seconds,
         )
-    ]
-    reconciliation_reports = _reconciliation_reports(
-        conn,
-        report_ids,
-        git_probe=probe_session,
-        profile_roster=profile_roster,
-    )
-    result.reconciliation = {
-        task_id: report.to_dict()
-        for task_id, report in reconciliation_reports.items()
-        if report.opted_in or report.findings
-    }
-    if enable_continuations:
-        result.continuations = queue_reconciliation_continuations(
-            conn,
-            reconciliation_reports,
-            limit=continuation_limit,
+        result.maintenance_conflicts.extend(
+            getattr(detect_stale_running, "_last_transition_conflicts", [])
         )
-
-    def _profile_can_spawn(name: str) -> bool:
-        if profile_roster is None:
-            return True
-        if callable(profile_roster):
-            try:
-                return bool(profile_roster(name))
-            except Exception:
-                return True
-        try:
-            return str(name).casefold() in {
-                str(getattr(item, "name", item)).casefold()
-                for item in profile_roster
-            }
-        except TypeError:
-            return True
+        result.crashed = detect_crashed_workers(conn)
+        result.maintenance_conflicts.extend(
+            getattr(detect_crashed_workers, "_last_transition_conflicts", [])
+        )
+        # detect_crashed_workers stashes protocol-violation auto-blocks on
+        # itself so the public list-return stays stable. Pull them into the
+        # DispatchResult here so telemetry / tests see the trip.
+        _crash_auto_blocked = getattr(
+            detect_crashed_workers, "_last_auto_blocked", []
+        )
+        if _crash_auto_blocked:
+            result.auto_blocked.extend(_crash_auto_blocked)
+        _crash_rate_limited = getattr(
+            detect_crashed_workers, "_last_rate_limited", []
+        )
+        if _crash_rate_limited:
+            result.rate_limited.extend(_crash_rate_limited)
+        result.timed_out = enforce_max_runtime(conn)
+        result.maintenance_conflicts.extend(
+            getattr(enforce_max_runtime, "_last_transition_conflicts", [])
+        )
+        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -13332,34 +11579,20 @@ def _dispatch_once_locked(
     _default_assignee = (default_assignee or "").strip() or None
     _default_assignee_resolved = False
     if _default_assignee:
-        _default_assignee_resolved = _profile_can_spawn(_default_assignee)
+        try:
+            from hermes_cli.profiles import profile_exists as _pe
+            _default_assignee_resolved = bool(_pe(_default_assignee))
+        except Exception:
+            # Profiles module not importable (test stubs, exotic envs).
+            # Trust the operator's config and try the assignment; the
+            # downstream profile_exists check on the assigned row will
+            # bucket it as nonspawnable if the profile genuinely isn't
+            # there, with the existing diagnostic.
+            _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if _task_has_pending_ended_worker_scope(conn, row["id"]):
-            if not any(
-                item.get("task_id") == row["id"]
-                and item.get("action") == "spawn_deferred"
-                for item in result.scope_cleanup
-            ):
-                result.scope_cleanup.append({
-                    "task_id": row["id"],
-                    "action": "spawn_deferred",
-                    "reason": "cleanup_pending",
-                })
-            continue
         row_assignee = row["assignee"]
-        report = reconciliation_reports.get(str(row["id"]))
-        if report is not None and not report.actionable:
-            blocking = [
-                finding.kind for finding in report.findings
-                if finding.data.get("dispatch_blocked") is True
-            ]
-            code = blocking[0] if blocking else "reconciliation_changed"
-            result.skipped_reconciliation.append((row["id"], code))
-            if code == "assignee_non_runnable":
-                result.skipped_nonspawnable.append(row["id"])
-            continue
         if not row_assignee:
             # Honour kanban.default_assignee: when the dispatcher hits an
             # unassigned ready task and an operator-configured fallback
@@ -13378,19 +11611,18 @@ def _dispatch_once_locked(
                 if not dry_run:
                     try:
                         with write_txn(conn):
-                            assigned = conn.execute(
+                            conn.execute(
                                 "UPDATE tasks SET assignee = ? WHERE id = ? "
                                 "AND (assignee IS NULL OR assignee = '')",
                                 (_default_assignee, row["id"]),
                             )
-                            if assigned.rowcount == 1:
-                                _append_event(
-                                    conn, row["id"], "assigned",
-                                    {
-                                        "assignee": _default_assignee,
-                                        "source": "kanban.default_assignee",
-                                    },
-                                )
+                            _append_event(
+                                conn, row["id"], "assigned",
+                                {
+                                    "assignee": _default_assignee,
+                                    "source": "kanban.default_assignee",
+                                },
+                            )
                     except Exception:
                         _log.debug(
                             "kanban dispatch: failed to apply default_assignee=%r "
@@ -13401,37 +11633,9 @@ def _dispatch_once_locked(
                         continue
                 row_assignee = _default_assignee
                 result.auto_assigned_default.append(row["id"])
-                if not dry_run and report is not None and report.opted_in:
-                    report = _reconciliation_reports(
-                        conn,
-                        [str(row["id"])],
-                        git_probe=probe_session,
-                        profile_roster=profile_roster,
-                    ).get(str(row["id"]))
-                    reconciliation_reports[str(row["id"])] = report
-                    if report is not None:
-                        result.reconciliation[str(row["id"])] = report.to_dict()
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
-        preflight_ok, preflight_reason, preflight_payload = _preflight_ready_task(
-            conn,
-            row["id"],
-            board=board,
-            dry_run=dry_run,
-        )
-        if not preflight_ok:
-            if preflight_reason == "capability_mismatch" and preflight_payload:
-                result.capability_blocked.append(
-                    (
-                        row["id"],
-                        list(preflight_payload.get("required") or []),
-                        list(preflight_payload.get("missing") or []),
-                    )
-                )
-            else:
-                result.auto_blocked.append(row["id"])
-            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -13442,7 +11646,11 @@ def _dispatch_once_locked(
         # subprocess would crash on startup, get reaped as a zombie,
         # the task would loop back to ``ready`` on next tick, and we'd
         # burn CPU forever (#kanban-dispatcher-crash-loop 2026-05-05).
-        if not _profile_can_spawn(row_assignee):
+        try:
+            from hermes_cli.profiles import profile_exists  # local import: avoids cycle
+        except Exception:
+            profile_exists = None  # type: ignore[assignment]
+        if profile_exists is not None and not profile_exists(row_assignee):
             # Bucket separately from skipped_unassigned: the operator
             # cannot fix this by assigning a profile (the assignee IS the
             # intended owner — a terminal lane). Health telemetry uses
@@ -13496,17 +11704,8 @@ def _dispatch_once_locked(
                     _per_profile_running.get(row_assignee, 0) + 1
                 )
             continue
-        claimed = claim_task(
-            conn,
-            row["id"],
-            ttl_seconds=ttl_seconds,
-            reconciliation_report=report,
-        )
+        claimed = claim_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            if report is not None and report.opted_in:
-                result.skipped_reconciliation.append(
-                    (row["id"], "reconciliation_changed")
-                )
             continue
         try:
             resolved_branch_name = None
@@ -13515,17 +11714,12 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            _block_deterministic_preflight_failure(
-                conn,
-                claimed.id,
-                reason_code="workspace_config",
-                error=f"workspace: {exc}",
-                payload={
-                    "workspace_kind": claimed.workspace_kind,
-                    "workspace_path": claimed.workspace_path,
-                },
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
             )
-            result.auto_blocked.append(claimed.id)
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -13540,12 +11734,10 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    spawn_kwargs["board"] = board
-                if "db_path" in sig.parameters:
-                    spawn_kwargs["db_path"] = db_path
-                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+                    pid = _spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -13597,67 +11789,21 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
-        if _task_has_pending_ended_worker_scope(conn, row["id"]):
-            if not any(
-                item.get("task_id") == row["id"]
-                and item.get("action") == "spawn_deferred"
-                for item in result.scope_cleanup
-            ):
-                result.scope_cleanup.append({
-                    "task_id": row["id"],
-                    "action": "spawn_deferred",
-                    "reason": "cleanup_pending",
-                })
-            continue
-        report = reconciliation_reports.get(str(row["id"]))
-        if report is not None and not report.actionable:
-            blocking = [
-                finding.kind for finding in report.findings
-                if finding.data.get("dispatch_blocked") is True
-            ]
-            code = blocking[0] if blocking else "reconciliation_changed"
-            result.skipped_reconciliation.append((row["id"], code))
-            if code == "assignee_non_runnable":
-                result.skipped_nonspawnable.append(row["id"])
-            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
-        preflight_ok, preflight_reason, preflight_payload = _preflight_ready_task(
-            conn,
-            row["id"],
-            board=board,
-            dry_run=dry_run,
-        )
-        if not preflight_ok:
-            if preflight_reason == "capability_mismatch" and preflight_payload:
-                result.capability_blocked.append(
-                    (
-                        row["id"],
-                        list(preflight_payload.get("required") or []),
-                        list(preflight_payload.get("missing") or []),
-                    )
-                )
-            else:
-                result.auto_blocked.append(row["id"])
-            continue
-        if not _profile_can_spawn(row["assignee"]):
+        try:
+            from hermes_cli.profiles import profile_exists
+        except Exception:
+            profile_exists = None  # type: ignore[assignment]
+        if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
             continue
-        claimed = claim_review_task(
-            conn,
-            row["id"],
-            ttl_seconds=ttl_seconds,
-            reconciliation_report=report,
-        )
+        claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:
-            if report is not None and report.opted_in:
-                result.skipped_reconciliation.append(
-                    (row["id"], "reconciliation_changed")
-                )
             continue
         try:
             resolved_branch_name = None
@@ -13666,17 +11812,12 @@ def _dispatch_once_locked(
             else:
                 workspace = resolve_workspace(claimed, board=board)
         except Exception as exc:
-            _block_deterministic_preflight_failure(
-                conn,
-                claimed.id,
-                reason_code="workspace_config",
-                error=f"workspace: {exc}",
-                payload={
-                    "workspace_kind": claimed.workspace_kind,
-                    "workspace_path": claimed.workspace_path,
-                },
+            auto = _record_spawn_failure(
+                conn, claimed.id, f"workspace: {exc}",
+                failure_limit=failure_limit,
             )
-            result.auto_blocked.append(claimed.id)
+            if auto:
+                result.auto_blocked.append(claimed.id)
             continue
         # Persist the resolved workspace path so the worker can cd there.
         set_workspace_path(conn, claimed.id, str(workspace))
@@ -13688,12 +11829,10 @@ def _dispatch_once_locked(
             import inspect
             try:
                 sig = inspect.signature(_spawn)
-                spawn_kwargs = {}
                 if "board" in sig.parameters:
-                    spawn_kwargs["board"] = board
-                if "db_path" in sig.parameters:
-                    spawn_kwargs["db_path"] = db_path
-                pid = _spawn(claimed, str(workspace), **spawn_kwargs)
+                    pid = _spawn(claimed, str(workspace), board=board)
+                else:
+                    pid = _spawn(claimed, str(workspace))
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
@@ -13958,1653 +12097,24 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
     if not hermes_home:
         return None
     try:
-        from agent.secret_scope import (
-            build_profile_secret_scope,
-            reset_secret_scope,
-            set_secret_scope,
-        )
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
         from hermes_cli.config import load_config
         from hermes_cli.tools_config import _get_platform_tools
 
-        home_token = set_hermes_home_override(hermes_home)
-        secret_token = None
+        token = set_hermes_home_override(hermes_home)
         try:
-            secret_token = set_secret_scope(
-                build_profile_secret_scope(Path(hermes_home))
-            )
             cfg = load_config()
             toolsets = sorted(_get_platform_tools(cfg, "cli"))
         finally:
-            if secret_token is not None:
-                reset_secret_scope(secret_token)
-            reset_hermes_home_override(home_token)
+            reset_hermes_home_override(token)
         return toolsets or None
-    except Exception:
-        _log.debug("kanban worker: target-profile CLI toolset resolution failed")
-        return None
-
-
-def _current_cgroup_path() -> Optional[str]:
-    """Return this process's systemd/unified cgroup path on Linux, if available."""
-    if not sys.platform.startswith("linux"):
-        return None
-    try:
-        for line in Path("/proc/self/cgroup").read_text(encoding="utf-8").splitlines():
-            hierarchy, controllers, path = line.split(":", 2)
-            if (
-                (hierarchy == "0" and not controllers)
-                or "name=systemd" in controllers.split(",")
-            ):
-                return path
-    except (OSError, ValueError):
-        return None
-    return None
-
-
-_SYSTEMD_WORKER_SCOPE_PREFIX = "hermes-kanban-worker-"
-_SYSTEMD_WORKER_SCOPE_RE = re.compile(
-    rf"^{re.escape(_SYSTEMD_WORKER_SCOPE_PREFIX)}[0-9a-f]{{32}}\.scope$"
-)
-_SYSTEMD_WORKER_SCOPE_LEGACY_RE = re.compile(
-    rf"^{re.escape(_SYSTEMD_WORKER_SCOPE_PREFIX)}[A-Za-z0-9_.-]+\.scope$"
-)
-_SYSTEMD_USER_MANAGER_KIND = "systemd-user"
-_SYSTEMD_USER_RUNTIME_ROOT = Path("/run/user")
-_SYSTEMD_SCOPE_MIN_VERSION = 236  # --collect was added in systemd 236.
-_SYSTEMD_PROBE_TIMEOUT_SECONDS = 2.0
-_SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
-_ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS = 5
-_ENDED_WORKER_SCOPE_CLEANUP_LIMIT = 4
-_WORKER_SCOPE_CLEANUP_FINAL_EVENT = "worker_scope_cleanup_finalized"
-_LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT = "legacy_worker_launch_classified"
-_LEGACY_DIRECT_CLASSIFIED_LAUNCH_MODE = "legacy-direct-classified"
-_LOCAL_MACHINE_ID_PATH = Path("/etc/machine-id")
-_CGROUP_V2_ROOT = Path("/sys/fs/cgroup")
-_LEGACY_SCOPE_CGROUP_SCAN_LIMIT = 4096
-
-
-class _WorkerLaunchUncertain(RuntimeError):
-    """A scoped launcher could not be acknowledged or safely stopped."""
-
-    def __init__(self, pid: int, message: str):
-        super().__init__(message)
-        self.pid = int(pid)
-
-
-@dataclass(frozen=True)
-class _SystemdUserManagerTarget:
-    """Locally validated address of one user manager.
-
-    Paths are derived from the numeric kernel identity and deliberately never
-    serialized into Kanban receipts or lifecycle diagnostics.
-    """
-
-    manager_kind: str
-    manager_uid: int
-    runtime_dir: Path = field(repr=False)
-    bus_path: Path = field(repr=False)
-
-
-@dataclass(frozen=True)
-class _WorkerScopeStatus:
-    """Resolved scope state plus the exact manager used to prove it."""
-
-    unit: Optional[str]
-    state: str
-    manager_target: Optional[_SystemdUserManagerTarget]
-    launch_mode: str
-    launch_acknowledged: Optional[bool] = None
-
-    def __iter__(self):
-        # Preserve the historical ``unit, state = _worker_scope_state(...)``
-        # shape for internal callers and third-party tests.
-        yield self.unit
-        yield self.state
-
-
-def _scope_status_fields(scope: Any) -> tuple[Any, str, Any, str, Optional[bool]]:
-    """Read modern scope receipts and legacy two-tuple test seams alike."""
-    if isinstance(scope, _WorkerScopeStatus):
-        return (
-            scope.unit, scope.state, scope.manager_target,
-            scope.launch_mode, scope.launch_acknowledged,
+    except Exception as exc:
+        _log.debug(
+            "kanban worker: could not resolve CLI toolsets for HERMES_HOME=%r (%s)",
+            hermes_home,
+            exc,
         )
-    try:
-        unit, state = scope
-    except (TypeError, ValueError):
-        return None, "unknown", None, "invalid", None
-    return unit, state, None, "legacy", None
-
-
-def _trusted_worker_scope_evidence(scope: Any) -> tuple[bool, bool]:
-    """Return authenticated scope-boundary and scope-gone evidence.
-
-    An acknowledged systemd launch may be collected immediately after a
-    successful ``stop`` because worker scopes use ``--collect``.  Treat that
-    exact receipt's ``not-found`` state the same before and after stopping,
-    while keeping every unacknowledged or malformed boundary fail closed.
-    """
-    unit, state, manager_target, launch_mode, launch_acknowledged = (
-        _scope_status_fields(scope)
-    )
-    authenticated_receipt = bool(
-        unit
-        and (manager_target is not None or launch_mode == "legacy")
-        and launch_mode in {"systemd-user-scope", "legacy"}
-    )
-    trusted = authenticated_receipt and (
-        state in {"active", "inactive"}
-        or (state == "not-found" and launch_acknowledged is True)
-    )
-    proves_gone = trusted and (
-        state == "inactive"
-        or (state == "not-found" and launch_acknowledged is True)
-    )
-    return trusted, proves_gone
-
-
-class _WorkerLaunchPid(int):
-    """Integer-compatible worker PID carrying its durable launch handle."""
-
-    scope_unit: Optional[str]
-    manager_kind: Optional[str]
-    manager_uid: Optional[int]
-    launch_acknowledged: Optional[bool]
-
-    def __new__(
-        cls,
-        pid: int,
-        *,
-        scope_unit: Optional[str] = None,
-        manager_kind: Optional[str] = None,
-        manager_uid: Optional[int] = None,
-        launch_acknowledged: Optional[bool] = None,
-    ):
-        value = int.__new__(cls, int(pid))
-        value.scope_unit = scope_unit
-        value.manager_kind = manager_kind
-        value.manager_uid = manager_uid
-        value.launch_acknowledged = launch_acknowledged
-        return value
-
-
-def _resolve_systemd_user_manager_target(
-    manager_kind: object,
-    manager_uid: object,
-    *,
-    platform: Optional[str] = None,
-    runtime_root: Optional[os.PathLike[str] | str] = None,
-    real_uid: Optional[int] = None,
-    effective_uid: Optional[int] = None,
-    lstat_fn=None,
-) -> Optional[_SystemdUserManagerTarget]:
-    """Validate and build the only supported local user-manager target.
-
-    Receipt data may select neither a username nor a bus path. The persisted
-    UID is accepted only when it exactly matches both kernel identities of the
-    replacement dispatcher. Official user-service -> system-service migration
-    keeps ``User=`` unchanged, so this crosses managers without granting a
-    privileged dispatcher authority over arbitrary users.
-    """
-    active_platform = platform if platform is not None else sys.platform
-    if not active_platform.startswith("linux"):
         return None
-    if manager_kind != _SYSTEMD_USER_MANAGER_KIND:
-        return None
-    if isinstance(manager_uid, bool) or not isinstance(manager_uid, int):
-        return None
-    if manager_uid < 0:
-        return None
-    getuid = getattr(os, "getuid", None)
-    geteuid = getattr(os, "geteuid", None)
-    if getuid is None or geteuid is None:
-        return None
-    actual_real_uid = int(getuid()) if real_uid is None else int(real_uid)
-    actual_effective_uid = int(geteuid()) if effective_uid is None else int(effective_uid)
-    if manager_uid != actual_real_uid or manager_uid != actual_effective_uid:
-        return None
-
-    root = Path(runtime_root) if runtime_root is not None else _SYSTEMD_USER_RUNTIME_ROOT
-    runtime_dir = root / str(manager_uid)
-    bus_path = runtime_dir / "bus"
-    inspect = lstat_fn if lstat_fn is not None else os.lstat
-    try:
-        runtime_stat = inspect(runtime_dir)
-        bus_stat = inspect(bus_path)
-    except (OSError, TypeError, ValueError):
-        return None
-    if not stat.S_ISDIR(runtime_stat.st_mode) or runtime_stat.st_uid != manager_uid:
-        return None
-    # pam_systemd creates this directory 0700. A group/world-accessible runtime
-    # directory would let another local account replace the well-known bus.
-    if stat.S_IMODE(runtime_stat.st_mode) & 0o077:
-        return None
-    if not stat.S_ISSOCK(bus_stat.st_mode) or bus_stat.st_uid != manager_uid:
-        return None
-    return _SystemdUserManagerTarget(
-        manager_kind=_SYSTEMD_USER_MANAGER_KIND,
-        manager_uid=manager_uid,
-        runtime_dir=runtime_dir,
-        bus_path=bus_path,
-    )
-
-
-def _current_systemd_user_manager_target() -> Optional[_SystemdUserManagerTarget]:
-    """Resolve the current process's manager without trusting ambient env."""
-    getuid = getattr(os, "getuid", None)
-    if getuid is None:
-        return None
-    return _resolve_systemd_user_manager_target(
-        _SYSTEMD_USER_MANAGER_KIND,
-        int(getuid()),
-    )
-
-
-def _systemd_user_manager_environment(
-    target: _SystemdUserManagerTarget,
-) -> dict[str, str]:
-    """Return a minimal, deterministic environment for one validated bus."""
-    return {
-        "XDG_RUNTIME_DIR": str(target.runtime_dir),
-        "DBUS_SESSION_BUS_ADDRESS": f"unix:path={target.bus_path}",
-    }
-
-
-def _systemd_service_manager(cgroup_path: Optional[str]) -> Optional[str]:
-    """Classify a service-hosted cgroup as ``user`` or ``system``.
-
-    A ``.service`` leaf is not enough: both user and system manager units use
-    that suffix.  A real user-manager service is nested beneath
-    ``user@<uid>.service``; system services live beneath ``system.slice``.
-    Anything else is deliberately ambiguous and must keep the direct spawn
-    path.
-    """
-    if not cgroup_path:
-        return None
-    path = cgroup_path.rstrip("/")
-    if not path.rsplit("/", 1)[-1].endswith(".service"):
-        return None
-    if re.search(r"/user@\d+\.service(?:/|$)", path):
-        return "user"
-    if path.startswith("/system.slice/"):
-        return "system"
-    return None
-
-
-def _systemd_user_manager_target_for_cgroup(
-    cgroup_path: Optional[str],
-) -> Optional[_SystemdUserManagerTarget]:
-    """Resolve the authenticated current user manager named by a cgroup."""
-    if _systemd_service_manager(cgroup_path) != "user" or not cgroup_path:
-        return None
-    match = re.search(r"/user@(\d+)\.service(?:/|$)", cgroup_path)
-    if match is None:
-        return None
-    try:
-        manager_uid = int(match.group(1))
-    except (TypeError, ValueError):
-        return None
-    return _resolve_systemd_user_manager_target(
-        _SYSTEMD_USER_MANAGER_KIND,
-        manager_uid,
-    )
-
-
-def _systemd_run_major_version(
-    runner: str,
-    *,
-    run_fn=None,
-) -> Optional[int]:
-    """Return ``systemd-run``'s major version, bounded and side-effect free."""
-    run = run_fn if run_fn is not None else subprocess.run
-    try:
-        result = run(
-            [runner, "--version"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS,
-            check=False,
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
-        return None
-    if result.returncode != 0:
-        return None
-    match = re.search(r"\bsystemd\s+(\d+)\b", result.stdout or "")
-    return int(match.group(1)) if match else None
-
-
-def _systemd_user_manager_reachable(
-    *,
-    manager_target: Optional[_SystemdUserManagerTarget] = None,
-    systemctl: Optional[str] = None,
-    run_fn=None,
-) -> bool:
-    """Return whether an explicitly targeted user manager is reachable."""
-    controller = systemctl if systemctl is not None else shutil.which("systemctl")
-    if not controller:
-        return False
-    target = manager_target or _current_systemd_user_manager_target()
-    if target is None:
-        return False
-    run = run_fn if run_fn is not None else subprocess.run
-    try:
-        result = run(
-            [controller, "--user", "show", "--property=Version", "--value"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS,
-            check=False,
-            env=_systemd_user_manager_environment(target),
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
-        return False
-    return result.returncode == 0
-
-
-def _systemd_user_scope_available(
-    runner: str,
-    *,
-    manager_target: Optional[_SystemdUserManagerTarget] = None,
-    run_fn=None,
-    systemctl: Optional[str] = None,
-) -> bool:
-    """Return whether the synchronous user-scope launch path is usable."""
-    version = _systemd_run_major_version(runner, run_fn=run_fn)
-    return bool(
-        version is not None
-        and version >= _SYSTEMD_SCOPE_MIN_VERSION
-        and _systemd_user_manager_reachable(
-            manager_target=manager_target,
-            systemctl=systemctl,
-            run_fn=run_fn,
-        )
-    )
-
-
-_REAL_SYSTEMD_USER_SCOPE_AVAILABLE = _systemd_user_scope_available
-
-
-def _canonical_board_db_identity(
-    *,
-    board: Optional[str] = None,
-    db_path: Optional[os.PathLike[str] | str] = None,
-) -> str:
-    """Return the private stable input used to namespace worker scopes."""
-    path = Path(db_path) if db_path is not None else kanban_db_path(board=board)
-    return os.path.normcase(str(path.expanduser().resolve(strict=False)))
-
-
-def _connection_main_db_path(conn: sqlite3.Connection) -> Optional[Path]:
-    """Return the connection's main on-disk DB path, if it has one."""
-    try:
-        for row in conn.execute("PRAGMA database_list").fetchall():
-            if row[1] == "main" and row[2]:
-                return _canonical_db_path(row[2])
-    except (sqlite3.Error, IndexError, TypeError):
-        return None
-    return None
-
-
-def _canonical_db_path(
-    db_path: Optional[os.PathLike[str] | str],
-) -> Optional[Path]:
-    """Resolve one on-disk SQLite identity without consulting board state.
-
-    Dispatch/reclaim synchronization must use the path owned by the active
-    SQLite connection. Returning ``None`` for an in-memory/invalid identity is
-    intentional: callers that protect lifecycle writes must fail closed rather
-    than silently selecting a board-derived lock file.
-    """
-    if db_path is None:
-        return None
-    try:
-        raw = str(db_path).strip()
-        if not raw or raw == ":memory:":
-            return None
-        return Path(raw).expanduser().resolve(strict=False)
-    except (OSError, TypeError, ValueError):
-        return None
-
-
-def _worker_scope_unit_name(
-    task_id: str,
-    run_id: int,
-    *,
-    board: Optional[str] = None,
-    db_path: Optional[os.PathLike[str] | str] = None,
-) -> str:
-    """Build an opaque, reconstructible, cross-board-safe scope name."""
-    board_identity = _canonical_board_db_identity(board=board, db_path=db_path)
-    material = f"v1\0{board_identity}\0{task_id}\0{int(run_id)}".encode("utf-8")
-    digest = hashlib.blake2s(material, digest_size=16).hexdigest()
-    return f"{_SYSTEMD_WORKER_SCOPE_PREFIX}{digest}.scope"
-
-
-def _legacy_worker_scope_unit_name(task_id: str, run_id: int) -> str:
-    """Reconstruct the pre-fix unit name while already-running scopes drain."""
-    safe_task = re.sub(r"[^A-Za-z0-9_.-]+", "-", task_id).strip("-.") or "task"
-    return f"{_SYSTEMD_WORKER_SCOPE_PREFIX}{safe_task[:120]}-{int(run_id)}.scope"
-
-
-def _scope_exec_ack_argv(cmd: list[str], ready_fd: int) -> list[str]:
-    """Wrap ``cmd`` with a same-PID acknowledgement immediately before exec."""
-    code = (
-        "import os,sys;"
-        "fd=int(sys.argv[1]);"
-        "os.write(fd,b'1');"
-        "os.close(fd);"
-        "os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
-    )
-    return [sys.executable, "-c", code, str(int(ready_fd)), *cmd]
-
-
-def _await_scope_exec_ack(
-    proc: subprocess.Popen,
-    ready_fd: int,
-    *,
-    timeout: float = _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS,
-) -> None:
-    """Wait for the payload's pre-exec byte or fail without orphaning it."""
-    import select
-
-    readable, _, _ = select.select([ready_fd], [], [], max(0.0, float(timeout)))
-    if readable:
-        marker = os.read(ready_fd, 1)
-        if marker == b"1":
-            return
-        try:
-            returncode = proc.wait(timeout=0.5)
-        except (subprocess.TimeoutExpired, AttributeError):
-            returncode = proc.poll()
-        if returncode is None:
-            raise _WorkerLaunchUncertain(
-                proc.pid,
-                "scope acknowledgement pipe closed while systemd-run remained alive",
-            )
-        raise RuntimeError(
-            "systemd-run exited before the Kanban worker exec acknowledgement "
-            f"(status {returncode})"
-        )
-
-    # No acknowledgement means the client may be wedged in manager setup.
-    # Kill the same process that would later exec the worker; only release the
-    # DB claim after we have proved that process is gone.
-    try:
-        proc.kill()
-    except ProcessLookupError:
-        pass
-    except OSError as exc:
-        raise _WorkerLaunchUncertain(
-            proc.pid,
-            "scope acknowledgement timeout: stop_failed",
-        ) from None
-    try:
-        proc.wait(timeout=1.0)
-    except subprocess.TimeoutExpired as exc:
-        raise _WorkerLaunchUncertain(
-            proc.pid,
-            "systemd-run launch acknowledgement timed out and the client remained alive",
-        ) from exc
-    raise RuntimeError("systemd-run launch acknowledgement timed out before worker exec")
-
-
-def _systemd_worker_scope_argv(
-    cmd: list[str],
-    task: Task,
-    *,
-    board: Optional[str] = None,
-    db_path: Optional[os.PathLike[str] | str] = None,
-    cgroup_path: Optional[str] = None,
-    manager_target: Optional[_SystemdUserManagerTarget] = None,
-    systemd_run: Optional[str] = None,
-    platform: Optional[str] = None,
-    user_manager_ready: Optional[bool] = None,
-) -> list[str]:
-    """Wrap a worker argv in an independent transient user scope when needed.
-
-    ``start_new_session=True`` isolates Unix signals but does not move a child
-    out of its parent's systemd cgroup. A gateway/dispatcher service restart
-    with cgroup-wide kill semantics would therefore kill every active Kanban
-    worker and its descendants. ``systemd-run --scope`` moves the launched
-    process into a sibling transient scope while preserving its PID (the
-    ``systemd-run`` client execs the requested command after the move), so the
-    existing PID/run/crash/cancellation tracking remains valid.
-
-    Only service-hosted Linux dispatchers need this wrapper. Direct CLI,
-    launchd, Windows, containers without systemd-run, and other non-systemd
-    environments keep the existing direct subprocess path.
-    """
-    active_platform = platform if platform is not None else sys.platform
-    if not active_platform.startswith("linux"):
-        return cmd
-    current = cgroup_path if cgroup_path is not None else _current_cgroup_path()
-    if _systemd_service_manager(current) != "user":
-        return cmd
-    target = manager_target or _systemd_user_manager_target_for_cgroup(current)
-    if target is None:
-        return cmd
-    runner = systemd_run if systemd_run is not None else shutil.which("systemd-run")
-    if not runner:
-        return cmd
-    if (
-        user_manager_ready is None
-        and subprocess.Popen is not _REAL_SUBPROCESS_POPEN
-        and _systemd_user_scope_available is _REAL_SYSTEMD_USER_SCOPE_AVAILABLE
-    ):
-        return cmd
-    ready = (
-        _systemd_user_scope_available(runner, manager_target=target)
-        if user_manager_ready is None
-        else bool(user_manager_ready)
-    )
-    if not ready or task.current_run_id is None:
-        return cmd
-    try:
-        unit = _worker_scope_unit_name(
-            task.id,
-            int(task.current_run_id),
-            board=board,
-            db_path=db_path,
-        )
-    except (OSError, ValueError):
-        return cmd
-    return [
-        runner,
-        "--user",
-        "--scope",
-        "--quiet",
-        "--collect",
-        f"--unit={unit}",
-        "--",
-        *cmd,
-    ]
-
-
-def _systemd_user_scope_possible(
-    *,
-    cgroup_path: Optional[str] = None,
-    systemd_run: Optional[str] = None,
-    systemctl: Optional[str] = None,
-    platform: Optional[str] = None,
-    run_fn=None,
-) -> bool:
-    """Return whether this host may contain managed user worker scopes.
-
-    Recovery is deliberately independent of the replacement dispatcher's
-    manager, launcher availability, and current user-bus health. A worker may
-    have been launched by an earlier user-service dispatcher and survived a
-    restart into a system service. The actual unit query below distinguishes
-    active, absent, and unknown state; unknown fails closed.
-    """
-    active_platform = platform if platform is not None else sys.platform
-    return active_platform.startswith("linux")
-
-
-def _valid_worker_scope_unit(unit: str) -> bool:
-    return bool(
-        len(unit) <= 255
-        and (
-            _SYSTEMD_WORKER_SCOPE_RE.fullmatch(unit)
-            or _SYSTEMD_WORKER_SCOPE_LEGACY_RE.fullmatch(unit)
-        )
-    )
-
-
-def _local_legacy_classifier_identity() -> Optional[str]:
-    """Return a non-secret identity for this exact Linux host and UID.
-
-    The operator compatibility record must stop applying when a board moves
-    to another host. The identity therefore comes only from the fixed-system
-    local machine-id plus the kernel UID; no receipt, environment,
-    username, hostname, path, or caller-provided selector participates. The
-    directory-owner check tolerates user-namespace remapping of host root.
-    """
-    if not sys.platform.startswith("linux"):
-        return None
-    getuid = getattr(os, "getuid", None)
-    geteuid = getattr(os, "geteuid", None)
-    if getuid is None or geteuid is None:
-        return None
-    uid = int(getuid())
-    if uid < 0 or uid != int(geteuid()):
-        return None
-    path = _LOCAL_MACHINE_ID_PATH
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd: Optional[int] = None
-    try:
-        fd = os.open(path, flags)
-        info = os.fstat(fd)
-        parent_info = os.lstat(path.parent)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or not stat.S_ISDIR(parent_info.st_mode)
-            or info.st_uid != parent_info.st_uid
-            or stat.S_IMODE(info.st_mode) & 0o022
-            or stat.S_IMODE(parent_info.st_mode) & 0o022
-            or (parent_info.st_uid == uid and uid != 0)
-        ):
-            return None
-        raw = os.read(fd, 128)
-        if os.read(fd, 1):
-            return None
-    except (OSError, TypeError, ValueError):
-        return None
-    finally:
-        if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
-    try:
-        machine_id = raw.decode("ascii").strip().lower()
-    except (UnicodeDecodeError, UnboundLocalError):
-        return None
-    if re.fullmatch(r"[0-9a-f]{32}", machine_id) is None:
-        return None
-    material = f"legacy-worker-host-v1\0{machine_id}\0{uid}".encode("ascii")
-    return hashlib.sha256(material).hexdigest()
-
-
-def _locally_present_legacy_worker_scope(
-    units: Iterable[str],
-) -> tuple[Optional[str], str]:
-    """Return exact local cgroup evidence as ``(unit, state)``.
-
-    This is positive evidence only. Absence never classifies a receipt as
-    direct and never authorizes a stop; it merely leaves an explicit trusted
-    operator classification in control. The bounded walk stays below the
-    fixed local cgroup-v2 user-manager subtree and follows no symlinks.
-    """
-    expected = {unit for unit in units if _valid_worker_scope_unit(unit)}
-    if not expected or not sys.platform.startswith("linux"):
-        return None, "unknown"
-    getuid = getattr(os, "getuid", None)
-    geteuid = getattr(os, "geteuid", None)
-    if getuid is None or geteuid is None:
-        return None, "unknown"
-    uid = int(getuid())
-    if uid < 0 or uid != int(geteuid()):
-        return None, "unknown"
-    root = _CGROUP_V2_ROOT
-    user_root = root / "user.slice" / f"user-{uid}.slice" / f"user@{uid}.service"
-    try:
-        controllers = os.lstat(root / "cgroup.controllers")
-    except FileNotFoundError:
-        return None, "unknown"
-    except (OSError, TypeError, ValueError):
-        return None, "unknown"
-    try:
-        user_info = os.lstat(user_root)
-    except FileNotFoundError:
-        return None, "not-found"
-    except (OSError, TypeError, ValueError):
-        return None, "unknown"
-    if not stat.S_ISREG(controllers.st_mode) or not stat.S_ISDIR(user_info.st_mode):
-        return None, "unknown"
-    if user_info.st_uid not in {0, uid}:
-        return None, "unknown"
-
-    visited = 0
-    scan_failed = False
-
-    def mark_scan_failed(_error: OSError) -> None:
-        nonlocal scan_failed
-        scan_failed = True
-
-    try:
-        for current, dirnames, _filenames in os.walk(
-            user_root,
-            topdown=True,
-            onerror=mark_scan_failed,
-            followlinks=False,
-        ):
-            safe_children: list[str] = []
-            for name in dirnames:
-                visited += 1
-                if visited > _LEGACY_SCOPE_CGROUP_SCAN_LIMIT:
-                    return None, "unknown"
-                child = Path(current) / name
-                try:
-                    child_info = os.lstat(child)
-                except OSError:
-                    scan_failed = True
-                    continue
-                if not stat.S_ISDIR(child_info.st_mode):
-                    continue
-                if name in expected:
-                    if child_info.st_uid in {0, uid}:
-                        return name, "active"
-                    return None, "unknown"
-                safe_children.append(name)
-            dirnames[:] = safe_children
-    except OSError:
-        return None, "unknown"
-    return (None, "unknown") if scan_failed else (None, "not-found")
-
-
-def _classified_legacy_direct_scope_status(
-    candidates: Iterable[str],
-    *,
-    manager_target: Optional[_SystemdUserManagerTarget],
-) -> _WorkerScopeStatus:
-    """Honor a trusted direct record unless local scope evidence intervenes."""
-    evidenced_unit, evidence_state = _locally_present_legacy_worker_scope(candidates)
-    if evidenced_unit is not None or evidence_state == "unknown":
-        return _WorkerScopeStatus(
-            evidenced_unit,
-            "unknown",
-            manager_target,
-            "legacy",
-        )
-    return _WorkerScopeStatus(
-        None,
-        "not-applicable",
-        None,
-        _LEGACY_DIRECT_CLASSIFIED_LAUNCH_MODE,
-    )
-
-
-def _legacy_classifier_board_identity(
-    conn: sqlite3.Connection,
-    *,
-    db_path: Optional[os.PathLike[str] | str] = None,
-) -> Optional[str]:
-    """Hash the active connection's canonical path without persisting it."""
-    resolved = (
-        _canonical_db_path(db_path)
-        if db_path is not None
-        else _connection_main_db_path(conn)
-    )
-    if resolved is None:
-        return None
-    material = f"legacy-worker-board-v1\0{resolved}".encode("utf-8")
-    return hashlib.sha256(material).hexdigest()
-
-
-def _legacy_worker_launch_classification(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: int,
-    *,
-    spawned_event_id: int,
-    spawned_payload_raw: str,
-    spawned_pid: object,
-    db_path: Optional[os.PathLike[str] | str] = None,
-) -> Optional[str]:
-    """Validate one durable, exact-receipt-bound legacy classification."""
-    rows = conn.execute(
-        "SELECT payload FROM task_events "
-        "WHERE task_id=? AND run_id=? AND kind=? ORDER BY id ASC",
-        (task_id, int(run_id), _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT),
-    ).fetchall()
-    if not rows:
-        return None
-    if len(rows) != 1 or type(spawned_pid) is not int or int(spawned_pid) <= 0:
-        return "invalid"
-    try:
-        payload = json.loads(rows[0]["payload"]) if rows[0]["payload"] else None
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return "invalid"
-    expected_keys = {
-        "version",
-        "run_id",
-        "launch_mode",
-        "pid",
-        "spawned_event_id",
-        "spawned_receipt_sha256",
-        "host_identity",
-        "board_identity",
-    }
-    if not isinstance(payload, dict) or set(payload) != expected_keys:
-        return "invalid"
-    identity = _local_legacy_classifier_identity()
-    board_identity = _legacy_classifier_board_identity(conn, db_path=db_path)
-    expected_digest = hashlib.sha256(spawned_payload_raw.encode("utf-8")).hexdigest()
-    if (
-        type(payload.get("version")) is not int
-        or payload.get("version") != 1
-        or type(payload.get("run_id")) is not int
-        or payload.get("run_id") != int(run_id)
-        or payload.get("launch_mode") != "direct"
-        or type(payload.get("pid")) is not int
-        or payload.get("pid") != int(spawned_pid)
-        or type(payload.get("spawned_event_id")) is not int
-        or payload.get("spawned_event_id") != int(spawned_event_id)
-        or not isinstance(payload.get("spawned_receipt_sha256"), str)
-        or not secrets.compare_digest(
-            payload.get("spawned_receipt_sha256"),
-            expected_digest,
-        )
-        or identity is None
-        or not isinstance(payload.get("host_identity"), str)
-        or not secrets.compare_digest(payload.get("host_identity"), identity)
-        or board_identity is None
-        or not isinstance(payload.get("board_identity"), str)
-        or not secrets.compare_digest(
-            payload.get("board_identity"),
-            board_identity,
-        )
-    ):
-        return "invalid"
-    return "direct"
-
-
-def classify_legacy_worker_run(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: int,
-    *,
-    launch_mode: str,
-    expected_pid: int,
-) -> bool:
-    """Durably classify one ended PID-only local run by explicit operator fact.
-
-    Only the irrecoverably ambiguous legacy ``{"pid": N}`` shape is eligible.
-    The record is bound to the exact spawned event bytes, run, PID, and current
-    fixed machine identity. It cannot classify modern receipts or travel with
-    a copied board, and repeated identical calls are idempotent.
-    """
-    if launch_mode != "direct":
-        raise ValueError("legacy launch classification only accepts direct")
-    if isinstance(run_id, bool) or not isinstance(run_id, int) or run_id <= 0:
-        raise ValueError("run_id must be a positive integer")
-    if (
-        isinstance(expected_pid, bool)
-        or not isinstance(expected_pid, int)
-        or expected_pid <= 0
-    ):
-        raise ValueError("expected_pid must be a positive integer")
-    identity = _local_legacy_classifier_identity()
-    if identity is None:
-        raise RuntimeError("trusted local machine identity is unavailable")
-    board_identity = _legacy_classifier_board_identity(conn)
-    if board_identity is None:
-        raise RuntimeError("canonical board identity is unavailable")
-
-    with write_txn(conn):
-        run = conn.execute(
-            "SELECT r.ended_at, t.current_run_id "
-            "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
-            "WHERE r.id=? AND r.task_id=?",
-            (int(run_id), task_id),
-        ).fetchone()
-        if run is None:
-            raise ValueError("unknown task/run pair")
-        if run["ended_at"] is None or (
-            run["current_run_id"] is not None
-            and int(run["current_run_id"]) == int(run_id)
-        ):
-            raise ValueError("legacy launch classification requires a non-current ended run")
-        spawned = conn.execute(
-            "SELECT id, payload FROM task_events "
-            "WHERE task_id=? AND run_id=? AND kind='spawned' ORDER BY id ASC",
-            (task_id, int(run_id)),
-        ).fetchall()
-        if len(spawned) != 1 or not isinstance(spawned[0]["payload"], str):
-            raise ValueError("legacy launch classification requires one spawned receipt")
-        raw_payload = spawned[0]["payload"]
-        try:
-            receipt = json.loads(raw_payload)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            raise ValueError("legacy spawned receipt is malformed") from None
-        if (
-            not isinstance(receipt, dict)
-            or set(receipt) != {"pid"}
-            or type(receipt.get("pid")) is not int
-            or receipt.get("pid") <= 0
-        ):
-            raise ValueError("only an exact PID-only legacy receipt can be classified")
-        if receipt["pid"] != expected_pid:
-            raise ValueError("expected PID does not match the legacy spawned receipt")
-
-        classification = {
-            "version": 1,
-            "run_id": int(run_id),
-            "launch_mode": "direct",
-            "pid": int(expected_pid),
-            "spawned_event_id": int(spawned[0]["id"]),
-            "spawned_receipt_sha256": hashlib.sha256(
-                raw_payload.encode("utf-8")
-            ).hexdigest(),
-            "host_identity": identity,
-            "board_identity": board_identity,
-        }
-        existing = conn.execute(
-            "SELECT payload FROM task_events "
-            "WHERE task_id=? AND run_id=? AND kind=? ORDER BY id ASC",
-            (task_id, int(run_id), _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT),
-        ).fetchall()
-        if existing:
-            if len(existing) != 1:
-                raise ValueError("legacy launch classification is ambiguous")
-            try:
-                current = (
-                    json.loads(existing[0]["payload"])
-                    if existing[0]["payload"]
-                    else None
-                )
-            except (TypeError, ValueError, json.JSONDecodeError):
-                current = None
-            if current != classification:
-                raise ValueError("legacy launch classification does not match")
-            return True
-        _append_event(
-            conn,
-            task_id,
-            _LEGACY_WORKER_LAUNCH_CLASSIFIED_EVENT,
-            classification,
-            run_id=int(run_id),
-        )
-        return True
-
-
-def _systemd_user_scope_state(
-    unit: str,
-    *,
-    manager_target: Optional[_SystemdUserManagerTarget] = None,
-    systemctl: Optional[str] = None,
-    run_fn=None,
-) -> str:
-    """Return ``active``, ``inactive``, ``not-found``, or ``unknown``."""
-    if not _valid_worker_scope_unit(unit):
-        return "unknown"
-    controller = systemctl if systemctl is not None else shutil.which("systemctl")
-    if not controller:
-        return "unknown"
-    target = manager_target or _current_systemd_user_manager_target()
-    if target is None:
-        return "unknown"
-    run = run_fn if run_fn is not None else subprocess.run
-    try:
-        result = run(
-            [
-                controller,
-                "--user",
-                "show",
-                unit,
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--no-pager",
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=_SYSTEMD_PROBE_TIMEOUT_SECONDS,
-            check=False,
-            env=_systemd_user_manager_environment(target),
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
-        return "unknown"
-    if result.returncode != 0:
-        return "unknown"
-    properties = {}
-    for line in (result.stdout or "").splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            properties[key] = value
-    if properties.get("LoadState") == "not-found":
-        return "not-found"
-    active = properties.get("ActiveState")
-    if active in {"inactive", "failed"}:
-        return "inactive"
-    if active:
-        return "active"
-    return "unknown"
-
-
-def _stop_systemd_user_scope(
-    unit: str,
-    *,
-    manager_target: Optional[_SystemdUserManagerTarget] = None,
-    systemctl: Optional[str] = None,
-    run_fn=None,
-) -> Optional[bool]:
-    """Stop a worker scope and confirm it no longer has an active cgroup."""
-    if not _valid_worker_scope_unit(unit):
-        return None
-    controller = systemctl if systemctl is not None else shutil.which("systemctl")
-    if not controller:
-        return None
-    target = manager_target or _current_systemd_user_manager_target()
-    if target is None:
-        return None
-    run = run_fn if run_fn is not None else subprocess.run
-    try:
-        run(
-            [controller, "--user", "stop", unit],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            timeout=7.0,
-            check=False,
-            env=_systemd_user_manager_environment(target),
-        )
-    except (OSError, subprocess.SubprocessError, TimeoutError):
-        # State below remains authoritative: a stop can race collection and
-        # return non-zero even though the unit is already gone.
-        pass
-    state = "unknown"
-    for _ in range(10):
-        state = _systemd_user_scope_state(
-            unit,
-            manager_target=target,
-            systemctl=controller,
-            run_fn=run,
-        )
-        if state == "not-found":
-            return True
-        if state == "unknown":
-            return None
-        time.sleep(0.1)
-    return False if state in {"active", "inactive"} else None
-
-
-def _worker_scope_state(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: Optional[int],
-    *,
-    db_path: Optional[os.PathLike[str] | str] = None,
-) -> _WorkerScopeStatus:
-    """Resolve an attempt's scope only through its authenticated manager."""
-    if run_id is None:
-        return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
-    scope_possible = _systemd_user_scope_possible()
-
-    # New runs persist the launch mode and exact opaque unit alongside the
-    # real worker PID in the spawned event. This keeps direct/custom spawn_fn
-    # runs on the PID fallback while allowing scope recovery after dispatcher
-    # manager migration or loss of the systemd-run launcher binary.
-    try:
-        event = conn.execute(
-            "SELECT id, payload FROM task_events "
-            "WHERE task_id = ? AND run_id = ? AND kind = 'spawned' "
-            "ORDER BY id DESC LIMIT 1",
-            (task_id, int(run_id)),
-        ).fetchone()
-        if event is None:
-            # A claimed run can be inspected before PID persistence, and test
-            # or third-party callers may set a PID directly. Without a spawned
-            # receipt there is no evidence that this run used a scope.
-            return _WorkerScopeStatus(None, "not-applicable", None, "untracked")
-        payload = json.loads(event["payload"]) if event["payload"] else None
-    except (sqlite3.Error, TypeError, ValueError, json.JSONDecodeError):
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    if not isinstance(payload, dict):
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-
-    has_launch_mode = "launch_mode" in payload
-    launch_mode = payload.get("launch_mode") if has_launch_mode else "legacy"
-    launch_ack_present = "launch_acknowledged" in payload
-    launch_acknowledged = (
-        payload.get("launch_acknowledged") if launch_ack_present else None
-    )
-    if launch_ack_present and type(launch_acknowledged) is not bool:
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    if launch_mode == "direct":
-        if any(
-            key in payload
-            for key in (
-                "scope_unit",
-                "manager_kind",
-                "manager_uid",
-                "launch_acknowledged",
-            )
-        ):
-            return _WorkerScopeStatus(None, "unknown", None, "invalid")
-        return _WorkerScopeStatus(None, "not-applicable", None, "direct")
-    if has_launch_mode and launch_mode != "systemd-user-scope":
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    if launch_mode == "legacy" and any(
-        key in payload
-        for key in (
-            "scope_unit",
-            "manager_kind",
-            "manager_uid",
-            "launch_acknowledged",
-        )
-    ):
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    resolved_db_path = (
-        _canonical_db_path(db_path)
-        if db_path is not None
-        else _connection_main_db_path(conn)
-    )
-    legacy_classification: Optional[str] = None
-    if not has_launch_mode:
-        legacy_classification = _legacy_worker_launch_classification(
-            conn,
-            task_id,
-            int(run_id),
-            spawned_event_id=int(event["id"]),
-            spawned_payload_raw=str(event["payload"]),
-            spawned_pid=payload.get("pid"),
-            db_path=resolved_db_path,
-        )
-        if legacy_classification == "invalid":
-            return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-    if not scope_possible:
-        # A DB can move between hosts. Only an explicit direct receipt above
-        # or an exact, same-host operator classification is safe to finalize
-        # without a user-systemd manager. Legacy/scoped receipts otherwise
-        # remain pending so another host can reconcile them later.
-        if legacy_classification == "direct":
-            if resolved_db_path is None:
-                return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-            try:
-                candidates = (
-                    _worker_scope_unit_name(
-                        task_id,
-                        int(run_id),
-                        db_path=resolved_db_path,
-                    ),
-                    _legacy_worker_scope_unit_name(task_id, int(run_id)),
-                )
-            except (OSError, TypeError, ValueError):
-                return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-            return _classified_legacy_direct_scope_status(
-                candidates,
-                manager_target=None,
-            )
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-
-    if resolved_db_path is None:
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-    try:
-        current_unit = _worker_scope_unit_name(
-            task_id,
-            int(run_id),
-            db_path=resolved_db_path,
-        )
-        legacy_unit = _legacy_worker_scope_unit_name(task_id, int(run_id))
-    except (OSError, TypeError, ValueError):
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-
-    manager_kind_present = "manager_kind" in payload
-    manager_uid_present = "manager_uid" in payload
-    if manager_kind_present != manager_uid_present:
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-    if manager_kind_present:
-        target = _resolve_systemd_user_manager_target(
-            payload.get("manager_kind"),
-            payload.get("manager_uid"),
-        )
-    else:
-        # Compatibility with pre-manager receipts is safe because this derives
-        # only the replacement process's own UID and fixed /run/user path.
-        target = _current_systemd_user_manager_target()
-    if target is None:
-        if legacy_classification == "direct":
-            return _classified_legacy_direct_scope_status(
-                (current_unit, legacy_unit),
-                manager_target=None,
-            )
-        return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-
-    if launch_mode == "systemd-user-scope":
-        persisted_unit = payload.get("scope_unit")
-        if (
-            not isinstance(persisted_unit, str)
-            or persisted_unit != current_unit
-            or not _valid_worker_scope_unit(persisted_unit)
-        ):
-            return _WorkerScopeStatus(None, "unknown", None, launch_mode)
-        state = _systemd_user_scope_state(
-            persisted_unit,
-            manager_target=target,
-        )
-        return _WorkerScopeStatus(
-            persisted_unit,
-            state,
-            target,
-            launch_mode,
-            launch_acknowledged,
-        )
-
-    if not has_launch_mode:
-        # Pre-handle runs may still own either deterministic unit name. Treat
-        # them as potentially scoped regardless of the current dispatcher's
-        # manager so an upgrade/restart cannot release a surviving descendant.
-        candidates = (current_unit, legacy_unit)
-    else:  # pragma: no cover - guarded by launch_mode validation above
-        return _WorkerScopeStatus(None, "unknown", None, "invalid")
-    unknown_unit: Optional[str] = None
-    inactive_unit: Optional[str] = None
-    for unit in candidates:
-        state = _systemd_user_scope_state(unit, manager_target=target)
-        if state == "active":
-            return _WorkerScopeStatus(unit, state, target, launch_mode)
-        if state == "inactive" and inactive_unit is None:
-            inactive_unit = unit
-        if state == "unknown" and unknown_unit is None:
-            unknown_unit = unit
-    if unknown_unit is not None:
-        return _WorkerScopeStatus(unknown_unit, "unknown", target, launch_mode)
-    if inactive_unit is not None:
-        return _WorkerScopeStatus(inactive_unit, "inactive", target, launch_mode)
-    if legacy_classification == "direct":
-        return _classified_legacy_direct_scope_status(
-            candidates,
-            manager_target=target,
-        )
-    return _WorkerScopeStatus(None, "not-found", target, launch_mode)
-
-
-def _ended_worker_scope_cleanup_authorized(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: int,
-) -> bool:
-    """Return whether one durable ended run no longer owns the task."""
-    row = conn.execute(
-        "SELECT r.ended_at, t.current_run_id, "
-        "       EXISTS(SELECT 1 FROM task_events e "
-        "              WHERE e.task_id=r.task_id AND e.run_id=r.id "
-        "                AND e.kind='spawned') AS has_receipt "
-        "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
-        "WHERE r.id=? AND r.task_id=?",
-        (int(run_id), task_id),
-    ).fetchone()
-    return bool(
-        row is not None
-        and row["ended_at"] is not None
-        and bool(row["has_receipt"])
-        and (
-            row["current_run_id"] is None
-            or int(row["current_run_id"]) != int(run_id)
-        )
-    )
-
-
-def _finalize_ended_worker_scope_cleanup(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: int,
-    *,
-    disposition: str,
-    launch_mode: str,
-) -> bool:
-    """Durably mark one proved-terminal scope receipt as reconciled."""
-    with write_txn(conn):
-        if not _ended_worker_scope_cleanup_authorized(conn, task_id, run_id):
-            return False
-        exists = conn.execute(
-            "SELECT 1 FROM task_events WHERE task_id=? AND run_id=? AND kind=?",
-            (task_id, int(run_id), _WORKER_SCOPE_CLEANUP_FINAL_EVENT),
-        ).fetchone()
-        if exists is None:
-            _append_event(
-                conn,
-                task_id,
-                _WORKER_SCOPE_CLEANUP_FINAL_EVENT,
-                {
-                    "run_id": int(run_id),
-                    "disposition": disposition,
-                    "launch_mode": launch_mode,
-                },
-                run_id=int(run_id),
-            )
-        return True
-
-
-def _validated_ended_worker_scope_target(
-    conn: sqlite3.Connection,
-    task_id: str,
-    run_id: int,
-    status: _WorkerScopeStatus,
-    *,
-    db_path: os.PathLike[str] | str,
-) -> Optional[tuple[str, _SystemdUserManagerTarget]]:
-    """Reconstruct and revalidate the exact unit/manager before stopping."""
-    unit = status.unit
-    target = status.manager_target
-    if not isinstance(unit, str) or not _valid_worker_scope_unit(unit):
-        return None
-    canonical_db_path = _canonical_db_path(db_path)
-    if canonical_db_path is None:
-        return None
-    try:
-        opaque_unit = _worker_scope_unit_name(
-            task_id,
-            int(run_id),
-            db_path=canonical_db_path,
-        )
-        legacy_unit = _legacy_worker_scope_unit_name(task_id, int(run_id))
-    except (OSError, TypeError, ValueError):
-        return None
-    if status.launch_mode == "systemd-user-scope":
-        if unit != opaque_unit:
-            return None
-    elif status.launch_mode == "legacy":
-        if unit not in {opaque_unit, legacy_unit}:
-            return None
-    else:
-        return None
-    if target is None:
-        return None
-    resolved_target = _resolve_systemd_user_manager_target(
-        target.manager_kind,
-        target.manager_uid,
-    )
-    if resolved_target is None:
-        return None
-    return unit, resolved_target
-
-
-def _task_has_pending_ended_worker_scope(
-    conn: sqlite3.Connection,
-    task_id: str,
-) -> bool:
-    """Fence respawn while an ended scoped receipt is not yet reconciled."""
-    return conn.execute(
-        "SELECT 1 FROM task_runs r "
-        "WHERE r.task_id=? AND r.ended_at IS NOT NULL "
-        "  AND EXISTS(SELECT 1 FROM task_events spawned "
-        "             WHERE spawned.task_id=r.task_id AND spawned.run_id=r.id "
-        "               AND spawned.kind='spawned') "
-        "  AND NOT EXISTS(SELECT 1 FROM task_events finalized "
-        "                 WHERE finalized.task_id=r.task_id "
-        "                   AND finalized.run_id=r.id AND finalized.kind=?) "
-        "  AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.id=r.task_id "
-        "                 AND t.current_run_id=r.id) LIMIT 1",
-        (task_id, _WORKER_SCOPE_CLEANUP_FINAL_EVENT),
-    ).fetchone() is not None
-
-
-def _reconcile_ended_worker_scopes(
-    conn: sqlite3.Connection,
-    *,
-    process_effects: bool,
-    db_path: os.PathLike[str] | str,
-    now: Optional[int] = None,
-    limit: int = _ENDED_WORKER_SCOPE_CLEANUP_LIMIT,
-) -> list[dict[str, Any]]:
-    """Stop and collect exact scopes for durably ended worker runs.
-
-    Work is bounded per dispatcher tick. Each candidate must have an ended
-    ``task_runs`` row, an exact run-bound ``spawned`` receipt, and must no
-    longer be the task's current run. Unknown identity/state remains pending
-    and fences respawn without preventing later candidates or unrelated work.
-    """
-    if limit <= 0:
-        return []
-    observed_now = int(time.time()) if now is None else int(now)
-    rows = conn.execute(
-        "SELECT r.id AS run_id, r.task_id, r.ended_at, t.status AS task_status "
-        "FROM task_runs r JOIN tasks t ON t.id=r.task_id "
-        "WHERE r.ended_at IS NOT NULL "
-        "  AND (t.current_run_id IS NULL OR t.current_run_id != r.id) "
-        "  AND EXISTS(SELECT 1 FROM task_events spawned "
-        "             WHERE spawned.task_id=r.task_id AND spawned.run_id=r.id "
-        "               AND spawned.kind='spawned') "
-        "  AND NOT EXISTS(SELECT 1 FROM task_events finalized "
-        "                 WHERE finalized.task_id=r.task_id "
-        "                   AND finalized.run_id=r.id AND finalized.kind=?) "
-        "ORDER BY CASE WHEN t.status IN ('ready','review') THEN 0 ELSE 1 END, "
-        "         r.ended_at ASC, r.id ASC LIMIT ?",
-        (_WORKER_SCOPE_CLEANUP_FINAL_EVENT, int(limit)),
-    ).fetchall()
-    decisions: list[dict[str, Any]] = []
-    for row in rows:
-        task_id = str(row["task_id"])
-        run_id = int(row["run_id"])
-        base = {"task_id": task_id, "run_id": run_id}
-        try:
-            status = _worker_scope_state(
-                conn,
-                task_id,
-                run_id,
-                db_path=db_path,
-            )
-        except Exception:
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "scope_state_error",
-            })
-            continue
-        if not isinstance(status, _WorkerScopeStatus):
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "invalid_scope_status",
-            })
-            continue
-        if status.state == "not-applicable":
-            if _finalize_ended_worker_scope_cleanup(
-                conn,
-                task_id,
-                run_id,
-                disposition="not_applicable",
-                launch_mode=status.launch_mode,
-            ):
-                continue
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "lifecycle_changed",
-            })
-            continue
-        if status.state == "not-found":
-            if _finalize_ended_worker_scope_cleanup(
-                conn,
-                task_id,
-                run_id,
-                disposition="absent",
-                launch_mode=status.launch_mode,
-            ):
-                continue
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "lifecycle_changed",
-            })
-            continue
-        if status.state == "unknown":
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "scope_state_unknown",
-            })
-            continue
-        if status.state not in {"active", "inactive"}:
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "invalid_scope_state",
-            })
-            continue
-        if int(row["ended_at"]) > (
-            observed_now - _ENDED_WORKER_SCOPE_POST_END_GRACE_SECONDS
-        ):
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "post_end_grace",
-            })
-            continue
-        validated = _validated_ended_worker_scope_target(
-            conn,
-            task_id,
-            run_id,
-            status,
-            db_path=db_path,
-        )
-        if validated is None:
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "scope_identity_invalid",
-            })
-            continue
-        if not _ended_worker_scope_cleanup_authorized(conn, task_id, run_id):
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "lifecycle_changed",
-            })
-            continue
-        if not process_effects:
-            decisions.append({
-                **base,
-                "action": "would_collect",
-                "reason": "ended_scope_active",
-            })
-            continue
-        unit, manager_target = validated
-        try:
-            stopped = _stop_systemd_user_scope(
-                unit,
-                manager_target=manager_target,
-            )
-        except Exception:
-            stopped = None
-        if stopped is True:
-            if _finalize_ended_worker_scope_cleanup(
-                conn,
-                task_id,
-                run_id,
-                disposition="collected",
-                launch_mode=status.launch_mode,
-            ):
-                decisions.append({
-                    **base,
-                    "action": "collected",
-                    "reason": "ended_scope_stopped",
-                })
-            else:
-                decisions.append({
-                    **base,
-                    "action": "deferred",
-                    "reason": "lifecycle_changed",
-                })
-        elif stopped is False:
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "scope_stop_incomplete",
-            })
-        else:
-            decisions.append({
-                **base,
-                "action": "deferred",
-                "reason": "scope_stop_unknown",
-            })
-    return decisions
-
-
-def _available_capabilities_from_toolsets(toolsets: Iterable[str]) -> set[str]:
-    names = {str(t).strip().lower() for t in toolsets if str(t).strip()}
-    available: set[str] = set()
-    if "terminal" in names:
-        available.update({"terminal", "process"})
-    if "file" in names:
-        available.update({"file", "file_patch"})
-    if "browser" in names:
-        available.add("browser")
-    if NETWORK_CAPABLE_TOOLSETS & names:
-        available.add("network")
-    for name in names:
-        available.add(f"private:{name}")
-    return available
-
-
-def _resolve_assignee_toolsets(assignee: Optional[str]) -> tuple[Optional[list[str]], Optional[str]]:
-    if not assignee:
-        return None, "task has no assignee"
-    try:
-        from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
-
-        profile = normalize_profile_name(assignee)
-        hermes_home = resolve_profile_env(profile)
-    except Exception:
-        return None, "profile_resolution_failed"
-    toolsets = _resolve_worker_cli_toolsets(hermes_home)
-    if toolsets is None:
-        return None, "profile_toolset_resolution_failed"
-    return toolsets, None
-
-
-def capability_preflight(
-    task: Task,
-) -> tuple[bool, dict[str, Any]]:
-    required = normalize_required_capabilities(task.required_capabilities) or []
-    if not required:
-        return True, {"required": [], "available": [], "missing": []}
-    toolsets, error = _resolve_assignee_toolsets(task.assignee)
-    if error:
-        return False, {
-            "required": required,
-            "available": [],
-            "missing": required,
-            "assignee": task.assignee,
-            "error": error,
-        }
-    available = _available_capabilities_from_toolsets(toolsets or [])
-    missing: list[str] = []
-    for cap in required:
-        if cap.startswith("private:"):
-            if cap not in available:
-                missing.append(cap)
-        elif cap not in available:
-            missing.append(cap)
-    return not missing, {
-        "required": required,
-        "available": sorted(available),
-        "missing": missing,
-        "assignee": task.assignee,
-        "toolsets": toolsets or [],
-    }
-
-
-def _preflight_ready_task(
-    conn: sqlite3.Connection,
-    task_id: str,
-    *,
-    board: Optional[str],
-    dry_run: bool,
-) -> tuple[bool, Optional[str], Optional[dict[str, Any]]]:
-    task = get_task(conn, task_id)
-    if task is None:
-        return False, "not_found", None
-    if task.workspace_kind in {"dir", "worktree"}:
-        try:
-            _validate_persistent_workspace_create_contract(
-                workspace_kind=task.workspace_kind,
-                workspace_path=task.workspace_path,
-                project_repo=None,
-                board=board,
-            )
-        except Exception as exc:
-            error = f"workspace: {exc}"
-            payload = {"workspace_kind": task.workspace_kind, "workspace_path": task.workspace_path}
-            if not dry_run:
-                _block_deterministic_preflight_failure(
-                    conn,
-                    task.id,
-                    reason_code="workspace_config",
-                    error=error,
-                    payload=payload,
-                )
-            return False, "workspace_config", {"error": error, **payload}
-    ok, cap_payload = capability_preflight(task)
-    if not ok:
-        error = (
-            "missing required capabilities for "
-            f"{task.assignee or '(unassigned)'}: {', '.join(cap_payload['missing'])}"
-        )
-        if not dry_run:
-            _block_deterministic_preflight_failure(
-                conn,
-                task.id,
-                reason_code="capability_mismatch",
-                error=error,
-                payload=cap_payload,
-            )
-        return False, "capability_mismatch", {"error": error, **cap_payload}
-    return True, None, None
 
 
 def _default_spawn(
@@ -15612,7 +12122,6 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
-    db_path: Optional[os.PathLike[str] | str] = None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -15630,118 +12139,12 @@ def _default_spawn(
     if not task.assignee:
         raise ValueError(f"task {task.id} has no assignee")
 
-    canonical_db_path = _canonical_db_path(
-        db_path if db_path is not None else kanban_db_path(board=board)
-    )
-    if canonical_db_path is None:
-        raise RuntimeError(
-            "kanban worker spawn requires a canonical on-disk database identity"
-        )
-
-    from hermes_cli.profiles import normalize_profile_name, resolve_profile_env
+    from hermes_cli.profiles import normalize_profile_name
 
     profile_arg = normalize_profile_name(task.assignee)
-    try:
-        target_home: Optional[Path] = Path(resolve_profile_env(profile_arg))
-    except FileNotFoundError:
-        # Preserve the historical fixture/early-setup fallback: the child CLI
-        # will report the missing profile after parsing ``-p``.
-        target_home = None
 
     prompt = f"work kanban task {task.id}"
-    from tools.environments.local import hermes_subprocess_env
-
-    env = hermes_subprocess_env(inherit_credentials=False)
-    # The central sanitizer knows standard provider names, but profiles may
-    # reference arbitrary ``key_env`` variables. Strip every key owned by the
-    # dispatcher's current/default profile before selecting the assignee; the
-    # child loads only the target profile's .env after ``-p`` activation.
-    try:
-        from agent.secret_scope import current_secret_scope, load_env_file
-        from hermes_constants import get_hermes_home
-        from hermes_cli.env_loader import get_secret_source
-
-        import yaml
-
-        parent_owned_keys: set[str] = set(_WORKER_PROFILE_AMBIENT_KEYS)
-        active_scope = current_secret_scope()
-        if active_scope is not None:
-            parent_owned_keys.update(str(key) for key in active_scope)
-        parent_home = Path(get_hermes_home())
-        profile_homes = [parent_home]
-        if target_home is not None and target_home != parent_home:
-            profile_homes.append(target_home)
-        for profile_home in profile_homes:
-            for file_name in (".env", ".op.env"):
-                parent_owned_keys.update(load_env_file(profile_home / file_name))
-
-        # External secret backends can inject arbitrary names that do not
-        # follow provider-key suffix conventions and need not appear in an
-        # env file. Their provenance is authoritative parent ownership.
-        parent_owned_keys.update(
-            key for key in env if get_secret_source(key) is not None
-        )
-
-        # Parent and target configs can each reference arbitrary shell names.
-        # Enumerate names only (never values), including every ``${VAR}``
-        # interpolation, so target startup cannot consume the dispatcher's
-        # ambient endpoint/key when its own profile omits that value.
-        for profile_home in profile_homes:
-            config_path = profile_home / "config.yaml"
-            if not config_path.exists():
-                continue
-            raw_config = yaml.safe_load(
-                config_path.read_text(encoding="utf-8")
-            ) or {}
-            pending: list[tuple[Any, tuple[str, ...]]] = [(raw_config, ())]
-            seen_containers: set[int] = set()
-            while pending:
-                value, config_path_parts = pending.pop()
-                if isinstance(value, (dict, list)):
-                    identity = id(value)
-                    if identity in seen_containers:
-                        continue
-                    seen_containers.add(identity)
-                if isinstance(value, dict):
-                    for config_key, child in value.items():
-                        config_key_text = str(config_key)
-                        if config_key_text in {
-                            "key_env",
-                            "api_key_env",
-                            "access_token_env",
-                            "service_account_token_env",
-                        }:
-                            env_name = str(child or "").strip()
-                            if env_name:
-                                parent_owned_keys.add(env_name)
-                        if config_path_parts == ("secrets", "onepassword", "env"):
-                            output_env_name = config_key_text.strip()
-                            if output_env_name:
-                                parent_owned_keys.add(output_env_name)
-                        pending.append(
-                            (child, (*config_path_parts, config_key_text))
-                        )
-                elif isinstance(value, list):
-                    pending.extend((child, config_path_parts) for child in value)
-                elif isinstance(value, str):
-                    parent_owned_keys.update(
-                        name.strip()
-                        for name in re.findall(r"\${([^}]+)}", value)
-                        if name.strip()
-                    )
-        parent_owned_keys.update(
-            key
-            for key in env
-            if key.startswith(_WORKER_PROFILE_AMBIENT_PREFIXES)
-        )
-        for key in parent_owned_keys:
-            env.pop(key, None)
-    except Exception:
-        # Ownership uncertainty is itself unsafe: continuing could expose an
-        # arbitrary parent-profile secret to a differently scoped worker.
-        raise RuntimeError(
-            "kanban worker spawn refused: parent secret ownership unavailable"
-        ) from None
+    env = dict(os.environ)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -15752,8 +12155,15 @@ def _default_spawn(
     # back to Path.home() / ".hermes" (the DEFAULT profile root), ignoring the
     # profile-specific config entirely.  Fixes profile-scoped fallback_providers
     # being invisible to kanban workers.
-    if target_home is not None:
-        env["HERMES_HOME"] = str(target_home)
+    from hermes_cli.profiles import resolve_profile_env
+    try:
+        env["HERMES_HOME"] = resolve_profile_env(profile_arg)
+    except FileNotFoundError:
+        # Profile dir doesn't exist — defer resolution to the CLI's
+        # _apply_profile_override() via HERMES_PROFILE (set below).
+        # This only happens in test fixtures where the isolated
+        # HERMES_HOME never had profiles created.
+        pass
     if task.tenant:
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
@@ -15809,7 +12219,7 @@ def _default_spawn(
     # dispatcher's. Belt-and-braces with the `get_default_hermes_root()`
     # resolution in `kanban_home()` — symmetric resolution is the norm,
     # but unusual symlink / Docker layouts are caught here too.
-    env["HERMES_KANBAN_DB"] = str(canonical_db_path)
+    env["HERMES_KANBAN_DB"] = str(kanban_db_path(board=board))
     env["HERMES_KANBAN_WORKSPACES_ROOT"] = str(workspaces_root(board=board))
     # Board slug — the final defense-in-depth pin. If the worker ever
     # resolves kanban paths without the DB / workspaces env vars, the
@@ -15866,16 +12276,15 @@ def _default_spawn(
         # protocol violation (incident 2026-06-09 t_d9cbe312).
         cmd.append("-Q")
     worker_cmd = cmd
-    scope_cgroup_path = _current_cgroup_path()
+    db_path = _canonical_db_path(kanban_db_path(board=board))
     scope_manager_target = _systemd_user_manager_target_for_cgroup(
-        scope_cgroup_path,
+        _current_cgroup_path(),
     )
     cmd = _systemd_worker_scope_argv(
         worker_cmd,
         task,
         board=board,
-        db_path=canonical_db_path,
-        cgroup_path=scope_cgroup_path,
+        db_path=db_path,
         manager_target=scope_manager_target,
     )
     scope_unit: Optional[str] = None
@@ -15883,17 +12292,14 @@ def _default_spawn(
     scope_ready_write: Optional[int] = None
     scope_launch_acknowledged: Optional[bool] = None
     if cmd is not worker_cmd:
-        # A synchronous scope keeps systemd-run's PID by execing the payload in
-        # place. Put a one-byte acknowledgement immediately before that exec so
-        # a D-Bus/polkit/unit-name failure cannot be mistaken for a worker that
-        # successfully started. The pipe is inherited only by this child.
         delimiter = cmd.index("--")
-        scope_unit = cmd[5].removeprefix("--unit=")
-        if scope_manager_target is None:  # pragma: no cover - defensive
+        scope_unit = next(
+            part.removeprefix("--unit=")
+            for part in cmd[:delimiter]
+            if part.startswith("--unit=")
+        )
+        if scope_manager_target is None:
             raise RuntimeError("scoped worker launch lost its validated user manager")
-        # Do not let inherited ambient variables redirect systemd-run. The same
-        # process execs the worker, so keep its normal environment and replace
-        # only the user-bus selectors with the locally derived target.
         for key in (
             "XDG_RUNTIME_DIR",
             "DBUS_SESSION_BUS_ADDRESS",
@@ -15904,7 +12310,7 @@ def _default_spawn(
         env.update(_systemd_user_manager_environment(scope_manager_target))
         scope_ready_read, scope_ready_write = os.pipe()
         cmd = [
-            *cmd[: delimiter + 1],
+            *cmd[:delimiter + 1],
             *_scope_exec_ack_argv(worker_cmd, scope_ready_write),
         ]
     # Redirect output to a per-task log under <board-root>/logs/.
@@ -15959,10 +12365,7 @@ def _default_spawn(
             try:
                 _await_scope_exec_ack(proc, scope_ready_read)
                 scope_launch_acknowledged = True
-            except _WorkerLaunchUncertain as exc:
-                # Safety-first: retain the claim and PID when we cannot prove
-                # either exec success or launcher death. Crash/TTL handling can
-                # recover it later without spawning a duplicate.
+            except _WorkerLaunchUncertain:
                 scope_launch_acknowledged = False
                 _log.warning(
                     "kanban worker launch state uncertain; claim retained "
@@ -15980,13 +12383,11 @@ def _default_spawn(
         scope_unit=scope_unit,
         manager_kind=(
             scope_manager_target.manager_kind
-            if scope_unit is not None and scope_manager_target is not None
-            else None
+            if scope_unit is not None and scope_manager_target is not None else None
         ),
         manager_uid=(
             scope_manager_target.manager_uid
-            if scope_unit is not None and scope_manager_target is not None
-            else None
+            if scope_unit is not None and scope_manager_target is not None else None
         ),
         launch_acknowledged=scope_launch_acknowledged,
     )
@@ -16378,14 +12779,14 @@ def board_stats(conn: sqlite3.Connection) -> dict:
     by_status: dict[str, int] = {}
     for row in conn.execute(
         "SELECT status, COUNT(*) AS n FROM tasks "
-        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') GROUP BY status"
+        "WHERE status != 'archived' GROUP BY status"
     ):
         by_status[row["status"]] = int(row["n"])
 
     by_assignee: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') AND assignee IS NOT NULL "
+        "WHERE status != 'archived' AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         by_assignee.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])
@@ -16817,7 +13218,7 @@ def known_assignees(conn: sqlite3.Connection) -> list[dict]:
     counts: dict[str, dict[str, int]] = {}
     for row in conn.execute(
         "SELECT assignee, status, COUNT(*) AS n FROM tasks "
-        "WHERE status NOT IN ('archived', 'superseded', 'stale_continuity_only') AND assignee IS NOT NULL "
+        "WHERE status != 'archived' AND assignee IS NOT NULL "
         "GROUP BY assignee, status"
     ):
         counts.setdefault(row["assignee"], {})[row["status"]] = int(row["n"])

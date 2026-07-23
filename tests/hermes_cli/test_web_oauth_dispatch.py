@@ -323,7 +323,7 @@ def test_codex_dashboard_worker_persists_inside_session_profile(tmp_path, monkey
     monkeypatch.setattr(
         auth_mod,
         "_save_codex_tokens",
-        lambda tokens, **_kwargs: saved_homes.append(get_hermes_home()),
+        lambda tokens: saved_homes.append(get_hermes_home()),
     )
 
     sid, _ = ws._new_oauth_session(

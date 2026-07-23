@@ -10,7 +10,6 @@ Usage:
 """
 
 from contextlib import asynccontextmanager, contextmanager
-from contextvars import copy_context
 
 import asyncio
 import atexit
@@ -18,6 +17,7 @@ import base64
 import binascii
 import concurrent.futures
 import functools
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -48,8 +48,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 import yaml
-
-from agent.secret_scope import UnscopedSecretError
 
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 if str(PROJECT_ROOT) not in sys.path:
@@ -91,6 +89,7 @@ from gateway.status import (
     get_running_pid_cached,
     get_running_pid,
     get_runtime_status_running_pid,
+    normalize_updated_at,
     parse_active_agents,
     read_runtime_status,
 )
@@ -217,10 +216,15 @@ async def _lifespan(app: "FastAPI"):
     # Reap idle/dead keep-alive PTY sessions in the background (30-min TTL).
     pty_reaper_task = asyncio.create_task(run_reaper(PTY_REGISTRY))
 
+    # Periodic authenticated self-test (feeds the ``dashboard`` component on
+    # /api/status).  The loop exits immediately when httpx is unavailable.
+    selftest_task = asyncio.create_task(_dashboard_selftest_loop())
+
     try:
         yield
     finally:
         pty_reaper_task.cancel()
+        selftest_task.cancel()
         await PTY_REGISTRY.close_all()
         if cron_stop is not None:
             cron_stop.set()
@@ -283,6 +287,18 @@ app.include_router(_memory_oauth_router)
 # ---------------------------------------------------------------------------
 _SESSION_TOKEN = os.environ.get("HERMES_DASHBOARD_SESSION_TOKEN") or secrets.token_urlsafe(32)
 _SESSION_HEADER_NAME = "X-Hermes-Session-Token"
+_SSH_OWNER_NONCE: Optional[str] = None
+
+
+def _apply_ssh_session_token(token: str) -> None:
+    global _SESSION_TOKEN
+    if token:
+        _SESSION_TOKEN = token
+
+
+def _apply_ssh_owner_nonce(nonce: Optional[str]) -> None:
+    global _SSH_OWNER_NONCE
+    _SSH_OWNER_NONCE = nonce
 
 # In-browser Chat tab (/chat, /api/pty, /api/ws, …).  Always enabled: the
 # desktop app and the dashboard's own Chat tab both drive the agent over the
@@ -614,6 +630,137 @@ async def _token_auth_seam(request: Request, call_next):
     """
     from hermes_cli.dashboard_auth.token_auth import token_auth_middleware
     return await token_auth_middleware(request, call_next)
+
+
+# ---------------------------------------------------------------------------
+# Dashboard component health — in-process error/self-test counters that feed
+# the ``components`` dict on ``/api/status``.  That endpoint is in
+# ``PUBLIC_API_PATHS``, so everything exported from here must be counts and
+# enums only: no exception messages, no request paths, no tokens.
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_HEALTH_WINDOW_SECONDS = 300.0
+
+
+class DashboardHealth:
+    """Module-level holder for dashboard-process health signals.
+
+    Tracks unhandled exceptions / 5xx responses seen by the outermost HTTP
+    middleware (rolling window) and the result of the periodic authenticated
+    self-test.  ``last_error_path`` and ``last_error_type`` are internal
+    diagnostics for logs/debuggers — :meth:`snapshot` deliberately exports
+    neither (public-payload no-secrets contract).
+    """
+
+    def __init__(self, window_seconds: float = _DASHBOARD_HEALTH_WINDOW_SECONDS) -> None:
+        self.window_seconds = window_seconds
+        self._error_times: "deque[float]" = deque(maxlen=256)
+        self.last_error_type: Optional[str] = None
+        self.last_error_path: Optional[str] = None  # internal-only, never serialized
+        self.last_error_at: Optional[float] = None
+        self.selftest_status: str = "unknown"  # unknown | ok | failing
+        self.selftest_http_status: Optional[int] = None
+        self.selftest_at: Optional[float] = None
+
+    def record_error(self, exc_type: str, path: str) -> None:
+        now = time.time()
+        self._error_times.append(now)
+        self.last_error_type = exc_type
+        self.last_error_path = path
+        self.last_error_at = now
+
+    def record_selftest(self, passed: bool, http_status: Optional[int]) -> None:
+        self.selftest_status = "ok" if passed else "failing"
+        self.selftest_http_status = http_status
+        self.selftest_at = time.time()
+
+    def recent_error_count(self) -> int:
+        cutoff = time.time() - self.window_seconds
+        while self._error_times and self._error_times[0] < cutoff:
+            self._error_times.popleft()
+        return len(self._error_times)
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Public component payload: status enum + counts + timestamps only."""
+        errors = self.recent_error_count()
+        status = "degraded" if (errors or self.selftest_status == "failing") else "ok"
+        return {
+            "status": status,
+            "recent_unhandled_errors": errors,
+            "last_error_at": self.last_error_at,
+            "selftest": self.selftest_status,
+        }
+
+
+DASHBOARD_HEALTH = DashboardHealth()
+
+
+@app.middleware("http")
+async def _dashboard_health_middleware(request: Request, call_next):
+    """Outermost middleware: count unhandled exceptions and 5xx responses.
+
+    Registered after ``_token_auth_seam`` so it is the outermost layer
+    (Starlette middleware is outermost-last) — nothing below can raise past
+    it unseen.  Records into :data:`DASHBOARD_HEALTH` and re-raises; never
+    swallows or alters the response.
+    """
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        DASHBOARD_HEALTH.record_error(type(exc).__name__, request.url.path)
+        raise
+    if response.status_code >= 500:
+        DASHBOARD_HEALTH.record_error(f"http_{response.status_code}", request.url.path)
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Authenticated-route self-test: every minute, make one in-process request
+# against a cheap DB-touching authenticated route with the real session
+# token.  Catches the class of failure where liveness looks fine but every
+# authenticated request 500s (e.g. wedged state DB).
+# ---------------------------------------------------------------------------
+
+_DASHBOARD_SELFTEST_INTERVAL_SECONDS = 60.0
+_DASHBOARD_SELFTEST_ROUTE = "/api/sessions?limit=1"
+
+
+async def _dashboard_selftest_once() -> None:
+    """Run one authenticated in-process self-test request and record it."""
+    try:
+        import httpx
+    except ImportError:
+        return  # optional dependency — skip cleanly, leave status "unknown"
+    try:
+        transport = httpx.ASGITransport(app=app)
+        # base_url uses a loopback name so the Host-header middleware accepts
+        # the request on loopback binds.
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://127.0.0.1"
+        ) as client:
+            resp = await client.get(
+                _DASHBOARD_SELFTEST_ROUTE,
+                headers={_SESSION_HEADER_NAME: _SESSION_TOKEN},
+            )
+        DASHBOARD_HEALTH.record_selftest(resp.status_code == 200, resp.status_code)
+    except Exception:
+        DASHBOARD_HEALTH.record_selftest(False, None)
+
+
+async def _dashboard_selftest_loop() -> None:
+    """Periodic self-test driver started from the lifespan."""
+    try:
+        import httpx  # noqa: F401
+    except ImportError:
+        _log.debug("httpx unavailable — dashboard self-test disabled")
+        return
+    while True:
+        await asyncio.sleep(_DASHBOARD_SELFTEST_INTERVAL_SECONDS)
+        # On OAuth-gated binds the legacy session token is not honoured, so
+        # the probe would false-alarm 401 — skip until the gate is off.
+        if getattr(app.state, "auth_required", False):
+            continue
+        await _dashboard_selftest_once()
 
 
 # ---------------------------------------------------------------------------
@@ -989,33 +1136,68 @@ def _custom_provider_options(
     return names
 
 
-def _schema_with_voice_provider_options() -> Dict[str, Dict[str, Any]]:
-    """Return CONFIG_SCHEMA with per-request voice provider options merged.
+def _memory_provider_schema_options(cfg: Dict[str, Any]) -> List[str]:
+    """Discovered memory providers for a per-request schema merge.
 
-    Computed at request time (not import time) so options reflect the
-    CURRENT config.yaml — including providers added after the server
-    started, and the profile-scoped config when the request carries a
-    ``profile`` param. The module-level ``CONFIG_SCHEMA`` is never mutated;
-    entries that change are shallow-copied onto a copied mapping.
+    Reuses the cheap directory scan of :func:`_memory_provider_options` and
+    additionally preserves the currently-configured provider, so a value
+    selected in config but not (yet) discoverable — e.g. a plugin removed from
+    disk — never silently vanishes from the dropdown.
+    """
+    options = _memory_provider_options()
+
+    memory = cfg.get("memory")
+    configured = memory.get("provider") if isinstance(memory, dict) else None
+    current = _normalize_memory_provider_name(configured)
+
+    if current and current not in options:
+        options = [*options, current]
+
+    return options
+
+
+def _schema_with_dynamic_provider_options() -> Dict[str, Dict[str, Any]]:
+    """Return CONFIG_SCHEMA with per-request discovery-driven options merged.
+
+    Some ``*.provider`` selects have options that are discovered at runtime
+    (voice backends via the tts/stt registries + config.yaml command
+    providers; memory providers via a plugin-dir scan). The module-level
+    ``_SCHEMA_OVERRIDES`` freezes those lists at import time, so a provider
+    installed after the server started never appears. This recomputes them at
+    request time — reflecting the CURRENT config.yaml, the profile-scoped
+    config when the request carries a ``profile`` param, and mid-session
+    plugin installs — for every surface that reads the schema (desktop, CLI,
+    dashboard), with no extra frontend round-trips.
+
+    The module-level ``CONFIG_SCHEMA`` is never mutated; entries that change
+    are shallow-copied onto a copied mapping.
     """
     try:
         cfg = load_config()
     except Exception:  # pragma: no cover - schema must survive config errors
         return CONFIG_SCHEMA
+
     overlay: Dict[str, Dict[str, Any]] = {}
-    for kind in ("tts", "stt"):
-        key = f"{kind}.provider"
+
+    def merge(key: str, options: List[str]) -> None:
         entry = CONFIG_SCHEMA.get(key)
-        if not isinstance(entry, dict) or not isinstance(entry.get("options"), list):
-            continue
-        merged = _custom_provider_options(kind, list(entry["options"]), cfg)
-        if merged != entry["options"]:
-            overlay[key] = {**entry, "options": merged}
+
+        if isinstance(entry, dict) and isinstance(entry.get("options"), list) and options != entry["options"]:
+            overlay[key] = {**entry, "options": options}
+
+    for kind in ("tts", "stt"):
+        entry = CONFIG_SCHEMA.get(f"{kind}.provider")
+        existing = entry.get("options") if isinstance(entry, dict) else None
+
+        if isinstance(existing, list):
+            merge(f"{kind}.provider", _custom_provider_options(kind, list(existing), cfg))
+
+    merge("memory.provider", _memory_provider_schema_options(cfg))
+
     if not overlay:
         return CONFIG_SCHEMA
-    fields = dict(CONFIG_SCHEMA)
-    fields.update(overlay)
-    return fields
+
+    return {**CONFIG_SCHEMA, **overlay}
 
 
 class ConfigUpdate(BaseModel):
@@ -1363,14 +1545,29 @@ def _apply_main_model_assignment(
 
 
 _GATEWAY_HEALTH_URL = os.getenv("GATEWAY_HEALTH_URL")
+_GATEWAY_HEALTH_TIMEOUT_MAX = 1.0
+_GATEWAY_HEALTH_ROUTE_TIMEOUT = 1.0
 try:
-    _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "3"))
+    _GATEWAY_HEALTH_TIMEOUT = float(os.getenv("GATEWAY_HEALTH_TIMEOUT", "1"))
 except (ValueError, TypeError):
     _log.warning(
-        "Invalid GATEWAY_HEALTH_TIMEOUT value %r — using default 3.0s",
+        "Invalid GATEWAY_HEALTH_TIMEOUT value %r — using default 1.0s",
         os.getenv("GATEWAY_HEALTH_TIMEOUT"),
     )
-    _GATEWAY_HEALTH_TIMEOUT = 3.0
+    _GATEWAY_HEALTH_TIMEOUT = 1.0
+if _GATEWAY_HEALTH_TIMEOUT <= 0:
+    _log.warning(
+        "Invalid non-positive GATEWAY_HEALTH_TIMEOUT value %.3fs — using default 1.0s",
+        _GATEWAY_HEALTH_TIMEOUT,
+    )
+    _GATEWAY_HEALTH_TIMEOUT = 1.0
+elif _GATEWAY_HEALTH_TIMEOUT > _GATEWAY_HEALTH_TIMEOUT_MAX:
+    _log.warning(
+        "Capping GATEWAY_HEALTH_TIMEOUT %.3fs to %.3fs for dashboard liveness probes",
+        _GATEWAY_HEALTH_TIMEOUT,
+        _GATEWAY_HEALTH_TIMEOUT_MAX,
+    )
+    _GATEWAY_HEALTH_TIMEOUT = _GATEWAY_HEALTH_TIMEOUT_MAX
 
 _STATUS_ACTIVE_SESSIONS_TIMEOUT = 0.75
 
@@ -1531,6 +1728,7 @@ _SENSITIVE_MANAGED_FILE_BASENAMES = frozenset({
     "google_oauth.json",
     "webhook_subscriptions.json",
     "bws_cache.json",
+    "bws_cache.enc.json",
     # git's credential-store helper cache (agent.file_safety blocks this too).
     ".git-credentials",
 })
@@ -2777,6 +2975,14 @@ def _collect_profile_gateway_topology() -> Dict[str, Any]:
     return {"profiles": profile_names, "gateway_mode": mode, "gateways": gateways}
 
 
+@app.get("/api/ssh/ownership")
+async def get_ssh_ownership(request: Request):
+    _require_token(request)
+    if not _SSH_OWNER_NONCE:
+        raise HTTPException(status_code=404, detail="SSH ownership is not active")
+    return {"ok": True, "sshOwnerNonce": _SSH_OWNER_NONCE, "protocolVersion": 1}
+
+
 @app.get("/api/status")
 async def get_status(profile: Optional[str] = None):
     status_scope = None
@@ -2806,9 +3012,17 @@ async def get_status(profile: Optional[str] = None):
 
         if not gateway_running and _GATEWAY_HEALTH_URL:
             loop = asyncio.get_running_loop()
-            alive, remote_health_body = await loop.run_in_executor(
-                None, _probe_gateway_health
-            )
+            try:
+                alive, remote_health_body = await asyncio.wait_for(
+                    loop.run_in_executor(None, _probe_gateway_health),
+                    timeout=_GATEWAY_HEALTH_ROUTE_TIMEOUT,
+                )
+            except TimeoutError:
+                _log.warning(
+                    "/api/status gateway health probe exceeded %.2fs; using local status",
+                    _GATEWAY_HEALTH_ROUTE_TIMEOUT,
+                )
+                alive, remote_health_body = False, None
             if alive:
                 gateway_running = True
                 # PID from the remote container (display only — not locally valid)
@@ -2857,7 +3071,11 @@ async def get_status(profile: Optional[str] = None):
                     if key in configured_gateway_platforms
                 }
             gateway_exit_reason = runtime.get("exit_reason")
-            gateway_updated_at = runtime.get("updated_at")
+            # Contract: gateway_updated_at is RFC3339 string | null, never a
+            # number. ``runtime`` here may be the local gateway_state.json
+            # (legacy gateways wrote epoch floats; hand edits can inject
+            # anything) or a remote /health/detailed body — normalize both.
+            gateway_updated_at = normalize_updated_at(runtime.get("updated_at"))
             if not gateway_running:
                 gateway_state = gateway_state if gateway_state in {"stopped", "startup_failed"} else "stopped"
                 gateway_platforms = {}
@@ -2908,9 +3126,29 @@ async def get_status(profile: Optional[str] = None):
         # "loopback only — no auth gate" with no extra round trips.
         auth_required = bool(getattr(app.state, "auth_required", False))
         auth_providers: list[str] = []
+        # RFC 8252 native-app capability advertisement. The desktop reads this
+        # to decide whether it can use the system-browser + loopback + PKCE
+        # flow (no embedded webview, no session cookies) or must fall back to
+        # the legacy embedded-webview cookie flow. "cookie" is always available
+        # in gated mode; "native_pkce" is present only when at least one
+        # registered session provider is a brokerable OAuth provider (not a
+        # password or token-only credential). Absent field / missing
+        # "native_pkce" ⇒ older gateway ⇒ desktop falls back automatically.
+        auth_flows: list[str] = []
         try:
-            from hermes_cli.dashboard_auth import list_providers as _list_providers
+            from hermes_cli.dashboard_auth import (
+                list_providers as _list_providers,
+                list_session_providers as _list_session_providers,
+            )
             auth_providers = [p.name for p in _list_providers()]
+            if auth_required:
+                auth_flows.append("cookie")
+                brokerable = [
+                    p for p in _list_session_providers()
+                    if not getattr(p, "supports_password", False)
+                ]
+                if brokerable:
+                    auth_flows.append("native_pkce")
         except Exception:
             # Module not importable yet (early startup) — leave as [].
             pass
@@ -2952,8 +3190,73 @@ async def get_status(profile: Optional[str] = None):
             "active_sessions": active_sessions,
             "auth_required": auth_required,
             "auth_providers": auth_providers,
+            "auth_flows": auth_flows,
             "nous_session_valid": nous_session_valid,
         }
+
+        # Component-level health rollup. Counts and status enums only — this
+        # payload is public (PUBLIC_API_PATHS), so no messages, paths, or
+        # other detail that could carry secrets. The storage probe reuses the
+        # gateway readiness state_db check (read-only, 1s-bounded) in an
+        # executor so a wedged DB can't stall the event loop.
+        components: Dict[str, Any] = {
+            "gateway": {
+                "status": "ok" if gateway_running and gateway_state in {"running", "draining"} else "degraded",
+                "state": gateway_state or ("running" if gateway_running else "stopped"),
+            },
+            "dashboard": DASHBOARD_HEALTH.snapshot(),
+        }
+        try:
+            from gateway.readiness import _probe_state_db
+
+            storage_check = await asyncio.get_running_loop().run_in_executor(
+                None, functools.partial(_probe_state_db, get_hermes_home())
+            )
+            components["storage"] = {"status": storage_check.get("status", "degraded")}
+        except Exception:
+            components["storage"] = {"status": "degraded"}
+        platform_states = [
+            str(value.get("state") or value.get("status") or "").lower()
+            for value in gateway_platforms.values()
+            if isinstance(value, dict)
+        ]
+        platforms_ok = all(
+            state in {"connected", "running", "ok"} for state in platform_states
+        )
+        components["platforms"] = {
+            "status": "ok" if platforms_ok else "degraded",
+            "configured": len(gateway_platforms),
+            "connected": sum(
+                1 for state in platform_states if state in {"connected", "running", "ok"}
+            ),
+        }
+        status["components"] = components
+        status["overall"] = (
+            "ok"
+            if all(item.get("status") == "ok" for item in components.values())
+            else "degraded"
+        )
+
+        # Deferred FTS rebuild progress (schema v23): lets the desktop /
+        # dashboard render a "search index rebuilding: N%" indicator instead
+        # of users wondering why old-message search is slower after an
+        # update. None/absent when no rebuild is pending (the common case).
+        # Read-only probe, never blocks startup, never raises.
+        try:
+            from hermes_state import SessionDB as _SDB
+            from hermes_constants import get_hermes_home as _ghh
+
+            _db_path = _ghh() / "state.db"
+            if _db_path.exists():
+                _sdb = _SDB(db_path=_db_path, read_only=True)
+                try:
+                    _rebuild = _sdb.fts_rebuild_status()
+                finally:
+                    _sdb.close()
+                if _rebuild is not None:
+                    status["fts_rebuild"] = _rebuild
+        except Exception:
+            pass
 
         # Profile + gateway topology: which profiles exist, whether one
         # multiplexed gateway or several per-profile gateways serve them, and
@@ -3771,8 +4074,37 @@ async def update_hermes():
             "update_command": recommended_update_command_for_method(install_method),
         }
 
+    if install_method in {"nix", "nixos"}:
+        message = recommended_update_command_for_method(install_method)
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "nix_update_unsupported",
+            "message": message,
+            "update_command": message,
+        }
+
+    from hermes_cli.update_channel import UpdateChannelError, resolve_update_target
+
     try:
-        proc = _spawn_hermes_action(["update"], "hermes-update")
+        target = resolve_update_target(project_root=PROJECT_ROOT)
+    except UpdateChannelError as exc:
+        message = f"Hermes update blocked by release-channel policy: {exc}"
+        _record_completed_action("hermes-update", message, exit_code=1)
+        return {
+            "ok": False,
+            "pid": None,
+            "name": "hermes-update",
+            "error": "update_channel_unconfigured",
+            "message": message,
+        }
+
+    try:
+        proc = _spawn_hermes_action(
+            ["update", "--branch", target.branch], "hermes-update"
+        )
     except Exception as exc:
         _log.exception("Failed to spawn hermes update")
         raise HTTPException(status_code=500, detail=f"Failed to start update: {exc}")
@@ -3783,18 +4115,22 @@ async def update_hermes():
     }
 
 
-def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
-    """Commits the local checkout is behind ``origin/main`` by, newest first.
+def _recent_upstream_commits(n: int = 20, target=None) -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind its update target by, newest first.
 
-    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
+    Logs the SAME range the behind-count uses (normally ``HEAD..origin/main`` — see
     ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
     feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
     commits), which would leave the changelog empty even though the count is
-    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+    non-zero. Pinning to the resolved target keeps count and changelog consistent.
 
     Best-effort: returns [] if not a git checkout, origin/main is unreachable,
     or git is unavailable. Never raises into the request path.
     """
+    if target is None:
+        from hermes_cli.update_channel import UpdateTarget
+
+        target = UpdateTarget(remote="origin", branch="main")
     try:
         out = subprocess.run(
             [
@@ -3803,7 +4139,7 @@ def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
                 str(PROJECT_ROOT),
                 "log",
                 "--format=%H%x1f%s%x1f%an%x1f%ct",
-                "HEAD..origin/main",
+                f"HEAD..{target.remote}/{target.branch}",
                 f"-n{int(n)}",
             ],
             capture_output=True,
@@ -3840,18 +4176,18 @@ async def check_hermes_update(force: bool = False):
     ``POST /api/hermes/update`` actually runs ``hermes update``.
 
     Returns:
-        install_method: 'git' | 'pip' | 'docker' | 'nixos' | 'homebrew' | ...
+        install_method: 'git' | 'docker' | 'nix' | 'nixos' | 'unknown'
         current_version: installed Hermes version string
         behind: commits behind upstream (>=1), 0 if up to date,
-                -1 if behind by an unknown count (nix/pypi), or null if the
+                -1 if behind by an unknown count, or null if the
                 check could not run (offline, no remote, etc.)
         update_available: convenience bool (behind is non-zero and not null)
         can_apply: True when the dashboard's update button can apply it
-                   in place (git/pip); False for docker/nix/homebrew where the
+                   in place (git); False for other install methods where the
                    user must update out-of-band
         update_command: the recommended command for this install method
         message: human-readable guidance for non-applyable methods
-        commits: for git/pip installs that are behind, a list of the commits
+        commits: for git installs that are behind, a list of the commits
                  the local checkout is behind upstream by — each
                  {sha, summary, author, at}. Absent/empty otherwise. The
                  desktop's remote update overlay renders this as "what's
@@ -3879,7 +4215,7 @@ async def check_hermes_update(force: bool = False):
         "current_version": __version__,
         "behind": None,
         "update_available": False,
-        "can_apply": install_method in ("git", "pip"),
+        "can_apply": install_method == "git",
         "update_command": update_command,
         "message": None,
     }
@@ -3888,7 +4224,19 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = format_docker_update_message()
         return payload
 
-    # banner.check_for_updates() handles git / pypi / nix-revision paths and
+    target = None
+    if install_method == "git":
+        from hermes_cli.update_channel import UpdateChannelError, resolve_update_target
+
+        try:
+            target = resolve_update_target(project_root=PROJECT_ROOT)
+        except UpdateChannelError as exc:
+            payload["can_apply"] = False
+            payload["error"] = "update_channel_unconfigured"
+            payload["message"] = f"Hermes update blocked by release-channel policy: {exc}"
+            return payload
+
+    # banner.check_for_updates() handles git / nix-revision paths and
     # caches the result for 6h. ``force`` busts the cache so the "Check now"
     # button reflects reality immediately.
     try:
@@ -3900,7 +4248,13 @@ async def check_hermes_update(force: bool = False):
             except OSError:
                 pass
 
-        behind = await asyncio.to_thread(check_for_updates)
+        if target is None or (target.remote == "origin" and target.branch == "main"):
+            # Keep the historical no-argument call for generic main checks;
+            # this also preserves compatibility with lightweight checker
+            # adapters used by dashboard integrations.
+            behind = await asyncio.to_thread(check_for_updates)
+        else:
+            behind = await asyncio.to_thread(check_for_updates, target=target)
     except Exception:
         _log.exception("Update check failed")
         behind = None
@@ -3913,10 +4267,15 @@ async def check_hermes_update(force: bool = False):
     else:
         payload["update_available"] = True
         # Enrich with the actual commits we're behind by, so the desktop's
-        # remote update overlay can show "what's changed". git/pip only;
+        # remote update overlay can show "what's changed". git only;
         # best-effort (empty list on any failure).
-        if install_method in ("git", "pip"):
-            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+        if install_method == "git":
+            if target is None or (target.remote == "origin" and target.branch == "main"):
+                payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
+            else:
+                payload["commits"] = await asyncio.to_thread(
+                    _recent_upstream_commits, target=target
+                )
 
     return payload
 
@@ -5948,11 +6307,11 @@ async def get_defaults():
 
 @app.get("/api/config/schema")
 async def get_schema(profile: Optional[str] = None):
-    # Voice provider options are merged per-request so user-declared
-    # command providers (tts.providers.* / stt.providers.*) added after
-    # server start still show up, scoped to the requested profile's config.
+    # Discovery-driven provider options (voice command providers + memory
+    # provider plugins) are merged per-request so providers added after server
+    # start still show up, scoped to the requested profile's config.
     with _config_profile_scope(profile):
-        fields = _schema_with_voice_provider_options()
+        fields = _schema_with_dynamic_provider_options()
     return {"fields": fields, "category_order": _CATEGORY_ORDER}
 
 
@@ -6157,8 +6516,6 @@ def get_recommended_default_model(provider: str = ""):
             try:
                 state = get_provider_auth_state("nous") or {}
                 portal_url = state.get("portal_base_url", "") or ""
-            except UnscopedSecretError:
-                raise
             except Exception:
                 portal_url = ""
 
@@ -6176,8 +6533,6 @@ def get_recommended_default_model(provider: str = ""):
 
             model = pick_silent_default_model(model_ids, provider="nous")
             return {"provider": "nous", "model": model, "free_tier": bool(free_tier)}
-        except UnscopedSecretError:
-            raise
         except Exception:
             _log.exception("GET /api/model/recommended-default (nous) failed")
             return {"provider": "nous", "model": "", "free_tier": None}
@@ -9171,8 +9526,6 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
     if read_hermes_oauth_credentials:
         try:
             hermes_creds = read_hermes_oauth_credentials()
-        except UnscopedSecretError:
-            raise
         except Exception:
             hermes_creds = None
     if hermes_creds and hermes_creds.get("accessToken"):
@@ -9185,9 +9538,8 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
             "has_refresh_token": bool(hermes_creds.get("refreshToken")),
         }
 
-    # Env-var / secret-source path. The config helper is profile-scope aware:
-    # a multiplexed status request must never fall through to process ambient
-    # credentials when its owning profile has no value.
+    # Env-var / secret-source path. ``get_env_value`` checks the process
+    # environment first (where Bitwarden-sourced secrets land) then .env.
     env_var_order: tuple = ("ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN")
     try:
         from hermes_cli.auth import PROVIDER_REGISTRY
@@ -9204,7 +9556,7 @@ def _anthropic_oauth_status() -> Dict[str, Any]:
         format_secret_source_suffix = None  # type: ignore
 
     for var in env_var_order:
-        value = get_env_value(var) if get_env_value else None
+        value = (get_env_value(var) if get_env_value else None) or os.getenv(var)
         if not value:
             continue
         suffix = format_secret_source_suffix(var) if format_secret_source_suffix else ""
@@ -9229,8 +9581,6 @@ def _claude_code_only_status() -> Dict[str, Any]:
     try:
         from agent.anthropic_adapter import read_claude_code_credentials
         creds = read_claude_code_credentials()
-    except UnscopedSecretError:
-        raise
     except Exception:
         creds = None
     if creds and creds.get("accessToken"):
@@ -9359,8 +9709,6 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
     if status_fn is not None:
         try:
             return status_fn()
-        except UnscopedSecretError:
-            raise
         except Exception as e:
             return {"logged_in": False, "error": str(e)}
     try:
@@ -9445,8 +9793,6 @@ def _resolve_provider_status(provider_id: str, status_fn) -> Dict[str, Any]:
                 "expires_at": raw.get("expires_at") or raw.get("access_expires_at"),
                 "has_refresh_token": bool(raw.get("has_refresh_token")),
             }
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         return {"logged_in": False, "error": str(e)}
     return {"logged_in": False}
@@ -9564,7 +9910,7 @@ async def list_oauth_providers(profile: Optional[str] = None):
     sync with the `hermes model` picker; _OAUTH_OVERRIDES supplies per-provider
     flow/status/cli metadata.
     """
-    with _auth_profile_scope(profile):
+    with _profile_scope(profile):
         providers = []
         for p in _build_oauth_catalog():
             status = _resolve_provider_status(p["id"], p.get("status_fn"))
@@ -9592,7 +9938,7 @@ async def disconnect_oauth_provider(
     """Disconnect an OAuth provider. Token-protected (matches /env/reveal)."""
     _require_token(request)
 
-    with _auth_profile_scope(profile):
+    with _profile_scope(profile):
         catalog_by_id = {p["id"]: p for p in _build_oauth_catalog()}
         provider = catalog_by_id.get(provider_id)
         if provider is None:
@@ -9628,16 +9974,12 @@ async def disconnect_oauth_provider(
                 if oauth_file.exists():
                     oauth_file.unlink()
                     cleared = True
-            except UnscopedSecretError:
-                raise
             except Exception:
                 pass
             # Also clear the credential pool entry if present.
             try:
                 from hermes_cli.auth import clear_provider_auth
                 cleared = clear_provider_auth("anthropic") or cleared
-            except UnscopedSecretError:
-                raise
             except Exception:
                 pass
             _log.info("oauth/disconnect: %s", provider_id)
@@ -9650,8 +9992,6 @@ async def disconnect_oauth_provider(
                 invalidate_nous_auth_status_cache()
             _log.info("oauth/disconnect: %s (cleared=%s)", provider_id, cleared)
             return {"ok": bool(cleared), "provider": provider_id}
-        except UnscopedSecretError:
-            raise
         except Exception as e:
             _log.exception("disconnect %s failed", provider_id)
             raise HTTPException(status_code=500, detail=str(e))
@@ -9763,24 +10103,11 @@ def _oauth_session_profile(
     session_id: str,
     fallback: Optional[str] = None,
 ) -> Optional[str]:
-    """Return the immutable owner bound when the OAuth session was created.
-
-    ``None`` is an unambiguous owner: the dashboard's current/default profile.
-    It must not be treated as missing state and replaced by a submit-time named
-    profile.
-    """
+    """Return the profile that owns an OAuth session, if one was provided."""
     with _oauth_sessions_lock:
         sess = _oauth_sessions.get(session_id)
-        if not sess:
-            return _oauth_profile_name(fallback)
-        profile = sess.get("profile")
-    requested = _oauth_profile_name(fallback)
-    if requested is not None and requested != profile:
-        raise HTTPException(
-            status_code=409,
-            detail="OAuth session belongs to a different profile",
-        )
-    return profile
+        profile = sess.get("profile") if sess else None
+    return profile or _oauth_profile_name(fallback)
 
 
 def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_at_ms: int) -> None:
@@ -9822,8 +10149,6 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
         for e in existing:
             try:
                 pool.remove_entry(getattr(e, "id", ""))
-            except UnscopedSecretError:
-                raise
             except Exception:
                 pass
         entry = PooledCredential(
@@ -9838,8 +10163,6 @@ def _save_anthropic_oauth_creds(access_token: str, refresh_token: str, expires_a
             expires_at_ms=expires_at_ms,
         )
         pool.add_entry(entry)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         _log.warning("anthropic pool add (dashboard) failed: %s", e)
 
@@ -9938,10 +10261,8 @@ def _submit_anthropic_pkce(
 
     expires_at_ms = int(time.time() * 1000) + (expires_in * 1000)
     try:
-        with _auth_profile_scope(_oauth_session_profile(session_id, profile)):
+        with _profile_scope(_oauth_session_profile(session_id, profile)):
             _save_anthropic_oauth_creds(access_token, refresh_token, expires_at_ms)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         with _oauth_sessions_lock:
             sess["status"] = "error"
@@ -9966,13 +10287,13 @@ async def _start_device_code_flow(
     if provider_id == "nous":
         from hermes_cli.auth import (
             _request_device_code,
-            _nous_portal_env_override,
             PROVIDER_REGISTRY,
         )
         import httpx
         pconfig = PROVIDER_REGISTRY["nous"]
         portal_base_url = (
-            _nous_portal_env_override()
+            os.getenv("HERMES_PORTAL_BASE_URL")
+            or os.getenv("NOUS_PORTAL_BASE_URL")
             or pconfig.portal_base_url
         ).rstrip("/")
         client_id = pconfig.client_id
@@ -9993,8 +10314,8 @@ async def _start_device_code_flow(
                     scope,
                 )
 
-        device_data, effective_scope = await _run_auth_in_executor(
-            _do_nous_device_request
+        device_data, effective_scope = await asyncio.get_running_loop().run_in_executor(
+            None, _do_nous_device_request
         )
         sid, sess = _new_oauth_session("nous", "device_code", profile=profile)
         sess["device_code"] = str(device_data["device_code"])
@@ -10003,9 +10324,9 @@ async def _start_device_code_flow(
         sess["portal_base_url"] = portal_base_url
         sess["client_id"] = client_id
         sess["scope"] = effective_scope
-        _start_auth_thread(
-            _nous_poller, sid, name=f"oauth-poll-{sid[:6]}"
-        )
+        threading.Thread(
+            target=_nous_poller, args=(sid,), daemon=True, name=f"oauth-poll-{sid[:6]}"
+        ).start()
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10023,9 +10344,10 @@ async def _start_device_code_flow(
         # so we run the full helper in a worker and proxy the user_code +
         # verification_url back via the session dict. The helper prints
         # to stdout — we capture nothing here, just status.
-        _start_auth_thread(
-            _codex_full_login_worker, sid, name=f"oauth-codex-{sid[:6]}"
-        )
+        threading.Thread(
+            target=_codex_full_login_worker, args=(sid,), daemon=True,
+            name=f"oauth-codex-{sid[:6]}",
+        ).start()
         # Block briefly until the worker has populated the user_code, OR error.
         deadline = time.monotonic() + 10
         while time.monotonic() < deadline:
@@ -10064,11 +10386,8 @@ async def _start_device_code_flow(
         )
         import httpx
         verifier, challenge, state = _minimax_pkce_pair()
-        from hermes_cli.config import get_env_value_prefer_dotenv
-
         portal_base_url = (
-            get_env_value_prefer_dotenv("MINIMAX_PORTAL_BASE_URL")
-            or MINIMAX_OAUTH_GLOBAL_BASE
+            os.getenv("MINIMAX_PORTAL_BASE_URL") or MINIMAX_OAUTH_GLOBAL_BASE
         ).rstrip("/")
         def _do_minimax_request():
             with httpx.Client(
@@ -10083,7 +10402,9 @@ async def _start_device_code_flow(
                     code_challenge=challenge,
                     state=state,
                 )
-        device_data = await _run_auth_in_executor(_do_minimax_request)
+        device_data = await asyncio.get_event_loop().run_in_executor(
+            None, _do_minimax_request
+        )
         sid, sess = _new_oauth_session("minimax-oauth", "device_code", profile=profile)
         # The CLI flow names this `interval_ms` because MiniMax's
         # `interval` field is in milliseconds (defensive default 2000ms
@@ -10111,9 +10432,12 @@ async def _start_device_code_flow(
             expires_at_ts = time.time() + expired_in_raw
             expires_in_seconds = expired_in_raw
         sess["expires_at"] = expires_at_ts
-        _start_auth_thread(
-            _minimax_poller, sid, name=f"oauth-poll-{sid[:6]}"
-        )
+        threading.Thread(
+            target=_minimax_poller,
+            args=(sid,),
+            daemon=True,
+            name=f"oauth-poll-{sid[:6]}",
+        ).start()
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10134,14 +10458,19 @@ async def _start_device_code_flow(
             ) as client:
                 return _xai_oauth_request_device_code(client)
 
-        device_data = await _run_auth_in_executor(_do_xai_device_request)
+        device_data = await asyncio.get_running_loop().run_in_executor(
+            None, _do_xai_device_request
+        )
         sid, sess = _new_oauth_session("xai-oauth", "device_code", profile=profile)
         sess["device_code"] = str(device_data["device_code"])
         sess["interval"] = int(device_data["interval"])
         sess["expires_at"] = time.time() + int(device_data["expires_in"])
-        _start_auth_thread(
-            _xai_device_poller, sid, name=f"oauth-poll-{sid[:6]}"
-        )
+        threading.Thread(
+            target=_xai_device_poller,
+            args=(sid,),
+            daemon=True,
+            name=f"oauth-poll-{sid[:6]}",
+        ).start()
         return {
             "session_id": sid,
             "flow": "device_code",
@@ -10203,7 +10532,7 @@ def _nous_poller(session_id: str) -> None:
             ),
             "expires_in": token_ttl,
         }
-        with _auth_profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(_oauth_session_profile(session_id)):
             full_state = refresh_nous_oauth_from_state(
                 auth_state,
                 timeout_seconds=15.0,
@@ -10214,8 +10543,6 @@ def _nous_poller(session_id: str) -> None:
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: nous login completed (session=%s)", session_id)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         _log.warning("nous device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10295,13 +10622,11 @@ def _minimax_poller(session_id: str) -> None:
             ).isoformat(),
             "expires_in": expires_in_s,
         }
-        with _auth_profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(_oauth_session_profile(session_id)):
             _minimax_save_auth_state(auth_state)
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: minimax login completed (session=%s)", session_id)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         _log.warning("minimax device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10346,13 +10671,12 @@ def _xai_device_poller(session_id: str) -> None:
             "expires_in": token_data.get("expires_in"),
             "token_type": str(token_data.get("token_type") or "Bearer").strip() or "Bearer",
         }
-        with _auth_profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(_oauth_session_profile(session_id)):
             _save_xai_oauth_tokens(
                 tokens,
                 discovery=discovery,
                 last_refresh=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
                 auth_mode="oauth_device_code",
-                to_active_profile=True,
             )
             # The singleton write above is the single source of truth: the
             # credential-pool load seeds it as the canonical ``device_code``
@@ -10367,8 +10691,6 @@ def _xai_device_poller(session_id: str) -> None:
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: xai login completed (session=%s)", session_id)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         _log.warning("xai device-code poll failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10526,16 +10848,14 @@ def _codex_full_login_worker(session_id: str) -> None:
 
         from hermes_cli.auth import _save_codex_tokens
 
-        with _auth_profile_scope(_oauth_session_profile(session_id)):
+        with _profile_scope(_oauth_session_profile(session_id)):
             _save_codex_tokens({
                 "access_token": access_token,
                 "refresh_token": refresh_token,
-            }, to_active_profile=True)
+            })
         with _oauth_sessions_lock:
             sess["status"] = "approved"
         _log.info("oauth/device: openai-codex login completed (session=%s)", session_id)
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         _log.warning("codex device-code worker failed (session=%s): %s", session_id, e)
         with _oauth_sessions_lock:
@@ -10571,14 +10891,11 @@ async def start_oauth_login(
         # silently launch the Anthropic OAuth flow (the bug fixed in this
         # change for MiniMax). New PKCE providers must add their own
         # start function and an explicit branch here.
-        with _auth_profile_scope(profile):
-            if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
-                return _start_anthropic_pkce(profile=profile)
-            if catalog_entry["flow"] == "device_code":
-                return await _start_device_code_flow(provider_id, profile=profile)
+        if catalog_entry["flow"] == "pkce" and provider_id == "anthropic":
+            return _start_anthropic_pkce(profile=profile)
+        if catalog_entry["flow"] == "device_code":
+            return await _start_device_code_flow(provider_id, profile=profile)
     except HTTPException:
-        raise
-    except UnscopedSecretError:
         raise
     except Exception as e:
         _log.exception("oauth/start %s failed", provider_id)
@@ -10601,14 +10918,9 @@ async def submit_oauth_code(
     """Submit the auth code for PKCE flows. Token-protected."""
     _require_token(request)
     if provider_id == "anthropic":
-        effective_profile = _oauth_session_profile(body.session_id, profile)
-        with _auth_profile_scope(effective_profile):
-            return await _run_auth_in_executor(
-                _submit_anthropic_pkce,
-                body.session_id,
-                body.code,
-                profile,
-            )
+        return await asyncio.get_running_loop().run_in_executor(
+            None, _submit_anthropic_pkce, body.session_id, body.code, profile,
+        )
     raise HTTPException(status_code=400, detail=f"submit not supported for {provider_id}")
 
 
@@ -12984,40 +13296,34 @@ def _pool_entry_summary(entry: Any, index: int) -> Dict[str, Any]:
 
 
 @app.get("/api/credentials/pool")
-async def list_credential_pool(profile: Optional[str] = None):
+async def list_credential_pool():
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
-    with _auth_profile_scope(profile):
-        providers = []
-        # read_credential_pool(None) lists every provider that has pooled entries;
-        # load_pool() then gives us the rich PooledCredential objects per provider.
-        raw_pool = read_credential_pool()
-        for provider_id in sorted(raw_pool.keys()):
-            try:
-                pool = load_pool(provider_id)
-            except UnscopedSecretError:
-                raise
-            except Exception:
-                _log.exception("load_pool(%s) failed", provider_id)
-                continue
-            entries = pool.entries()
-            if not entries:
-                continue
-            providers.append({
-                "provider": provider_id,
-                "entries": [
-                    _pool_entry_summary(e, i)
-                    for i, e in enumerate(entries, start=1)
-                ],
-            })
-        return {"providers": providers}
+    providers = []
+    # read_credential_pool(None) lists every provider that has pooled entries;
+    # load_pool() then gives us the rich PooledCredential objects per provider.
+    raw_pool = read_credential_pool()
+    for provider_id in sorted(raw_pool.keys()):
+        try:
+            pool = load_pool(provider_id)
+        except Exception:
+            _log.exception("load_pool(%s) failed", provider_id)
+            continue
+        entries = pool.entries()
+        if not entries:
+            continue
+        providers.append({
+            "provider": provider_id,
+            "entries": [
+                _pool_entry_summary(e, i) for i, e in enumerate(entries, start=1)
+            ],
+        })
+    return {"providers": providers}
 
 
 @app.post("/api/credentials/pool")
-async def add_credential_pool_entry(
-    body: CredentialPoolAdd, profile: Optional[str] = None
-):
+async def add_credential_pool_entry(body: CredentialPoolAdd):
     import uuid as _uuid
     from agent.credential_pool import (
         load_pool,
@@ -13032,101 +13338,98 @@ async def add_credential_pool_entry(
     if not provider or not api_key:
         raise HTTPException(status_code=400, detail="provider and api_key are required")
 
-    with _auth_profile_scope(profile):
-        try:
-            pool = load_pool(provider)
-            label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
-            entry = PooledCredential(
-                provider=provider,
-                id=_uuid.uuid4().hex[:6],
-                label=label,
-                auth_type=AUTH_TYPE_API_KEY,
-                priority=0,
-                source=SOURCE_MANUAL,
-                access_token=api_key,
-            )
-            pool.add_entry(entry)
-            # Re-adding a credential is an explicit re-engagement signal: lift
-            # every suppression for this provider so a source deleted earlier
-            # (via DELETE below or `hermes auth remove`) can seed again.
-            if not provider.startswith(CUSTOM_POOL_PREFIX):
-                try:
-                    from hermes_cli.auth import (
-                        _load_auth_store,
-                        unsuppress_credential_source,
-                    )
-
-                    suppressed = _load_auth_store().get("suppressed_sources", {})
-                    for src in list(suppressed.get(provider, []) or []):
-                        unsuppress_credential_source(provider, src)
-                except UnscopedSecretError:
-                    raise
-                except Exception:
-                    _log.exception("unsuppress after pool add failed (non-fatal)")
-        except UnscopedSecretError:
-            raise
-        except HTTPException:
-            raise
-        except Exception as exc:
-            _log.exception("POST /api/credentials/pool failed")
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {"ok": True, "provider": provider, "count": len(pool.entries())}
+    try:
+        pool = load_pool(provider)
+        label = (body.label or "").strip() or f"key #{len(pool.entries()) + 1}"
+        entry = PooledCredential(
+            provider=provider,
+            id=_uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_API_KEY,
+            priority=0,
+            source=SOURCE_MANUAL,
+            access_token=api_key,
+        )
+        pool.add_entry(entry)
+        # Re-adding a credential is an explicit re-engagement signal: lift
+        # every suppression for this provider so a source deleted earlier
+        # (via DELETE below or `hermes auth remove`) can seed again.
+        # Mirrors the `hermes auth add` behaviour in auth_commands.py.
+        if not provider.startswith(CUSTOM_POOL_PREFIX):
+            try:
+                from hermes_cli.auth import (
+                    _load_auth_store,
+                    unsuppress_credential_source,
+                )
+                suppressed = _load_auth_store().get("suppressed_sources", {})
+                for src in list(suppressed.get(provider, []) or []):
+                    unsuppress_credential_source(provider, src)
+            except Exception:
+                _log.exception("unsuppress after pool add failed (non-fatal)")
+    except HTTPException:
+        raise
+    except Exception as exc:
+        _log.exception("POST /api/credentials/pool failed")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "provider": provider, "count": len(pool.entries())}
 
 
 @app.delete("/api/credentials/pool/{provider}/{index}")
-async def remove_credential_pool_entry(
-    provider: str, index: int, profile: Optional[str] = None
-):
-    """Remove one pool entry and suppress any source that could reseed it."""
+async def remove_credential_pool_entry(provider: str, index: int):
+    """Remove a pool entry.  ``index`` is 1-based (matches the list response).
+
+    Removal must be sticky (#55217): ``load_pool()`` re-seeds entries from
+    their backing source (.env var, OAuth singleton file, custom-provider
+    config) on every call, so deleting only the pool row silently reverts on
+    the next dashboard refresh.  We dispatch through the same RemovalStep
+    registry the CLI ``hermes auth remove`` uses: each source cleans up its
+    external state and suppresses ``(provider, source)`` so the seeders skip
+    it.  Manual entries have no registered step — nothing external to clean,
+    no suppression needed (they aren't re-seeded).
+    """
     from agent.credential_pool import load_pool
     from agent.credential_sources import find_removal_step
     from hermes_cli.auth import suppress_credential_source
 
     provider = (provider or "").strip().lower()
-    with _auth_profile_scope(profile):
-        try:
-            pool = load_pool(provider)
-            removed = pool.remove_index(index)
-        except UnscopedSecretError:
-            raise
-        except Exception as exc:
-            _log.exception("DELETE /api/credentials/pool failed")
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        if removed is None:
-            raise HTTPException(status_code=404, detail="No pool entry at that index")
+    try:
+        pool = load_pool(provider)
+        removed = pool.remove_index(index)
+    except Exception as exc:
+        _log.exception("DELETE /api/credentials/pool failed")
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if removed is None:
+        raise HTTPException(status_code=404, detail="No pool entry at that index")
 
-        cleaned: List[str] = []
-        hints: List[str] = []
-        step = find_removal_step(provider, removed.source or "")
-        if step is not None:
+    cleaned: List[str] = []
+    hints: List[str] = []
+    step = find_removal_step(provider, removed.source or "")
+    if step is not None:
+        try:
+            result = step.remove_fn(provider, removed)
+            cleaned = list(result.cleaned)
+            hints = list(result.hints)
+            if result.suppress:
+                suppress_credential_source(provider, removed.source)
+        except Exception:
+            # Cleanup is best-effort, but suppression is the actual bug fix —
+            # without it the entry resurrects on the next load_pool().  Apply
+            # it even when source-specific cleanup blew up.
+            _log.exception(
+                "credential source cleanup failed for %s/%s; suppressing anyway",
+                provider, removed.source,
+            )
             try:
-                result = step.remove_fn(provider, removed)
-                cleaned = list(result.cleaned)
-                hints = list(result.hints)
-                if result.suppress:
-                    suppress_credential_source(provider, removed.source)
-            except UnscopedSecretError:
-                raise
+                suppress_credential_source(provider, removed.source)
             except Exception:
-                # Cleanup is best-effort, but suppression prevents reseeding.
-                _log.exception(
-                    "credential source cleanup failed for %s/%s; suppressing anyway",
-                    provider,
-                    removed.source,
-                )
-                try:
-                    suppress_credential_source(provider, removed.source)
-                except UnscopedSecretError:
-                    raise
-                except Exception:
-                    _log.exception("suppress_credential_source failed")
-        return {
-            "ok": True,
-            "provider": provider,
-            "count": len(pool.entries()),
-            "cleaned": cleaned,
-            "hints": hints,
-        }
+                _log.exception("suppress_credential_source failed")
+    return {
+        "ok": True,
+        "provider": provider,
+        "count": len(pool.entries()),
+        "cleaned": cleaned,
+        "hints": hints,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -14797,66 +15100,6 @@ def _config_profile_scope(profile: Optional[str]):
         yield profile_dir
     finally:
         reset_hermes_home_override(token)
-
-
-@contextmanager
-def _auth_profile_scope(profile: Optional[str]):
-    """Await-safe profile home + secret scope for auth/status operations."""
-    from agent.secret_scope import (
-        build_profile_secret_scope,
-        is_multiplex_active,
-        reset_secret_scope,
-        set_secret_scope,
-    )
-
-    with _config_profile_scope(profile) as profile_dir:
-        owner_home = profile_dir or get_hermes_home()
-        requested = (profile or "").strip().lower()
-        if not is_multiplex_active() and requested in {"", "current"}:
-            # Preserve the classic dashboard contract: exported credentials
-            # remain valid for its one process-owned profile. Named-profile
-            # requests and multiplex deployments always install an owner scope.
-            yield owner_home
-            return
-        secret_token = set_secret_scope(build_profile_secret_scope(owner_home))
-        try:
-            yield owner_home
-        finally:
-            reset_secret_scope(secret_token)
-
-
-async def _run_auth_in_executor(func, *args):
-    """Run blocking auth work with the current profile ContextVars intact."""
-    context = copy_context()
-    call = functools.partial(func, *args)
-    executor = concurrent.futures.ThreadPoolExecutor(
-        max_workers=1,
-        thread_name_prefix="hermes-auth",
-    )
-    try:
-        return await asyncio.get_running_loop().run_in_executor(
-            executor, context.run, call
-        )
-    finally:
-        # Do not attach auth work to asyncio's process-wide default executor:
-        # its lifecycle is shared with unrelated dashboard tasks. The bounded
-        # provider call has already completed on the normal path; wait=False
-        # also keeps cancellation from blocking the event loop during teardown.
-        executor.shutdown(wait=False, cancel_futures=True)
-
-
-def _start_auth_thread(func, *args, name: str) -> threading.Thread:
-    """Start an OAuth worker carrying the initiating profile's context."""
-    context = copy_context()
-    call = functools.partial(func, *args)
-    thread = threading.Thread(
-        target=context.run,
-        args=(call,),
-        daemon=True,
-        name=name,
-    )
-    thread.start()
-    return thread
 
 
 class SkillToggle(BaseModel):
@@ -18012,7 +18255,18 @@ def mount_spa(application: FastAPI):
         ``__HERMES_AUTH_REQUIRED__`` flag lets the SPA pick the right
         auth scheme for /api/pty and /api/ws (ticket vs token).
         """
-        html = _index_path.read_text(encoding="utf-8")
+        try:
+            html = _index_path.read_text(encoding="utf-8")
+        except OSError:
+            # The dist dir existed at mount time but index.html is missing or
+            # unreadable now (partial build, wiped dist, permissions). Without
+            # this guard every request raises FileNotFoundError (500). Return
+            # the same JSON 404 payload mount_spa uses for a fully-missing
+            # dist so clients get a clear, consistent signal.
+            return JSONResponse(
+                {"error": "Frontend not built. Run: cd web && npm run build"},
+                status_code=404,
+            )
         chat_js = "true" if _DASHBOARD_EMBEDDED_CHAT_ENABLED else "false"
         gated = bool(getattr(app.state, "auth_required", False))
         gated_js = "true" if gated else "false"
@@ -19250,6 +19504,8 @@ def start_server(
     allow_public: bool = False,
     initial_profile: str = "",
     headless: bool = False,
+    ssh_session_token: Optional[str] = None,
+    ssh_owner_nonce: Optional[str] = None,
 ):
     """Start the web UI server.
 
@@ -19261,7 +19517,13 @@ def start_server(
     ``headless`` is the ``serve`` path: the JSON-RPC/WS backend with no UI
     build and no SPA mount (mount_spa() honours ``HERMES_SERVE_HEADLESS``), so
     the banner announces the bind rather than a browser URL.
+
+    ``ssh_session_token`` and ``ssh_owner_nonce`` are process-local Desktop SSH
+    bootstrap state. Neither is persisted or exported to child processes.
     """
+    _apply_ssh_session_token(ssh_session_token or "")
+    _apply_ssh_owner_nonce(ssh_owner_nonce)
+
     import uvicorn
 
     try:

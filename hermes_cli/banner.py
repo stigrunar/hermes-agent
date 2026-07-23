@@ -191,10 +191,15 @@ def _check_via_rev(local_rev: str) -> Optional[int]:
     return 0 if upstream_rev == local_rev else UPDATE_AVAILABLE_NO_COUNT
 
 
-def _check_via_local_git(repo_dir: Path) -> Optional[int]:
-    """Count commits behind origin/main in a local checkout."""
+def _check_via_local_git(repo_dir: Path, target=None) -> Optional[int]:
+    """Count commits behind a validated update target in a local checkout."""
+    from hermes_cli.update_channel import UpdateTarget
+
+    target = target or UpdateTarget(remote="origin", branch="main")
+    remote = target.remote
+    branch = target.branch
     origin_url = _git_stdout(["remote", "get-url", "origin"], cwd=repo_dir)
-    if _is_official_ssh_remote(origin_url):
+    if remote == "origin" and branch == "main" and _is_official_ssh_remote(origin_url):
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         checked = _check_via_rev(head_rev) if head_rev else None
         if checked == UPDATE_AVAILABLE_NO_COUNT:
@@ -213,9 +218,17 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     is_shallow = shallow == "true"
 
     try:
-        fetch_args = ["git", "fetch", "origin"]
-        if is_shallow:
-            fetch_args += ["--depth", "1"]
+        if remote == "origin" and branch == "main":
+            # Preserve the established generic-check argv, including its
+            # shallow-clone ordering.
+            fetch_args = ["git", "fetch", "origin"]
+            if is_shallow:
+                fetch_args += ["--depth", "1"]
+        else:
+            fetch_args = ["git", "fetch"]
+            if is_shallow:
+                fetch_args += ["--depth", "1"]
+            fetch_args += [remote, branch]
         fetch_args.append("--quiet")
         subprocess.run(
             fetch_args,
@@ -232,7 +245,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
         head_rev = _git_stdout(["rev-parse", "HEAD"], cwd=repo_dir)
         target_rev = (
             _git_stdout(["rev-parse", "FETCH_HEAD"], cwd=repo_dir)
-            or _git_stdout(["rev-parse", "origin/main"], cwd=repo_dir)
+            or _git_stdout(["rev-parse", f"{remote}/{branch}"], cwd=repo_dir)
         )
         if not head_rev or not target_rev:
             return None
@@ -240,7 +253,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
 
     try:
         result = subprocess.run(
-            ["git", "rev-list", "--count", "HEAD..origin/main"],
+            ["git", "rev-list", "--count", f"HEAD..{remote}/{branch}"],
             capture_output=True, text=True, timeout=5,
             cwd=str(repo_dir),
         )
@@ -251,49 +264,7 @@ def _check_via_local_git(repo_dir: Path) -> Optional[int]:
     return None
 
 
-def _version_tuple(v: str) -> tuple[int, ...]:
-    """Parse '0.13.0' into (0, 13, 0) for comparison. Non-numeric segments become 0."""
-    parts = []
-    for segment in v.split("."):
-        try:
-            parts.append(int(segment))
-        except ValueError:
-            parts.append(0)
-    return tuple(parts)
-
-
-def _fetch_pypi_latest(package: str = "hermes-agent") -> Optional[str]:
-    """Fetch the latest version of a package from PyPI. Returns None on failure."""
-    try:
-        import urllib.request
-        url = f"https://pypi.org/pypi/{package}/json"
-        req = urllib.request.Request(url, headers={"Accept": "application/json"})
-        with urllib.request.urlopen(req, timeout=5) as resp:
-            data = json.loads(resp.read())
-            return data.get("info", {}).get("version")
-    except Exception:
-        return None
-
-
-def check_via_pypi() -> Optional[int]:
-    """Compare installed version against PyPI latest.
-
-    Returns 0 if up-to-date, 1 if behind, None on failure.
-    """
-    latest = _fetch_pypi_latest()
-    if latest is None:
-        return None
-    if latest == VERSION:
-        return 0
-    try:
-        if _version_tuple(latest) > _version_tuple(VERSION):
-            return 1
-        return 0
-    except Exception:
-        return 1 if latest != VERSION else 0
-
-
-def check_for_updates() -> Optional[int]:
+def check_for_updates(target=None) -> Optional[int]:
     """Check whether a Hermes update is available.
 
     Two paths: if ``HERMES_REVISION`` is set (nix builds embed it), compare
@@ -307,19 +278,17 @@ def check_for_updates() -> Optional[int]:
     hermes_home = get_hermes_home()
     cache_file = hermes_home / ".update_check"
     embedded_rev = os.environ.get("HERMES_REVISION") or None
+    target_key = (
+        f"{target.remote}/{target.branch}" if target is not None else None
+    )
 
     # Docker images have no working tree to count commits against — the
     # published image excludes `.git` (see .dockerignore) and sets no
-    # HERMES_REVISION (that's nix-only). Without this guard the checks below
-    # fall through to `check_via_pypi()`, whose PyPI-version mismatch flag (1)
-    # then gets rendered by the CLI banner and the TUI badge as a phantom
-    # "1 commit behind" — even though no git repo or commit math is involved,
-    # and `hermes update` correctly refuses to run in-place inside the
-    # container anyway. The dashboard's REST `/api/hermes/update/check`
-    # endpoint already short-circuits docker the same way (web_server.py);
-    # mirror that here so the banner/TUI surfaces agree. Returning None makes
-    # both the Rich banner (build_welcome_banner) and the Ink badge
-    # (branding.tsx, guarded on `typeof === 'number' && > 0`) show nothing.
+    # HERMES_REVISION (that's nix-only). Returning None makes both the Rich
+    # banner (build_welcome_banner) and the Ink badge (branding.tsx, guarded
+    # on `typeof === 'number' && > 0`) show nothing. The dashboard's REST
+    # `/api/hermes/update/check` endpoint short-circuits docker the same way
+    # (web_server.py); mirror that here so the banner/TUI surfaces agree.
     try:
         from hermes_cli.config import detect_install_method, get_project_root
         if detect_install_method(get_project_root()) == "docker":
@@ -328,10 +297,7 @@ def check_for_updates() -> Optional[int]:
         pass
 
     # Read cache — invalidate if the embedded rev OR installed version has
-    # changed since the last check. The version guard matters for pip installs:
-    # `check_via_pypi()` compares against VERSION, so a `pip install --upgrade`
-    # changes VERSION but leaves rev unchanged (both None), and without this
-    # the stale "behind" count would survive the upgrade for up to 6h. See #34491.
+    # changed since the last check.
     now = time.time()
     try:
         if cache_file.exists():
@@ -340,6 +306,7 @@ def check_for_updates() -> Optional[int]:
                 now - cached.get("ts", 0) < _UPDATE_CHECK_CACHE_SECONDS
                 and cached.get("rev") == embedded_rev
                 and cached.get("ver") == VERSION
+                and cached.get("target") == target_key
             ):
                 return cached.get("behind")
     except Exception:
@@ -355,13 +322,24 @@ def check_for_updates() -> Optional[int]:
         if not (repo_dir / ".git").exists():
             repo_dir = hermes_home / "hermes-agent"
         if not (repo_dir / ".git").exists():
-            behind = check_via_pypi()
+            # No git checkout and no embedded revision — can't determine
+            # update status. This is the Docker path (already short-circuited
+            # above) or an unsupported install without a source tree.
+            behind = None
         else:
-            behind = _check_via_local_git(repo_dir)
+            behind = _check_via_local_git(repo_dir, target=target)
 
     try:
         cache_file.write_text(
-            json.dumps({"ts": now, "behind": behind, "rev": embedded_rev, "ver": VERSION})
+            json.dumps(
+                {
+                    "ts": now,
+                    "behind": behind,
+                    "rev": embedded_rev,
+                    "ver": VERSION,
+                    "target": target_key,
+                }
+            )
         )
     except Exception:
         pass
@@ -887,27 +865,6 @@ def build_welcome_banner(console: "Console", model: str, cwd: str,
                 right_lines.append(line)
     except Exception:
         pass  # Never break the banner over an update check
-
-    # Unsupported install-method warning — pip/PyPI and Homebrew are no
-    # longer an officially supported distribution method (see
-    # website/docs/getting-started/platform-support.md). Such installs miss
-    # the git checkout + installer-managed deps, so updates, self-update, and
-    # issue triage don't behave correctly. Warn, don't block. NixOS is fully
-    # supported and never hits this.
-    try:
-        from hermes_cli.config import (
-            detect_install_method,
-            format_unsupported_install_warning,
-            is_unsupported_install_method,
-            get_project_root
-        )
-        _install_method = detect_install_method(get_project_root())
-        if is_unsupported_install_method(_install_method):
-            right_lines.append(
-                f"[bold yellow]⚠ {format_unsupported_install_warning(_install_method)}[/]"
-            )
-    except Exception:
-        pass  # Never break the banner over the install-method check
 
     right_content = "\n".join(right_lines)
     layout_table.add_row(left_content, right_content)

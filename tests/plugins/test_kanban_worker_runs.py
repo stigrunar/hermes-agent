@@ -10,6 +10,8 @@ Covers:
 from __future__ import annotations
 
 import importlib.util
+import json
+import os
 import secrets
 import sys
 import time
@@ -21,6 +23,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_worker_process as kp
 
 
 # ---------------------------------------------------------------------------
@@ -114,9 +117,6 @@ def test_workers_active_with_running_task(client):
     assert w["task_status"] == "running"
     assert w["task_title"] == "active-worker"
     assert w["task_assignee"] == "alice"
-    assert w["reap_state"] is None
-    assert w["reap_attempt_uuid"] is None
-    assert w["reap_attempts"] == 0
 
 
 def test_workers_active_excludes_ended_runs(client):
@@ -331,8 +331,36 @@ def _setup_running_task_with_run(conn, *, title, assignee, worker_pid):
         (task_id, lock, future, worker_pid, int(time.time())),
     )
     run_id = cur.lastrowid
+    identity = kp.ProcessIdentity(worker_pid, 100.25)
+    scope_unit = kb._worker_scope_unit_name(
+        task_id, run_id, db_path=kb._connection_main_db_path(conn),
+    )
     conn.execute(
-        "UPDATE tasks SET current_run_id=? WHERE id=?", (run_id, task_id),
+        "UPDATE tasks SET current_run_id=?, worker_pid=? WHERE id=?",
+        (run_id, worker_pid, task_id),
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_identity=?, worker_tree=? WHERE id=?",
+        (
+            json.dumps(identity.to_dict()),
+            json.dumps([identity.to_dict()]),
+            run_id,
+        ),
+    )
+    kb._append_event(
+        conn,
+        task_id,
+        "spawned",
+        {
+            "pid": worker_pid,
+            "launch_mode": "systemd-user-scope",
+            "identity_verified": True,
+            "scope_unit": scope_unit,
+            "manager_kind": "systemd-user",
+            "manager_uid": os.getuid(),
+            "launch_acknowledged": True,
+        },
+        run_id=run_id,
     )
     conn.commit()
     return task_id, run_id
@@ -367,8 +395,8 @@ def test_terminate_run_409_already_ended(client):
     assert "already ended" in r.json()["detail"]
 
 
-def test_terminate_run_ok(client):
-    """Termination persists phase one; the leased reaper owns all signals."""
+def test_terminate_run_ok(client, monkeypatch):
+    """Happy path: a trusted scoped run is reaped and the reason is recorded."""
     conn = kb.connect()
     try:
         task_id, run_id = _setup_running_task_with_run(
@@ -376,6 +404,41 @@ def test_terminate_run_ok(client):
         )
     finally:
         conn.close()
+
+    identity_state = {33333: "alive"}
+    sent = []
+
+    monkeypatch.setattr(
+        kp,
+        "capture_process_tree",
+        lambda root, previous=(): kp.TreeCapture("captured", (root,)),
+    )
+    monkeypatch.setattr(
+        kp,
+        "identity_state",
+        lambda identity: identity_state.get(identity.pid, "unknown"),
+    )
+    monkeypatch.setattr(
+        kp,
+        "protected_process_identities",
+        lambda extra=(): (set(), set()),
+    )
+    trusted_scope = {"value": False}
+    monkeypatch.setattr(
+        kb,
+        "_worker_scope_state",
+        lambda *_args, **_kwargs: (
+            kb._WorkerScopeStatus(
+                "hermes-test-worker.scope",
+                "inactive",
+                "test-manager",
+                "systemd-user-scope",
+                True,
+            )
+            if trusted_scope["value"]
+            else kb._WorkerScopeStatus(None, "not-applicable", None, "direct")
+        ),
+    )
 
     r = client.post(
         f"/api/plugins/kanban/runs/{run_id}/terminate",
@@ -386,30 +449,50 @@ def test_terminate_run_ok(client):
     assert body["ok"] is True
     assert body["run_id"] == run_id
     assert body["task_id"] == task_id
-    assert body["pending_reap"] is True
-    assert body["status"] == "running"
-    assert body["reap_state"] == "identity_unverifiable"
-    assert body["assignee"] == "jane"
-    assert body["requested_assignee"] is None
     assert body["state"] == "pending_reap"
 
-    # This fixture is deliberately legacy PID-only: it must remain fenced,
-    # with ownership intact, until an exact identity can be verified.
+    conn = kb.connect()
+    try:
+        pending_run = kb.get_run(conn, run_id)
+        assert pending_run.claim_lock is not None
+        assert pending_run.terminal_payload["event_payload"]["reason"] == (
+            "operator abort"
+        )
+        first = kb.reconcile_worker_reaps(
+            conn,
+            signal_fn=lambda pid, sig: sent.append((pid, sig)),
+            protected_pid_fn=lambda: set(),
+        )
+    finally:
+        conn.close()
+    assert first[0]["state"] == "reap_pending"
+    assert sent == [(33333, kp.TERM_SIGNAL)]
+
+    identity_state[33333] = "gone"
+    trusted_scope["value"] = True
+    conn = kb.connect()
+    try:
+        second = kb.reconcile_worker_reaps(
+            conn,
+            signal_fn=lambda pid, sig: sent.append((pid, sig)),
+            protected_pid_fn=lambda: set(),
+        )
+    finally:
+        conn.close()
+    assert second[0]["state"] == "finalized"
+
+    # Task is back to ready, claim cleared.
     conn = kb.connect()
     try:
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid FROM tasks WHERE id=?",
             (task_id,),
         ).fetchone()
-        run = kb.get_run(conn, run_id)
     finally:
         conn.close()
-    assert row["status"] == "running"
-    assert row["claim_lock"] is not None
-    assert row["worker_pid"] == 33333
-    assert run is not None
-    assert run.reap_state == "identity_unverifiable"
-    assert run.terminal_payload is not None
+    assert row["status"] == "ready"
+    assert row["claim_lock"] is None
+    assert row["worker_pid"] is None
 
 
 def test_terminate_run_409_task_not_reclaimable(client, monkeypatch):

@@ -245,6 +245,39 @@ function Invoke-NativeWithRelaxedErrorAction {
         $ErrorActionPreference = $prevEAP
     }
 }
+
+function New-VerifiedPreUpdateRecoveryRef {
+    param([Parameter(Mandatory = $true)][string]$HeadSha)
+
+    if ($HeadSha -notmatch '^[0-9a-f]{40}$') {
+        throw "Cannot create recovery ref: invalid pre-update HEAD '$HeadSha'"
+    }
+
+    $recoveryRef = "refs/hermes/recovery/pre-update/$HeadSha"
+    $existing = @(git -c windows.appendAtomically=false rev-parse --verify $recoveryRef 2>$null)
+    $existingExit = $LASTEXITCODE
+    if ($existingExit -eq 0) {
+        $existingSha = ($existing -join "").Trim()
+        if ($existingSha -ne $HeadSha) {
+            throw "Recovery ref $recoveryRef already points to $existingSha, not $HeadSha"
+        }
+        $oldSha = $existingSha
+    } else {
+        $oldSha = -join (1..40 | ForEach-Object { "0" })
+    }
+
+    git -c windows.appendAtomically=false update-ref $recoveryRef $HeadSha $oldSha
+    if ($LASTEXITCODE -ne 0) {
+        throw "git update-ref failed for $recoveryRef"
+    }
+
+    $readback = @(git -c windows.appendAtomically=false rev-parse --verify $recoveryRef 2>$null)
+    $readbackExit = $LASTEXITCODE
+    if ($readbackExit -ne 0 -or (($readback -join "").Trim() -ne $HeadSha)) {
+        throw "Recovery ref readback failed for $recoveryRef"
+    }
+    return $recoveryRef
+}
 function Discard-LockfileChurn {
     param([string]$Repo = $InstallDir)
 
@@ -1520,7 +1553,20 @@ function Install-Repository {
                     # reset to the fetched remote so bootstrap/install can recover.
                     git -c windows.appendAtomically=false pull --ff-only origin $Branch
                     if ($LASTEXITCODE -ne 0) {
-                        Write-Warn "Fast-forward not possible; resetting managed install to origin/$Branch..."
+                        $preUpdateSha = @(git -c windows.appendAtomically=false rev-parse --verify HEAD 2>$null)
+                        $preUpdateExit = $LASTEXITCODE
+                        $preUpdateSha = ($preUpdateSha -join "").Trim()
+                        if ($preUpdateExit -ne 0 -or $preUpdateSha -notmatch '^[0-9a-f]{40}$') {
+                            throw "Cannot resolve pre-update HEAD; no reset performed"
+                        }
+                        try {
+                            $recoveryRef = New-VerifiedPreUpdateRecoveryRef -HeadSha $preUpdateSha
+                        } catch {
+                            throw "Recovery ref creation/readback failed; no reset performed. Current HEAD is unchanged: $preUpdateSha. $_"
+                        }
+                        Write-Warn "Fast-forward not possible; recovery ref verified before resetting managed install..."
+                        Write-Info "Recovery ref: $recoveryRef"
+                        Write-Info "Manual recovery: git reset --hard $recoveryRef"
                         git -c windows.appendAtomically=false reset --hard "origin/$Branch"
                         if ($LASTEXITCODE -ne 0) { throw "git reset --hard origin/$Branch failed (exit $LASTEXITCODE)" }
                     }

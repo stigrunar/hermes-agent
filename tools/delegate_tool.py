@@ -31,7 +31,6 @@ from concurrent.futures import (
 )
 from typing import Any, Dict, List, Optional
 
-from agent.secret_scope import UnscopedSecretError
 from toolsets import TOOLSETS
 
 # Sentinel value used by the runtime provider system for providers that are
@@ -50,7 +49,6 @@ DELEGATE_BLOCKED_TOOLS = frozenset(
         "clarify",  # no user interaction
         "memory",  # no writes to shared MEMORY.md
         "send_message",  # no cross-platform side effects
-        "execute_code",  # children should reason step-by-step, not write scripts
         "cronjob",  # no scheduling more work in the parent's name
     ]
 )
@@ -775,7 +773,7 @@ def _strip_blocked_tools(toolsets: List[str]) -> List[str]:
     """
     # Composite toolsets that should never pass through to children, even
     # though their individual tools aren't all in DELEGATE_BLOCKED_TOOLS.
-    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation", "code_execution"})
+    _COMPOSITE_BLOCKED_TOOLSETS = frozenset({"delegation"})
     blocked_toolset_names = {
         name
         for name, defn in TOOLSETS.items()
@@ -3133,8 +3131,6 @@ def _resolve_child_credential_pool(
             pool = load_pool(child_key)
             if pool is not None and pool.has_credentials():
                 return pool
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
             logger.debug(
                 "Could not resolve custom credential pool for child endpoint '%s': %s",
@@ -3152,8 +3148,6 @@ def _resolve_child_credential_pool(
         pool = load_pool(effective_provider)
         if pool is not None and pool.has_credentials():
             return pool
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         logger.debug(
             "Could not load credential pool for child provider '%s': %s",
@@ -3263,8 +3257,6 @@ def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
         from hermes_cli.runtime_provider import resolve_runtime_provider
 
         runtime = resolve_runtime_provider(requested=configured_provider, target_model=configured_model)
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
@@ -3434,10 +3426,10 @@ def _build_top_level_description() -> str:
         "status) and verify it yourself — fetch the URL, stat the file, read "
         "back the content — before telling the user the operation succeeded.\n"
         "- Leaf subagents (role='leaf', the default) CANNOT call: "
-        "delegate_task, clarify, memory, send_message, execute_code.\n"
+        "delegate_task, clarify, memory, send_message.\n"
         "- Orchestrator subagents (role='orchestrator') retain "
         "delegate_task so they can spawn their own workers, but still "
-        "cannot use clarify, memory, send_message, or execute_code. "
+        "cannot use clarify, memory, or send_message. "
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"

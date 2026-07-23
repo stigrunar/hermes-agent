@@ -8,16 +8,14 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
-import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
@@ -29,7 +27,7 @@ from hermes_cli import kanban_db as kb
 
 
 def _load_plugin_module():
-    """Dynamically load plugins/kanban/dashboard/plugin_api.py."""
+    """Dynamically load the dashboard plugin module for router/constants."""
     repo_root = Path(__file__).resolve().parents[2]
     plugin_file = repo_root / "plugins" / "kanban" / "dashboard" / "plugin_api.py"
     assert plugin_file.exists(), f"plugin file missing: {plugin_file}"
@@ -45,7 +43,6 @@ def _load_plugin_module():
 
 
 def _load_plugin_router():
-    """Return a freshly loaded Kanban dashboard router."""
     return _load_plugin_module().router
 
 
@@ -76,60 +73,18 @@ def test_board_empty(client):
     r = client.get("/api/plugins/kanban/board")
     assert r.status_code == 200
     data = r.json()
-    # The board exposes every actionable status once, in the source-defined
-    # order, while terminal history is represented by ``suppressed``.
+    # The board exposes the plugin's visible columns, not every DB status:
+    # audit-only terminal lanes remain queryable but are not board columns.
     names = [c["name"] for c in data["columns"]]
-    expected_columns = kb.VALID_STATUSES - kb.NON_ACTIONABLE_STATUSES - {"cancelled"}
-    assert set(names) == expected_columns
-    assert "cancelled" not in names
+    plugin_api = _load_plugin_module()
+    assert names == plugin_api.BOARD_COLUMNS
+    assert "archived" not in names
     for expected in ("triage", "todo", "scheduled", "ready", "running", "blocked", "done"):
         assert expected in names, f"missing column {expected}: {names}"
     assert all(len(c["tasks"]) == 0 for c in data["columns"])
-    assert data["suppressed"] == []
     assert data["tenants"] == []
     assert data["assignees"] == []
     assert data["latest_event_id"] == 0
-
-
-def test_cancelled_task_is_history_not_todo(client):
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "cancel me", "assignee": "operator"},
-    ).json()["task"]
-    with kb.connect() as conn:
-        assert kb.cancel_task(conn, task["id"], reason="operator")
-
-    data = client.get("/api/plugins/kanban/board").json()
-    assert all(task["id"] not in column["tasks"] for column in data["columns"])
-    history = next(item for item in data["suppressed"] if item["id"] == task["id"])
-    assert history["status"] == "cancelled"
-    assert history["non_authorizing"] is True
-
-
-def test_manual_recovery_required_remains_visible_on_board(client):
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "manual recovery", "assignee": "operator"},
-    ).json()["task"]
-    with kb.connect() as conn:
-        claimed = kb.claim_task(conn, task["id"], claimer="operator:test")
-        assert claimed is not None and claimed.current_run_id is not None
-        conn.execute(
-            "UPDATE task_runs SET reap_state='manual_recovery_required', "
-            "terminal_requested_at=100, reap_attempts=4 WHERE id=?",
-            (claimed.current_run_id,),
-        )
-        conn.commit()
-
-    data = client.get("/api/plugins/kanban/board").json()
-    running = next(column for column in data["columns"] if column["name"] == "running")
-    card = next(item for item in running["tasks"] if item["id"] == task["id"])
-    assert card["recovery_state"] == "manual_recovery_required"
-    assert card["reap_state"] == "manual_recovery_required"
-    assert any(
-        diagnostic["kind"] == "worker_manual_recovery_required"
-        for diagnostic in card["diagnostics"]
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -165,370 +120,6 @@ def test_create_task_appears_on_board(client):
     assert ready["tasks"][0]["id"] == task_id
     assert "acme" in data["tenants"]
     assert "researcher" in data["assignees"]
-
-
-@pytest.mark.parametrize("workspace_path", [None, "relative/path"])
-def test_create_dir_requires_absolute_anchor_before_insert(
-    client,
-    workspace_path,
-):
-    response = client.post(
-        "/api/plugins/kanban/tasks",
-        json={
-            "title": "bad dir",
-            "workspace_kind": "dir",
-            "workspace_path": workspace_path,
-        },
-    )
-    assert response.status_code == 400
-    with kb.connect_closing() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
-
-
-def test_proven_replacement_leaves_columns_but_remains_auditable(client):
-    source = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "superseded source", "assignee": "alice"},
-    ).json()["task"]
-    target = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "canonical replacement", "assignee": "alice"},
-    ).json()["task"]
-    head = "c" * 40
-    with kb.connect() as conn:
-        conn.execute("UPDATE tasks SET status = 'done' WHERE id = ?", (target["id"],))
-        conn.execute(
-            "INSERT INTO task_runs "
-            "(task_id, status, outcome, started_at, ended_at, metadata) "
-            "VALUES (?, 'done', 'completed', 1, 2, ?)",
-            (
-                target["id"],
-                json.dumps({"reconciliation": {
-                    "supersedes_task_id": source["id"],
-                    "canonical_live_task": target["id"],
-                    "candidate_head": head,
-                    "terminal_receipt": {
-                        "state": "merged",
-                        "task_id": target["id"],
-                        "head": head,
-                    },
-                }}),
-            ),
-        )
-
-    board = client.get("/api/plugins/kanban/board").json()
-    ordinary_ids = {
-        task["id"]
-        for column in board["columns"]
-        for task in column["tasks"]
-    }
-    assert source["id"] not in ordinary_ids
-    assert source["id"] in {task["id"] for task in board["suppressed"]}
-
-    detail = client.get(f"/api/plugins/kanban/tasks/{source['id']}")
-    assert detail.status_code == 200
-    assert detail.json()["task"]["id"] == source["id"]
-    assert any(
-        diagnostic["kind"] == "replacement_suppressed"
-        for diagnostic in detail.json()["task"]["diagnostics"]
-    )
-
-
-def test_large_board_diagnostics_complete_within_desktop_limit(kanban_home):
-    task_count = 3_500
-    event_count = 70_000
-    run_count = 5_000
-    now = int(time.time())
-    task_ids = [f"t_perf_{index:04d}" for index in range(task_count)]
-    source_id, replacement_id = task_ids[:2]
-    head = "c" * 40
-    source_receipt = {
-        "replacement_task_id": replacement_id,
-        "canonical_live_task": replacement_id,
-    }
-    replacement_receipt = {
-        "supersedes_task_id": source_id,
-        "canonical_live_task": replacement_id,
-        "candidate_head": head,
-        "terminal_receipt": {
-            "state": "merged",
-            "task_id": replacement_id,
-            "head": head,
-        },
-    }
-
-    with kb.connect() as conn:
-        conn.execute("BEGIN IMMEDIATE")
-        conn.executemany(
-            "INSERT INTO tasks "
-            "(id, title, status, priority, created_at, workspace_kind) "
-            "VALUES (?, ?, ?, 0, ?, 'scratch')",
-            [
-                (
-                    task_id,
-                    f"Performance task {index}",
-                    "done" if task_id == replacement_id else "ready",
-                    now,
-                )
-                for index, task_id in enumerate(task_ids)
-            ],
-        )
-        conn.executemany(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'progress', NULL, ?)",
-            [
-                (task_ids[index % task_count], now)
-                for index in range(event_count)
-            ],
-        )
-        run_rows = []
-        for index in range(run_count):
-            task_index = index % task_count
-            task_id = task_ids[task_index]
-            metadata = None
-            if index == task_count:
-                metadata = json.dumps({"reconciliation": source_receipt})
-            elif index == task_count + 1:
-                metadata = json.dumps({"reconciliation": replacement_receipt})
-            started_at = now + (index // task_count)
-            run_rows.append((task_id, started_at, started_at + 1, metadata))
-        conn.executemany(
-            "INSERT INTO task_runs "
-            "(task_id, status, outcome, started_at, ended_at, metadata) "
-            "VALUES (?, 'done', 'completed', ?, ?, ?)",
-            run_rows,
-        )
-        conn.commit()
-
-    plugin_api = _load_plugin_module()
-    started = time.perf_counter()
-    board = plugin_api.get_board(None, False, None, None, None)
-    elapsed = time.perf_counter() - started
-
-    ordinary = {
-        task["id"]: task
-        for column in board["columns"]
-        for task in column["tasks"]
-    }
-    suppressed = {task["id"]: task for task in board["suppressed"]}
-    assert len(ordinary) + len(suppressed) == task_count
-    assert source_id not in ordinary
-    assert replacement_id in ordinary
-    assert any(
-        diagnostic["kind"] == "replacement_suppressed"
-        and diagnostic["data"]["replacement"]["canonical_live_task"] == replacement_id
-        for diagnostic in suppressed[source_id]["diagnostics"]
-    )
-    assert board["latest_event_id"] == event_count
-    assert elapsed < 15, f"large board response took {elapsed:.3f}s"
-
-
-def test_non_actionable_rows_live_only_in_suppressed_audit(client):
-    with kb.connect_closing() as conn:
-        replacement = kb.create_task(conn, title="canonical", assignee="alice")
-        superseded = kb.create_task(conn, title="old", assignee="alice")
-        stale = kb.create_task(conn, title="stale", assignee="alice")
-        archived = kb.create_task(conn, title="archive", assignee="alice")
-        assert kb.mark_task_non_actionable(
-            conn,
-            superseded,
-            status="superseded",
-            actor="controller",
-            superseded_by=replacement,
-            live_path_task_id=replacement,
-            canonical_live_path="refs/heads/main",
-        )
-        assert kb.mark_task_non_actionable(
-            conn,
-            stale,
-            status="stale_continuity_only",
-            actor="controller",
-            live_path_task_id=replacement,
-            canonical_live_path="refs/heads/main",
-        )
-        assert kb.archive_task(conn, archived)
-
-    board = client.get("/api/plugins/kanban/board").json()
-    ordinary_ids = {
-        task["id"]
-        for column in board["columns"]
-        for task in column["tasks"]
-    }
-    suppressed_rows = {task["id"]: task for task in board["suppressed"]}
-    assert {superseded, stale, archived}.isdisjoint(ordinary_ids)
-    assert {superseded, stale, archived} <= set(suppressed_rows)
-    assert suppressed_rows[superseded]["non_authorizing"] is True
-    assert suppressed_rows[superseded]["superseded_by"] == replacement
-    assert suppressed_rows[superseded]["live_path_task_id"] == replacement
-    assert suppressed_rows[superseded]["canonical_live_path"] == "refs/heads/main"
-
-
-def test_suppressed_audit_client_is_discoverable_and_opens_existing_drawer():
-    """Execute the shipped IIFE and exercise the audit-to-drawer path.
-
-    The plugin has no separate source/build package: ``dist/index.js`` is the
-    tracked plain-IIFE browser surface. A bounded Node VM supplies only the
-    host SDK/React primitives the bundle expects, captures its registered
-    ``KanbanPage``, and renders its actual virtual-element tree. The harness
-    then clicks the real audit Open handler and rerenders the root to observe
-    the existing ``TaskDrawer`` props.
-    """
-    node = shutil.which("node")
-    if node is None:
-        pytest.fail("node is required for the dashboard IIFE runtime contract")
-
-    bundle = (
-        Path(__file__).resolve().parents[2]
-        / "plugins"
-        / "kanban"
-        / "dashboard"
-        / "dist"
-        / "index.js"
-    )
-    harness = r'''
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const vm = require("node:vm");
-
-const bundlePath = process.argv[1];
-const ordinaryId = "t_live";
-const suppressedId = "t_superseded";
-const boardFixture = {
-  columns: [{ name: "ready", tasks: [{
-    id: ordinaryId, title: "Live task", status: "ready", assignee: "alice",
-    tenant: null, body: "", result: "", latest_summary: "",
-  }] }],
-  suppressed: [{
-    id: suppressedId, title: "Superseded source", status: "done", assignee: "alice",
-    tenant: null, body: "", result: "", latest_summary: "",
-  }],
-  tenants: [], assignees: ["alice"], latest_event_id: 0,
-};
-
-let hookIndex = 0;
-const stateValues = [];
-function useState(initial) {
-  const index = hookIndex++;
-  if (!(index in stateValues)) {
-    const value = typeof initial === "function" ? initial() : initial;
-    // KanbanPage's fifth state slot is its loaded board; the seventh is its
-    // loading flag. Seed those real component states for this render.
-    stateValues[index] = index === 4 ? boardFixture : index === 6 ? false : value;
-  }
-  return [stateValues[index], function (next) {
-    stateValues[index] = typeof next === "function" ? next(stateValues[index]) : next;
-  }];
-}
-function useEffect() { hookIndex += 1; }
-function useMemo(factory) { hookIndex += 1; return factory(); }
-function useCallback(callback) { hookIndex += 1; return callback; }
-function useRef(value) { hookIndex += 1; return { current: value }; }
-
-function createElement(type, props, ...children) {
-  const nextProps = Object.assign({}, props || {});
-  if (children.length === 1) nextProps.children = children[0];
-  else if (children.length > 1) nextProps.children = children;
-  return { type, props: nextProps };
-}
-const React = { createElement, Component: class {} };
-const componentNames = [
-  "Card", "CardContent", "Badge", "Button", "Input", "Label",
-  "Select", "SelectOption", "Checkbox",
-];
-const components = Object.fromEntries(componentNames.map(name => [name, name]));
-let KanbanPage;
-const context = {
-  console,
-  URLSearchParams,
-  setTimeout,
-  clearTimeout,
-  window: {
-    __HERMES_PLUGIN_SDK__: {
-      React,
-      components,
-      hooks: { useState, useEffect, useCallback, useMemo, useRef },
-      utils: { cn: (...values) => values.filter(Boolean).join(" "), timeAgo: () => "" },
-      useI18n: () => ({ t: { kanban: null }, locale: "en" }),
-      fetchJSON: () => Promise.resolve({ boards: [], current: "default" }),
-      buildWsUrl: () => Promise.resolve("ws://127.0.0.1/events"),
-    },
-    __HERMES_PLUGINS__: { register: (name, component) => {
-      assert.equal(name, "kanban");
-      KanbanPage = component;
-    } },
-    localStorage: { getItem: () => null, setItem: () => {} },
-    prompt: () => null,
-    alert: () => {},
-  },
-};
-context.window.window = context.window;
-vm.runInNewContext(fs.readFileSync(bundlePath, "utf8"), context, { filename: bundlePath });
-assert.equal(typeof KanbanPage, "function", "bundle must register KanbanPage");
-
-function renderRoot() {
-  hookIndex = 0;
-  return KanbanPage({});
-}
-function childrenOf(node) {
-  if (!node || typeof node !== "object") return [];
-  const children = node.props && node.props.children;
-  return children == null ? [] : Array.isArray(children) ? children : [children];
-}
-function findComponent(node, name) {
-  if (!node || typeof node !== "object") return null;
-  if (typeof node.type === "function" && node.type.name === name) return node;
-  for (const child of childrenOf(node)) {
-    const found = findComponent(child, name);
-    if (found) return found;
-  }
-  return null;
-}
-function findElement(node, predicate) {
-  if (!node || typeof node !== "object") return null;
-  if (predicate(node)) return node;
-  for (const child of childrenOf(node)) {
-    const found = findElement(child, predicate);
-    if (found) return found;
-  }
-  return null;
-}
-function textContent(node) {
-  if (node == null || typeof node === "boolean") return "";
-  if (typeof node === "string" || typeof node === "number") return String(node);
-  return childrenOf(node).map(textContent).join("");
-}
-
-let root = renderRoot();
-const columns = findComponent(root, "BoardColumns");
-assert.ok(columns, "KanbanPage must render ordinary board columns");
-const ordinaryTasks = columns.props.board.columns.flatMap(column => column.tasks || []);
-assert.deepEqual(ordinaryTasks.map(task => task.id), [ordinaryId]);
-assert.ok(!ordinaryTasks.some(task => task.id === suppressedId));
-
-const audit = findComponent(root, "SuppressedAuditSection");
-assert.ok(audit, "suppressed task must be discoverable in the audit section");
-const auditTree = audit.type(audit.props);
-assert.match(textContent(auditTree), /Superseded source/);
-const open = findElement(auditTree, node =>
-  node.type === "button" && node.props.className === "hermes-kanban-suppressed-audit-open"
-);
-assert.ok(open, "audit row must expose an Open action");
-open.props.onClick();
-
-root = renderRoot();
-const drawer = findComponent(root, "TaskDrawer");
-assert.ok(drawer, "Open must enter the existing task drawer path");
-assert.equal(drawer.props.taskId, suppressedId);
-console.log("suppressed audit runtime contract passed");
-'''
-    result = subprocess.run(
-        [node, "-e", harness, str(bundle)],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
-    assert "suppressed audit runtime contract passed" in result.stdout
 
 
 def test_board_list_recommends_persistent_workspace_for_configured_workdir(
@@ -974,49 +565,30 @@ def test_patch_drag_drop_move_todo_to_ready(client):
     assert child_after["status"] == "ready"
 
 
-@pytest.mark.parametrize("terminal_status", sorted(kb.TERMINAL_STATUSES))
-def test_reopening_parent_demotes_ready_children(client, terminal_status):
-    """Reopening any terminal parent invalidates fan-in and sibling children.
+def test_reopening_parent_demotes_ready_child(client):
+    """Reopening a completed parent must invalidate ready children immediately.
 
     The dispatcher re-checks parent completion on claim, but the dashboard
     should not keep showing a stale child as ready after an operator drags
-    its parent back out of a canonical terminal state for more work.
+    its parent back out of done for more work.
     """
     parent = client.post("/api/plugins/kanban/tasks", json={"title": "p"}).json()["task"]
-    other_parent = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "other p"},
-    ).json()["task"]
-    fan_in_child = client.post(
+    child = client.post(
         "/api/plugins/kanban/tasks",
-        json={
-            "title": "fan-in child",
-            "parents": [parent["id"], other_parent["id"]],
-        },
+        json={"title": "c", "parents": [parent["id"]]},
     ).json()["task"]
-    sibling_child = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "sibling child", "parents": [parent["id"]]},
+    assert child["status"] == "todo"
+
+    r = client.patch(
+        f"/api/plugins/kanban/tasks/{parent['id']}",
+        json={"status": "done"},
+    )
+    assert r.status_code == 200
+
+    child_after_done = client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}"
     ).json()["task"]
-    assert fan_in_child["status"] == "todo"
-    assert sibling_child["status"] == "todo"
-
-    with kb.connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status=? WHERE id=?",
-            (terminal_status, parent["id"]),
-        )
-        conn.execute(
-            "UPDATE tasks SET status='done' WHERE id=?",
-            (other_parent["id"],),
-        )
-        conn.commit()
-        kb.recompute_ready(conn)
-
-    for child in (fan_in_child, sibling_child):
-        child_after_terminal = client.get(
-            f"/api/plugins/kanban/tasks/{child['id']}"
-        ).json()["task"]
-        assert child_after_terminal["status"] == "ready"
+    assert child_after_done["status"] == "ready"
 
     r = client.patch(
         f"/api/plugins/kanban/tasks/{parent['id']}",
@@ -1024,11 +596,10 @@ def test_reopening_parent_demotes_ready_children(client, terminal_status):
     )
     assert r.status_code == 200
 
-    for child in (fan_in_child, sibling_child):
-        child_after_reopen = client.get(
-            f"/api/plugins/kanban/tasks/{child['id']}"
-        ).json()["task"]
-        assert child_after_reopen["status"] == "todo"
+    child_after_reopen = client.get(
+        f"/api/plugins/kanban/tasks/{child['id']}"
+    ).json()["task"]
+    assert child_after_reopen["status"] == "todo"
 
 
 def test_patch_reassign(client):
@@ -1063,152 +634,6 @@ def test_patch_invalid_status(client):
         json={"status": "banana"},
     )
     assert r.status_code == 400
-
-
-def test_patch_status_cancelled_uses_kernel_and_returns_finalized_truth(client):
-    task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "cancel through patch"},
-    ).json()["task"]
-
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"status": "cancelled", "cancel_reason": "operator"},
-    )
-
-    assert response.status_code == 200, response.text
-    body = response.json()
-    assert body["task"]["status"] == "cancelled"
-    assert body["state"] == "finalized"
-    assert body["cancellation_applied"] is True
-    assert body["historical_preserved"] is False
-    with kb.connect() as conn:
-        event = kb.list_events(conn, task["id"])[-1]
-        assert event.kind == "cancelled"
-        assert event.payload == {"reason": "operator"}
-
-
-def test_patch_cancelled_reports_pending_manual_and_conflict_truth(
-    client, monkeypatch,
-):
-    from hermes_cli import kanban_worker_process as kp
-
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "active cancellation", "assignee": "worker"},
-    ).json()["task"]
-    with kb.connect() as conn:
-        claimed = kb.claim_task(conn, task["id"])
-        assert claimed is not None and claimed.current_run_id is not None
-        run_id = claimed.current_run_id
-        identity = kp.ProcessIdentity(45672, 456.72)
-        conn.execute("UPDATE tasks SET worker_pid=? WHERE id=?", (identity.pid, task["id"]))
-        conn.execute(
-            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? WHERE id=?",
-            (
-                identity.pid,
-                json.dumps(identity.to_dict()),
-                json.dumps([identity.to_dict()]),
-                run_id,
-            ),
-        )
-        conn.commit()
-    monkeypatch.setattr(
-        kp,
-        "capture_process_tree",
-        lambda root, previous=(): kp.TreeCapture(
-            "captured", tuple(previous) or (root,),
-        ),
-    )
-
-    stale = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"status": "cancelled", "expected_run_id": run_id + 1},
-    )
-    assert stale.status_code == 409
-
-    pending = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={
-            "status": "cancelled",
-            "cancel_reason": "operator",
-            "expected_run_id": run_id,
-        },
-    )
-    assert pending.status_code == 200, pending.text
-    assert pending.json()["state"] == "pending_reap"
-    assert pending.json()["reap_state"] == "terminal_requested"
-    assert pending.json()["task"]["status"] == "running"
-
-    with kb.connect() as conn:
-        conn.execute(
-            "UPDATE task_runs SET reap_state='manual_recovery_required' WHERE id=?",
-            (run_id,),
-        )
-        conn.commit()
-    manual = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={
-            "status": "cancelled",
-            "cancel_reason": "operator",
-            "expected_run_id": run_id,
-        },
-    )
-    assert manual.status_code == 200, manual.text
-    assert manual.json()["state"] == "manual_recovery_required"
-
-    conflict = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={
-            "status": "cancelled",
-            "cancel_reason": "different intent",
-            "expected_run_id": run_id,
-        },
-    )
-    assert conflict.status_code == 409
-    assert "terminal_transition_conflict" in conflict.json()["detail"]
-
-
-@pytest.mark.parametrize("terminal_status", sorted(kb.TERMINAL_STATUSES))
-@pytest.mark.parametrize("surface", ["patch", "bulk"])
-def test_dashboard_cancel_preserves_historical_terminal_status(
-    client, terminal_status, surface,
-):
-    task = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "historical cancel noop"},
-    ).json()["task"]
-    with kb.connect() as conn:
-        conn.execute(
-            "UPDATE tasks SET status=?, completed_at=123 WHERE id=?",
-            (terminal_status, task["id"]),
-        )
-        conn.commit()
-        before = [(event.id, event.kind) for event in kb.list_events(conn, task["id"])]
-
-    if surface == "patch":
-        response = client.patch(
-            f"/api/plugins/kanban/tasks/{task['id']}",
-            json={"status": "cancelled"},
-        )
-        assert response.status_code == 200, response.text
-        payload = response.json()
-        assert payload["historical_preserved"] is True
-        assert payload["cancellation_applied"] is False
-    else:
-        response = client.post(
-            "/api/plugins/kanban/tasks/bulk",
-            json={"ids": [task["id"]], "status": "cancelled"},
-        )
-        assert response.status_code == 200, response.text
-        payload = response.json()["results"][0]
-        assert payload["ok"] is True
-        assert payload["historical_preserved"] is True
-        assert payload["cancellation_applied"] is False
-
-    with kb.connect() as conn:
-        preserved = kb.get_task(conn, task["id"])
-        assert preserved.status == terminal_status
-        assert preserved.completed_at == 123
-        assert [(event.id, event.kind) for event in kb.list_events(conn, task["id"])] == before
 
 
 def test_patch_status_running_rejected(client):
@@ -1327,130 +752,6 @@ def test_add_link_cycle_rejected(client):
         json={"parent_id": b["id"], "child_id": a["id"]},
     )
     assert r.status_code == 400
-
-
-def test_explicit_review_handoff_api_direct(tmp_path, monkeypatch):
-    """Exercise the endpoint functions without the sandbox-blocked TestClient."""
-    import plugins.kanban.dashboard.plugin_api as pa
-
-    db_path = tmp_path / "kanban.db"
-    kb.init_db(db_path)
-    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
-    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
-
-    source = pa.create_task(pa.CreateTaskBody(title="source"), board="test")["task"]
-    review = pa.create_task(
-        pa.CreateTaskBody(title="review", parents=[source["id"]]), board="test",
-    )["task"]
-    nxt = pa.create_task(pa.CreateTaskBody(title="next"), board="test")["task"]
-    linked = pa.add_link(pa.LinkBody(
-        parent_id=source["id"],
-        child_id=review["id"],
-        relationship="review_gate",
-        next_task_id=nxt["id"],
-    ), board="test")
-    assert linked == {"ok": True, "relationship": "review_gate"}
-
-    handed_off = pa.update_task(
-        source["id"],
-        pa.UpdateTaskBody(
-            status="blocked", block_reason="review-required: inspect",
-        ),
-        board="test",
-    )
-    assert handed_off["task"]["status"] == "blocked"
-    with kb.connect(db_path) as conn:
-        assert kb.get_task(conn, review["id"]).status == "review"
-
-    verdict = pa.submit_review_verdict(
-        review["id"],
-        pa.ReviewVerdictBody(verdict="approved", summary="verified"),
-        board="test",
-    )
-    assert verdict == {"ok": True, "verdict": "approved"}
-    with kb.connect(db_path) as conn:
-        assert kb.get_task(conn, nxt["id"]).status == "ready"
-
-
-@pytest.mark.parametrize("state", ["active", "changes_requested"])
-def test_dashboard_protects_review_successor_status_mutations(
-    tmp_path, monkeypatch, state,
-):
-    import plugins.kanban.dashboard.plugin_api as pa
-
-    db_path = tmp_path / "kanban.db"
-    kb.init_db(db_path)
-    monkeypatch.setattr(pa, "_resolve_board", lambda board: "test")
-    monkeypatch.setattr(pa, "_conn", lambda board=None: kb.connect(db_path))
-
-    source = pa.create_task(
-        pa.CreateTaskBody(title="source", assignee="builder"), board="test",
-    )["task"]
-    review = pa.create_task(
-        pa.CreateTaskBody(
-            title="review", assignee="reviewer", parents=[source["id"]],
-        ),
-        board="test",
-    )["task"]
-    nxt = pa.create_task(
-        pa.CreateTaskBody(title="next"), board="test",
-    )["task"]
-    assert pa.add_link(pa.LinkBody(
-        parent_id=source["id"],
-        child_id=review["id"],
-        relationship="review_gate",
-        next_task_id=nxt["id"],
-    ), board="test") == {"ok": True, "relationship": "review_gate"}
-    handed_off = pa.update_task(
-        source["id"],
-        pa.UpdateTaskBody(
-            status="blocked", block_reason="review-required: inspect",
-        ),
-        board="test",
-    )
-    assert handed_off["task"]["status"] == "blocked"
-
-    if state == "changes_requested":
-        verdict = pa.submit_review_verdict(
-            review["id"],
-            pa.ReviewVerdictBody(
-                verdict="changes_requested", summary="please recut",
-            ),
-            board="test",
-        )
-        assert verdict == {"ok": True, "verdict": "changes_requested"}
-
-    with pytest.raises(HTTPException) as single:
-        pa.update_task(
-            nxt["id"], pa.UpdateTaskBody(status="ready"), board="test",
-        )
-    assert single.value.status_code == 409
-    assert "successor gate" in single.value.detail
-
-    bulk = pa.bulk_update(
-        pa.BulkTaskBody(ids=[nxt["id"]], status="ready"), board="test",
-    )
-    bulk_result = bulk["results"]
-    assert len(bulk_result) == 1
-    assert bulk_result[0]["id"] == nxt["id"]
-    assert bulk_result[0]["ok"] is False
-    assert "successor gate" in bulk_result[0]["error"]
-
-    ordinary = pa.create_task(
-        pa.CreateTaskBody(title="ordinary"), board="test",
-    )["task"]
-    ordinary_patch = pa.update_task(
-        ordinary["id"],
-        pa.UpdateTaskBody(status="blocked", block_reason="wait"),
-        board="test",
-    )
-    assert ordinary_patch["task"]["status"] == "blocked"
-    ordinary_bulk = pa.bulk_update(
-        pa.BulkTaskBody(ids=[ordinary["id"]], status="ready"), board="test",
-    )
-    assert ordinary_bulk["results"][0]["ok"] is True
-    with kb.connect(db_path) as conn:
-        assert kb.get_task(conn, nxt["id"]).status == "todo"
 
 
 # ---------------------------------------------------------------------------
@@ -1875,43 +1176,6 @@ def test_bulk_status_done_forwards_completion_summary(client):
         conn.close()
 
 
-def test_bulk_status_cancelled_reports_each_finalized_and_stale_expected_run(
-    client,
-):
-    first = client.post(
-        "/api/plugins/kanban/tasks", json={"title": "bulk cancel first"},
-    ).json()["task"]
-    second = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "bulk cancel stale", "assignee": "worker"},
-    ).json()["task"]
-    with kb.connect() as conn:
-        claimed = kb.claim_task(conn, second["id"])
-        assert claimed is not None and claimed.current_run_id is not None
-        second_run_id = claimed.current_run_id
-
-    response = client.post(
-        "/api/plugins/kanban/tasks/bulk",
-        json={
-            "ids": [first["id"], second["id"]],
-            "status": "cancelled",
-            "cancel_reason": "bulk operator",
-            "expected_run_ids": {second["id"]: second_run_id + 1},
-        },
-    )
-
-    assert response.status_code == 200, response.text
-    results = {item["id"]: item for item in response.json()["results"]}
-    assert results[first["id"]]["ok"] is True
-    assert results[first["id"]]["status"] == "cancelled"
-    assert results[first["id"]]["state"] == "finalized"
-    assert results[second["id"]]["ok"] is False
-    assert "refused" in results[second["id"]]["error"]
-    with kb.connect() as conn:
-        assert kb.get_task(conn, second["id"]).status == "running"
-        assert kb.get_task(conn, second["id"]).current_run_id == second_run_id
-
-
 def test_bulk_status_running_rejected(client):
     """Bulk updates must match single-task PATCH: direct 'running' is invalid."""
     t = client.post("/api/plugins/kanban/tasks", json={"title": "x"}).json()["task"]
@@ -2229,40 +1493,6 @@ def test_patch_status_archive_closes_running_run(client):
         assert kb.latest_run(conn, tid).outcome == "reclaimed"
     finally:
         conn.close()
-
-
-def test_patch_running_to_ready_retains_claim_when_scope_stop_is_unproven(
-    client,
-    monkeypatch,
-):
-    task = client.post(
-        "/api/plugins/kanban/tasks",
-        json={"title": "active", "assignee": "worker"},
-    ).json()["task"]
-    with kb.connect_closing() as conn:
-        claimed = kb.claim_task(conn, task["id"])
-        assert claimed is not None
-    monkeypatch.setattr(
-        kb,
-        "_terminate_reclaimed_worker",
-        lambda *_a, **_k: {
-            "host_local": True,
-            "termination_attempted": False,
-            "terminated": False,
-            "scope_unknown": True,
-        },
-    )
-
-    response = client.patch(
-        f"/api/plugins/kanban/tasks/{task['id']}",
-        json={"status": "ready"},
-    )
-    assert response.status_code == 409
-    with kb.connect_closing() as conn:
-        retained = kb.get_task(conn, task["id"])
-    assert retained.status == "running"
-    assert retained.claim_lock == claimed.claim_lock
-    assert retained.current_run_id == claimed.current_run_id
 
 
 def test_event_dict_includes_run_id(client):
@@ -2791,23 +2021,17 @@ def test_reclaim_endpoint_releases_running_claim(client):
     assert body["ok"] is True
     assert body["task_id"] == t
 
-    # Phase B accepts the request but keeps the claim until the exact worker
-    # tree can be proven gone by the leased reaper.
-    assert body["state"] == "pending_reap"
-    assert body["status"] == "running"
-    assert body["reap_state"] == "identity_unverifiable"
+    # Exact-worker recovery is two phase: the endpoint accepts the durable
+    # request and retains ownership until the leased reaper proves exit.
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?", (t,),
+            "SELECT status, claim_lock FROM tasks WHERE id=?", (t,),
         ).fetchone()
+        assert body["state"] == "pending_reap"
+        assert body["reap_state"] == "identity_unverifiable"
         assert row["status"] == "running"
         assert row["claim_lock"] is not None
-        assert row["current_run_id"] is not None
-        reap = conn2.execute(
-            "SELECT reap_state FROM task_runs WHERE id=?", (row["current_run_id"],),
-        ).fetchone()
-        assert reap["reap_state"] == "identity_unverifiable"
     finally:
         conn2.close()
 
@@ -2873,9 +2097,9 @@ def test_reassign_endpoint_409_on_running_without_reclaim(client):
     assert r.status_code == 409
 
 
-def test_reassign_endpoint_with_reclaim_first_defers_on_running(client):
-    """With reclaim_first=true, the reassignment is durable but deferred
-    until Phase B proves the worker tree is gone."""
+def test_reassign_endpoint_with_reclaim_first_succeeds_on_running(client):
+    """With reclaim_first=true, a running task is reclaimed+reassigned in
+    one call."""
     import secrets
     conn = kb.connect()
     try:
@@ -2903,23 +2127,18 @@ def test_reassign_endpoint_with_reclaim_first_defers_on_running(client):
     )
     assert r.status_code == 200, r.text
     body = r.json()
-    assert body["state"] == "pending_reap"
-    assert body["status"] == "running"
     assert body["assignee"] == "orig"
     assert body["requested_assignee"] == "new"
+    assert body["state"] == "pending_reap"
     assert body["reap_state"] == "identity_unverifiable"
 
     conn2 = kb.connect()
     try:
         row = conn2.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id=?", (t,),
+            "SELECT status, assignee FROM tasks WHERE id=?", (t,),
         ).fetchone()
         assert row["status"] == "running"
         assert row["assignee"] == "orig"
-        payload = conn2.execute(
-            "SELECT terminal_payload FROM task_runs WHERE id=?", (row["current_run_id"],),
-        ).fetchone()["terminal_payload"]
-        assert json.loads(payload)["assignee"] == "new"
     finally:
         conn2.close()
 
@@ -2995,46 +2214,6 @@ def test_diagnostics_endpoint_severity_filter(client):
     data = r.json()
     assert data["count"] == 1
     assert data["diagnostics"][0]["task_id"] == p2
-
-
-def test_diagnostics_endpoint_includes_cross_task_chain_findings(client):
-    conn = kb.connect()
-    try:
-        parent = kb.create_task(conn, title="source", assignee="worker")
-        child = kb.create_task(
-            conn, title="child", assignee="worker", parents=[parent],
-        )
-        # Reproduce the pre-review-handoff persisted shape directly.  The live
-        # transition now rejects this unsafe graph before mutating either task.
-        conn.execute(
-            "UPDATE tasks SET status='blocked' WHERE id=?",
-            (parent,),
-        )
-        conn.execute(
-            "INSERT INTO task_events (task_id, kind, payload, created_at) "
-            "VALUES (?, 'blocked', ?, ?)",
-            (
-                parent,
-                '{"reason":"review-required: inspect the source handoff"}',
-                int(time.time()),
-            ),
-        )
-        conn.commit()
-    finally:
-        conn.close()
-
-    response = client.get("/api/plugins/kanban/diagnostics")
-    assert response.status_code == 200
-    rows = response.json()["diagnostics"]
-    child_row = next(row for row in rows if row["task_id"] == child)
-    kinds = {diag["kind"] for diag in child_row["diagnostics"]}
-    assert "legacy_review_parent_gates_child" in kinds
-    finding = next(
-        diag for diag in child_row["diagnostics"]
-        if diag["kind"] == "legacy_review_parent_gates_child"
-    )
-    assert finding["data"]["parent_id"] == parent
-    assert finding["data"]["child_status"] == "todo"
 
 
 def test_board_exposes_diagnostics_list_and_summary(client):

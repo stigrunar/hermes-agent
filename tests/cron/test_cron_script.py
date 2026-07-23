@@ -112,7 +112,7 @@ class TestRunJobScript:
 
         success, output = _run_job_script(str(script))
         assert success is True
-        assert output == "hello from script\n"
+        assert output == "hello from script"
 
     def test_script_relative_path(self, cron_env):
         from cron.scheduler import _run_job_script
@@ -122,7 +122,7 @@ class TestRunJobScript:
 
         success, output = _run_job_script("relative.py")
         assert success is True
-        assert output == "relative works\n"
+        assert output == "relative works"
 
     def test_script_not_found(self, cron_env):
         from cron.scheduler import _run_job_script
@@ -170,7 +170,7 @@ class TestRunJobScript:
 
         success, output = _run_job_script("env_probe.py")
         assert success is True
-        assert output == "ABSENT\n"
+        assert output == "ABSENT"
 
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
@@ -207,7 +207,7 @@ class TestRunJobScript:
         success, output = _run_job_script("probe.py")
 
         assert success is True
-        assert output == "ok\n"
+        assert output == "ok"
         assert captured["argv"] == [str(base_python), str(script.resolve())]
         assert captured["kwargs"]["creationflags"] == 0x08000000
         env = captured["kwargs"]["env"]
@@ -244,7 +244,7 @@ class TestRunJobScript:
         success, output = _run_job_script("probe.py")
 
         assert success is True
-        assert output == "ok\n"
+        assert output == "ok"
         assert captured["argv"] == [str(python), str(script.resolve())]
         assert captured["kwargs"]["encoding"] == "utf-8"
         assert captured["kwargs"]["errors"] == "replace"
@@ -269,7 +269,7 @@ class TestRunJobScript:
         success, output = _run_job_script("probe.py")
 
         assert success is True
-        assert output == "ok\n"
+        assert output == "ok"
         assert captured["argv"] == [sys.executable, str(script.resolve())]
         assert captured["kwargs"]["text"] is True
         assert "creationflags" not in captured["kwargs"]
@@ -290,47 +290,15 @@ class TestRunJobScript:
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
 
+        # Use a very short timeout
         monkeypatch.setattr(sched_mod, "_SCRIPT_TIMEOUT", 1)
 
-        token = "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
-        script = cron_env / "scripts" / f"{token}.py"
-        script.write_text("print('unreached')\n")
-        monkeypatch.setattr(
-            sched_mod.subprocess,
-            "run",
-            lambda *args, **kwargs: (_ for _ in ()).throw(
-                sched_mod.subprocess.TimeoutExpired(args[0], 1)
-            ),
-        )
+        script = cron_env / "scripts" / "slow.py"
+        script.write_text("import time; time.sleep(30)\n")
 
         success, output = _run_job_script(str(script))
         assert success is False
         assert "timed out" in output.lower()
-        assert token not in output
-
-    def test_script_exception_diagnostic_is_strictly_redacted(
-        self, cron_env, monkeypatch
-    ):
-        from cron import scheduler as sched_mod
-        from cron.scheduler import _run_job_script
-
-        script = cron_env / "scripts" / "probe.py"
-        script.write_text("print('unreached')\n")
-        token = "sk-proj-abcdefghijklmnopqrstuvwxyz012345"
-
-        def fail_run(*args, **kwargs):
-            raise RuntimeError(
-                f"OPENAI_API_KEY={token} from /home/alice/.hermes/config.yaml"
-            )
-
-        monkeypatch.setattr(sched_mod.subprocess, "run", fail_run)
-
-        success, output = _run_job_script(str(script))
-
-        assert success is False
-        assert token not in output
-        assert "/home/alice" not in output
-        assert "<home>" in output
 
     def test_script_json_output(self, cron_env):
         """Scripts can output structured JSON for the LLM to parse."""
@@ -522,7 +490,7 @@ class TestScriptPathContainment:
 
         success, output = _run_job_script("good.py")
         assert success is True
-        assert output == "ok\n"
+        assert output == "ok"
 
     def test_subdirectory_inside_scripts_dir_allowed(self, cron_env):
         """Relative paths to subdirectories within scripts/ should work."""
@@ -535,7 +503,7 @@ class TestScriptPathContainment:
 
         success, output = _run_job_script("monitors/check.py")
         assert success is True
-        assert output == "sub ok\n"
+        assert output == "sub ok"
 
     def test_absolute_path_inside_scripts_dir_allowed(self, cron_env):
         """Absolute paths that resolve WITHIN scripts/ should work."""
@@ -546,7 +514,7 @@ class TestScriptPathContainment:
 
         success, output = _run_job_script(str(script))
         assert success is True
-        assert output == "abs ok\n"
+        assert output == "abs ok"
 
     @pytest.mark.skipif(
         sys.platform == "win32",

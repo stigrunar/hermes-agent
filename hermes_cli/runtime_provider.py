@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 from urllib.parse import urlparse
 from typing import Any, Dict, Optional
@@ -17,11 +18,7 @@ from agent.credential_pool import (
     get_custom_provider_pool_key,
     load_pool,
 )
-from agent.secret_scope import (
-    UnscopedSecretError,
-    get_deployment_env,
-    get_secret as _get_secret,
-)
+from agent.secret_scope import get_secret as _get_secret
 from hermes_cli.auth import (
     AuthError,
     DEFAULT_CODEX_BASE_URL,
@@ -46,7 +43,7 @@ from hermes_cli.config import (
     normalize_extra_headers,
 )
 from hermes_constants import OPENROUTER_BASE_URL
-from utils import base_url_host_matches, base_url_hostname
+from utils import base_url_host_matches, base_url_hostname, env_int
 
 
 def _getenv(name: str, default: str = "") -> str:
@@ -60,14 +57,6 @@ def _getenv(name: str, default: str = "") -> str:
     """
     val = _get_secret(name, default)
     return val if val is not None else default
-
-
-def _deployment_int(name: str, default: int) -> int:
-    """Parse an exact-allowlisted deployment tuning value."""
-    try:
-        return int(get_deployment_env(name, str(default)) or default)
-    except (TypeError, ValueError):
-        return default
 
 
 def _normalize_custom_provider_name(value: str) -> str:
@@ -102,8 +91,6 @@ def _config_base_url_trustworthy_for_bare_custom(cfg_base_url: str, cfg_provider
 
         if _resolve_provider(cfg_provider_norm) == "custom":
             return True
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
     if base_url_host_matches(bu, "openrouter.ai"):
@@ -598,8 +585,6 @@ def _try_resolve_from_custom_pool(
             "source": f"pool:{pool_key}",
             "credential_pool": pool,
         }
-    except UnscopedSecretError:
-        raise
     except Exception:
         return None
 
@@ -907,7 +892,7 @@ def canonical_custom_identity(
         except Exception:
             candidate = ""
     if not candidate:
-        candidate = _getenv("HERMES_INFERENCE_PROVIDER", "").strip()
+        candidate = os.environ.get("HERMES_INFERENCE_PROVIDER", "").strip()
 
     candidate_norm = _normalize_custom_provider_name(candidate)
     # A bare/non-routable candidate cannot heal a bare custom override.
@@ -1305,7 +1290,6 @@ def _resolve_azure_foundry_runtime(
         else:
             try:
                 from agent.azure_identity_adapter import (
-                    AzureCredentialScopeError,
                     EntraIdentityConfig,
                     SCOPE_AI_AZURE_DEFAULT,
                     build_token_provider,
@@ -1322,12 +1306,10 @@ def _resolve_azure_foundry_runtime(
                 or SCOPE_AI_AZURE_DEFAULT
             )
             try:
-                entra_config = EntraIdentityConfig.from_active_scope(
+                entra_config = EntraIdentityConfig(
                     scope=scope,
                 )
                 token_provider = build_token_provider(config=entra_config)
-            except AzureCredentialScopeError as exc:
-                raise AuthError(str(exc), code="azure_ambient_credentials_disabled") from exc
             except ImportError as exc:
                 raise AuthError(str(exc)) from exc
             api_key = token_provider
@@ -1354,9 +1336,13 @@ def _resolve_azure_foundry_runtime(
     # ── Static API key (legacy / default) ──────────────────────────────
     api_key = explicit_api_key
     if not api_key:
-        from hermes_cli.config import get_env_value
-
-        api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or ""
+        try:
+            from hermes_cli.config import get_env_value
+            api_key = get_env_value("AZURE_FOUNDRY_API_KEY") or ""
+        except Exception:
+            api_key = ""
+    if not api_key:
+        api_key = _getenv("AZURE_FOUNDRY_API_KEY", "").strip()
     if not api_key:
         raise AuthError(
             "Azure Foundry requires an API key. Set AZURE_FOUNDRY_API_KEY in "
@@ -1452,7 +1438,7 @@ def _resolve_explicit_runtime(
             str(state.get("agent_key") or "").strip()
             if _agent_key_is_usable(
                 state,
-                max(60, _deployment_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800)),
+                max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800)),
             )
             else ""
         )
@@ -1640,7 +1626,7 @@ def resolve_runtime_provider(
                 "in ~/.hermes/.env, or run 'gcloud auth application-default "
                 "login' for ADC. Set the GCP project/region under vertex: in "
                 "config.yaml if they aren't embedded in the credentials. "
-                "Install the extra with: pip install 'hermes-agent[vertex]'."
+                "Run `hermes setup` to install Vertex support."
             )
         return {
             "provider": "vertex",
@@ -1735,8 +1721,6 @@ def resolve_runtime_provider(
 
     try:
         pool = load_pool(provider) if should_use_pool else None
-    except UnscopedSecretError:
-        raise
     except Exception:
         pool = None
     if pool and pool.has_credentials():
@@ -1754,10 +1738,7 @@ def resolve_runtime_provider(
         # expired/missing, refresh the selected pool entry before falling back
         # to singleton auth resolution.
         if provider == "nous" and entry is not None:
-            min_ttl = max(
-                60,
-                _deployment_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800),
-            )
+            min_ttl = max(60, env_int("HERMES_NOUS_MIN_KEY_TTL_SECONDS", 1800))
             nous_state = {
                 "agent_key": getattr(entry, "agent_key", None),
                 "agent_key_expires_at": getattr(entry, "agent_key_expires_at", None),
@@ -1983,26 +1964,17 @@ def resolve_runtime_provider(
     # AWS Bedrock (native Converse API via boto3)
     if provider == "bedrock":
         from agent.bedrock_adapter import (
-            BedrockCredentialScopeError,
             has_aws_credentials,
-            resolve_bedrock_credentials,
             resolve_aws_auth_env_var,
             resolve_bedrock_region,
             is_anthropic_bedrock_model,
         )
-        from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-        scoped_env = current_secret_scope() if is_multiplex_active() else None
-        try:
-            aws_credentials = resolve_bedrock_credentials(scoped_env)
-        except BedrockCredentialScopeError as exc:
-            raise AuthError(str(exc), code="no_aws_credentials") from exc
         # When the user explicitly selected bedrock (not auto-detected),
         # trust boto3's credential chain — it handles IMDS, ECS task roles,
         # Lambda execution roles, SSO, and other implicit sources that our
         # env-var check can't detect.
         is_explicit = requested_provider in {"bedrock", "aws", "aws-bedrock", "amazon-bedrock", "amazon"}
-        if not is_explicit and not has_aws_credentials(scoped_env):
+        if not is_explicit and not has_aws_credentials():
             raise AuthError(
                 "No AWS credentials found for Bedrock. Configure one of:\n"
                 "  - AWS_ACCESS_KEY_ID + AWS_SECRET_ACCESS_KEY\n"
@@ -2014,14 +1986,8 @@ def resolve_runtime_provider(
         # Read bedrock-specific config from config.yaml
         _bedrock_cfg = load_config().get("bedrock", {})
         # Region priority: config.yaml bedrock.region → env var → us-east-1
-        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region(scoped_env)
-        if is_multiplex_active() and not region:
-            raise AuthError(
-                "Bedrock multiplex profiles must configure bedrock.region or "
-                "AWS_REGION in that profile",
-                code="bedrock_region_missing",
-            )
-        auth_source = aws_credentials.source or resolve_aws_auth_env_var(scoped_env) or "aws-sdk-default-chain"
+        region = (_bedrock_cfg.get("region") or "").strip() or resolve_bedrock_region()
+        auth_source = resolve_aws_auth_env_var() or "aws-sdk-default-chain"
         # Build guardrail config if configured
         _gr = _bedrock_cfg.get("guardrail", {})
         guardrail_config = None
@@ -2044,9 +2010,7 @@ def resolve_runtime_provider(
         # credentials from session"). Route these users through the Converse
         # API regardless of model. Ref: #28156.
         _current_model = str(target_model or model_cfg.get("default") or "").strip()
-        _has_bearer_token = bool(
-            _getenv("AWS_BEARER_TOKEN_BEDROCK", "").strip()
-        )
+        _has_bearer_token = bool(os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip())
         if is_anthropic_bedrock_model(_current_model) and not _has_bearer_token:
             # Claude on Bedrock → AnthropicBedrock SDK → anthropic_messages path
             runtime = {

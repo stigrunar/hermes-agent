@@ -30,7 +30,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
-from agent.secret_scope import UnscopedSecretError
 from hermes_constants import get_hermes_home
 from tools import skill_usage
 from utils import atomic_json_write
@@ -1899,8 +1898,6 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         _acp_args = list(_rp.get("args") or [])
         if isinstance(_rp.get("model"), str) and _rp["model"].strip():
             _model_name = _rp["model"].strip()
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
 

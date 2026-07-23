@@ -33,8 +33,10 @@ def _read_store(path):
 def profile_and_root(tmp_path, monkeypatch):
     """Wire a profile auth store + a distinct global-root auth store on disk.
 
-    Returns (profile_path, root_path). HOME points away from the tmp root so
-    auth-store test seat belts cannot mistake it for a live user store.
+    Returns (profile_path, root_path). The pytest seat belt in
+    ``_write_through_xai_oauth_to_global_root`` only refuses the *real* user's
+    ``$HOME/.hermes/auth.json``; a tmp_path root is allowed, so we point HOME
+    away from the tmp root to keep the guard from tripping on these fixtures.
     """
     profile_path = tmp_path / "profiles" / "work" / "auth.json"
     root_path = tmp_path / "root" / "auth.json"
@@ -50,15 +52,11 @@ def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_an
     """Profile reading root's grant must push rotated tokens back to root."""
     profile_path, root_path = profile_and_root
     # Profile has NO own xai-oauth block (reads root via fallback).
-    _write_store(
-        profile_path,
-        {"version": 1, "active_provider": "anthropic", "providers": {}},
-    )
+    _write_store(profile_path, {"version": 1, "providers": {}})
     _write_store(
         root_path,
         {
             "version": 1,
-            "active_provider": "nous",
             "providers": {
                 "xai-oauth": {
                     "tokens": {
@@ -77,17 +75,14 @@ def test_refresh_writes_through_to_root_when_profile_has_no_own_state(profile_an
     }
     auth._save_xai_oauth_tokens(rotated)
 
-    # The borrowing profile stays empty so a later root rotation remains
-    # visible instead of being hidden by a stale shadow.
+    # Profile got the rotated chain (existing behavior).
     profile = _read_store(profile_path)
-    assert "xai-oauth" not in profile.get("providers", {})
-    assert profile["active_provider"] == "anthropic"
+    assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
 
     # AND the global root no longer holds the revoked refresh token (#43589).
     root = _read_store(root_path)
     assert root["providers"]["xai-oauth"]["tokens"]["access_token"] == "new-access"
     assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "new-refresh"
-    assert root["active_provider"] == "nous"
 
 
 def test_refresh_does_not_touch_root_when_profile_has_own_state(profile_and_root):
@@ -136,7 +131,7 @@ def test_refresh_does_not_touch_root_when_profile_has_own_state(profile_and_root
     assert root["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "root-untouched-refresh"
 
 
-def test_source_save_uses_single_store_in_classic_mode(tmp_path, monkeypatch):
+def test_write_through_is_noop_in_classic_mode(tmp_path, monkeypatch):
     """Classic mode (profile == root) already saves to root; no double write."""
     profile_path = tmp_path / "auth.json"
     monkeypatch.setattr(auth, "_auth_file_path", lambda: profile_path)
@@ -152,26 +147,13 @@ def test_source_save_uses_single_store_in_classic_mode(tmp_path, monkeypatch):
     assert store["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"
 
 
-def test_source_save_failure_does_not_create_profile_shadow(profile_and_root, monkeypatch):
-    """A failed root save fails closed without persisting a stale profile copy."""
+def test_write_through_failure_does_not_break_profile_save(profile_and_root, monkeypatch):
+    """A failed root write-through must not break the profile's own save."""
     profile_path, root_path = profile_and_root
     _write_store(profile_path, {"version": 1, "providers": {}})
-    _write_store(
-        root_path,
-        {
-            "version": 1,
-            "providers": {
-                "xai-oauth": {
-                    "tokens": {
-                        "access_token": "old-access",
-                        "refresh_token": "old-refresh",
-                    }
-                }
-            },
-        },
-    )
+    _write_store(root_path, {"version": 1, "providers": {}})
 
-    # Make the owning root write blow up.
+    # Make the root write blow up; the profile save must still succeed.
     real_save = auth._save_auth_store
 
     def _exploding_save(store, target_path=None):
@@ -181,8 +163,7 @@ def test_source_save_failure_does_not_create_profile_shadow(profile_and_root, mo
 
     monkeypatch.setattr(auth, "_save_auth_store", _exploding_save)
 
-    with pytest.raises(OSError, match="simulated root write failure"):
-        auth._save_xai_oauth_tokens({"access_token": "a", "refresh_token": "r"})
+    auth._save_xai_oauth_tokens({"access_token": "a", "refresh_token": "r"})
 
     profile = _read_store(profile_path)
-    assert "xai-oauth" not in profile.get("providers", {})
+    assert profile["providers"]["xai-oauth"]["tokens"]["refresh_token"] == "r"

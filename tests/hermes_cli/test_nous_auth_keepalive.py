@@ -1,5 +1,4 @@
 from hermes_cli import nous_auth_keepalive as keepalive
-from agent import secret_scope as ss
 
 
 def test_keepalive_refreshes_stale_pool_entry(monkeypatch):
@@ -59,16 +58,3 @@ def test_keepalive_falls_back_to_singleton_state(monkeypatch):
 
     assert keepalive.refresh_nous_auth_keepalive_once(timeout_seconds=15.0) is True
     assert calls == [{"timeout_seconds": 15.0}]
-
-
-def test_multiplex_keepalive_does_not_launch_or_refresh(monkeypatch):
-    def _unexpected(*_args, **_kwargs):
-        raise AssertionError("multiplex keepalive must not launch or refresh")
-
-    monkeypatch.setattr(keepalive.threading, "Thread", _unexpected)
-    monkeypatch.setattr(keepalive, "refresh_nous_auth_keepalive_once", _unexpected)
-    ss.set_multiplex_active(True)
-    try:
-        assert keepalive.start_nous_auth_keepalive(initial_delay_seconds=0) is None
-    finally:
-        ss.set_multiplex_active(False)

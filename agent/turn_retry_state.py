@@ -60,10 +60,9 @@ class TurnRetryState:
     has_retried_429: bool = False
 
     # ── Auth-failure provider failover ───────────────────────────────────
-    # Set while escalating a persistent 401/403 (after the per-provider
-    # credential-refresh attempt above failed). A successful provider switch
-    # clears it, allowing the next independently broken fallback to advance one
-    # more bounded chain hop; an unsuccessful switch leaves it set.
+    # Set once we've escalated a persistent 401/403 (after the per-provider
+    # credential-refresh attempt above failed) to the fallback chain, so we
+    # don't loop on the same auth failover within one attempt.
     auth_failover_attempted: bool = False
 
     # ── Restart signals (read by the outer loop after the attempt) ───────
@@ -74,6 +73,10 @@ class TurnRetryState:
     # was rolled back off ``messages`` and the loop should re-issue the API
     # call against the newly-activated provider (#32421).
     restart_with_rebuilt_messages: bool = False
+    # A user correction cancelled the in-flight provider request. The outer
+    # loop must append a role-safe checkpoint + user message, rebuild the API
+    # payload, and retry the same logical iteration.
+    restart_with_redirected_messages: bool = False
 
     def __iter__(self):
         # Convenience for debugging / tests: iterate (name, value) pairs.

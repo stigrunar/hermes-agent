@@ -268,16 +268,6 @@ _JWT_RE = re.compile(
 # Negative lookahead prevents matching hex strings or identifiers
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
-# Local identity paths are diagnostic metadata, not functional payloads.  The
-# strict persistence pass masks the username-bearing prefix while retaining
-# any useful project-relative suffix.  URL paths are excluded by the negative
-# lookbehind (their preceding character is another slash or a hostname char).
-_LOCAL_HOME_PATH_RE = re.compile(
-    r"(?<![A-Za-z0-9_./-])(?:/(?:home|Users)/[^/\s]+|[A-Za-z]:[\\/]Users[\\/][^\\/\s]+)",
-    re.IGNORECASE,
-)
-_USER_RUNTIME_PATH_RE = re.compile(r"/run/user/\d+(?:/bus)?")
-
 # URLs containing query strings — matches `scheme://...?...[# or end]`.
 # Used to scan text for URLs whose query params may contain secrets.
 # Ported from nearai/ironclaw#2529.
@@ -498,38 +488,6 @@ def redact_cdp_url(value: object) -> str:
     return text
 
 
-def redact_for_persistence(value):
-    """Force-redact explicitly classified durable diagnostic values.
-
-    Functional task payloads must keep their original credentials when they
-    are needed for a workflow.  This stricter recursive boundary is reserved
-    for persisted diagnostic/error metadata, where reusable credentials,
-    URL-auth/query secrets, and host identity paths must not survive.
-    """
-    if isinstance(value, str):
-        text = redact_sensitive_text(
-            value,
-            force=True,
-            full_mask=True,
-            redact_url_credentials=True,
-        )
-        if not text:
-            return text
-        text = _redact_url_query_params(text)
-        text = _redact_url_userinfo(text)
-        text = _redact_http_request_target_query_params(text)
-        text = _LOCAL_HOME_PATH_RE.sub("<home>", text)
-        text = _USER_RUNTIME_PATH_RE.sub("<user-runtime>", text)
-        return text
-    if isinstance(value, dict):
-        return {key: redact_for_persistence(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [redact_for_persistence(item) for item in value]
-    if isinstance(value, tuple):
-        return tuple(redact_for_persistence(item) for item in value)
-    return value
-
-
 def _redact_http_request_target_query_params(text: str) -> str:
     """Redact sensitive query params in HTTP access-log request targets."""
     def _sub(m: re.Match) -> str:
@@ -588,7 +546,6 @@ def redact_sensitive_text(
     force: bool = False,
     code_file: bool = False,
     file_read: bool = False,
-    full_mask: bool = False,
     redact_url_credentials: bool = False,
 ) -> str:
     """Apply all redaction patterns to a block of text.
@@ -597,9 +554,6 @@ def redact_sensitive_text(
     Enabled by default. Disable via security.redact_secrets: false in config.yaml.
     Set force=True for safety boundaries that must never return raw secrets
     regardless of the user's global logging redaction preference.
-
-    Set full_mask=True for durable diagnostics/receipts. No random credential
-    bytes or phone-number digits are retained in that mode.
 
     Set redact_url_credentials=True at non-navigation egress boundaries to
     additionally redact credential-named query parameters and ``user:pass@``
@@ -645,11 +599,9 @@ def redact_sensitive_text(
     if file_read:
         code_file = True
 
-    _mask = _mask_token_nonreusable if full_mask else _mask_token
-
     # Known prefixes (sk-, ghp_, etc.) — gate on substring presence
     if _has_known_prefix_substring(text):
-        _prefix_sub = _mask_token_nonreusable if (file_read or full_mask) else _mask_token
+        _prefix_sub = _mask_token_nonreusable if file_read else _mask_token
         text = _PREFIX_RE.sub(lambda m: _prefix_sub(m.group(1)), text)
 
     # ENV assignments: OPENAI_API_KEY=***  (skip for code files — false positives)
@@ -662,7 +614,7 @@ def redact_sensitive_text(
                 # prose/log contexts (issue #2852): ``KEY=os.getenv('X')``.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{name}={quote}{_mask(value)}{quote}"
+                return f"{name}={quote}{_mask_token(value)}{quote}"
             text = _ENV_ASSIGN_RE.sub(_redact_env, text)
             # Lowercase/dotted config keys (issue #16413). Skip URLs entirely —
             # web-URL query params are intentionally passed through (see note
@@ -681,7 +633,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f'{key}: "{_mask(value)}"'
+                return f'{key}: "{_mask_token(value)}"'
             text = _JSON_FIELD_RE.sub(_redact_json, text)
 
         # Unquoted YAML / colon config: password: ***  (after JSON so quoted
@@ -695,7 +647,7 @@ def redact_sensitive_text(
                 # not a leaked secret value.
                 if _ENV_LOOKUP_VALUE_RE.match(value):
                     return m.group(0)
-                return f"{key}{sep}{_mask(value)}"
+                return f"{key}{sep}{_mask_token(value)}"
             text = _YAML_ASSIGN_RE.sub(_redact_yaml, text)
 
     # Authorization headers — _AUTH_HEADER_RE matches any scheme after
@@ -703,7 +655,7 @@ def redact_sensitive_text(
     # cheapest substring gate that covers every casing without a casefold().
     if "uthorization" in text or "UTHORIZATION" in text:
         text = _AUTH_HEADER_RE.sub(
-            lambda m: m.group(1) + (m.group(2) or "") + _mask(m.group(3)),
+            lambda m: m.group(1) + (m.group(2) or "") + _mask_token(m.group(3)),
             text,
         )
 
@@ -711,7 +663,7 @@ def redact_sensitive_text(
     # colon-separated, so gate on ":" — the regex itself is the precise filter.
     if ":" in text:
         text = _SECRET_HEADER_RE.sub(
-            lambda m: m.group(1) + _mask(m.group(2)),
+            lambda m: m.group(1) + _mask_token(m.group(2)),
             text,
         )
 
@@ -720,8 +672,6 @@ def redact_sensitive_text(
         def _redact_telegram(m):
             prefix = m.group(1) or ""
             digits = m.group(2)
-            if full_mask:
-                return f"{prefix}***"
             return f"{prefix}{digits}:***"
         text = _TELEGRAM_RE.sub(_redact_telegram, text)
 
@@ -752,13 +702,13 @@ def redact_sensitive_text(
         # query-string tokens are left to pass through (see the web-URL note
         # below). See _URL_BARE_TOKEN_RE for the false-positive guards.
         text = _URL_BARE_TOKEN_RE.sub(
-            lambda m: f"{m.group(1)}{_mask(m.group(2))}{m.group(3)}",
+            lambda m: f"{m.group(1)}{_mask_token(m.group(2))}{m.group(3)}",
             text,
         )
 
     # JWT tokens (eyJ... — base64-encoded JSON headers)
     if "eyJ" in text:
-        text = _JWT_RE.sub(lambda m: _mask(m.group(0)), text)
+        text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
 
     # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log
     # request targets) is intentionally OFF. Many legitimate workflows pass
@@ -785,16 +735,12 @@ def redact_sensitive_text(
     if "+" in text:
         def _redact_phone(m):
             phone = m.group(1)
-            if full_mask:
-                return "***"
             if len(phone) <= 8:
                 return phone[:2] + "****" + phone[-2:]
             return phone[:4] + "****" + phone[-4:]
         text = _SIGNAL_PHONE_RE.sub(_redact_phone, text)
 
     return text
-
-
 
 
 # Commands whose stdout is an environment-variable dump (KEY=value lines),

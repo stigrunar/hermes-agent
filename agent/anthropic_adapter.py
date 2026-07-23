@@ -22,12 +22,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from hermes_constants import get_hermes_home
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope,
-    get_secret,
-    is_multiplex_active,
-)
+from agent.secret_scope import current_secret_scope, get_secret, is_multiplex_active
 from typing import Any, Dict, List, Optional, Tuple
 from utils import base_url_host_matches, normalize_proxy_env_vars
 
@@ -873,8 +868,7 @@ def build_anthropic_bedrock_client(region: str):
     it, Bedrock caps these models at 200K even though the Anthropic API
     serves them with 1M natively.
 
-    Multiplex profiles pass an explicit owner-scoped AWS identity. Classic
-    single-profile callers retain the boto3 default credential chain.
+    Auth uses the boto3 default credential chain (IAM roles, SSO, env vars).
     """
     _anthropic_sdk = _get_anthropic_sdk()
     if _anthropic_sdk is None:
@@ -889,23 +883,8 @@ def build_anthropic_bedrock_client(region: str):
         )
     from httpx import Timeout
 
-    from agent.bedrock_adapter import resolve_bedrock_credentials
-
-    credentials = resolve_bedrock_credentials()
-    auth_kwargs = {}
-    if credentials.access_key_id and credentials.secret_access_key:
-        auth_kwargs.update(
-            aws_access_key=credentials.access_key_id,
-            aws_secret_key=credentials.secret_access_key,
-        )
-        if credentials.session_token:
-            auth_kwargs["aws_session_token"] = credentials.session_token
-    elif credentials.profile_name:
-        auth_kwargs["aws_profile"] = credentials.profile_name
-
     return _anthropic_sdk.AnthropicBedrock(
         aws_region=region,
-        **auth_kwargs,
         timeout=Timeout(timeout=900.0, connect=10.0),
         # Delegate retry to hermes's outer loop (honors Retry-After); the SDK
         # default max_retries=2 ignores it and double-retries. (#26293)
@@ -1298,8 +1277,6 @@ def _resolve_anthropic_pool_token() -> Optional[str]:
         # is deliberately NOT used — it runs clear_expired=True, refresh=True,
         # which would violate this read-only contract.
         entries = pool._available_entries(clear_expired=False, refresh=False)
-    except UnscopedSecretError:
-        raise
     except Exception:
         logger.debug("Failed to read Anthropic credential_pool", exc_info=True)
         return None
@@ -1412,7 +1389,7 @@ def run_oauth_setup_token() -> Optional[str]:
 
     # Check env vars that may have been set
     for env_var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_TOKEN"):
-        val = (get_secret(env_var, "") or "").strip()
+        val = os.getenv(env_var, "").strip()
         if val:
             return val
 
@@ -2443,6 +2420,24 @@ def _evict_old_screenshots(result: List[Dict[str, Any]]) -> None:
                 ]
 
 
+def _ensure_leading_user_turn(result: List[Dict[str, Any]]) -> None:
+    """Anthropic requires messages[0] to have role=user.
+
+    After a second context compaction on the auto path the summary can be
+    emitted as role=assistant with nothing in front of it (the system prompt
+    lives outside messages[] or is extracted into the separate ``system``
+    param), so messages[0] ends up assistant and the Messages API rejects
+    the request with HTTP 400 — often masked by a misleading
+    "tool_use ids were found without tool_result blocks" error (#52160).
+
+    Mirror the Bedrock Converse adapter, which unconditionally prepends a
+    minimal user turn when the first message is not user
+    (convert_messages_to_converse).
+    """
+    if result and result[0].get("role") != "user":
+        result.insert(0, {"role": "user", "content": [{"type": "text", "text": " "}]})
+
+
 def convert_messages_to_anthropic(
     messages: List[Dict],
     base_url: str | None = None,
@@ -2501,6 +2496,7 @@ def convert_messages_to_anthropic(
 
     _strip_orphaned_tool_blocks(result)
     result = _merge_consecutive_roles(result)
+    _ensure_leading_user_turn(result)
     _manage_thinking_signatures(result, base_url, model)
     _evict_old_screenshots(result)
 

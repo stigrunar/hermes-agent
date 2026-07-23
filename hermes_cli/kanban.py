@@ -80,12 +80,6 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "session_id": t.session_id,
         "workflow_template_id": t.workflow_template_id,
         "current_step_key": t.current_step_key,
-        "superseded_by": t.superseded_by,
-        "live_path_task_id": t.live_path_task_id,
-        "canonical_live_path": t.canonical_live_path,
-        "required_capabilities": list(t.required_capabilities or []),
-        "failure_classification": t.failure_classification,
-        "failure_fingerprint": t.failure_fingerprint,
     }
 
 
@@ -344,16 +338,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "(repeatable). The kanban lifecycle is already "
                                "injected automatically. Example: "
                                "--skill translation --skill github-code-review")
-    p_create.add_argument(
-        "--requires",
-        action="append",
-        default=[],
-        dest="required_capabilities",
-        help=(
-            "Required runtime capability for dispatch (repeatable): terminal, "
-            "file, file_patch, process, browser, network, or private:<toolset>."
-        ),
-    )
     p_create.add_argument("--max-retries", type=int, default=None,
                           metavar="N",
                           help="Per-task override for the consecutive-failure "
@@ -470,25 +454,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_reclaim.add_argument(
         "--reason", default=None,
         help="Human-readable reason (recorded on the reclaimed event)",
-    )
-
-    p_classify_legacy = sub.add_parser(
-        "classify-legacy-run",
-        help="Classify one ended PID-only legacy run after operator verification",
-    )
-    p_classify_legacy.add_argument("task_id")
-    p_classify_legacy.add_argument("run_id", type=int)
-    p_classify_legacy.add_argument(
-        "--launch-mode",
-        choices=("direct",),
-        required=True,
-        help="Verified historical launch mode (only direct is classifiable)",
-    )
-    p_classify_legacy.add_argument(
-        "--pid",
-        type=int,
-        required=True,
-        help="Exact PID from the legacy spawned receipt",
     )
 
     p_reassign = sub.add_parser(
@@ -711,60 +676,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
-    p_nonaction = sub.add_parser(
-        "non-actionable",
-        help="Mark a task superseded or stale_continuity_only with live-path audit fields",
-    )
-    p_nonaction.add_argument("task_id")
-    p_nonaction.add_argument(
-        "--status",
-        required=True,
-        choices=["superseded", "stale_continuity_only"],
-    )
-    p_nonaction.add_argument("--superseded-by", default=None)
-    p_nonaction.add_argument("--live-path-task-id", default=None)
-    p_nonaction.add_argument("--canonical-live-path", default=None)
-    p_nonaction.add_argument("--reason", default=None)
-    p_nonaction.add_argument("--actor", default=None)
-    p_nonaction.add_argument("--json", action="store_true")
-
-    p_live = sub.add_parser(
-        "detached-live-path",
-        help="Park parent-gated mirrors behind a blocked source and record a detached live task",
-    )
-    p_live.add_argument("source_task_id")
-    p_live.add_argument("detached_task_id")
-    p_live.add_argument("--reason", default=None)
-    p_live.add_argument("--actor", default=None)
-    p_live.add_argument("--json", action="store_true")
-
-    p_close = sub.add_parser(
-        "controller-closeout",
-        help="Controller-only closeout using a structured acceptance receipt",
-    )
-    p_close.add_argument("task_id")
-    p_close.add_argument("--receipt", required=True, help="JSON receipt object")
-    p_close.add_argument("--result", default=None)
-    p_close.add_argument("--actor", default=None)
-    p_close.add_argument("--json", action="store_true")
-
-    p_migrate = sub.add_parser(
-        "reconcile-live-path",
-        help="Dry-run/apply bounded stale-child reconciliation from explicit IDs or JSON mapping",
-    )
-    p_migrate.add_argument("--mapping", default=None, help="JSON file with reconciliation entries")
-    p_migrate.add_argument("--source", default=None)
-    p_migrate.add_argument("--detached", default=None)
-    p_migrate.add_argument(
-        "--allow-terminal-evidence",
-        action="store_true",
-        help="For explicit --source/--detached only: accept a done detached task with positive completion evidence",
-    )
-    p_migrate.add_argument("--reason", default="bounded live-path reconciliation")
-    p_migrate.add_argument("--actor", default=None)
-    p_migrate.add_argument("--apply", action="store_true")
-    p_migrate.add_argument("--json", action="store_true")
-
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -777,20 +688,6 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     )
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
-    p_disp.add_argument(
-        "--continue-blockers",
-        action="store_true",
-        help=(
-            "Opt into bounded continuation auditing and the external-safe "
-            "15-minute blocker continuation pass; not used by the gateway dispatcher"
-        ),
-    )
-    p_disp.add_argument(
-        "--continuation-limit",
-        type=int,
-        default=kb.DEFAULT_CONTINUATION_LIMIT,
-        help=f"Maximum classified continuations (default: {kb.DEFAULT_CONTINUATION_LIMIT})",
-    )
     p_disp.add_argument("--max", type=int, default=None,
                         help="Cap number of spawns this pass")
     p_disp.add_argument("--failure-limit", type=int,
@@ -1010,6 +907,25 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_gc.add_argument("--log-retention-days", type=int, default=30,
                       help="Delete worker log files older than N days (default: 30)")
 
+    # --- repair ---
+    p_repair = sub.add_parser(
+        "repair",
+        help="Check kanban.db integrity and auto-repair index-only corruption",
+        description=(
+            "Runs PRAGMA integrity_check on the board's DB and reports the "
+            "result. When the failure consists only of index-scoped errors "
+            "('wrong # of entries in index <name>' / 'row N missing from "
+            "index <name>'), the corrupt file is quarantined to a "
+            ".corrupt.<hash>.bak sibling first and the damaged indexes are "
+            "rebuilt with REINDEX — the same narrow auto-repair the "
+            "connect-time guard applies. Any other corruption class is "
+            "reported and left untouched (fail-closed). Exits 0 when the DB "
+            "is healthy or was repaired, non-zero when it is still corrupt."
+        ),
+    )
+    p_repair.add_argument("--json", action="store_true",
+                          help="Emit the repair report as JSON")
+
     kanban_parser.set_defaults(_kanban_parser=kanban_parser)
     return kanban_parser
 
@@ -1080,6 +996,12 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
+        # init_db() itself raises KanbanDbCorruptError, which would turn
+        # every `hermes kanban repair` into "could not initialize database"
+        # without ever reaching the repair path.
+        if action == "repair":
+            return _cmd_repair(args)
         try:
             kb.init_db()
         except Exception as exc:
@@ -1095,7 +1017,6 @@ def kanban_command(args: argparse.Namespace) -> int:
             "show":     _cmd_show,
             "assign":   _cmd_assign,
             "reclaim":  _cmd_reclaim,
-            "classify-legacy-run": _cmd_classify_legacy_run,
             "reassign": _cmd_reassign,
             "diagnostics": _cmd_diagnostics,
             "diag":     _cmd_diagnostics,
@@ -1115,10 +1036,6 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
-            "non-actionable": _cmd_non_actionable,
-            "detached-live-path": _cmd_detached_live_path,
-            "controller-closeout": _cmd_controller_closeout,
-            "reconcile-live-path": _cmd_reconcile_live_path,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1504,7 +1421,6 @@ def _cmd_create(args: argparse.Namespace) -> int:
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime,
             skills=getattr(args, "skills", None) or None,
-            required_capabilities=getattr(args, "required_capabilities", None) or None,
             max_retries=max_retries,
             goal_mode=bool(getattr(args, "goal_mode", False)),
             goal_max_turns=getattr(args, "goal_max_turns", None),
@@ -1841,8 +1757,6 @@ def _cmd_reclaim(args: argparse.Namespace) -> int:
     return 0
 
 
-
-
 def _cmd_reassign(args: argparse.Namespace) -> int:
     profile = None if args.profile.lower() in {"none", "-", "null"} else args.profile
     with kb.connect_closing() as conn:
@@ -1902,84 +1816,53 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
-        requested_task_id = getattr(args, "task", None)
-        requested_task = (
-            kb.get_task(conn, requested_task_id)
-            if requested_task_id else None
-        )
-        if requested_task_id and requested_task is None:
-            print(f"no such task: {requested_task_id}", file=sys.stderr)
-            return 1
-
-        # Graph findings need the linked neighbor rows even in one-task mode.
-        # Keep the task-level API unchanged and merge its results with the
-        # separate chain engine here.
-        rows = list(conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'"
-        ).fetchall())
-        if requested_task is not None and requested_task_id not in {
-            r["id"] for r in rows
-        }:
-            rows.append(conn.execute(
-                "SELECT * FROM tasks WHERE id = ?", (requested_task_id,)
-            ).fetchone())
-        # Archived parents still release linked children under the kernel's
-        # dependency semantics. Keep them as graph context without showing
-        # archived cards in the unfiltered CLI result.
-        graph_rows = list(conn.execute("SELECT * FROM tasks").fetchall())
-        ids = [r["id"] for r in graph_rows]
-        ev_by = {i: [] for i in ids}
-        run_by = {i: [] for i in ids}
-        links = []
-        if ids:
-            placeholders = ",".join(["?"] * len(ids))
-            for row in conn.execute(
-                f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-                tuple(ids),
-            ):
-                ev_by.setdefault(row["task_id"], []).append(row)
-            for row in conn.execute(
-                f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-                tuple(ids),
-            ):
-                run_by.setdefault(row["task_id"], []).append(row)
-            links = list(conn.execute(
-                f"SELECT parent_id, child_id FROM task_links "
-                f"WHERE parent_id IN ({placeholders}) AND child_id IN ({placeholders})",
-                tuple(ids) + tuple(ids),
-            ))
-        review_handoffs = kb.list_review_handoffs(conn)
-
-        chain_by_task = kd.compute_chain_diagnostics(
-            graph_rows, links, ev_by, run_by,
-            review_handoffs=review_handoffs,
-        )
-        reconciliation_context = kd.build_reconciliation_context({
-            str(row["id"]): {
-                "task": row,
-                "_runs": run_by.get(str(row["id"]), []),
+        # Either one-task mode or fleet mode.
+        if getattr(args, "task", None):
+            task = kb.get_task(conn, args.task)
+            if task is None:
+                print(f"no such task: {args.task}", file=sys.stderr)
+                return 1
+            diags_by_task = {
+                args.task: kd.compute_task_diagnostics(
+                    task,
+                    kb.list_events(conn, args.task),
+                    kb.list_runs(conn, args.task),
+                    config=diag_config,
+                )
             }
-            for row in graph_rows
-        })
-        git_probe = kd.GitProbeSession()
-        try:
-            from hermes_cli.profiles import profile_exists
-            profile_roster = profile_exists
-        except Exception:
-            profile_roster = None
-        diags_by_task = {}
-        for row in rows:
-            tid = row["id"]
-            if requested_task_id and tid != requested_task_id:
-                continue
-            dl = kd.compute_task_diagnostics(
-                row, ev_by.get(tid, []), run_by.get(tid, []), config=diag_config,
-                tasks=reconciliation_context,
-                git_probe=git_probe,
-                profile_roster=profile_roster,
-            ) + chain_by_task.get(tid, [])
-            if dl:
-                diags_by_task[tid] = dl
+        else:
+            # Fleet mode: pull all non-archived tasks + their events/runs.
+            rows = list(conn.execute(
+                "SELECT * FROM tasks WHERE status != 'archived'"
+            ).fetchall())
+            ids = [r["id"] for r in rows]
+            if not ids:
+                diags_by_task = {}
+            else:
+                placeholders = ",".join(["?"] * len(ids))
+                ev_by = {i: [] for i in ids}
+                for row in conn.execute(
+                    f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
+                    tuple(ids),
+                ):
+                    ev_by.setdefault(row["task_id"], []).append(row)
+                run_by = {i: [] for i in ids}
+                for row in conn.execute(
+                    f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
+                    tuple(ids),
+                ):
+                    run_by.setdefault(row["task_id"], []).append(row)
+                diags_by_task = {}
+                for r in rows:
+                    tid = r["id"]
+                    dl = kd.compute_task_diagnostics(
+                        r,
+                        ev_by.get(tid, []),
+                        run_by.get(tid, []),
+                        config=diag_config,
+                    )
+                    if dl:
+                        diags_by_task[tid] = dl
 
         # Severity filter.
         sev = getattr(args, "severity", None)
@@ -2384,24 +2267,18 @@ def _cmd_block(args: argparse.Namespace) -> int:
     failed: list[str] = []
     with kb.connect_closing() as conn:
         for tid in ids:
-            try:
-                ok = kb.block_task(
-                    conn,
-                    tid,
-                    reason=reason,
-                    kind=kind,
-                    expected_run_id=_worker_run_id_for(tid),
-                )
-            except ValueError as exc:
-                failed.append(tid)
-                print(f"cannot block {tid}: {exc}", file=sys.stderr)
-                continue
-            if not ok:
+            if reason:
+                kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
+            if not kb.block_task(
+                conn,
+                tid,
+                reason=reason,
+                kind=kind,
+                expected_run_id=_worker_run_id_for(tid),
+            ):
                 failed.append(tid)
                 print(f"cannot block {tid}", file=sys.stderr)
             else:
-                if reason:
-                    kb.add_comment(conn, tid, author, f"BLOCKED: {reason}")
                 # Report where the task actually landed — dependency blocks go
                 # to todo, and a tripped unblock-loop breaker routes to triage.
                 landed = kb.get_task(conn, tid)
@@ -2542,25 +2419,6 @@ def _cmd_archive(args: argparse.Namespace) -> int:
     return 0 if not failed else 1
 
 
-
-
-
-
-
-
-
-
-def _preview_reconcile(conn, entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return kb.reconcile_detached_live_paths(
-        conn,
-        entries,
-        actor="preview",
-        apply=False,
-    )["preview"]
-
-
-
-
 def _cmd_tail(args: argparse.Namespace) -> int:
     last_id = 0
     print(f"Tailing events for {args.task_id}. Ctrl-C to stop.")
@@ -2618,20 +2476,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
     with kb.connect_closing() as conn:
-        dispatch_kwargs = {
-            "dry_run": args.dry_run,
-            "max_spawn": max_spawn,
-            "max_in_progress": max_in_progress,
-            "failure_limit": getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
-            "default_assignee": default_assignee,
-            "max_in_progress_per_profile": max_in_progress_per_profile,
-        }
-        if getattr(args, "continue_blockers", False):
-            dispatch_kwargs["enable_continuations"] = True
-            dispatch_kwargs["continuation_limit"] = getattr(
-                args, "continuation_limit", kb.DEFAULT_CONTINUATION_LIMIT,
-            )
-        res = kb.dispatch_once(conn, **dispatch_kwargs)
+        res = kb.dispatch_once(
+            conn,
+            dry_run=args.dry_run,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+        )
     if getattr(args, "json", False):
         print(json.dumps({
             "reclaimed": res.reclaimed,
@@ -2639,10 +2492,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "timed_out": res.timed_out,
             "stale": res.stale,
             "auto_blocked": res.auto_blocked,
-            "capability_blocked": [
-                {"task_id": tid, "required": required, "missing": missing}
-                for (tid, required, missing) in res.capability_blocked
-            ],
             "promoted": res.promoted,
             "spawned": [
                 {"task_id": tid, "assignee": who, "workspace": ws}
@@ -2650,27 +2499,13 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,
-            "skipped_reconciliation": [
-                {"task_id": task_id, "finding": finding}
-                for task_id, finding in res.skipped_reconciliation
-            ],
-            "reconciliation": res.reconciliation,
-            "continuations": res.continuations,
             "skipped_per_profile_capped": [
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
             "auto_assigned_default": res.auto_assigned_default,
-            "skipped_locked": res.skipped_locked,
-            "dispatch_lock_error": res.dispatch_lock_error,
-            "continuation_decisions": res.continuation_decisions,
-            "scope_cleanup": res.scope_cleanup,
         }, indent=2))
         return 0
-    if res.skipped_locked:
-        print("Dispatch lock: contended (tick skipped)")
-    elif res.dispatch_lock_error is not None:
-        print(f"Dispatch lock error: {res.dispatch_lock_error} (tick skipped)")
     print(f"Reclaimed:    {res.reclaimed}")
     print(f"Crashed:      {len(res.crashed)}")
     if res.crashed:
@@ -2684,10 +2519,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     print(f"Auto-blocked: {len(res.auto_blocked)}")
     if res.auto_blocked:
         print(f"  {', '.join(res.auto_blocked)}")
-    print(f"Capability-blocked: {len(res.capability_blocked)}")
-    for tid, required, missing in res.capability_blocked:
-        tag = " (dry)" if args.dry_run else ""
-        print(f"  - {tid}{tag}: missing {', '.join(missing)} (required {', '.join(required)})")
     print(f"Promoted:     {res.promoted}")
     print(f"Spawned:      {len(res.spawned)}")
     for tid, who, ws in res.spawned:
@@ -2710,35 +2541,6 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
-    if res.skipped_reconciliation:
-        print(
-            "Skipped (reconciliation guard): "
-            + ", ".join(
-                f"{task_id} [{finding}]"
-                for task_id, finding in res.skipped_reconciliation
-            )
-        )
-    if res.scope_cleanup:
-        print("Worker scope cleanup:")
-        for item in res.scope_cleanup:
-            run_suffix = (
-                f" run {item['run_id']}" if item.get("run_id") is not None else ""
-            )
-            print(
-                f"  - {item.get('task_id')}{run_suffix}: "
-                f"{item.get('action')} ({item.get('reason')})"
-            )
-    if res.continuations:
-        print(f"Continuation audit decisions: {len(res.continuations)}")
-    if res.continuation_decisions:
-        print("Continuations:")
-        for decision in res.continuation_decisions:
-            print(
-                f"  - {decision.get('decision')} "
-                f"{decision.get('source_task_id')} "
-                f"-> {decision.get('replacement_task_id') or '-'} "
-                f"({decision.get('reason')})"
-            )
     return 0
 
 
@@ -3371,6 +3173,76 @@ def _cmd_gc(args: argparse.Namespace) -> int:
     print(f"GC complete: {removed_ws} workspace(s), "
           f"{removed_events} event row(s), {removed_logs} log file(s) removed")
     return 0
+
+
+def _cmd_repair(args: argparse.Namespace) -> int:
+    """Check DB integrity and apply the narrow index-REINDEX auto-repair.
+
+    Dispatched BEFORE the auto ``kb.init_db()`` in :func:`kanban_command`
+    (init itself refuses corrupt DBs), so this is reachable on exactly the
+    boards that need it. Exit codes: 0 = healthy / repaired / no DB file,
+    1 = still corrupt (non-index corruption, or REINDEX did not produce a
+    clean re-check).
+    """
+    try:
+        report = kb.repair_db()
+    except Exception as exc:  # locked/busy probe, unexpected I/O
+        print(f"kanban repair: {exc}", file=sys.stderr)
+        return 1
+
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "status": report.status,
+            "db_path": str(report.db_path),
+            "messages": report.messages,
+            "post_repair_messages": report.post_repair_messages,
+            "backup_path": (
+                str(report.backup_path) if report.backup_path else None
+            ),
+            "reindexed": report.reindexed,
+        }, indent=2))
+        return 0 if report.status in {"ok", "repaired", "missing"} else 1
+
+    if report.status == "missing":
+        print(f"No kanban DB at {report.db_path} — nothing to repair.")
+        return 0
+    if report.status == "ok":
+        print(f"{report.db_path}: integrity_check ok — no repair needed.")
+        return 0
+    if report.status == "repaired":
+        print(f"{report.db_path}: repaired.")
+        print(f"  reindexed: {', '.join(report.reindexed)}")
+        if report.backup_path:
+            print(f"  pre-repair backup: {report.backup_path}")
+        print("  integrity_check now ok.")
+        return 0
+    # still corrupt
+    print(f"{report.db_path}: CORRUPT.", file=sys.stderr)
+    for line in (report.messages or [])[:10]:
+        print(f"  {line}", file=sys.stderr)
+    if report.reindexed:
+        print(
+            f"  REINDEX ({', '.join(report.reindexed)}) attempted but "
+            f"integrity_check is still failing:",
+            file=sys.stderr,
+        )
+        for line in (report.post_repair_messages or [])[:10]:
+            print(f"    {line}", file=sys.stderr)
+    else:
+        print(
+            "  Not an index-only failure — automatic REINDEX repair does "
+            "not apply (fail-closed).",
+            file=sys.stderr,
+        )
+    if report.backup_path:
+        print(f"  corrupt copy quarantined at: {report.backup_path}",
+              file=sys.stderr)
+    print(
+        "  Recover manually (e.g. `sqlite3 kanban.db \".recover\"` into a "
+        "fresh file) or move the file aside to start a new board.",
+        file=sys.stderr,
+    )
+    return 1
 
 
 # ---------------------------------------------------------------------------

@@ -37,6 +37,15 @@ def _make_runner():
     return runner
 
 
+@pytest.fixture(autouse=True)
+def _isolate_update_remote_topology(monkeypatch):
+    """Gateway tests must not inherit remotes from the developer checkout."""
+    monkeypatch.setattr(
+        "hermes_cli.update_channel._has_remote",
+        lambda _project_root, _name: False,
+    )
+
+
 # ---------------------------------------------------------------------------
 # _handle_update_command
 # ---------------------------------------------------------------------------
@@ -46,21 +55,54 @@ class TestHandleUpdateCommand:
     """Tests for GatewayRunner._handle_update_command."""
 
     @pytest.mark.asyncio
-    async def test_managed_install_returns_package_manager_guidance(self, monkeypatch):
+    async def test_stig_release_channel_is_forwarded_to_detached_update(self, tmp_path):
+        from hermes_cli.update_channel import UpdateTarget
+
         runner = _make_runner()
         event = _make_event()
-        monkeypatch.setenv("HERMES_MANAGED", "homebrew")
+        root = tmp_path / "project"
+        (root / ".git").mkdir(parents=True)
+        (root / "gateway").mkdir()
+        fake_file = str(root / "gateway" / "slash_commands.py")
+        Path(fake_file).touch()
+        home = tmp_path / "home"
+        home.mkdir()
+        popen = MagicMock()
 
-        # Guard: prevent any accidental fall-through from spawning a real
-        # `hermes update --gateway` against the CI checkout. The managed-install
-        # guard should return before Popen is ever reached, but mock it as
-        # belt-and-suspenders so a premature return doesn't corrupt the repo.
-        with patch("subprocess.Popen") as mock_popen:
+        with patch("gateway.run._hermes_home", home), \
+             patch("gateway.slash_commands.__file__", fake_file), \
+             patch(
+                 "hermes_cli.update_channel.resolve_update_target",
+                 return_value=UpdateTarget("stig", "release/stig-tested"),
+             ), \
+             patch("shutil.which", side_effect=lambda name: f"/usr/bin/{name}"), \
+             patch("subprocess.Popen", popen):
             result = await runner._handle_update_command(event)
 
-        assert "managed by Homebrew" in result
-        assert "brew upgrade hermes-agent" in result
-        mock_popen.assert_not_called()  # must return before reaching Popen
+        assert "Starting Hermes update" in result
+        command = popen.call_args.args[0][-1]
+        assert "--branch release/stig-tested" in command
+
+    @pytest.mark.asyncio
+    async def test_unconfigured_stig_channel_does_not_spawn(self, tmp_path):
+        from hermes_cli.update_channel import UpdateChannelError
+
+        runner = _make_runner()
+        event = _make_event()
+        root = tmp_path / "project"
+        (root / ".git").mkdir(parents=True)
+        (root / "gateway").mkdir()
+        fake_file = str(root / "gateway" / "slash_commands.py")
+        Path(fake_file).touch()
+
+        with patch("gateway.slash_commands.__file__", fake_file), \
+             patch("gateway.run._resolve_hermes_bin", return_value=["/usr/bin/hermes"]), \
+             patch("hermes_cli.update_channel.resolve_update_target", side_effect=UpdateChannelError("missing channel")), \
+             patch("subprocess.Popen") as popen:
+            result = await runner._handle_update_command(event)
+
+        assert "blocked by release-channel policy" in result
+        popen.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_no_git_directory(self, tmp_path):

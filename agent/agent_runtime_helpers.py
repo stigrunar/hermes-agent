@@ -33,7 +33,6 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from hermes_cli.timeouts import get_provider_request_timeout
-from agent.secret_scope import UnscopedSecretError
 from agent.prompt_builder import format_steer_marker
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
 from agent.trajectory import convert_scratchpad_to_think
@@ -1402,8 +1401,6 @@ def restore_primary_runtime(agent) -> bool:
                 from agent.credential_pool import load_pool
 
                 agent._credential_pool = load_pool(primary_provider)
-            except UnscopedSecretError:
-                raise
             except Exception as exc:
                 logger.warning(
                     "Restore could not reload primary credential pool for %s: %s",
@@ -1499,8 +1496,6 @@ def restore_primary_runtime(agent) -> bool:
             agent.model, agent.provider,
         )
         return True
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
@@ -1758,8 +1753,6 @@ def anthropic_prompt_cache_policy(
                     )
                     _agg_base_url = _rt.get("base_url") or ""
                     _agg_api_mode = _rt.get("api_mode") or ""
-                except UnscopedSecretError:
-                    raise
                 except Exception:
                     pass
                 return anthropic_prompt_cache_policy(
@@ -1769,8 +1762,6 @@ def anthropic_prompt_cache_policy(
                     api_mode=_agg_api_mode,
                     model=_agg_model,
                 )
-        except UnscopedSecretError:
-            raise
         except Exception as _moa_exc:  # pragma: no cover - defensive
             logger.debug("MoA aggregator cache-policy resolution failed: %s", _moa_exc)
         return False, False
@@ -2078,8 +2069,6 @@ def switch_model(agent, new_model, new_provider, api_key='', base_url='', api_mo
             try:
                 from agent.credential_pool import load_pool
                 agent._credential_pool = load_pool(new_provider)
-            except UnscopedSecretError:
-                raise
             except Exception as _pool_exc:  # noqa: BLE001
                 logger.warning(
                     "switch_model: credential pool reload failed for %s (%s); "

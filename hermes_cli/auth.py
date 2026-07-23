@@ -46,17 +46,11 @@ import httpx
 from hermes_cli.config import (
     get_hermes_home,
     get_config_path,
-    get_env_value_prefer_dotenv,
     read_raw_config,
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
 from agent.credential_persistence import sanitize_borrowed_credential_payload
-from agent.secret_scope import (
-    UnscopedSecretError,
-    get_deployment_env,
-    get_secret,
-)
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -571,18 +565,6 @@ def has_usable_secret(value: Any, *, min_length: int = 4) -> bool:
     return True
 
 
-def _profile_env(name: str, default: str = "") -> str:
-    """Read a profile-owned credential, selector, or endpoint override."""
-    value = get_env_value_prefer_dotenv(name)
-    return value if value is not None else default
-
-
-def _deployment_env(name: str, default: str = "") -> str:
-    """Read a name explicitly classified as process/deployment-global."""
-    value = get_deployment_env(name, default)
-    return value if value is not None else default
-
-
 def _resolve_api_key_provider_secret(
     provider_id: str, pconfig: ProviderConfig
 ) -> tuple[str, str]:
@@ -595,17 +577,13 @@ def _resolve_api_key_provider_secret(
             if token:
                 api_token, _base_url = get_copilot_api_token(token)
                 return api_token, source
-        except UnscopedSecretError:
-            raise
         except ValueError as exc:
-            logger.warning(
-                "Copilot token validation failed: %s",
-                _redact_auth_diagnostic(str(exc)),
-            )
+            logger.warning("Copilot token validation failed: %s", exc)
         except Exception:
             pass
         return "", ""
 
+    from hermes_cli.config import get_env_value_prefer_dotenv
     for env_var in pconfig.api_key_env_vars:
         # Prefer ~/.hermes/.env over os.environ so a deliberate key rotation
         # in the user's .env file isn't shadowed by a stale shell export
@@ -625,8 +603,6 @@ def _resolve_api_key_provider_secret(
                 key = str(key).strip()
                 if has_usable_secret(key):
                     return key, f"credential_pool:{provider_id}"
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -881,33 +857,23 @@ def _format_nous_entitlement_auth_error(error: AuthError) -> str:
         )
         if message:
             return message
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
     return f"{error} Check credits or billing in Nous Portal, then retry."
 
 
-def _redact_auth_diagnostic(value: Any) -> Any:
-    """Return a value safe for durable auth diagnostics.
-
-    Auth failures frequently include provider-controlled response text.  The
-    auth store and OAuth trace are durable boundaries, so they must not retain
-    raw or partially preserved credential/PII bytes even when display-time
-    redaction is disabled.
-    """
-    try:
-        from agent.redact import redact_for_persistence
-
-        return redact_for_persistence(value)
-    except Exception:
-        # Diagnostic formatting must fail closed without interfering with the
-        # credential quarantine that called it.
-        return "[redacted diagnostic]"
+def _token_fingerprint(token: Any) -> Optional[str]:
+    """Return a short hash fingerprint for telemetry without leaking token bytes."""
+    if not isinstance(token, str):
+        return None
+    cleaned = token.strip()
+    if not cleaned:
+        return None
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:12]
 
 
 def _oauth_trace_enabled() -> bool:
-    raw = _deployment_env("HERMES_OAUTH_TRACE").strip().lower()
+    raw = os.getenv("HERMES_OAUTH_TRACE", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
 
 
@@ -917,7 +883,7 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
     payload: Dict[str, Any] = {"event": event}
     if sequence_id:
         payload["sequence_id"] = sequence_id
-    payload.update(_redact_auth_diagnostic(fields))
+    payload.update(fields)
     logger.info("oauth_trace %s", json.dumps(payload, sort_keys=True, ensure_ascii=False))
 
 
@@ -1267,11 +1233,7 @@ def _load_provider_state_with_source(
 
 
 @contextmanager
-def _provider_state_transaction(
-    provider_id: str,
-    *,
-    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
-):
+def _provider_state_transaction(provider_id: str):
     """Lock the active auth store and any global fallback source in order.
 
     Profile-backed refresh paths must take the global auth-store lock before
@@ -1279,7 +1241,7 @@ def _provider_state_transaction(
     target lock is acquired prevents both stale refreshes and whole-file lost
     updates without inverting the documented auth -> shared lock order.
     """
-    with _auth_store_lock(timeout_seconds=timeout_seconds):
+    with _auth_store_lock():
         auth_store = _load_auth_store()
         state, source_path = _load_provider_state_with_source(
             auth_store,
@@ -1290,10 +1252,7 @@ def _provider_state_transaction(
             yield auth_store, state, source_path
             return
 
-        with _auth_store_lock(
-            timeout_seconds=timeout_seconds,
-            target_path=source_path,
-        ):
+        with _auth_store_lock(target_path=source_path):
             source_store = _load_auth_store(source_path)
             source_providers = source_store.get("providers")
             source_state = None
@@ -1301,10 +1260,7 @@ def _provider_state_transaction(
                 raw_state = source_providers.get(provider_id)
                 if isinstance(raw_state, dict):
                     source_state = dict(raw_state)
-            # Yield the owning store, not the empty borrowing profile store.
-            # Callers may quarantine sibling pool rows in the same atomic
-            # transaction before persisting the provider state.
-            yield source_store, source_state, source_path
+            yield auth_store, source_state, source_path
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -1336,8 +1292,6 @@ def _save_provider_state_to_source(
     provider_id: str,
     state: Dict[str, Any],
     source_path: Optional[Path],
-    *,
-    set_active: bool = False,
 ) -> None:
     """Persist provider state back to the auth store it was read from."""
     active_path = _auth_file_path()
@@ -1348,25 +1302,16 @@ def _save_provider_state_to_source(
     except Exception:
         same_store = source_path == active_path
     if same_store:
-        _store_provider_state(
-            auth_store,
-            provider_id,
-            state,
-            set_active=set_active,
-        )
+        _save_provider_state(auth_store, provider_id, state)
         _save_auth_store(auth_store)
         return
 
-    # ``_provider_state_transaction`` yields the source store while holding
-    # this path's lock, so preserve any sibling pool quarantine performed by
-    # the caller in the same atomic save.
-    _store_provider_state(
-        auth_store,
+    _persist_provider_state_to_store(
         provider_id,
         state,
-        set_active=set_active,
+        source_path,
+        set_active=True,
     )
-    _save_auth_store(auth_store, target_path=source_path)
 
 
 def _store_provider_state(
@@ -1383,6 +1328,25 @@ def _store_provider_state(
     providers[provider_id] = state
     if set_active:
         auth_store["active_provider"] = provider_id
+
+
+def _persist_provider_state_to_store(
+    provider_id: str,
+    state: Dict[str, Any],
+    target_path: Path,
+    *,
+    set_active: bool = False,
+) -> Path:
+    """Merge one provider into a specific auth store under that store's lock."""
+    with _auth_store_lock(target_path=target_path):
+        auth_store = _load_auth_store(target_path)
+        _store_provider_state(
+            auth_store,
+            provider_id,
+            dict(state),
+            set_active=set_active,
+        )
+        return _save_auth_store(auth_store, target_path=target_path)
 
 
 def mark_provider_active_if_unset(provider_id: str) -> None:
@@ -1436,42 +1400,7 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
     return True
 
 
-def _read_credential_pool_with_source(
-    provider_id: str,
-) -> tuple[List[Dict[str, Any]], Path]:
-    """Return one provider slice and the auth store that owns the rows.
-
-    Runtime health/rotation updates must follow inherited rows back to their
-    source.  Returning only the merged list loses that ownership information
-    and causes a profile process to materialize a stale shadow on its first
-    status write.
-    """
-    active_path = _auth_file_path()
-    auth_store = _load_auth_store()
-    pool = auth_store.get("credential_pool")
-    if not isinstance(pool, dict):
-        pool = {}
-    provider_entries = pool.get(provider_id)
-    if isinstance(provider_entries, list) and provider_entries:
-        return list(provider_entries), active_path
-
-    global_path = _global_auth_file_path()
-    global_store = _load_global_auth_store()
-    global_pool = global_store.get("credential_pool") if global_store else None
-    if isinstance(global_pool, dict):
-        global_entries = global_pool.get(provider_id)
-        if (
-            global_path is not None
-            and isinstance(global_entries, list)
-            and global_entries
-        ):
-            return list(global_entries), global_path
-    return [], active_path
-
-
-def read_credential_pool(
-    provider_id: Optional[str] = None,
-) -> Dict[str, Any] | List[Dict[str, Any]]:
+def read_credential_pool(provider_id: Optional[str] = None) -> Dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
     In profile mode, the profile's credential pool is authoritative. If a
@@ -1484,15 +1413,9 @@ def read_credential_pool(
     ``hermes auth add <provider>`` inside the profile, profile entries
     fully shadow global for that provider on the next read.
 
-    Explicit writes default to the active profile. Runtime pool updates use the
-    private source-aware read plus ``write_credential_pool(target_path=...)``
-    so inherited rows stay owned by the global store. See issue #18594
-    follow-up.
+    Writes always go to the profile (``write_credential_pool`` is unchanged).
+    See issue #18594 follow-up.
     """
-    if provider_id is not None:
-        entries, _source_path = _read_credential_pool_with_source(provider_id)
-        return entries
-
     auth_store = _load_auth_store()
     pool = auth_store.get("credential_pool")
     if not isinstance(pool, dict):
@@ -1504,16 +1427,24 @@ def read_credential_pool(
     if isinstance(maybe_global_pool, dict):
         global_pool = maybe_global_pool
 
-    merged = dict(pool)
-    for gp_key, gp_entries in global_pool.items():
-        if not isinstance(gp_entries, list) or not gp_entries:
-            continue
-        # Per-provider shadowing: profile wins whenever it has ANY entries.
-        existing = merged.get(gp_key)
-        if isinstance(existing, list) and existing:
-            continue
-        merged[gp_key] = list(gp_entries)
-    return merged
+    if provider_id is None:
+        merged = dict(pool)
+        for gp_key, gp_entries in global_pool.items():
+            if not isinstance(gp_entries, list) or not gp_entries:
+                continue
+            # Per-provider shadowing: profile wins whenever it has ANY entries.
+            existing = merged.get(gp_key)
+            if isinstance(existing, list) and existing:
+                continue
+            merged[gp_key] = list(gp_entries)
+        return merged
+
+    provider_entries = pool.get(provider_id)
+    if isinstance(provider_entries, list) and provider_entries:
+        return list(provider_entries)
+    # Profile has no entries for this provider — fall back to global.
+    global_entries = global_pool.get(provider_id)
+    return list(global_entries) if isinstance(global_entries, list) else []
 
 
 def write_credential_pool(
@@ -1521,12 +1452,8 @@ def write_credential_pool(
     entries: List[Dict[str, Any]],
     *,
     removed_ids: Optional[Iterable[str]] = None,
-    target_path: Optional[Path] = None,
 ) -> Path:
     """Persist one provider's credential pool under auth.json.
-
-    ``target_path`` is reserved for source-aware runtime updates. Interactive
-    auth mutations omit it and therefore continue to target the active profile.
 
     This is the final disk-boundary guard for borrowed/reference-only
     credentials. Callers may pass raw dictionaries, so sanitize here even when
@@ -1541,8 +1468,8 @@ def write_credential_pool(
     merge does not resurrect them from the on-disk copy.
     """
     removed = {rid for rid in (removed_ids or ()) if rid}
-    with _auth_store_lock(target_path=target_path):
-        auth_store = _load_auth_store(target_path)
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
         pool = auth_store.get("credential_pool")
         if not isinstance(pool, dict):
             pool = {}
@@ -1568,7 +1495,7 @@ def write_credential_pool(
                 continue
             merged.append(sanitize_borrowed_credential_payload(disk_entry, provider_id))
         pool[provider_id] = merged
-        return _save_auth_store(auth_store, target_path=target_path)
+        return _save_auth_store(auth_store)
 
 
 def suppress_credential_source(provider_id: str, source: str) -> None:
@@ -1620,9 +1547,9 @@ def get_provider_auth_state(provider_id: str) -> Optional[Dict[str, Any]]:
     In profile mode, ``_load_provider_state`` already falls back to the
     global-root ``auth.json`` per-provider when the profile has no entry —
     so this is now a thin convenience wrapper. Profile state always wins
-    when present. Explicit login/admin writes still target the active profile;
-    runtime rotation helpers preserve the store that supplied an inherited
-    grant. This mirrors ``read_credential_pool``'s per-provider shadowing so that
+    when present. Writes (``_save_auth_store`` / ``persist_*_credentials``)
+    are unchanged — they still target the profile only. This mirrors
+    ``read_credential_pool``'s per-provider shadowing semantics so that
     ``_seed_from_singletons`` can reseed a profile's credential pool from
     global-scope provider state (e.g. a globally-authenticated Anthropic
     OAuth or Nous device-code session). See issue #18594 follow-up.
@@ -1658,8 +1585,6 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         active = (auth_store.get("active_provider") or "").strip().lower()
         if active and active == normalized:
             return True
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -1672,8 +1597,6 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
             cfg_provider = (model_cfg.get("provider") or "").strip().lower()
             if cfg_provider == normalized:
                 return True
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -1692,7 +1615,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
         for env_var in pconfig.api_key_env_vars:
             if env_var in _IMPLICIT_ENV_VARS:
                 continue
-            if has_usable_secret(get_secret(env_var, "")):
+            if has_usable_secret(os.getenv(env_var, "")):
                 return True
 
     # 4. Check persisted credential-pool entries that came from EXPLICIT flows
@@ -1711,7 +1634,7 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 # the user deletes the env var (#55790) — only count it when
                 # the referenced var still resolves to a usable secret NOW.
                 env_var = entry.get("source", "").split(":", 1)[1].strip()
-                if env_var and has_usable_secret(get_secret(env_var, "")):
+                if env_var and has_usable_secret(os.getenv(env_var, "")):
                     return True
                 continue
             if (
@@ -1719,8 +1642,6 @@ def is_provider_explicitly_configured(provider_id: str) -> bool:
                 or source.startswith("manual:")
             ):
                 return True
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -1917,14 +1838,10 @@ def resolve_provider(
             _cfg_provider = _model_cfg.get("provider")
             if isinstance(_cfg_provider, str) and _cfg_provider.strip().lower() in PROVIDER_REGISTRY:
                 return _cfg_provider.strip().lower()
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.debug("Could not read config.yaml model.provider for auto-resolution: %s", e)
 
-    if has_usable_secret(_profile_env("OPENAI_API_KEY")) or has_usable_secret(
-        _profile_env("OPENROUTER_API_KEY")
-    ):
+    if has_usable_secret(os.getenv("OPENAI_API_KEY")) or has_usable_secret(os.getenv("OPENROUTER_API_KEY")):
         return "openrouter"
 
     # Auto-detect an OpenRouter credential added via `hermes auth add openrouter`
@@ -1939,8 +1856,6 @@ def resolve_provider(
 
         if _load_pool("openrouter").has_credentials():
             return "openrouter"
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.debug("Could not check OpenRouter credential pool: %s", e)
 
@@ -1953,8 +1868,6 @@ def resolve_provider(
         _maybe = _store.get("active_provider")
         if _maybe and _maybe in PROVIDER_REGISTRY and get_auth_status(_maybe).get("logged_in"):
             _oauth_active = _maybe
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.debug("Could not pre-read active auth provider: %s", e)
 
@@ -1971,7 +1884,7 @@ def resolve_provider(
         if pid in {"copilot", "lmstudio"}:
             continue
         for env_var in pconfig.api_key_env_vars:
-            if has_usable_secret(_profile_env(env_var)):
+            if has_usable_secret(os.getenv(env_var, "")):
                 # An exported API key now wins over a logged-in OAuth provider
                 # (the #29285 fix). Surface that so a user who deliberately uses
                 # OAuth but has a stale key in ~/.hermes/.env isn't silently
@@ -2155,36 +2068,35 @@ def _validate_nous_inference_url_from_network(url: Optional[str]) -> Optional[st
 def _nous_inference_env_override() -> Optional[str]:
     """Return the user-set ``NOUS_INFERENCE_BASE_URL`` override, if any.
 
-    This is the documented dev/staging escape hatch. It is profile-owned in
-    multiplex mode because the selected URL receives that profile's bearer;
-    the active secret scope is therefore authoritative. The configured value
-    is intentionally NOT gated by the network host allowlist, unlike an
-    untrusted Portal-returned URL.
+    This is the documented dev/staging escape hatch. The env source is
+    trusted (the OS user set it themselves), so it is intentionally NOT
+    gated by the network host allowlist — unlike Portal-returned URLs.
 
     Returns a trailing-slash-stripped non-empty string, or ``None`` when
     the env var is unset/blank.
     """
-    return _optional_base_url(_profile_env("NOUS_INFERENCE_BASE_URL"))
+    return _optional_base_url(os.getenv("NOUS_INFERENCE_BASE_URL"))
 
 
 def _nous_portal_env_override() -> Optional[str]:
-    """Return the trusted deployment/profile Portal override, if any.
+    """Return the user/deployment-set Portal base URL override, if any.
 
     Mirrors ``_nous_inference_env_override()``: ``HERMES_PORTAL_BASE_URL`` /
     ``NOUS_PORTAL_BASE_URL`` are the documented dev/staging escape hatch for
-    pointing Hermes at a non-production Nous Portal. The ``HERMES_*`` name is
-    an explicit hosted-deployment route stamped into containers and therefore
-    wins process-wide; ``NOUS_PORTAL_BASE_URL`` remains profile-owned under
-    multiplexing. Neither trusted override is gated by
-    ``_NOUS_PORTAL_ALLOWED_HOSTS``; that allowlist rejects an untrusted network
-    value persisted to auth state.
+    pointing Hermes at a non-production Nous Portal (e.g. a hosted agent
+    provisioned on nous-account-service's `staging` environment, which stamps
+    ``HERMES_PORTAL_BASE_URL=https://portal.staging-nousresearch.com`` into
+    the container env). The env source is trusted (the OS user/deployment
+    set it themselves), so — like the inference override — it must NOT be
+    gated by ``_NOUS_PORTAL_ALLOWED_HOSTS``: that allowlist exists to reject
+    an untrusted NETWORK-provided value (a poisoned portal_base_url
+    persisted to auth.json), not a value the operator explicitly configured.
 
     Returns a trailing-slash-stripped non-empty string, or ``None`` when
     neither env var is set/blank.
     """
     return _optional_base_url(
-        _deployment_env("HERMES_PORTAL_BASE_URL")
-        or _profile_env("NOUS_PORTAL_BASE_URL")
+        os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
     )
 
 
@@ -2295,6 +2207,7 @@ def _log_nous_invoke_jwt_selected(
     _oauth_trace(
         "nous_invoke_jwt_selected",
         sequence_id=sequence_id,
+        access_token_fp=_token_fingerprint(access_token),
     )
 
 
@@ -2567,10 +2480,7 @@ def resolve_qwen_runtime_credentials(
             code="qwen_access_token_missing",
         )
 
-    base_url = (
-        _profile_env("HERMES_QWEN_BASE_URL").strip().rstrip("/")
-        or DEFAULT_QWEN_BASE_URL
-    )
+    base_url = os.getenv("HERMES_QWEN_BASE_URL", "").strip().rstrip("/") or DEFAULT_QWEN_BASE_URL
     return {
         "provider": "qwen-oauth",
         "base_url": base_url,
@@ -2628,10 +2538,12 @@ def _spotify_client_id(
     explicit: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> str:
+    from hermes_cli.config import get_env_value
+
     candidates = (
         explicit,
-        _profile_env("HERMES_SPOTIFY_CLIENT_ID"),
-        _profile_env("SPOTIFY_CLIENT_ID"),
+        get_env_value("HERMES_SPOTIFY_CLIENT_ID"),
+        get_env_value("SPOTIFY_CLIENT_ID"),
         state.get("client_id") if isinstance(state, dict) else None,
     )
     for candidate in candidates:
@@ -2649,10 +2561,12 @@ def _spotify_redirect_uri(
     explicit: Optional[str] = None,
     state: Optional[Dict[str, Any]] = None,
 ) -> str:
+    from hermes_cli.config import get_env_value
+
     candidates = (
         explicit,
-        _profile_env("HERMES_SPOTIFY_REDIRECT_URI"),
-        _profile_env("SPOTIFY_REDIRECT_URI"),
+        get_env_value("HERMES_SPOTIFY_REDIRECT_URI"),
+        get_env_value("SPOTIFY_REDIRECT_URI"),
         state.get("redirect_uri") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_REDIRECT_URI,
     )
@@ -2664,8 +2578,10 @@ def _spotify_redirect_uri(
 
 
 def _spotify_api_base_url(state: Optional[Dict[str, Any]] = None) -> str:
+    from hermes_cli.config import get_env_value
+
     candidates = (
-        _profile_env("HERMES_SPOTIFY_API_BASE_URL"),
+        get_env_value("HERMES_SPOTIFY_API_BASE_URL"),
         state.get("api_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_API_BASE_URL,
     )
@@ -2677,8 +2593,10 @@ def _spotify_api_base_url(state: Optional[Dict[str, Any]] = None) -> str:
 
 
 def _spotify_accounts_base_url(state: Optional[Dict[str, Any]] = None) -> str:
+    from hermes_cli.config import get_env_value
+
     candidates = (
-        _profile_env("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
+        get_env_value("HERMES_SPOTIFY_ACCOUNTS_BASE_URL"),
         state.get("accounts_base_url") if isinstance(state, dict) else None,
         DEFAULT_SPOTIFY_ACCOUNTS_BASE_URL,
     )
@@ -3013,7 +2931,7 @@ def resolve_spotify_runtime_credentials(
                     state["last_auth_error"] = {
                         "provider": "spotify",
                         "code": exc.code or "refresh_failed",
-                        "message": _redact_auth_diagnostic(str(exc)),
+                        "message": str(exc),
                         "reason": "runtime_refresh_failure",
                         "relogin_required": True,
                         "at": datetime.now(timezone.utc).isoformat(),
@@ -3022,10 +2940,7 @@ def resolve_spotify_runtime_credentials(
                         _store_provider_state(auth_store, "spotify", state, set_active=False)
                         _save_auth_store(auth_store)
                     except Exception as _save_exc:
-                        logger.debug(
-                            "Spotify OAuth: failed to persist quarantined state: %s",
-                            _redact_auth_diagnostic(str(_save_exc)),
-                        )
+                        logger.debug("Spotify OAuth: failed to persist quarantined state: %s", _save_exc)
                 raise
 
     access_token = str(state.get("access_token", "") or "").strip()
@@ -3241,7 +3156,7 @@ def _is_remote_session() -> bool:
     set ``SSH_CLIENT`` / ``SSH_TTY``, so the SSH-only check left
     them with no guidance and no fallback.
     """
-    if _deployment_env("SSH_CLIENT") or _deployment_env("SSH_TTY"):
+    if os.getenv("SSH_CLIENT") or os.getenv("SSH_TTY"):
         return True
     # Browser-only remote IDEs / cloud shells.  Keep this list narrow
     # (well-known, documented env vars set by the host platform) so
@@ -3254,7 +3169,7 @@ def _is_remote_session() -> bool:
         "REPL_ID",             # Replit
         "STACKBLITZ",          # StackBlitz
     ):
-        if _deployment_env(var):
+        if os.getenv(var):
             return True
     return False
 
@@ -3305,13 +3220,13 @@ def _can_open_graphical_browser() -> bool:
         base = os.path.basename(token).lower()
         return base in _CONSOLE_BROWSER_NAMES
 
-    browser_env = _deployment_env("BROWSER")
+    browser_env = os.environ.get("BROWSER", "")
     if browser_env and _names_console_browser(browser_env):
         return False
 
     if sys.platform.startswith("linux"):
         has_display = bool(
-            _deployment_env("DISPLAY") or _deployment_env("WAYLAND_DISPLAY")
+            os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY")
         )
         # An explicit graphical $BROWSER can work without $DISPLAY in odd
         # setups, but a console $BROWSER already returned False above, so the
@@ -3347,7 +3262,7 @@ def _ssh_user_at_host() -> str:
         hostname = _socket.gethostname() or "<this-host>"
     except OSError:
         hostname = "<this-host>"
-    user = _deployment_env("USER") or _deployment_env("LOGNAME") or "<user>"
+    user = os.getenv("USER") or os.getenv("LOGNAME") or "<user>"
     return f"{user}@{hostname}"
 
 
@@ -3551,36 +3466,13 @@ def _sync_codex_pool_entries(
         entry["last_error_reset_at"] = None
 
 
-def _save_codex_tokens(
-    tokens: Dict[str, str],
-    last_refresh: str = None,
-    label: str = None,
-    *,
-    to_active_profile: bool = False,
-) -> None:
-    """Save Codex OAuth tokens to their owning auth store.
-
-    Runtime refreshes preserve the source of an inherited grant. Explicit
-    login/import passes ``to_active_profile=True`` to create a deliberate
-    profile shadow and select the provider.
-    """
+def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None, label: str = None) -> None:
+    """Save Codex OAuth tokens to Hermes auth store (~/.hermes/auth.json)."""
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    transaction = (
-        _auth_store_lock()
-        if to_active_profile
-        else _provider_state_transaction("openai-codex")
-    )
-    with transaction as transaction_value:
-        if to_active_profile:
-            auth_store = _load_auth_store()
-            providers = auth_store.get("providers")
-            raw_state = providers.get("openai-codex") if isinstance(providers, dict) else None
-            state = dict(raw_state) if isinstance(raw_state, dict) else {}
-            source_path = _auth_file_path()
-        else:
-            auth_store, state, source_path = transaction_value
-            state = state or {}
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        state = _load_provider_state(auth_store, "openai-codex") or {}
         # Capture the previous singleton tokens BEFORE overwriting them.  The
         # pool-sync step uses this to distinguish legacy singleton-aliases
         # (which should be refreshed) from independent accounts that
@@ -3592,19 +3484,14 @@ def _save_codex_tokens(
         state["auth_mode"] = "chatgpt"
         if label and str(label).strip():
             state["label"] = str(label).strip()
+        _save_provider_state(auth_store, "openai-codex", state)
         _sync_codex_pool_entries(
             auth_store,
             tokens,
             last_refresh,
             previous_singleton_tokens=previous_singleton_tokens,
         )
-        _save_provider_state_to_source(
-            auth_store,
-            "openai-codex",
-            state,
-            source_path,
-            set_active=to_active_profile,
-        )
+        _save_auth_store(auth_store)
 
 
 def _recover_codex_tokens_from_cli(reason: str) -> Optional[Dict[str, str]]:
@@ -3807,7 +3694,7 @@ def _import_codex_cli_tokens() -> Optional[Dict[str, str]]:
     Returns tokens dict if valid and not expired, None otherwise.
     Does NOT write to the shared file.
     """
-    codex_home = _deployment_env("CODEX_HOME").strip()
+    codex_home = os.getenv("CODEX_HOME", "").strip()
     if not codex_home:
         codex_home = str(Path.home() / ".codex")
     auth_path = Path(codex_home).expanduser() / "auth.json"
@@ -3874,7 +3761,7 @@ def resolve_codex_runtime_credentials(
         pool_token = _pool_codex_access_token()
         if pool_token:
             base_url = (
-                _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
+                os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
                 or DEFAULT_CODEX_BASE_URL
             )
             return {
@@ -3887,6 +3774,34 @@ def resolve_codex_runtime_credentials(
             }
         pool_rate_limit = _codex_pool_rate_limit_status()
         if pool_rate_limit:
+            # Before surfacing the persisted cooldown, ask the Codex usage
+            # endpoint whether the quota actually reset early (banked reset
+            # redeemed, plan upgraded, window reset upstream).  The persisted
+            # ``last_error_reset_at`` can be days in the future while the
+            # account is already usable again — see issue #43747.
+            stale_token = str(pool_rate_limit.get("access_token") or "").strip()
+            if stale_token and _probe_codex_quota_restored(
+                stale_token,
+                base_url=pool_rate_limit.get("base_url"),
+            ):
+                logger.info(
+                    "Codex quota restored upstream — clearing stale pool cooldown(s)."
+                )
+                clear_codex_pool_quota_cooldowns()
+                pool_token = _pool_codex_access_token()
+                if pool_token:
+                    base_url = (
+                        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+                        or DEFAULT_CODEX_BASE_URL
+                    )
+                    return {
+                        "provider": "openai-codex",
+                        "base_url": base_url,
+                        "api_key": pool_token,
+                        "source": "credential_pool",
+                        "last_refresh": None,
+                        "auth_mode": "chatgpt",
+                    }
             reset_at = pool_rate_limit.get("reset_at")
             if isinstance(reset_at, (int, float)) and reset_at > time.time():
                 remaining = int(reset_at - time.time())
@@ -3923,13 +3838,7 @@ def resolve_codex_runtime_credentials(
         should_refresh = _codex_access_token_is_expiring(access_token, refresh_skew_seconds)
     if should_refresh:
         # Re-read under lock to avoid racing with other Hermes processes
-        with _provider_state_transaction(
-            "openai-codex",
-            timeout_seconds=max(
-                float(AUTH_LOCK_TIMEOUT_SECONDS),
-                refresh_timeout_seconds + 5.0,
-            ),
-        ):
+        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_codex_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -3943,7 +3852,7 @@ def resolve_codex_runtime_credentials(
                 access_token = str(tokens.get("access_token", "") or "").strip()
 
     base_url = (
-        _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
+        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
 
@@ -3955,6 +3864,190 @@ def resolve_codex_runtime_credentials(
         "last_refresh": data.get("last_refresh"),
         "auth_mode": "chatgpt",
     }
+
+
+def _is_codex_rate_limit_shaped(
+    code: Any,
+    reason: Any,
+    message: Any,
+) -> bool:
+    """True when persisted pool-entry error metadata describes a 429/quota stop."""
+    reason_l = str(reason or "").lower()
+    message_l = str(message or "").lower()
+    return (
+        code == 429
+        or "rate_limit" in reason_l
+        or "usage_limit" in reason_l
+        or "quota" in reason_l
+        or "rate limit" in message_l
+        or "usage limit" in message_l
+        or "quota" in message_l
+    )
+
+
+# Throttle for the live Codex quota probe below.  The probe runs on the hot
+# credential-selection path while the pool is exhausted, so without a floor a
+# busy gateway would hammer the usage endpoint on every model/auxiliary call.
+CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS = 300  # 5 minutes
+_codex_quota_probe_cache: Dict[str, Tuple[float, Optional[bool]]] = {}
+_codex_quota_probe_lock = threading.Lock()
+
+
+def _codex_usage_probe_url(base_url: Optional[str]) -> str:
+    """Resolve the Codex usage endpoint for a probe.
+
+    Mirrors the Codex CLI's PathStyle split (codex-rs backend-client, same
+    logic as ``agent.account_usage._codex_backend_urls``): base URLs
+    containing ``/backend-api`` use the ChatGPT ``/wham/usage`` path;
+    everything else uses ``/api/codex/usage``.  Kept local so this low-level
+    auth module doesn't import the auxiliary account-usage module.
+    """
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        normalized = (
+            os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+            or DEFAULT_CODEX_BASE_URL
+        )
+    if normalized.endswith("/codex"):
+        normalized = normalized[: -len("/codex")]
+    prefix = normalized + ("/wham" if "/backend-api" in normalized else "/api/codex")
+    return prefix + "/usage"
+
+
+def _probe_codex_quota_restored(
+    access_token: Any,
+    *,
+    base_url: Optional[str] = None,
+    min_interval_seconds: float = CODEX_QUOTA_PROBE_MIN_INTERVAL_SECONDS,
+) -> Optional[bool]:
+    """Ask the Codex usage endpoint whether this account's quota is usable again.
+
+    Hermes persists a Codex 429's ``reset_at`` locally and freezes the
+    credential until it elapses — but the upstream window can reopen EARLY
+    (the user redeems a banked rate-limit reset via the Codex CLI/ChatGPT UI,
+    upgrades their plan, or OpenAI resets the window).  This probe detects
+    that: it GETs the same ``/usage`` endpoint the Codex CLI uses and checks
+    the reported windows.
+
+    Returns:
+      * ``True``  — every reported rate-limit window is below 100% used;
+        the account can serve requests again and stale local cooldowns
+        should be lifted.
+      * ``False`` — a window is still fully used (or the probe itself 429'd);
+        keep the cooldown.
+      * ``None``  — indeterminate (no token, network error, unexpected
+        payload/status); keep the cooldown.
+
+    Probes are throttled per access token (module-local cache) so the hot
+    selection path can fire this freely.
+    """
+    token = str(access_token or "").strip()
+    if not token:
+        return None
+    # Real Codex access tokens are JWTs. Refusing to probe non-JWT tokens
+    # avoids pointless network calls for corrupt/placeholder entries (and
+    # keeps hermetic test fixtures with dummy tokens offline).
+    if not _decode_jwt_claims(token):
+        return None
+    cache_key = hashlib.sha256(token.encode("utf-8")).hexdigest()[:16]
+    now = time.monotonic()
+    with _codex_quota_probe_lock:
+        cached = _codex_quota_probe_cache.get(cache_key)
+        if cached is not None and (now - cached[0]) < min_interval_seconds:
+            return cached[1]
+        # Reserve the slot immediately so concurrent selectors don't stampede
+        # the endpoint while this probe is in flight.
+        _codex_quota_probe_cache[cache_key] = (now, None)
+
+    result: Optional[bool] = None
+    try:
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "codex-cli",
+        }
+        # Best-effort ChatGPT-Account-Id from the JWT (the backend requires it
+        # for some account shapes; harmless to omit for others).
+        claims = _decode_jwt_claims(token)
+        account_id = (
+            claims.get("https://api.openai.com/auth", {}).get("chatgpt_account_id")
+            if isinstance(claims.get("https://api.openai.com/auth"), dict)
+            else None
+        )
+        if isinstance(account_id, str) and account_id.strip():
+            headers["ChatGPT-Account-Id"] = account_id.strip()
+        with httpx.Client(timeout=10.0) as client:
+            response = client.get(_codex_usage_probe_url(base_url), headers=headers)
+        if response.status_code == 200:
+            payload = response.json() or {}
+            rate_limit = payload.get("rate_limit") or {}
+            worst_used: Optional[float] = None
+            for key in ("primary_window", "secondary_window"):
+                used = (rate_limit.get(key) or {}).get("used_percent")
+                if isinstance(used, (int, float)):
+                    worst_used = max(worst_used or 0.0, float(used))
+            if worst_used is not None:
+                result = worst_used < 100.0
+        elif response.status_code == 429:
+            result = False
+    except Exception:
+        logger.debug("Codex quota probe failed", exc_info=True)
+        result = None
+
+    with _codex_quota_probe_lock:
+        _codex_quota_probe_cache[cache_key] = (now, result)
+    return result
+
+
+def clear_codex_pool_quota_cooldowns(access_token: Optional[str] = None) -> int:
+    """Clear rate-limit cooldowns on persisted openai-codex pool entries.
+
+    Called after the upstream quota is KNOWN to be restored (a successful
+    ``/usage reset`` redemption, or a positive live probe) so auth.json stops
+    freezing credentials behind a stale ``last_error_reset_at``.  Only lifts
+    ``exhausted`` entries whose error metadata is 429/quota-shaped — DEAD
+    (terminal auth) entries and non-rate-limit failures are untouched.
+
+    When *access_token* is given, only the matching entry is cleared;
+    otherwise every rate-limited entry clears (a redeemed banked reset
+    restores the whole account, and any entry that is genuinely still
+    exhausted just re-freezes with fresh metadata on its next 429).
+
+    Returns the number of entries cleared.
+    """
+    cleared = 0
+    try:
+        with _auth_store_lock():
+            auth_store = _load_auth_store()
+            pool = auth_store.get("credential_pool")
+            entries = pool.get("openai-codex") if isinstance(pool, dict) else None
+            if not isinstance(entries, list):
+                return 0
+            for entry in entries:
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("last_status") != "exhausted":
+                    continue
+                if access_token and str(entry.get("access_token") or "") != access_token:
+                    continue
+                if not _is_codex_rate_limit_shaped(
+                    entry.get("last_error_code"),
+                    entry.get("last_error_reason"),
+                    entry.get("last_error_message"),
+                ):
+                    continue
+                entry["last_status"] = None
+                entry["last_status_at"] = None
+                entry["last_error_code"] = None
+                entry["last_error_reason"] = None
+                entry["last_error_message"] = None
+                entry["last_error_reset_at"] = None
+                cleared += 1
+            if cleared:
+                _save_auth_store(auth_store)
+    except Exception:
+        logger.debug("Failed to clear Codex pool quota cooldowns", exc_info=True)
+    return cleared
 
 
 def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
@@ -4024,6 +4117,8 @@ def _codex_pool_rate_limit_status() -> Optional[Dict[str, Any]]:
                 "reset_at": reset_at,
                 "reason": entry.get("last_error_reason"),
                 "message": entry.get("last_error_message"),
+                "access_token": token.strip(),
+                "base_url": entry.get("base_url"),
             }
     except Exception:
         logger.debug("Codex pool rate-limit lookup failed", exc_info=True)
@@ -4171,6 +4266,60 @@ def _read_xai_oauth_tokens(*, _lock: bool = True) -> Dict[str, Any]:
     }
 
 
+def _profile_has_own_xai_oauth_state(auth_store: Dict[str, Any]) -> bool:
+    """True when this store has its OWN ``providers.xai-oauth`` block.
+
+    Distinguishes a profile that genuinely shadows the root xAI grant from
+    one that only *reads* root via ``_load_provider_state``'s fallback. Only
+    the latter needs the refresh write-through below.
+    """
+    providers = auth_store.get("providers")
+    return isinstance(providers, dict) and isinstance(providers.get("xai-oauth"), dict)
+
+
+def _write_through_xai_oauth_to_global_root(state: Dict[str, Any]) -> None:
+    """Persist a rotated xAI OAuth ``state`` into the global-root auth.json.
+
+    Best-effort write-through for the multi-profile rotation hazard (#43589):
+    xAI rotates the refresh_token on every refresh, so when a profile session
+    refreshes a grant it resolved from the root fallback, the rotated chain
+    must land back in root. Otherwise root keeps a now-revoked refresh token
+    and every other profile reading the stale root grant dies with
+    ``invalid_grant`` once its access token expires.
+
+    Only updates ``providers.xai-oauth`` in the root store; never touches the
+    profile store (the caller already saved that). Swallows all errors — a
+    failed write-through degrades to the pre-existing behavior (root stale),
+    it must never break the profile's own successful save.
+    """
+    global_path = _global_auth_file_path()
+    if global_path is None:
+        # Classic mode (profile == root); the profile save already hit root.
+        return
+    # Seat belt: under pytest, refuse to write the real user's
+    # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
+    # (mirrors the read-side guard in _load_global_auth_store). Uses the
+    # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return
+            except Exception:
+                return
+    try:
+        _persist_provider_state_to_store(
+            "xai-oauth",
+            state,
+            global_path,
+            set_active=False,
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug("xAI OAuth: write-through to global root failed: %s", exc)
+
+
 def _save_xai_oauth_tokens(
     tokens: Dict[str, Any],
     *,
@@ -4178,25 +4327,17 @@ def _save_xai_oauth_tokens(
     redirect_uri: str = "",
     last_refresh: Optional[str] = None,
     auth_mode: str = "oauth_device_code",
-    to_active_profile: bool = False,
 ) -> None:
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    transaction = (
-        _auth_store_lock()
-        if to_active_profile
-        else _provider_state_transaction("xai-oauth")
-    )
-    with transaction as transaction_value:
-        if to_active_profile:
-            auth_store = _load_auth_store()
-            providers = auth_store.get("providers")
-            raw_state = providers.get("xai-oauth") if isinstance(providers, dict) else None
-            state = dict(raw_state) if isinstance(raw_state, dict) else {}
-            source_path = _auth_file_path()
-        else:
-            auth_store, state, source_path = transaction_value
-            state = state or {}
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        # A profile that lacks its own xai-oauth block is reading the root
+        # grant through _load_provider_state's fallback. When such a profile
+        # refreshes the (rotating) grant, we must write the rotated chain back
+        # to root too, or root is left holding a revoked refresh token (#43589).
+        write_through_to_root = not _profile_has_own_xai_oauth_state(auth_store)
+        state = _load_provider_state(auth_store, "xai-oauth") or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -4204,13 +4345,10 @@ def _save_xai_oauth_tokens(
             state["discovery"] = discovery
         if redirect_uri:
             state["redirect_uri"] = redirect_uri
-        _save_provider_state_to_source(
-            auth_store,
-            "xai-oauth",
-            state,
-            source_path,
-            set_active=to_active_profile,
-        )
+        _save_provider_state(auth_store, "xai-oauth", state)
+        _save_auth_store(auth_store)
+        if write_through_to_root:
+            _write_through_xai_oauth_to_global_root(state)
 
 
 def _xai_access_token_is_expiring(access_token: str, skew_seconds: int = 0) -> bool:
@@ -4572,13 +4710,7 @@ def resolve_xai_oauth_runtime_credentials(
     if (not should_refresh) and refresh_if_expiring:
         should_refresh = _xai_access_token_is_expiring(access_token, effective_skew)
     if should_refresh:
-        with _provider_state_transaction(
-            "xai-oauth",
-            timeout_seconds=max(
-                float(AUTH_LOCK_TIMEOUT_SECONDS),
-                refresh_timeout_seconds + 5.0,
-            ),
-        ) as (source_store, source_state, source_path):
+        with _auth_store_lock(timeout_seconds=max(float(AUTH_LOCK_TIMEOUT_SECONDS), refresh_timeout_seconds + 5.0)):
             data = _read_xai_oauth_tokens(_lock=False)
             tokens = dict(data["tokens"])
             access_token = str(tokens.get("access_token", "") or "").strip()
@@ -4610,8 +4742,8 @@ def resolve_xai_oauth_runtime_credentials(
                         # Clear dead tokens from auth.json so subsequent sessions fail fast
                         # without a network retry. Mirrors credential_pool.py quarantine.
                         try:
-                            _q_store = source_store
-                            _q_state = dict(source_state or {})
+                            _q_store = _load_auth_store()
+                            _q_state = _load_provider_state(_q_store, "xai-oauth") or {}
                             _q_tokens = dict(_q_state.get("tokens") or {})
                             _q_tokens.pop("access_token", None)
                             _q_tokens.pop("refresh_token", None)
@@ -4619,28 +4751,22 @@ def resolve_xai_oauth_runtime_credentials(
                             _q_state["last_auth_error"] = {
                                 "provider": "xai-oauth",
                                 "code": exc.code or "xai_refresh_failed",
-                                "message": _redact_auth_diagnostic(str(exc)),
+                                "message": str(exc),
                                 "reason": "runtime_refresh_failure",
                                 "relogin_required": True,
                                 "at": datetime.now(timezone.utc).isoformat(),
                             }
-                            _save_provider_state_to_source(
-                                _q_store,
-                                "xai-oauth",
-                                _q_state,
-                                source_path,
-                                set_active=False,
-                            )
+                            _store_provider_state(_q_store, "xai-oauth", _q_state, set_active=False)
+                            _save_auth_store(_q_store)
                         except Exception as _save_exc:
                             logger.debug(
-                                "xAI OAuth: failed to persist quarantined state: %s",
-                                _redact_auth_diagnostic(str(_save_exc)),
+                                "xAI OAuth: failed to persist quarantined state: %s", _save_exc,
                             )
                     raise
 
     base_url = _xai_validate_inference_base_url(
-        _profile_env("HERMES_XAI_BASE_URL").strip().rstrip("/")
-        or _profile_env("XAI_BASE_URL").strip().rstrip("/"),
+        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
+        or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
         fallback=DEFAULT_XAI_OAUTH_BASE_URL,
     )
     return {
@@ -4694,9 +4820,9 @@ def _resolve_verify(
     effective_ca = (
         ca_bundle
         or tls_state.get("ca_bundle")
-        or _deployment_env("HERMES_CA_BUNDLE")
-        or _deployment_env("SSL_CERT_FILE")
-        or _deployment_env("REQUESTS_CA_BUNDLE")
+        or os.getenv("HERMES_CA_BUNDLE")
+        or os.getenv("SSL_CERT_FILE")
+        or os.getenv("REQUESTS_CA_BUNDLE")
     )
 
     if effective_insecure:
@@ -4833,7 +4959,7 @@ def _nous_shared_auth_dir() -> Path:
     ``<HERMES_HOME>/shared/``. Sits outside any named profile so all
     profiles under the same root share the store.
     """
-    override = _deployment_env("HERMES_SHARED_AUTH_DIR").strip()
+    override = os.getenv("HERMES_SHARED_AUTH_DIR", "").strip()
     if override:
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
@@ -4988,12 +5114,11 @@ def _write_shared_nous_state(state: Dict[str, Any]) -> None:
                     pass
         _oauth_trace(
             "nous_shared_store_written",
+            path=str(path),
+            refresh_token_fp=_token_fingerprint(refresh_token),
         )
     except Exception as exc:
-        logger.debug(
-            "Failed to write shared Nous auth store: %s",
-            _redact_auth_diagnostic(str(exc)),
-        )
+        logger.debug("Failed to write shared Nous auth store: %s", exc)
 
 
 def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
@@ -5013,10 +5138,7 @@ def _read_shared_nous_state() -> Optional[Dict[str, Any]]:
     try:
         payload = json.loads(path.read_text())
     except (OSError, ValueError) as exc:
-        logger.debug(
-            "Shared Nous auth store is unreadable: %s",
-            _redact_auth_diagnostic(str(exc)),
-        )
+        logger.debug("Shared Nous auth store at %s is unreadable: %s", path, exc)
         return None
     if not isinstance(payload, dict):
         return None
@@ -5040,10 +5162,7 @@ def _clear_shared_nous_state(reason: str) -> None:
                 pass
         _oauth_trace("nous_shared_store_cleared", reason=reason)
     except Exception as exc:
-        logger.debug(
-            "Failed to clear shared Nous auth store: %s",
-            _redact_auth_diagnostic(str(exc)),
-        )
+        logger.debug("Failed to clear shared Nous auth store: %s", exc)
 
 
 def _is_terminal_nous_refresh_error(exc: Exception) -> bool:
@@ -5109,8 +5228,10 @@ def _quarantine_nous_oauth_state(
     # is already empty, which is too late to root-cause. A managed log drain may
     # be WARNING-only, so this MUST be logger.warning (INFO never reaches it).
     #
-    # Redaction safety: diagnostics are value-free. Do not include raw or
-    # derived token material, and do not include the profile's absolute path.
+    # Redaction safety: emit ONLY the 12-char SHA-256 hex prefix of the refresh
+    # token (correlates to NAS's refreshTokenHash without leaking the secret) plus
+    # sizes/booleans. NEVER pass a raw token/agent_key into the log call — Hermes
+    # has a known bug class where credential-shaped literals get corrupted in logs.
     forensic: Dict[str, Any] = {
         "reason": reason,
         "error_code": error.code,
@@ -5118,11 +5239,13 @@ def _quarantine_nous_oauth_state(
         # agent_key_id (both non-secret routing identifiers).
         "client_id": state.get("client_id"),
         "agent_key_id": state.get("agent_key_id"),
+        "refresh_token_fp": _token_fingerprint(state.get("refresh_token")),
     }
 
     # On-disk integrity of the auth store at the moment of quarantine.
     try:
         auth_path = _auth_file_path()
+        forensic["auth_json_path"] = str(auth_path)
         try:
             st = os.stat(auth_path)
             forensic["auth_json_size"] = st.st_size
@@ -5168,7 +5291,7 @@ def _quarantine_nous_oauth_state(
     state["last_auth_error"] = {
         "provider": "nous",
         "code": error.code,
-        "message": _redact_auth_diagnostic(str(error)),
+        "message": str(error),
         "reason": reason,
         "relogin_required": True,
         "at": datetime.now(timezone.utc).isoformat(),
@@ -5268,14 +5391,14 @@ def _try_import_shared_nous_state(
         )
         if _is_terminal_nous_refresh_error(exc):
             _clear_shared_nous_state("shared_import_terminal_refresh_failure")
-        logger.debug("Shared Nous import failed: %s", _redact_auth_diagnostic(str(exc)))
+        logger.debug("Shared Nous import failed: %s", exc)
         return None
     except Exception as exc:
         _oauth_trace(
             "nous_shared_import_failed",
             error_type=type(exc).__name__,
         )
-        logger.debug("Shared Nous import failed: %s", _redact_auth_diagnostic(str(exc)))
+        logger.debug("Shared Nous import failed: %s", exc)
         return None
 
     return refreshed
@@ -5727,13 +5850,8 @@ def _sync_nous_pool_from_auth_store() -> None:
         from agent.credential_pool import load_pool
 
         load_pool("nous")
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
-        logger.debug(
-            "Failed to sync Nous credential pool from auth store: %s",
-            _redact_auth_diagnostic(str(exc)),
-        )
+        logger.debug("Failed to sync Nous credential pool from auth store: %s", exc)
 
 
 def resolve_nous_runtime_credentials(
@@ -5771,8 +5889,8 @@ def resolve_nous_runtime_credentials(
             """Resolve every routing value that shared OAuth state can replace."""
             portal_url = (
                 _optional_base_url(state.get("portal_base_url"))
-                or _profile_env("HERMES_PORTAL_BASE_URL")
-                or _profile_env("NOUS_PORTAL_BASE_URL")
+                or os.getenv("HERMES_PORTAL_BASE_URL")
+                or os.getenv("NOUS_PORTAL_BASE_URL")
                 or DEFAULT_NOUS_PORTAL_URL
             ).rstrip("/")
 
@@ -5862,6 +5980,8 @@ def resolve_nous_runtime_credentials(
                 "nous_state_persisted",
                 sequence_id=sequence_id,
                 reason=reason,
+                refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
+                access_token_fp=_token_fingerprint(state.get("access_token")),
             )
             persisted_state = dict(state)
             state_persisted = True
@@ -5876,6 +5996,7 @@ def resolve_nous_runtime_credentials(
         _oauth_trace(
             "nous_runtime_credentials_start",
             sequence_id=sequence_id,
+            refresh_token_fp=_token_fingerprint(state.get("refresh_token")),
         )
 
         with httpx.Client(timeout=timeout, headers={"Accept": "application/json"}, verify=verify) as client:
@@ -5941,6 +6062,7 @@ def resolve_nous_runtime_credentials(
                             "refresh_start",
                             sequence_id=sequence_id,
                             reason=refresh_reason,
+                            refresh_token_fp=_token_fingerprint(refresh_token),
                         )
                         try:
                             refreshed = _refresh_access_token(
@@ -5963,6 +6085,7 @@ def resolve_nous_runtime_credentials(
                             raise
                         now = datetime.now(timezone.utc)
                         access_ttl = _coerce_ttl_seconds(refreshed.get("expires_in"))
+                        previous_refresh_token = refresh_token
                         state["access_token"] = refreshed["access_token"]
                         state["refresh_token"] = refreshed.get("refresh_token") or refresh_token
                         state["token_type"] = refreshed.get("token_type") or state.get("token_type") or "Bearer"
@@ -5995,6 +6118,8 @@ def resolve_nous_runtime_credentials(
                             "refresh_success",
                             sequence_id=sequence_id,
                             reason=refresh_reason,
+                            previous_refresh_token_fp=_token_fingerprint(previous_refresh_token),
+                            new_refresh_token_fp=_token_fingerprint(refresh_token),
                         )
                         # Persist immediately so validation failures cannot drop rotated refresh tokens.
                         _persist_state("post_refresh_access_token")
@@ -6127,8 +6252,6 @@ def _snapshot_nous_pool_status() -> Dict[str, Any]:
             "credential_source": f"pool:{label}",
             "source": f"pool:{label}",
         }
-    except UnscopedSecretError:
-        raise
     except Exception:
         return _empty_nous_auth_status()
 
@@ -6294,8 +6417,6 @@ def get_nous_session_validity() -> str:
     # so we report "terminal" even after the in-memory AuthError is long gone.
     try:
         state = get_provider_auth_state("nous")
-    except UnscopedSecretError:
-        raise
     except Exception:
         state = None
 
@@ -6310,8 +6431,6 @@ def get_nous_session_validity() -> str:
 
     try:
         status = get_nous_auth_status()
-    except UnscopedSecretError:
-        raise
     except Exception:
         # Status computation itself failed — indeterminate, not terminal.
         return NOUS_SESSION_UNKNOWN
@@ -6373,8 +6492,6 @@ def get_codex_auth_status() -> Dict[str, Any]:
                     ),
                     "reset_at": rate_limit.get("reset_at"),
                 }
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -6421,8 +6538,6 @@ def get_xai_oauth_auth_status() -> Dict[str, Any]:
                         "source": f"pool:{getattr(entry, 'label', 'unknown')}",
                         "api_key": api_key,
                     }
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -6456,7 +6571,7 @@ def get_api_key_provider_status(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = _profile_env(pconfig.base_url_env_var).strip()
+        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -6482,17 +6597,13 @@ def get_external_process_provider_status(provider_id: str) -> Dict[str, Any]:
         return {"configured": False}
 
     command = (
-        _deployment_env("HERMES_COPILOT_ACP_COMMAND").strip()
-        or _deployment_env("COPILOT_CLI_PATH").strip()
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
-    raw_args = _deployment_env("HERMES_COPILOT_ACP_ARGS").strip()
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
-    base_url = (
-        _profile_env(pconfig.base_url_env_var).strip()
-        if pconfig.base_url_env_var
-        else ""
-    )
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
@@ -6563,8 +6674,6 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config, get_env_value_prefer_dotenv
         cfg = load_config()
-    except UnscopedSecretError:
-        raise
     except Exception:
         cfg = {}
 
@@ -6588,15 +6697,9 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
             entra_cfg = {}
             if isinstance(model_cfg, dict) and isinstance(model_cfg.get("entra"), dict):
                 entra_cfg = model_cfg["entra"]
-            stored_identity_config = EntraIdentityConfig.from_dict(
+            identity_config = EntraIdentityConfig.from_dict(
                 entra_cfg,
                 default_scope=SCOPE_AI_AZURE_DEFAULT,
-            )
-            identity_config = EntraIdentityConfig.from_active_scope(
-                scope=stored_identity_config.scope,
-                exclude_interactive_browser=(
-                    stored_identity_config.exclude_interactive_browser
-                ),
             )
             info["azure_identity_installed"] = installed
             info["scope"] = identity_config.scope
@@ -6615,15 +6718,16 @@ def _get_azure_foundry_auth_status() -> Dict[str, Any]:
                     "is skipped here. Run `hermes doctor` to verify token acquisition."
                 )
             return info
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
             info["logged_in"] = False
             info["error"] = f"azure-identity check failed: {exc}"
             return info
 
     # api_key mode (default)
-    api_key = _profile_env("AZURE_FOUNDRY_API_KEY")
+    try:
+        api_key = get_env_value_prefer_dotenv("AZURE_FOUNDRY_API_KEY") or ""
+    except Exception:
+        api_key = os.getenv("AZURE_FOUNDRY_API_KEY", "")
     info["logged_in"] = has_usable_secret(api_key)
     return info
 
@@ -6654,7 +6758,7 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
 
     env_url = ""
     if pconfig.base_url_env_var:
-        env_url = _profile_env(pconfig.base_url_env_var).strip()
+        env_url = os.getenv(pconfig.base_url_env_var, "").strip()
 
     if provider_id in {"kimi-coding", "kimi-coding-cn"}:
         base_url = _resolve_kimi_base_url(api_key, pconfig.inference_base_url, env_url)
@@ -6678,8 +6782,6 @@ def resolve_api_key_provider_credentials(provider_id: str) -> Dict[str, Any]:
                 resolved = (resolved or "").strip()
                 if resolved:
                     base_url = resolved
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
             logger.debug("Copilot base URL resolution fell back to default: %s", exc)
     elif env_url:
@@ -6714,20 +6816,16 @@ def resolve_external_process_provider_credentials(provider_id: str) -> Dict[str,
             code="invalid_provider",
         )
 
-    base_url = (
-        _profile_env(pconfig.base_url_env_var).strip()
-        if pconfig.base_url_env_var
-        else ""
-    )
+    base_url = os.getenv(pconfig.base_url_env_var, "").strip() if pconfig.base_url_env_var else ""
     if not base_url:
         base_url = pconfig.inference_base_url
 
     command = (
-        _deployment_env("HERMES_COPILOT_ACP_COMMAND").strip()
-        or _deployment_env("COPILOT_CLI_PATH").strip()
+        os.getenv("HERMES_COPILOT_ACP_COMMAND", "").strip()
+        or os.getenv("COPILOT_CLI_PATH", "").strip()
         or "copilot"
     )
-    raw_args = _deployment_env("HERMES_COPILOT_ACP_ARGS").strip()
+    raw_args = os.getenv("HERMES_COPILOT_ACP_ARGS", "").strip()
     args = shlex.split(raw_args) if raw_args else ["--acp", "--stdio"]
     resolved_command = shutil.which(command) if command else None
     if not resolved_command and not base_url.startswith("acp+tcp://"):
@@ -6936,9 +7034,15 @@ def _prompt_model_selection(
     If *unavailable_models* is provided, those models are shown grayed out
     and unselectable, with an upgrade link to *portal_url*.
     """
-    from hermes_cli.models import _format_price_per_mtok
+    from hermes_cli.models import (
+        _format_price_per_mtok,
+        compute_sale_discount,
+    )
 
     _unavailable = unavailable_models or []
+    # Sale chrome (★ / -N% / was) is Nous Portal-only — never for OpenRouter
+    # or other providers even if pricing.original is somehow present.
+    sale_chrome = (confirm_provider or "").strip().lower() == "nous"
 
     def _confirmed_selection(mid: str) -> Optional[str]:
         if not mid:
@@ -6965,16 +7069,31 @@ def _prompt_model_selection(
 
     # Column-aligned labels when pricing is available
     has_pricing = bool(pricing and any(pricing.get(m) for m in all_models))
-    name_col = max((len(m) for m in all_models), default=0) + 2 if has_pricing else 0
+    # Leave room for a leading "★ " on sale rows (Nous only).
+    name_pad = 3 if sale_chrome else 2
+    name_col = (
+        max((len(m) for m in all_models), default=0) + name_pad
+        if has_pricing
+        else 0
+    )
 
-    # Pre-compute formatted prices and dynamic column widths
-    _price_cache: dict[str, tuple[str, str, str]] = {}
+    # Pre-compute formatted prices and sale chrome.
+    # (inp, out, cache, pct|None, was_inp, was_out)
+    # Sale chrome is drawn as curses/ANSI segments (yellow % / dim "was"),
+    # not baked into a single plain string — curses addnstr would otherwise
+    # render escape bytes literally.
+    _price_cache: dict[str, tuple[str, str, str, int | None, str, str]] = {}
     price_col = 3  # minimum width
     cache_col = 0  # only set if any model has cache pricing
     has_cache = False
+    any_on_sale = False
+    _DIM = "\033[2m"
+    _RESET = "\033[0m"
     if has_pricing:
         for mid in all_models:
             p = pricing.get(mid)  # type: ignore[union-attr]
+            pct: int | None = None
+            was_inp = was_out = ""
             if p:
                 inp = _format_price_per_mtok(p.get("prompt", ""))
                 out = _format_price_per_mtok(p.get("completion", ""))
@@ -6982,26 +7101,68 @@ def _prompt_model_selection(
                 cache = _format_price_per_mtok(cache_read) if cache_read else ""
                 if cache:
                     has_cache = True
+                if sale_chrome:
+                    sale = compute_sale_discount(
+                        p.get("prompt", ""),
+                        p.get("completion", ""),
+                        p.get("original"),
+                    )
+                    if sale is not None:
+                        any_on_sale = True
+                        pct, was_prompt_raw, was_out_raw = sale
+                        was_inp = (
+                            _format_price_per_mtok(was_prompt_raw)
+                            if was_prompt_raw != ""
+                            else "?"
+                        )
+                        was_out = (
+                            _format_price_per_mtok(was_out_raw)
+                            if was_out_raw != ""
+                            else "?"
+                        )
             else:
                 inp, out, cache = "", "", ""
-            _price_cache[mid] = (inp, out, cache)
+            _price_cache[mid] = (inp, out, cache, pct, was_inp, was_out)
             price_col = max(price_col, len(inp), len(out))
             cache_col = max(cache_col, len(cache))
         if has_cache:
             cache_col = max(cache_col, 5)  # minimum: "Cache" header
 
-    def _label(mid):
-        if has_pricing:
-            inp, out, cache = _price_cache.get(mid, ("", "", ""))
-            price_part = f" {inp:>{price_col}}  {out:>{price_col}}"
-            if has_cache:
-                price_part += f"  {cache:>{cache_col}}"
-            base = f"{mid:<{name_col}}{price_part}"
+    def _label_segments(mid):
+        """Build a rich radiolist row: yellow ★/% , dim was, plain prices."""
+        if not has_pricing:
+            segs: list[tuple[str, str | None]] = [(mid, None)]
+            if mid == current_model:
+                segs.append(("  ← currently in use", None))
+            return segs
+
+        inp, out, cache, pct, was_inp, was_out = _price_cache.get(
+            mid, ("", "", "", None, "", "")
+        )
+        on_sale = pct is not None
+        # Reserve 2 columns for "★ " so sale and non-sale names share alignment.
+        star_w = 2
+        if on_sale:
+            name_segs: list[tuple[str, str | None]] = [
+                ("★ ", "yellow"),
+                (f"{mid:<{name_col - star_w}}", None),
+            ]
         else:
-            base = mid
+            name_segs = [(f"{mid:<{name_col}}", None)]
+
+        price_part = f" {inp:>{price_col}}  {out:>{price_col}}"
+        if has_cache:
+            price_part += f"  {cache:>{cache_col}}"
+        segs = [*name_segs, (price_part, None)]
+        if on_sale:
+            segs.append((f"  -{pct}%", "yellow"))
+            segs.append((f"  was {was_inp}/{was_out}", "dim"))
         if mid == current_model:
-            base += "  ← currently in use"
-        return base
+            segs.append(("  ← currently in use", None))
+        return segs
+
+    def _label(mid):
+        return "".join(text for text, _style in _label_segments(mid))
 
     # Default cursor on the current model (index 0 if it was reordered to top)
     default_idx = 0
@@ -7016,11 +7177,11 @@ def _prompt_model_selection(
         header = f"\n{pad}{'':>{name_col}} {'In':>{price_col}}  {'Out':>{price_col}}"
         if has_cache:
             header += f"  {'Cache':>{cache_col}}"
-        menu_title += header + "  /Mtok"
-
-    # ANSI escape for dim text
-    _DIM = "\033[2m"
-    _RESET = "\033[0m"
+        # Legend lives on the column-header line so it reads as a key
+        # (★ = on sale), not a fake menu row.
+        menu_title += header + "  $/Mtok"
+        if any_on_sale:
+            menu_title += "  ★ = on sale"
 
     # Try arrow-key menu first, fall back to number input.
     # Uses the shared curses radiolist (ESC/arrow-key handling that works
@@ -7030,7 +7191,7 @@ def _prompt_model_selection(
     try:
         from hermes_cli.curses_ui import curses_radiolist
 
-        choices = [_label(mid) for mid in ordered]
+        choices = [_label_segments(mid) for mid in ordered]
         choices.append("Enter custom model name")
         choices.append("Skip (keep current)")
 
@@ -7044,8 +7205,8 @@ def _prompt_model_selection(
         # screen clear. menu_title already embeds the aligned price header.
         desc_lines: list[str] = []
         if has_pricing:
-            # menu_title is "Select default model:\n<pad><header>  /Mtok"
-            # Keep only the header portion for the description.
+            # menu_title is "Select default model:\n<pad><header>  $/Mtok\n…"
+            # Keep only the header/legend portion for the description.
             header_part = menu_title.split("\n", 1)
             if len(header_part) > 1:
                 desc_lines.extend(header_part[1].splitlines())
@@ -7078,11 +7239,18 @@ def _prompt_model_selection(
     except (ImportError, NotImplementedError, OSError, subprocess.SubprocessError):
         pass
 
-    # Fallback: numbered list
-    print(menu_title)
+    # Fallback: numbered list (ANSI colors for sale chrome)
+    from hermes_cli.curses_ui import format_radio_item_ansi
+    from hermes_cli.colors import Colors, color
+
+    for line in menu_title.splitlines():
+        if "★" in line:
+            print(line.replace("★", color("★", Colors.YELLOW), 1))
+        else:
+            print(line)
     num_width = len(str(len(ordered) + 2))
     for i, mid in enumerate(ordered, 1):
-        print(f"  {i:>{num_width}}. {_label(mid)}")
+        print(f"  {i:>{num_width}}. {format_radio_item_ansi(_label_segments(mid))}")
     n = len(ordered)
     print(f"  {n + 1:>{num_width}}. Enter custom model name")
     print(f"  {n + 2:>{num_width}}. Skip (keep current)")
@@ -7190,11 +7358,8 @@ def _login_openai_codex(
             except (EOFError, KeyboardInterrupt):
                 do_import = "n"
             if do_import in {"y", "yes"}:
-                _save_codex_tokens(cli_tokens, to_active_profile=True)
-                base_url = (
-                    _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
-                    or DEFAULT_CODEX_BASE_URL
-                )
+                _save_codex_tokens(cli_tokens)
+                base_url = os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/") or DEFAULT_CODEX_BASE_URL
                 config_path = _update_config_for_provider("openai-codex", base_url)
                 print()
                 print("Credentials imported. Note: if Codex CLI refreshes its token,")
@@ -7211,11 +7376,7 @@ def _login_openai_codex(
     creds = _codex_device_code_login()
 
     # Save tokens to Hermes auth store
-    _save_codex_tokens(
-        creds["tokens"],
-        creds.get("last_refresh"),
-        to_active_profile=True,
-    )
+    _save_codex_tokens(creds["tokens"], creds.get("last_refresh"))
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
@@ -7274,7 +7435,6 @@ def _login_xai_oauth(
         redirect_uri=creds.get("redirect_uri", ""),
         last_refresh=creds.get("last_refresh"),
         auth_mode="oauth_device_code",
-        to_active_profile=True,
     )
     # An explicit interactive re-login is a strong signal the user wants the
     # xAI credential re-enabled. ``hermes auth remove xai-oauth`` leaves a
@@ -7458,8 +7618,8 @@ def _xai_oauth_device_code_login(
             code="xai_device_token_invalid",
         )
     base_url = _xai_validate_inference_base_url(
-        _profile_env("HERMES_XAI_BASE_URL").strip().rstrip("/")
-        or _profile_env("XAI_BASE_URL").strip().rstrip("/"),
+        os.getenv("HERMES_XAI_BASE_URL", "").strip().rstrip("/")
+        or os.getenv("XAI_BASE_URL", "").strip().rstrip("/"),
         fallback=DEFAULT_XAI_OAUTH_BASE_URL,
     )
     return {
@@ -7661,7 +7821,7 @@ def _codex_device_code_login() -> Dict[str, Any]:
 
     # Return tokens for the caller to persist (no longer writes to ~/.codex/)
     base_url = (
-        _profile_env("HERMES_CODEX_BASE_URL").strip().rstrip("/")
+        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
         or DEFAULT_CODEX_BASE_URL
     )
 
@@ -7978,7 +8138,7 @@ def _minimax_oauth_quarantine_on_terminal_refresh(state: Dict[str, Any], exc: Au
     state["last_auth_error"] = {
         "provider": "minimax-oauth",
         "code": exc.code or "refresh_failed",
-        "message": _redact_auth_diagnostic(str(exc)),
+        "message": str(exc),
         "reason": "runtime_refresh_failure",
         "relogin_required": True,
         "at": datetime.now(timezone.utc).isoformat(),
@@ -7986,10 +8146,7 @@ def _minimax_oauth_quarantine_on_terminal_refresh(state: Dict[str, Any], exc: Au
     try:
         _minimax_save_auth_state(state)
     except Exception as _save_exc:
-        logger.debug(
-            "MiniMax OAuth: failed to persist quarantined state: %s",
-            _redact_auth_diagnostic(str(_save_exc)),
-        )
+        logger.debug("MiniMax OAuth: failed to persist quarantined state: %s", _save_exc)
 
 
 def build_minimax_oauth_token_provider() -> Callable[[], str]:
@@ -8128,13 +8285,13 @@ def _nous_device_code_login(
     pconfig = PROVIDER_REGISTRY["nous"]
     portal_base_url = (
         portal_base_url
-        or _profile_env("HERMES_PORTAL_BASE_URL")
-        or _profile_env("NOUS_PORTAL_BASE_URL")
+        or os.getenv("HERMES_PORTAL_BASE_URL")
+        or os.getenv("NOUS_PORTAL_BASE_URL")
         or pconfig.portal_base_url
     ).rstrip("/")
     requested_inference_url = (
         inference_base_url
-        or _profile_env("NOUS_INFERENCE_BASE_URL")
+        or os.getenv("NOUS_INFERENCE_BASE_URL")
         or pconfig.inference_base_url
     ).rstrip("/")
     client_id = client_id or pconfig.client_id
@@ -8262,8 +8419,6 @@ def nous_token_has_billing_scope() -> bool:
     """
     try:
         state = get_provider_auth_state("nous") or {}
-    except UnscopedSecretError:
-        raise
     except Exception:
         return False
     scope = state.get("scope")
@@ -8345,8 +8500,8 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     insecure = bool(getattr(args, "insecure", False))
     ca_bundle = (
         getattr(args, "ca_bundle", None)
-        or _deployment_env("HERMES_CA_BUNDLE")
-        or _deployment_env("SSL_CERT_FILE")
+        or os.getenv("HERMES_CA_BUNDLE")
+        or os.getenv("SSL_CERT_FILE")
     )
 
     try:
@@ -8461,8 +8616,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                             )
                             or ""
                         )
-                    except UnscopedSecretError:
-                        raise
                     except Exception:
                         unavailable_message = ""
                     # The Portal's freeRecommendedModels endpoint is the
@@ -8502,8 +8655,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
                 print(unavailable_message or f"Upgrade at {_url} to access paid models.")
             else:
                 print("No curated models available for Nous Portal.")
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
             message = format_auth_error(exc) if isinstance(exc, AuthError) else str(exc)
             print()
@@ -8542,8 +8693,6 @@ def _login_nous(args, pconfig: ProviderConfig) -> None:
     except KeyboardInterrupt:
         print("\nLogin cancelled.")
         raise SystemExit(130)
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         print(f"Login failed: {exc}")
         raise SystemExit(1)
@@ -8571,7 +8720,7 @@ def logout_command(args) -> None:
         if should_reset_config:
             _reset_config_provider()
         print(f"Logged out of {provider_name}.")
-        if should_reset_config and _profile_env("OPENROUTER_API_KEY"):
+        if should_reset_config and os.getenv("OPENROUTER_API_KEY"):
             print("Hermes will use OpenRouter for inference.")
         elif should_reset_config:
             print("Run `hermes model` or configure an API key to use Hermes.")

@@ -9,7 +9,6 @@ import threading
 import time
 import uuid
 import re
-from contextlib import contextmanager
 from dataclasses import dataclass, fields, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -17,17 +16,11 @@ from typing import Any, Dict, List, Optional, Set, Tuple
 
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.config import load_env
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope as _current_secret_scope,
-    get_secret as _get_secret,
-    is_multiplex_active as _is_multiplex_active,
-)
+from agent.secret_scope import get_secret as _get_secret
 from agent.credential_persistence import (
     is_borrowed_credential_source,
     sanitize_borrowed_credential_payload,
 )
-from agent.redact import redact_for_persistence
 import hermes_cli.auth as auth_mod
 from hermes_cli.auth import (
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
@@ -37,9 +30,11 @@ from hermes_cli.auth import (
     _decode_jwt_claims,
     _load_auth_store,
     _load_provider_state,
-    _read_credential_pool_with_source,
     _resolve_kimi_base_url,
     _resolve_zai_base_url,
+    _save_auth_store,
+    _save_provider_state,
+    _store_provider_state,
     read_credential_pool,
     write_credential_pool,
 )
@@ -61,8 +56,6 @@ def _load_config_safe() -> Optional[dict]:
         from hermes_cli.config import load_config_readonly
 
         return load_config_readonly()
-    except UnscopedSecretError:
-        raise
     except Exception:
         return None
 
@@ -531,23 +524,65 @@ def credential_pool_matches_provider(
 DEFAULT_MAX_CONCURRENT_PER_CREDENTIAL = 1
 
 
+def _write_through_provider_state_to_global_root(
+    provider_id: str, state: Dict[str, Any]
+) -> None:
+    """Persist a rotated OAuth ``state`` into the global-root auth.json.
+
+    Best-effort write-through for the multi-profile rotation hazard
+    (#48415 / #43589): nous, openai-codex, and xai-oauth rotate the
+    refresh_token on refresh, so when a profile pool refresh rotates a grant
+    it resolved from the root fallback, the rotated chain must land back in
+    root. Otherwise root keeps a now-revoked refresh token and every other
+    profile reading the stale root grant dies with ``refresh_token_reused`` /
+    ``invalid_grant`` once its access token expires.
+
+    Only updates ``providers.<provider_id>`` in the root store; never touches
+    the profile store (the caller already saved that). Swallows all errors — a
+    failed write-through degrades to the pre-existing behavior (root stale), it
+    must never break the profile's own successful save. Mirrors
+    ``hermes_cli.auth._write_through_xai_oauth_to_global_root`` (which covers
+    the non-pool xAI refresh path) for the credential-pool refresh path.
+    """
+    try:
+        global_path = auth_mod._global_auth_file_path()
+    except Exception:
+        return
+    if global_path is None:
+        # Classic mode (profile == root); the profile save already hit root.
+        return
+    # Seat belt: under pytest, refuse to write the real user's
+    # ~/.hermes/auth.json even when HERMES_HOME points at a profile path
+    # (mirrors the read-side guard in _load_global_auth_store). Uses the
+    # unmodified HOME env, not Path.home() which fixtures may monkeypatch.
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        real_home_env = os.environ.get("HOME", "")
+        if real_home_env:
+            real_root = Path(real_home_env) / ".hermes" / "auth.json"
+            try:
+                if global_path.resolve(strict=False) == real_root.resolve(strict=False):
+                    return
+            except Exception:
+                return
+    try:
+        auth_mod._persist_provider_state_to_store(
+            provider_id,
+            state,
+            global_path,
+            set_active=False,
+        )
+    except Exception as exc:  # pragma: no cover - best effort
+        logger.debug(
+            "%s pool refresh: write-through to global root failed: %s",
+            provider_id,
+            exc,
+        )
+
+
 class CredentialPool:
-    def __init__(
-        self,
-        provider: str,
-        entries: List[PooledCredential],
-        *,
-        source_path: Optional[Path] = None,
-        source_entry_ids: Optional[Set[str]] = None,
-    ):
+    def __init__(self, provider: str, entries: List[PooledCredential]):
         self.provider = provider
         self._entries = sorted(entries, key=lambda entry: entry.priority)
-        self._source_path = source_path
-        self._source_entry_ids = (
-            set(source_entry_ids)
-            if source_entry_ids is not None
-            else {entry.id for entry in entries}
-        )
         self._current_id: Optional[str] = None
         self._strategy = get_pool_strategy(provider)
         self._lock = threading.Lock()
@@ -583,43 +618,11 @@ class CredentialPool:
                 return
 
     def _persist(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        entries = self._entries
-        removed = list(removed_ids or [])
-        target_path = self._source_path
-        if target_path is not None:
-            try:
-                inherited = not auth_mod._same_path(
-                    target_path,
-                    auth_mod._auth_file_path(),
-                )
-            except Exception:
-                inherited = False
-            if inherited:
-                # Profile-local env/config seeds are runtime-only while the
-                # provider is inherited. Never copy them into the global pool.
-                entries = [
-                    entry
-                    for entry in entries
-                    if entry.id in self._source_entry_ids
-                ]
-                removed = [rid for rid in removed if rid in self._source_entry_ids]
-        write_credential_pool(
-            self.provider,
-            [entry.to_dict() for entry in entries],
-            removed_ids=removed,
-            target_path=target_path,
-        )
-        self._source_entry_ids.difference_update(removed)
-
-    def _persist_to_active(self, *, removed_ids: Optional[List[str]] = None) -> None:
-        """Persist an explicit administrative mutation to the active profile."""
         write_credential_pool(
             self.provider,
             [entry.to_dict() for entry in self._entries],
             removed_ids=removed_ids,
         )
-        self._source_path = auth_mod._auth_file_path()
-        self._source_entry_ids = {entry.id for entry in self._entries}
 
     def _is_terminal_auth_failure(
         self,
@@ -650,9 +653,7 @@ class CredentialPool:
         status_code: Optional[int],
         error_context: Optional[Dict[str, Any]] = None,
     ) -> PooledCredential:
-        normalized_error = redact_for_persistence(
-            _normalize_error_context(error_context)
-        )
+        normalized_error = _normalize_error_context(error_context)
         # Permanent OAuth failures (token_invalidated, token_revoked, etc.)
         # transition to STATUS_DEAD instead of STATUS_EXHAUSTED.  Without this,
         # a revoked credential gets a 1-hour TTL cooldown and then re-enters
@@ -725,10 +726,8 @@ class CredentialPool:
                 self._replace_entry(entry, updated)
                 self._persist()
                 return updated
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
-            logger.debug("Failed to sync from credentials file: %s", redact_for_persistence(str(exc)))
+            logger.debug("Failed to sync from credentials file: %s", exc)
         return entry
 
     def _sync_codex_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -792,7 +791,7 @@ class CredentialPool:
                 self._persist()
                 return updated
         except Exception as exc:
-            logger.debug("Failed to sync Codex entry from auth.json: %s", redact_for_persistence(str(exc)))
+            logger.debug("Failed to sync Codex entry from auth.json: %s", exc)
         return entry
 
     def _sync_xai_oauth_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -850,7 +849,7 @@ class CredentialPool:
                 self._persist()
                 return updated
         except Exception as exc:
-            logger.debug("Failed to sync xAI OAuth entry from auth.json: %s", redact_for_persistence(str(exc)))
+            logger.debug("Failed to sync xAI OAuth entry from auth.json: %s", exc)
         return entry
 
     def _sync_xai_oauth_entry_from_pool_store(
@@ -889,7 +888,7 @@ class CredentialPool:
                 self._replace_entry(entry, stored)
                 return stored
         except Exception as exc:
-            logger.debug("Failed to sync xAI OAuth entry from credential pool: %s", redact_for_persistence(str(exc)))
+            logger.debug("Failed to sync xAI OAuth entry from credential pool: %s", exc)
         return entry
 
     def _sync_nous_entry_from_auth_store(self, entry: PooledCredential) -> PooledCredential:
@@ -961,7 +960,7 @@ class CredentialPool:
                 self._persist()
                 return updated
         except Exception as exc:
-            logger.debug("Failed to sync Nous entry from auth.json: %s", redact_for_persistence(str(exc)))
+            logger.debug("Failed to sync Nous entry from auth.json: %s", exc)
         return entry
 
     def _sync_device_code_entry_to_auth_store(self, entry: PooledCredential) -> None:
@@ -978,8 +977,8 @@ class CredentialPool:
 
         ``set_active=False`` on every write: a pool sync-back is a
         token-rotation side effect, not the user choosing a provider.
-        Setting ``active_provider`` during this write would mean every
-        Nous/Codex/xAI refresh in a multi-provider
+        Using ``_save_provider_state`` (which sets ``active_provider``)
+        here would mean every Nous/Codex/xAI refresh in a multi-provider
         setup silently flips the ``active_provider`` flag — the next
         ``hermes`` invocation that defaults to the active provider
         (e.g. setup wizard, ``hermes auth status``) would land on
@@ -992,21 +991,34 @@ class CredentialPool:
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
         if entry.source != "device_code":
             return
-        provider_id = {
-            "nous": "nous",
-            "openai-codex": "openai-codex",
-            "xai-oauth": "xai-oauth",
-        }.get(self.provider)
-        if provider_id is None:
-            return
         try:
-            with auth_mod._provider_state_transaction(provider_id) as (
-                auth_store,
-                state,
-                source_path,
-            ):
+            with _auth_store_lock():
+                auth_store = _load_auth_store()
+                # Decide BEFORE writing whether this profile is reading the
+                # grant from the global root (no own providers.<id> block) vs.
+                # genuinely shadowing it. A pool refresh rotates single-use
+                # OAuth refresh tokens, so a profile that resolved the grant
+                # from root MUST write the rotated chain back to root too —
+                # otherwise root keeps a revoked refresh token and every other
+                # profile reading the stale root grant dies with
+                # refresh_token_reused / invalid_grant once its access token
+                # expires. This mirrors the xAI write-through in
+                # hermes_cli.auth._save_xai_oauth_tokens (#43589); the pool
+                # refresh path is the Codex/xAI analog reported in #48415.
+                _wt_provider_id = {
+                    "nous": "nous",
+                    "openai-codex": "openai-codex",
+                    "xai-oauth": "xai-oauth",
+                }.get(self.provider)
+                write_through_to_root = bool(_wt_provider_id) and not (
+                    isinstance(auth_store.get("providers"), dict)
+                    and isinstance(
+                        auth_store["providers"].get(_wt_provider_id), dict
+                    )
+                )
                 if self.provider == "nous":
-                    if not isinstance(state, dict):
+                    state = _load_provider_state(auth_store, "nous")
+                    if state is None:
                         return
                     state["access_token"] = entry.access_token
                     if entry.refresh_token:
@@ -1025,8 +1037,10 @@ class CredentialPool:
                             state[extra_key] = val
                     if entry.inference_base_url:
                         state["inference_base_url"] = entry.inference_base_url
+                    _store_provider_state(auth_store, "nous", state, set_active=False)
 
                 elif self.provider == "openai-codex":
+                    state = _load_provider_state(auth_store, "openai-codex")
                     if not isinstance(state, dict):
                         return
                     tokens = state.get("tokens")
@@ -1037,8 +1051,10 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(auth_store, "openai-codex", state, set_active=False)
 
                 elif self.provider == "xai-oauth":
+                    state = _load_provider_state(auth_store, "xai-oauth")
                     if not isinstance(state, dict):
                         return
                     tokens = state.get("tokens")
@@ -1049,52 +1065,18 @@ class CredentialPool:
                         tokens["refresh_token"] = entry.refresh_token
                     if entry.last_refresh:
                         state["last_refresh"] = entry.last_refresh
+                    _store_provider_state(auth_store, "xai-oauth", state, set_active=False)
 
-                auth_mod._save_provider_state_to_source(
-                    auth_store,
-                    provider_id,
-                    state,
-                    source_path,
-                    set_active=False,
-                )
-        except UnscopedSecretError:
-            raise
-        except Exception as exc:
-            logger.debug(
-                "Failed to sync %s pool entry back to auth store: %s",
-                self.provider,
-                redact_for_persistence(str(exc)),
-            )
+                else:
+                    return
 
-    @contextmanager
-    def _single_use_refresh_transaction(self):
-        """Lock every auth store that can own a rotating OAuth grant."""
-        timeout = self._single_use_refresh_lock_timeout()
-        with auth_mod._provider_state_transaction(
-            self.provider,
-            timeout_seconds=timeout,
-        ) as (_auth_store, _state, provider_source_path):
-            pool_source_path = self._source_path
-            active_path = auth_mod._auth_file_path()
-            needs_pool_source_lock = (
-                pool_source_path is not None
-                and not auth_mod._same_path(pool_source_path, active_path)
-                and (
-                    provider_source_path is None
-                    or not auth_mod._same_path(
-                        pool_source_path,
-                        provider_source_path,
+                _save_auth_store(auth_store)
+                if write_through_to_root and _wt_provider_id:
+                    _write_through_provider_state_to_global_root(
+                        _wt_provider_id, state
                     )
-                )
-            )
-            if needs_pool_source_lock:
-                with _auth_store_lock(
-                    timeout_seconds=timeout,
-                    target_path=pool_source_path,
-                ):
-                    yield
-            else:
-                yield
+        except Exception as exc:
+            logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
     def _refresh_entry(self, entry: PooledCredential, *, force: bool) -> Optional[PooledCredential]:
         if entry.auth_type != AUTH_TYPE_OAUTH or not entry.refresh_token:
@@ -1117,7 +1099,9 @@ class CredentialPool:
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
             )
-            with self._single_use_refresh_transaction():
+            with _auth_store_lock(
+                timeout_seconds=self._single_use_refresh_lock_timeout()
+            ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
                     if synced is not entry:
@@ -1181,10 +1165,7 @@ class CredentialPool:
                             refreshed["expires_at_ms"],
                         )
                     except Exception as wexc:
-                        logger.debug(
-                            "Failed to write refreshed token to credentials file: %s",
-                            redact_for_persistence(str(wexc)),
-                        )
+                        logger.debug("Failed to write refreshed token to credentials file: %s", wexc)
             elif self.provider == "openai-codex":
                 # Adopt fresher tokens from auth.json before spending the
                 # refresh_token — single-use tokens consumed by another Hermes
@@ -1232,15 +1213,8 @@ class CredentialPool:
                 updated = self._sync_nous_entry_from_auth_store(entry)
             else:
                 return entry
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
-            logger.debug(
-                "Credential refresh failed for %s/%s: %s",
-                self.provider,
-                entry.id,
-                redact_for_persistence(str(exc)),
-            )
+            logger.debug("Credential refresh failed for %s/%s: %s", self.provider, entry.id, exc)
             # For anthropic claude_code entries: the refresh token may have been
             # consumed by another process. Check if ~/.claude/.credentials.json
             # has a newer token pair and retry once.
@@ -1273,18 +1247,10 @@ class CredentialPool:
                                 refreshed["expires_at_ms"],
                             )
                         except Exception as wexc:
-                            logger.debug(
-                                "Failed to write refreshed token to credentials file (retry path): %s",
-                                redact_for_persistence(str(wexc)),
-                            )
+                            logger.debug("Failed to write refreshed token to credentials file (retry path): %s", wexc)
                         return updated
-                    except UnscopedSecretError:
-                        raise
                     except Exception as retry_exc:
-                        logger.debug(
-                            "Retry refresh also failed: %s",
-                            redact_for_persistence(str(retry_exc)),
-                        )
+                        logger.debug("Retry refresh also failed: %s", retry_exc)
                 elif not self._entry_needs_refresh(synced):
                     # Credentials file had a valid (non-expired) token — use it directly
                     logger.debug("Credentials file has valid token, using without refresh")
@@ -1323,12 +1289,9 @@ class CredentialPool:
                         "xAI OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with auth_mod._provider_state_transaction("xai-oauth") as (
-                            auth_store,
-                            state,
-                            source_path,
-                        ):
-                            state = state or {}
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            state = _load_provider_state(auth_store, "xai-oauth") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
                                 if isinstance(tokens, dict):
@@ -1341,22 +1304,16 @@ class CredentialPool:
                                         state["last_auth_error"] = {
                                             "provider": "xai-oauth",
                                             "code": getattr(exc, "code", "unknown"),
-                                            "message": redact_for_persistence(str(exc)),
+                                            "message": str(exc),
                                             "reason": "credential_pool_refresh_failure",
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        auth_mod._save_provider_state_to_source(
-                                            auth_store,
-                                            "xai-oauth",
-                                            state,
-                                            source_path,
-                                            set_active=False,
-                                        )
+                                        _save_provider_state(auth_store, "xai-oauth", state)
+                                        _save_auth_store(auth_store)
                     except Exception as clear_exc:
                         logger.debug(
-                            "Failed to clear terminal xAI OAuth state: %s",
-                            redact_for_persistence(str(clear_exc)),
+                            "Failed to clear terminal xAI OAuth state: %s", clear_exc
                         )
                     removed_ids = [
                         item.id for item in self._entries
@@ -1402,12 +1359,9 @@ class CredentialPool:
                         "Codex OAuth refresh token is terminally invalid; clearing local token state"
                     )
                     try:
-                        with auth_mod._provider_state_transaction("openai-codex") as (
-                            auth_store,
-                            state,
-                            source_path,
-                        ):
-                            state = state or {}
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            state = _load_provider_state(auth_store, "openai-codex") or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
                                 if isinstance(tokens, dict):
@@ -1420,22 +1374,16 @@ class CredentialPool:
                                         state["last_auth_error"] = {
                                             "provider": "openai-codex",
                                             "code": getattr(exc, "code", "unknown"),
-                                            "message": redact_for_persistence(str(exc)),
+                                            "message": str(exc),
                                             "reason": "credential_pool_refresh_failure",
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        auth_mod._save_provider_state_to_source(
-                                            auth_store,
-                                            "openai-codex",
-                                            state,
-                                            source_path,
-                                            set_active=False,
-                                        )
+                                        _save_provider_state(auth_store, "openai-codex", state)
+                                        _save_auth_store(auth_store)
                     except Exception as clear_exc:
                         logger.debug(
-                            "Failed to clear terminal Codex OAuth state: %s",
-                            redact_for_persistence(str(clear_exc)),
+                            "Failed to clear terminal Codex OAuth state: %s", clear_exc
                         )
                     removed_ids = [
                         item.id for item in self._entries
@@ -1472,12 +1420,9 @@ class CredentialPool:
                 if auth_mod._is_terminal_nous_refresh_error(exc):
                     logger.debug("Nous refresh token is terminally invalid; clearing local token state")
                     try:
-                        with auth_mod._provider_state_transaction("nous") as (
-                            auth_store,
-                            state,
-                            source_path,
-                        ):
-                            state = state or {
+                        with _auth_store_lock():
+                            auth_store = _load_auth_store()
+                            state = _load_provider_state(auth_store, "nous") or {
                                 "client_id": entry.client_id,
                                 "portal_base_url": entry.portal_base_url,
                                 "inference_base_url": entry.inference_base_url,
@@ -1498,18 +1443,10 @@ class CredentialPool:
                                     exc,
                                     reason="credential_pool_refresh_failure",
                                 )
-                                auth_mod._save_provider_state_to_source(
-                                    auth_store,
-                                    "nous",
-                                    state,
-                                    source_path,
-                                    set_active=False,
-                                )
+                                _save_provider_state(auth_store, "nous", state)
+                                _save_auth_store(auth_store)
                     except Exception as clear_exc:
-                        logger.debug(
-                            "Failed to clear terminal Nous OAuth state: %s",
-                            redact_for_persistence(str(clear_exc)),
-                        )
+                        logger.debug("Failed to clear terminal Nous OAuth state: %s", clear_exc)
 
                     singleton_sources = {
                         auth_mod.NOUS_DEVICE_CODE_SOURCE,
@@ -1546,6 +1483,43 @@ class CredentialPool:
         # instead of re-seeding stale/consumed tokens.
         self._sync_device_code_entry_to_auth_store(updated)
         return updated
+
+    def _codex_quota_restored_upstream(self, entry: PooledCredential) -> bool:
+        """Live-check whether an exhausted Codex entry's quota reset early.
+
+        A Codex 429 persists a ``last_error_reset_at`` that can be days in
+        the future (weekly windows), but the upstream window can reopen
+        before then — the user redeems a banked rate-limit reset via the
+        Codex CLI / ChatGPT UI, upgrades their plan, or OpenAI resets the
+        window.  Without this check the pool keeps the credential frozen
+        until the stale timestamp elapses even though the account is
+        usable (issue #43747).
+
+        Only fires for openai-codex entries frozen by a 429/quota-shaped
+        error.  The underlying probe is throttled per token (5 min) so this
+        is safe on the hot selection path.
+        """
+        if self.provider != "openai-codex" or entry.last_status != STATUS_EXHAUSTED:
+            return False
+        if not auth_mod._is_codex_rate_limit_shaped(
+            entry.last_error_code,
+            entry.last_error_reason,
+            entry.last_error_message,
+        ):
+            return False
+        token = entry.access_token or ""
+        if not token:
+            return False
+        try:
+            return bool(
+                auth_mod._probe_codex_quota_restored(
+                    token,
+                    base_url=entry.base_url,
+                )
+            )
+        except Exception:
+            logger.debug("Codex quota-restored probe failed", exc_info=True)
+            return False
 
     def _entry_needs_refresh(self, entry: PooledCredential) -> bool:
         if entry.auth_type != AUTH_TYPE_OAUTH:
@@ -1668,7 +1642,18 @@ class CredentialPool:
             if entry.last_status == STATUS_EXHAUSTED:
                 exhausted_until = _exhausted_until(entry)
                 if exhausted_until is not None and now < exhausted_until:
-                    continue
+                    # Codex quota windows can reopen EARLY: the user redeems a
+                    # banked rate-limit reset (Codex CLI / ChatGPT UI), upgrades
+                    # their plan, or OpenAI resets the window.  The persisted
+                    # ``last_error_reset_at`` can then be days in the future
+                    # while the account is already usable again — a throttled
+                    # live probe of the Codex usage endpoint detects that and
+                    # lifts the stale cooldown (issue #43747).
+                    if not (
+                        clear_expired
+                        and self._codex_quota_restored_upstream(entry)
+                    ):
+                        continue
                 if clear_expired:
                     cleared = replace(
                         entry,
@@ -1903,7 +1888,7 @@ class CredentialPool:
                 new_entries.append(entry)
         if count:
             self._entries = new_entries
-            self._persist_to_active()
+            self._persist()
         return count
 
     def remove_index(self, index: int) -> Optional[PooledCredential]:
@@ -1914,7 +1899,11 @@ class CredentialPool:
             replace(entry, priority=new_priority)
             for new_priority, entry in enumerate(self._entries)
         ]
-        self._persist_to_active(removed_ids=[removed.id])
+        write_credential_pool(
+            self.provider,
+            [entry.to_dict() for entry in self._entries],
+            removed_ids=[removed.id],
+        )
         if self._current_id == removed.id:
             self._current_id = None
         return removed
@@ -1947,7 +1936,7 @@ class CredentialPool:
     def add_entry(self, entry: PooledCredential) -> PooledCredential:
         entry = replace(entry, priority=_next_priority(self._entries))
         self._entries.append(entry)
-        self._persist_to_active()
+        self._persist()
         return entry
 
 
@@ -2071,15 +2060,9 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
         # that masquerade.  Prefer ~/.hermes/.env over os.environ for the
         # same reason `_seed_from_env` does — that's the authoritative file
         # that `hermes setup` writes.
-        _env_file = (
-            {}
-            if _current_secret_scope() is not None or _is_multiplex_active()
-            else load_env()
-        )
+        _env_file = load_env()
 
         def _env_val(key: str) -> str:
-            if _current_secret_scope() is not None or _is_multiplex_active():
-                return (_get_secret(key, "") or "").strip()
             return (_env_file.get(key) or _get_secret(key, "") or "").strip()
 
         anthropic_api_key = _env_val("ANTHROPIC_API_KEY")
@@ -2218,10 +2201,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             "label": source,
                         },
                     )
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
-            logger.debug("Copilot token seed failed: %s", redact_for_persistence(str(exc)))
+            logger.debug("Copilot token seed failed: %s", exc)
 
     elif provider == "qwen-oauth":
         # Qwen OAuth tokens live in ~/.qwen/oauth_creds.json, written by
@@ -2250,10 +2231,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             "label": creds.get("auth_file", source_name),
                         },
                     )
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
-            logger.debug("Qwen OAuth token seed failed: %s", redact_for_persistence(str(exc)))
+            logger.debug("Qwen OAuth token seed failed: %s", exc)
 
     elif provider == "minimax-oauth":
         # MiniMax OAuth tokens live in ~/.hermes/auth.json providers.minimax-oauth.
@@ -2294,10 +2273,8 @@ def _seed_from_singletons(provider: str, entries: List[PooledCredential]) -> Tup
                             ),
                         },
                     )
-        except UnscopedSecretError:
-            raise
         except Exception as exc:
-            logger.debug("MiniMax OAuth token seed failed: %s", redact_for_persistence(str(exc)))
+            logger.debug("MiniMax OAuth token seed failed: %s", exc)
 
     elif provider == "openai-codex":
         # Respect user suppression — `hermes auth remove openai-codex` marks
@@ -2378,25 +2355,12 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
     # processes (Codex CLI, test scripts, etc.) should not override deliberate
     # changes to the .env file.
     def _get_env_prefer_dotenv(key: str) -> str:
-        # An installed profile scope is authoritative. It already contains
-        # .env plus any external source overrides resolved for this profile.
-        scope = _current_secret_scope()
-        if scope is not None or _is_multiplex_active():
-            return str(_get_secret(key, "") or "").strip()
-
         env_file = load_env()
         raw = env_file.get(key, "").strip()
-        env_val = os.environ.get(key, "").strip()
-        try:
-            from hermes_cli.env_loader import get_secret_source
-
-            externally_resolved = bool(get_secret_source(key))
-        except Exception:
-            externally_resolved = False
-        if externally_resolved and env_val:
-            return env_val
+        scoped_value = (_get_secret(key, "") or "").strip()
         # If .env contains an unresolved op:// reference, prefer the
-        # already-resolved value from os.environ (set by
+        # already-resolved value supplied by the active secret scope (or by
+        # os.environ in legacy single-profile mode), set by
         # load_hermes_dotenv() -> apply_onepassword_secrets()).  The raw
         # "op://Vault/Item/field" string would otherwise win and every
         # provider auth attempt would receive a URL instead of a key.  This
@@ -2404,9 +2368,9 @@ def _seed_from_env(provider: str, entries: List[PooledCredential]) -> Tuple[bool
         # references straight into .env rather than the secrets.onepassword
         # config block.  For every non-op:// value the original
         # .env-takes-precedence behaviour is preserved unchanged.
-        if raw.startswith("op://") and env_val:
-            return env_val
-        return raw or _get_secret(key, "") or env_val
+        if raw.startswith("op://") and scoped_value:
+            return scoped_value
+        return raw or scoped_value
 
     # Honour user suppression — `hermes auth remove <provider> <N>` for an
     # env-seeded credential marks the env:<VAR> source as suppressed so it
@@ -2622,45 +2586,7 @@ def _seed_custom_pool(pool_key: str, entries: List[PooledCredential]) -> Tuple[b
 
 def load_pool(provider: str) -> CredentialPool:
     provider = (provider or "").strip().lower()
-    raw_entries, source_path = _read_credential_pool_with_source(provider)
-    active_path = auth_mod._auth_file_path()
-    inherited_singleton_source = False
-    if not raw_entries and provider in {"nous", "openai-codex", "xai-oauth"}:
-        # A provider singleton can be inherited even when no credential-pool
-        # row exists yet. Treat that singleton's store as the owner of the
-        # device-code row synthesized below; otherwise the first pool status
-        # update copies the global token into the borrowing profile.
-        singleton_state, singleton_source_path = (
-            auth_mod._load_provider_state_with_source(
-                _load_auth_store(),
-                provider,
-            )
-        )
-        if provider == "nous":
-            has_singleton_material = bool(
-                isinstance(singleton_state, dict)
-                and (
-                    str(singleton_state.get("access_token") or "").strip()
-                    or str(singleton_state.get("agent_key") or "").strip()
-                )
-            )
-        else:
-            singleton_tokens = (
-                singleton_state.get("tokens")
-                if isinstance(singleton_state, dict)
-                else None
-            )
-            has_singleton_material = bool(
-                isinstance(singleton_tokens, dict)
-                and str(singleton_tokens.get("access_token") or "").strip()
-            )
-        if (
-            has_singleton_material
-            and singleton_source_path is not None
-            and not auth_mod._same_path(singleton_source_path, active_path)
-        ):
-            source_path = singleton_source_path
-            inherited_singleton_source = True
+    raw_entries = read_credential_pool(provider)
     disk_ids = {
         entry.get("id")
         for entry in raw_entries
@@ -2714,38 +2640,11 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    inherited = not auth_mod._same_path(source_path, active_path)
-    if changed and inherited:
-        # Loading an inherited pool is a read-only merge. Heal only borrowed
-        # secret material already present in the owning rows; profile-local
-        # singleton/env/config seeds must remain ephemeral and must not create
-        # either a root mutation or a profile shadow.
-        if raw_needs_sanitization:
-            write_credential_pool(
-                provider,
-                [
-                    sanitize_borrowed_credential_payload(payload, provider)
-                    if isinstance(payload, dict)
-                    else payload
-                    for payload in raw_entries
-                ],
-                target_path=source_path,
-            )
-    elif changed:
+    if changed:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,
             [entry.to_dict() for entry in sorted(entries, key=lambda item: item.priority)],
             removed_ids=disk_ids - new_ids,
         )
-    source_entry_ids = {entry_id for entry_id in disk_ids if entry_id}
-    if inherited_singleton_source:
-        source_entry_ids.update(
-            entry.id for entry in entries if entry.source == "device_code"
-        )
-    return CredentialPool(
-        provider,
-        entries,
-        source_path=source_path,
-        source_entry_ids=source_entry_ids,
-    )
+    return CredentialPool(provider, entries)

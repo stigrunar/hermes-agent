@@ -282,18 +282,8 @@ def run_secret_cli(
     base_keep = ("PATH", "HOME", "USERPROFILE", "SYSTEMROOT", "TMPDIR", "TEMP",
                  "LANG", "LC_ALL", "XDG_CONFIG_HOME", "XDG_DATA_HOME")
     env: Dict[str, str] = {}
-    for key in base_keep:
+    for key in (*base_keep, *allow_env):
         val = os.environ.get(key)
-        if val is not None:
-            env[key] = val
-    try:
-        from agent.secret_scope import current_secret_scope
-
-        scope = current_secret_scope()
-    except Exception:
-        scope = None
-    for key in allow_env:
-        val = scope.get(key) if scope is not None else os.environ.get(key)
         if val is not None:
             env[key] = val
     if extra_env:
@@ -318,6 +308,6 @@ def run_secret_cli(
             f"failed to invoke {Path(str(argv[0])).name}: {exc}"
         ) from exc
 
-    proc.stdout = scrub_ansi(proc.stdout or "")
+    proc.stdout = proc.stdout or ""
     proc.stderr = scrub_ansi(proc.stderr or "")
     return proc

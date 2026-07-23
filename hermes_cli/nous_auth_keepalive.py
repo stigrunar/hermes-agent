@@ -3,14 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from typing import Optional
 
-from agent.secret_scope import (
-    UnscopedSecretError,
-    get_deployment_env,
-    is_multiplex_active,
-)
 from hermes_cli.auth import (
     ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
     NOUS_INVOKE_JWT_MIN_TTL_SECONDS,
@@ -35,7 +31,7 @@ def _timeout_seconds(value: Optional[float]) -> float:
     if value is not None:
         return float(value)
     try:
-        return float(get_deployment_env("HERMES_NOUS_TIMEOUT_SECONDS", "15"))
+        return float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15"))
     except (TypeError, ValueError):
         return 15.0
 
@@ -61,8 +57,6 @@ def _refresh_selected_pool_entry(
         from agent.credential_pool import load_pool
 
         pool = load_pool("nous")
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         logger.debug("Nous auth keepalive: credential pool unavailable: %s", exc)
         return None
@@ -72,8 +66,6 @@ def _refresh_selected_pool_entry(
 
     try:
         entry = pool.select()
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         logger.debug("Nous auth keepalive: credential pool selection failed: %s", exc)
         return False
@@ -126,8 +118,6 @@ def refresh_nous_auth_keepalive_once(
         else:
             logger.debug("Nous auth keepalive failed: %s", exc)
         return False
-    except UnscopedSecretError:
-        raise
     except Exception as exc:
         logger.debug("Nous auth keepalive failed: %s", exc)
         return False
@@ -160,11 +150,6 @@ def start_nous_auth_keepalive(
     timeout_seconds: Optional[float] = None,
 ) -> Optional[threading.Thread]:
     """Start the process-wide Nous auth keepalive thread."""
-    # A multiplexed process has no single credential owner. Scoped request
-    # resolution already refreshes each profile independently, so a global
-    # keepalive would necessarily read the wrong profile (or fail unscoped).
-    if is_multiplex_active():
-        return None
     if interval_seconds <= 0:
         return None
 

@@ -4,10 +4,9 @@ from __future__ import annotations
 
 import datetime
 import json
+import os
 import uuid
 from typing import Any, Dict, Optional
-
-from agent.secret_scope import UnscopedSecretError
 
 
 MAX_XAI_STORAGE_EXPIRES_AFTER_SECONDS = 30 * 24 * 60 * 60
@@ -37,7 +36,7 @@ def has_xai_credentials() -> bool:
     other availability scans. Truthful refresh + expiry handling happens
     in ``search()`` (or whichever caller actually makes the request).
     """
-    if str(get_env_value("XAI_API_KEY") or "").strip():
+    if os.environ.get("XAI_API_KEY", "").strip():
         return True
     try:
         from hermes_constants import get_hermes_home
@@ -78,12 +77,15 @@ def get_env_value(name: str, default=None):
     ``tools.xai_http.get_env_value`` to inject dotenv-only secrets into the
     xAI credential resolver.
     """
-    from hermes_cli.config import (
-        get_env_value_prefer_dotenv as _hermes_get_env_value,
-    )
+    try:
+        from hermes_cli.config import get_env_value as _hermes_get_env_value
 
-    value = _hermes_get_env_value(name)
-    return value if value is not None else default
+        value = _hermes_get_env_value(name)
+        if value is not None:
+            return value
+    except Exception:
+        pass
+    return os.environ.get(name, default)
 
 
 def hermes_xai_user_agent() -> str:
@@ -103,8 +105,6 @@ def _load_config_section(section_name: str) -> Dict[str, Any]:
         cfg = load_config()
         section = cfg.get(section_name) if isinstance(cfg, dict) else None
         return section if isinstance(section, dict) else {}
-    except UnscopedSecretError:
-        raise
     except Exception:
         return {}
 
@@ -298,8 +298,6 @@ def resolve_xai_http_credentials(
                 "api_key": access_token,
                 "base_url": base_url,
             }
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 

@@ -2110,20 +2110,6 @@ def _windows_cron_python_invocation(python_exe: str) -> tuple[str, dict[str, str
     return str(interpreter), env_overlay
 
 
-def _redact_cron_diagnostic(value: object) -> str:
-    """Strictly redact a typed cron failure before persistence or delivery."""
-    try:
-        from agent.redact import redact_for_persistence
-
-        return str(redact_for_persistence(str(value)))
-    except Exception as exc:
-        logger.warning(
-            "Failed to redact cron diagnostic: %s",
-            type(exc).__name__,
-        )
-        return "Cron failure; diagnostic redaction failed"
-
-
 def _run_job_script(script_path: str) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
@@ -2170,15 +2156,15 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
     try:
         path.relative_to(scripts_dir_resolved)
     except ValueError:
-        return False, _redact_cron_diagnostic(
+        return False, (
             f"Blocked: script path resolves outside the scripts directory "
             f"({scripts_dir_resolved}): {script_path!r}"
         )
 
     if not path.exists():
-        return False, _redact_cron_diagnostic(f"Script not found: {path}")
+        return False, f"Script not found: {path}"
     if not path.is_file():
-        return False, _redact_cron_diagnostic(f"Script path is not a file: {path}")
+        return False, f"Script path is not a file: {path}"
 
     script_timeout = _get_script_timeout()
 
@@ -2197,7 +2183,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             "/bin/bash" if os.path.isfile("/bin/bash") else None
         )
         if _bash is None:
-            return False, _redact_cron_diagnostic(
+            return False, (
                 f"Cannot run .sh/.bash script {path.name!r}: bash not found on PATH. "
                 "On Windows, install Git for Windows (which ships Git Bash) "
                 "or rewrite the script as Python (.py)."
@@ -2229,30 +2215,33 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             env=env,
             **popen_kwargs,
         )
-        stdout = result.stdout or ""
-        stderr = result.stderr or ""
+        stdout = (result.stdout or "").strip()
+        stderr = (result.stderr or "").strip()
+
+        # Redact secrets from both stdout and stderr before any return path.
+        try:
+            from agent.redact import redact_sensitive_text
+            stdout = redact_sensitive_text(stdout)
+            stderr = redact_sensitive_text(stderr)
+        except Exception as e:
+            logger.warning("Failed to redact sensitive text from output: %s", e)
+            stdout = "[REDACTED - redaction failed]"
+            stderr = "[REDACTED - redaction failed]"
 
         if result.returncode != 0:
             parts = [f"Script exited with code {result.returncode}"]
             if stderr:
-                parts.append(f"stderr:\n{stderr.strip()}")
+                parts.append(f"stderr:\n{stderr}")
             if stdout:
-                parts.append(f"stdout:\n{stdout.strip()}")
-            return False, _redact_cron_diagnostic("\n".join(parts))
+                parts.append(f"stdout:\n{stdout}")
+            return False, "\n".join(parts)
 
-        # Successful stdout is a functional payload: preserve it exactly for
-        # no-agent delivery and save_job_output rather than rewriting strings
-        # that merely resemble credentials, signed URLs, or continuation data.
         return True, stdout
 
     except subprocess.TimeoutExpired:
-        return False, _redact_cron_diagnostic(
-            f"Script timed out after {script_timeout}s: {path}"
-        )
+        return False, f"Script timed out after {script_timeout}s: {path}"
     except Exception as exc:
-        return False, _redact_cron_diagnostic(
-            f"Script execution failed: {type(exc).__name__}: {exc}"
-        )
+        return False, f"Script execution failed: {exc}"
 
 
 def _run_job_script_with_claim_heartbeat(
@@ -2701,7 +2690,7 @@ def run_job(
     # to use. Keep this block self-contained.
     #
     # Semantics:
-    #   - script stdout (exact)   → delivered verbatim as the final message
+    #   - script stdout (trimmed) → delivered verbatim as the final message
     #   - empty stdout            → silent run (no delivery, success=True)
     #   - non-zero exit / timeout → delivered as an error alert, success=False
     #   - wakeAgent=false gate    → treated like empty stdout (silent), since
@@ -3597,12 +3586,8 @@ def run_job(
         return True, output, final_response, None
         
     except Exception as e:
-        error_msg = _redact_cron_diagnostic(
-            f"{type(e).__name__}: {str(e)}"
-        )
-        # Do not use logger.exception here: its traceback would re-emit the
-        # raw exception string after the typed diagnostic was redacted.
-        logger.error("Job '%s' failed: %s", job_name, error_msg)
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        logger.exception("Job '%s' failed: %s", job_name, error_msg)
         
         output = f"""# Cron Job: {job_name} (FAILED)
 

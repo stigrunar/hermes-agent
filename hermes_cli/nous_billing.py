@@ -17,25 +17,20 @@ Design rules:
   HTTP status, ``portalUrl`` deep-link, and ``retry_after``.
 - **Auth** = the OAuth bearer JWT Hermes already holds for inference
   (``get_provider_auth_state("nous")["access_token"]``). No API-key auth on these.
-- **Portal base URL** resolves with the same owner-scoped precedence as device login
+- **Portal base URL** resolves with the same precedence as the device-flow login
   (``auth.py``): ``HERMES_PORTAL_BASE_URL`` → ``NOUS_PORTAL_BASE_URL`` → the
   stored auth-state ``portal_base_url`` → the registry default. This is how the
-  E2E run points the owning profile at a preview deployment with zero code change.
+  E2E run points the client at a preview deployment with zero code change.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Optional
-
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope,
-    is_multiplex_active,
-)
 
 DEFAULT_PORTAL_BASE_URL = "https://portal.nousresearch.com"
 
@@ -181,11 +176,7 @@ def resolve_portal_base_url(state: Optional[dict[str, Any]] = None) -> str:
     ``HERMES_PORTAL_BASE_URL`` → ``NOUS_PORTAL_BASE_URL`` → stored auth-state
     ``portal_base_url`` → registry default. Trailing slash stripped.
     """
-    from hermes_cli.config import get_env_value_prefer_dotenv
-
-    env = get_env_value_prefer_dotenv(
-        "HERMES_PORTAL_BASE_URL"
-    ) or get_env_value_prefer_dotenv("NOUS_PORTAL_BASE_URL")
+    env = os.getenv("HERMES_PORTAL_BASE_URL") or os.getenv("NOUS_PORTAL_BASE_URL")
     if env and env.strip():
         return env.strip().rstrip("/")
     if state:
@@ -265,16 +256,7 @@ def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
     global _token_cache
     import time as _time
 
-    multiplex = is_multiplex_active()
-    if multiplex and current_secret_scope() is None:
-        raise UnscopedSecretError(
-            "Nous billing credential resolution requires an owner profile scope "
-            "while multiplexing is active"
-        )
-
-    # The legacy cache is process-global. Never consult or populate it in a
-    # multiplex deployment: a token/base pair belongs to exactly one profile.
-    if use_cache and not multiplex and _token_cache is not None:
+    if use_cache and _token_cache is not None:
         cached_at, token, base = _token_cache
         if (_time.time() - cached_at) < _TOKEN_CACHE_TTL_SECONDS:
             return token, base
@@ -283,8 +265,6 @@ def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
         from hermes_cli.auth import get_provider_auth_state
 
         state = get_provider_auth_state("nous") or {}
-    except UnscopedSecretError:
-        raise
     except Exception:
         state = {}
 
@@ -297,8 +277,7 @@ def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
         token = state.get("access_token")
         if isinstance(token, str) and token.strip():
             resolved = (token.strip(), base)
-            if not multiplex:
-                _token_cache = (_time.time(), *resolved)
+            _token_cache = (_time.time(), *resolved)
             return resolved
         raise _billing_not_logged_in()
 
@@ -307,8 +286,7 @@ def _resolve_token_and_base(*, use_cache: bool = True) -> tuple[str, str]:
     except AuthError as exc:
         raise _billing_not_logged_in(exc) from exc
     resolved = (token.strip(), base)
-    if not multiplex:
-        _token_cache = (_time.time(), *resolved)
+    _token_cache = (_time.time(), *resolved)
     return resolved
 
 

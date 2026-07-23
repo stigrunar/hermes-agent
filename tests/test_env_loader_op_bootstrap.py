@@ -150,23 +150,6 @@ def test_credential_pool_still_prefers_dotenv_for_non_op_values(monkeypatch):
     assert token == "dotenv-value"
 
 
-def test_credential_pool_prefers_external_source_over_stale_dotenv(monkeypatch):
-    """Vault rotation must beat an obsolete raw .env value when attributed."""
-    monkeypatch.setattr(
-        env_loader,
-        "get_secret_source",
-        lambda name: "bitwarden" if name == "OPENROUTER_API_KEY" else None,
-    )
-
-    token = _seed_openrouter_token(
-        monkeypatch,
-        dotenv_value="stale-dotenv-value",
-        environ_value="resolved-vault-value",
-    )
-
-    assert token == "resolved-vault-value"
-
-
 def test_credential_pool_falls_back_to_env_when_dotenv_is_only_op_ref(monkeypatch):
     """An unresolved op:// in .env with no resolved env value yields the raw ref.
 

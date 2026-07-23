@@ -20,21 +20,10 @@ from typing import Any, NamedTuple, Optional
 
 from hermes_cli import __version__ as _HERMES_VERSION
 from hermes_cli.urllib_security import open_credentialed_url
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope,
-    get_secret,
-    is_multiplex_active,
-)
 
 # Identify ourselves so endpoints fronted by Cloudflare's Browser Integrity
 # Check (error 1010) don't reject the default ``Python-urllib/*`` signature.
 _HERMES_USER_AGENT = f"hermes-cli/{_HERMES_VERSION}"
-
-
-def _profile_env(name: str, default: str = "") -> str:
-    value = get_secret(name, default)
-    return value if value is not None else default
 
 COPILOT_BASE_URL = "https://api.githubcopilot.com"
 COPILOT_MODELS_URL = f"{COPILOT_BASE_URL}/models"
@@ -810,15 +799,8 @@ def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
     states return False so this compatibility wrapper does not block users.
     """
     global _free_tier_cache
-    multiplex = is_multiplex_active()
-    if multiplex and current_secret_scope() is None:
-        raise UnscopedSecretError(
-            "Nous account-tier resolution requires an owner profile scope "
-            "while multiplexing is active"
-        )
-
     now = time.monotonic()
-    if not multiplex and not force_fresh and _free_tier_cache is not None:
+    if not force_fresh and _free_tier_cache is not None:
         cached_result, cached_at = _free_tier_cache
         if now - cached_at < _FREE_TIER_CACHE_TTL:
             return cached_result
@@ -828,14 +810,10 @@ def check_nous_free_tier(*, force_fresh: bool = False) -> bool:
 
         account_info = get_nous_portal_account_info(force_fresh=force_fresh)
         result = account_info.is_free_tier
-        if not multiplex:
-            _free_tier_cache = (result, now)
+        _free_tier_cache = (result, now)
         return result
-    except UnscopedSecretError:
-        raise
     except Exception:
-        if not multiplex:
-            _free_tier_cache = (False, now)
+        _free_tier_cache = (False, now)
         return False  # default to paid on error — don't block users
 
 
@@ -997,8 +975,6 @@ def _resolve_nous_portal_url() -> str:
         if portal:
             return portal.rstrip("/")
         return str(DEFAULT_NOUS_PORTAL_URL).rstrip("/")
-    except UnscopedSecretError:
-        raise
     except Exception:
         return "https://portal.nousresearch.com"
 
@@ -1049,8 +1025,6 @@ def get_nous_recommended_aux_model(
     if free_tier is None:
         try:
             free_tier = check_nous_free_tier()
-        except UnscopedSecretError:
-            raise
         except Exception:
             # On any detection error, assume paid — paid users see both fields
             # anyway so this is a safe default that maximises model quality.
@@ -1599,23 +1573,107 @@ def _format_price_per_mtok(per_token_str: str) -> str:
     return f"${per_m:.2f}"
 
 
+def compute_sale_discount(
+    prompt: str,
+    completion: str,
+    original: Any,
+) -> tuple[int, str, str] | None:
+    """Derive sale chrome from gateway ``pricing.original`` when cheaper.
+
+    Nous Portal-only feature: callers gate on the provider; this helper only
+    sees ``original`` because the Nous fetch path opted in via
+    ``include_sale_original=True``.
+
+    Returns ``(discount_percent, was_prompt_raw, was_completion_raw)`` only when
+    ``original`` is a dict and the current prompt (fallback: completion) rate
+    is strictly below the corresponding original. Percent is
+    ``round((1 - current/original) * 100)`` — never hardcoded, and a discount
+    that rounds below 1% is treated as no sale (never render "-0%"). Returns
+    ``None`` when there is no sale (missing/equal/invalid original), so UIs
+    show normal prices.
+    """
+    if not isinstance(original, dict):
+        return None
+
+    was_prompt = original.get("prompt")
+    was_completion = original.get("completion")
+    if was_prompt in (None, "") and was_completion in (None, ""):
+        return None
+
+    def _finite(raw: Any) -> float | None:
+        try:
+            n = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 and n == n else None  # n == n rejects NaN
+
+    def _nonneg(raw: Any) -> float | None:
+        try:
+            n = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return n if n >= 0 and n == n else None
+
+    # Free / $0 models never show sale chrome, even if a leftover list price
+    # is higher (e.g. a :free sibling that inherited pricing.original).
+    cur_prompt_any = _nonneg(prompt) if prompt not in (None, "") else None
+    cur_comp_any = _nonneg(completion) if completion not in (None, "") else None
+    if cur_prompt_any == 0 and cur_comp_any == 0:
+        return None
+
+    cur_prompt = _finite(prompt) if prompt not in (None, "") else None
+    orig_prompt = _finite(was_prompt) if was_prompt not in (None, "") else None
+    if cur_prompt is not None and orig_prompt is not None and cur_prompt < orig_prompt:
+        pct = int(round((1.0 - (cur_prompt / orig_prompt)) * 100))
+        if pct < 1:
+            return None
+        return (
+            pct,
+            str(was_prompt),
+            str(was_completion) if was_completion not in (None, "") else "",
+        )
+
+    cur_comp = _finite(completion) if completion not in (None, "") else None
+    orig_comp = _finite(was_completion) if was_completion not in (None, "") else None
+    if cur_comp is not None and orig_comp is not None and cur_comp < orig_comp:
+        pct = int(round((1.0 - (cur_comp / orig_comp)) * 100))
+        if pct < 1:
+            return None
+        return (
+            pct,
+            str(was_prompt) if was_prompt not in (None, "") else "",
+            str(was_completion),
+        )
+
+    return None
+
+
 def fetch_models_with_pricing(
     api_key: str | None = None,
     base_url: str = "https://openrouter.ai/api",
     timeout: float = 8.0,
     *,
     force_refresh: bool = False,
-) -> dict[str, dict[str, str]]:
-    """Fetch ``/v1/models`` and return ``{model_id: {prompt, completion}}`` pricing.
+    include_sale_original: bool = False,
+) -> dict[str, dict[str, Any]]:
+    """Fetch ``/v1/models`` and return ``{model_id: {prompt, completion, ...}}``.
 
     Results are cached per *base_url* so repeated calls are free.
     Works with any OpenRouter-compatible endpoint (OpenRouter, Nous Portal).
+
+    When *include_sale_original* is true (Nous Portal only) and the gateway
+    advertises a global discount under ``pricing.original``, those
+    pre-discount rates are copied through as a nested ``original`` dict so
+    pickers can show sale chrome. Other providers never opt in — OpenRouter
+    (and anything else sharing this helper) keeps the legacy
+    ``{prompt, completion}`` shape even if a response happens to nest
+    ``original``.
     """
     cache_key = (base_url or "").rstrip("/")
     if not force_refresh and cache_key in _pricing_cache:
         return _pricing_cache[cache_key]
 
-    url = cache_key.rstrip("/") + "/v1/models"
+    url = cache_key + "/v1/models"
     headers: dict[str, str] = {
         "Accept": "application/json",
         "User-Agent": _HERMES_USER_AGENT,
@@ -1631,12 +1689,12 @@ def fetch_models_with_pricing(
         _pricing_cache[cache_key] = {}
         return {}
 
-    result: dict[str, dict[str, str]] = {}
+    result: dict[str, dict[str, Any]] = {}
     for item in payload.get("data", []):
         mid = item.get("id")
         pricing = item.get("pricing")
         if mid and isinstance(pricing, dict):
-            entry: dict[str, str] = {
+            entry: dict[str, Any] = {
                 "prompt": str(pricing.get("prompt", "")),
                 "completion": str(pricing.get("completion", "")),
             }
@@ -1644,6 +1702,22 @@ def fetch_models_with_pricing(
                 entry["input_cache_read"] = str(pricing["input_cache_read"])
             if pricing.get("input_cache_write"):
                 entry["input_cache_write"] = str(pricing["input_cache_write"])
+            # Sale chrome is Nous Portal-only. Never copy pricing.original for
+            # OpenRouter / other OpenAI-compatible catalogs.
+            if include_sale_original:
+                original = pricing.get("original")
+                if isinstance(original, dict):
+                    orig_entry: dict[str, str] = {}
+                    for key in (
+                        "prompt",
+                        "completion",
+                        "input_cache_read",
+                        "input_cache_write",
+                    ):
+                        if original.get(key) not in (None, ""):
+                            orig_entry[key] = str(original[key])
+                    if orig_entry.get("prompt") or orig_entry.get("completion"):
+                        entry["original"] = orig_entry
             result[mid] = entry
 
     _pricing_cache[cache_key] = result
@@ -1652,7 +1726,7 @@ def fetch_models_with_pricing(
 
 def _resolve_openrouter_api_key() -> str:
     """Best-effort OpenRouter API key for pricing fetch."""
-    return _profile_env("OPENROUTER_API_KEY").strip()
+    return os.getenv("OPENROUTER_API_KEY", "").strip()
 
 
 _DEFAULT_NOUS_INFERENCE_BASE = "https://inference-api.nousresearch.com"
@@ -1664,22 +1738,43 @@ def _resolve_nous_pricing_credentials() -> tuple[str, str]:
     The Nous inference ``/v1/models`` endpoint exposes pricing without
     authentication, so the api_key is best-effort: when runtime credential
     resolution fails (expired refresh token, missing auth.json, etc.) we
-    still return the default inference base URL so the picker keeps
-    working with anonymous pricing data.  Free-tier users in particular
-    need this — pricing drives the free/paid partition, and silently
-    returning empty pricing because of an auth blip makes the picker
-    look broken ("No free models currently available").
+    still return a usable inference base URL so the picker keeps working
+    with anonymous pricing data.  Free-tier users in particular need this
+    — pricing drives the free/paid partition, and silently returning empty
+    pricing because of an auth blip makes the picker look broken ("No free
+    models currently available").
+
+    Base URL precedence (mirrors runtime credential resolution):
+    1. ``NOUS_INFERENCE_BASE_URL`` env override (staging / preview)
+    2. Resolved runtime credential ``base_url``
+    3. Production default
+
+    Without (1), a staging profile's sale ``pricing.original`` never
+    reaches the pickers — the anonymous fallback would hit prod, which
+    has no ``original`` field.
     """
+    env_base = None
+    try:
+        from hermes_cli.auth import _nous_inference_env_override
+
+        env_base = _nous_inference_env_override()
+    except Exception:
+        env_base = None
+
+    api_key = ""
+    creds_base = ""
     try:
         from hermes_cli.auth import resolve_nous_runtime_credentials
+
         creds = resolve_nous_runtime_credentials()
         if creds:
-            return (creds.get("api_key", ""), creds.get("base_url", ""))
-    except UnscopedSecretError:
-        raise
+            api_key = creds.get("api_key", "") or ""
+            creds_base = (creds.get("base_url", "") or "").strip()
     except Exception:
         pass
-    return ("", _DEFAULT_NOUS_INFERENCE_BASE)
+
+    base_url = (env_base or creds_base or _DEFAULT_NOUS_INFERENCE_BASE).rstrip("/")
+    return (api_key, base_url)
 
 
 def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> dict[str, dict[str, str]]:
@@ -1709,6 +1804,8 @@ def get_pricing_for_provider(provider: str, *, force_refresh: bool = False) -> d
                 api_key=api_key,
                 base_url=stripped,
                 force_refresh=force_refresh,
+                # Sale chrome (pricing.original) is Nous Portal-only.
+                include_sale_original=True,
             )
     return {}
 
@@ -1776,14 +1873,11 @@ def _fetch_novita_pricing(
     Results are cached in ``_pricing_cache`` keyed on the resolved base URL —
     without this, every menu render or pricing lookup re-hits the network.
     """
-    api_key = _profile_env("NOVITA_API_KEY").strip()
+    api_key = os.getenv("NOVITA_API_KEY", "").strip()
     if not api_key:
         return {}
 
-    base_url = (
-        _profile_env("NOVITA_BASE_URL").strip()
-        or "https://api.novita.ai/openai/v1"
-    )
+    base_url = os.getenv("NOVITA_BASE_URL", "").strip() or "https://api.novita.ai/openai/v1"
     cache_key = base_url.rstrip("/")
     if not force_refresh and cache_key in _pricing_cache:
         return _pricing_cache[cache_key]
@@ -1860,12 +1954,10 @@ def list_available_providers() -> list[dict[str, str]]:
                 custom_base_url = _get_custom_base_url() or ""
                 has_creds = bool(custom_base_url.strip())
             elif pid == "openrouter":
-                has_creds = has_usable_secret(_profile_env("OPENROUTER_API_KEY"))
+                has_creds = has_usable_secret(os.getenv("OPENROUTER_API_KEY", ""))
             else:
                 status = get_auth_status(pid)
                 has_creds = bool(status.get("logged_in") or status.get("configured"))
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
         result.append({
@@ -2354,8 +2446,6 @@ def _resolve_copilot_catalog_api_key() -> str:
         api_key = str(creds.get("api_key") or "").strip()
         if api_key:
             return api_key
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -2377,14 +2467,10 @@ def _resolve_copilot_catalog_api_key() -> str:
                 continue
             try:
                 api_token, _expires_at = exchange_copilot_token(raw)
-            except UnscopedSecretError:
-                raise
             except Exception:
                 continue
             if api_token:
                 return api_token
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -2486,8 +2572,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
 
             creds = resolve_codex_runtime_credentials(refresh_if_expiring=True)
             access_token = creds.get("api_key")
-        except UnscopedSecretError:
-            raise
         except Exception:
             access_token = None
         return get_codex_model_ids(access_token=access_token)
@@ -2498,8 +2582,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             live = _fetch_github_models(_resolve_copilot_catalog_api_key())
             if live:
                 return live
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
         if normalized == "copilot-acp":
@@ -2513,8 +2595,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_nous_models(api_key=creds.get("api_key", ""), inference_base_url=creds.get("base_url", ""))
                 if live:
                     return live
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
         # Live failed (or no creds). Fall back to the docs-hosted manifest
@@ -2534,8 +2614,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_api_models(api_key, base_url)
                 if live:
                     return live
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
     if normalized == "anthropic":
@@ -2578,9 +2656,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
         if live:
             return live
     if normalized in ("openai", "openai-api"):
-        api_key = _profile_env("OPENAI_API_KEY").strip()
+        api_key = os.getenv("OPENAI_API_KEY", "").strip()
         if api_key:
-            base_raw = _profile_env("OPENAI_BASE_URL").strip().rstrip("/")
+            base_raw = os.getenv("OPENAI_BASE_URL", "").strip().rstrip("/")
             base = base_raw or "https://api.openai.com/v1"
             # Custom OpenAI-compatible endpoints (proxies, gateways, self-hosted)
             # may serve a small curated catalog — use the live list verbatim so
@@ -2622,8 +2700,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 live = fetch_api_models(api_key, base_url)
                 if live:
                     return live
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
     if normalized == "custom":
@@ -2633,9 +2709,9 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # Try common API key env vars for custom endpoints
             api_key = (
                 str(model_cfg.get("api_key", "") or "").strip()
-                or _profile_env("CUSTOM_API_KEY")
-                or _profile_env("OPENAI_API_KEY")
-                or _profile_env("OPENROUTER_API_KEY")
+                or os.getenv("CUSTOM_API_KEY", "")
+                or os.getenv("OPENAI_API_KEY", "")
+                or os.getenv("OPENROUTER_API_KEY", "")
             )
             api_mode = "anthropic_messages" if _base_url_looks_like_anthropic_messages(base_url) else None
             live = fetch_api_models(api_key, base_url, api_mode=api_mode)
@@ -2651,8 +2727,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             ids = bedrock_model_ids_or_none()
             if ids is not None:
                 return ids
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
 
@@ -2669,8 +2743,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
                 creds = resolve_api_key_provider_credentials(normalized)
                 api_key = str(creds.get("api_key") or "").strip()
                 base_url = str(creds.get("base_url") or "").strip()
-            except UnscopedSecretError:
-                raise
             except Exception:
                 api_key, base_url = "", _p.base_url
             if not base_url:
@@ -2713,8 +2785,6 @@ def provider_model_ids(provider: Optional[str], *, force_refresh: bool = False) 
             # Use profile's fallback_models if defined
             if _p.fallback_models:
                 return list(_p.fallback_models)
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
 
@@ -2767,6 +2837,8 @@ def _credential_fingerprint(provider: str) -> str:
     after re-auth bust the cache.
     """
     import hashlib
+    import os as _os
+
     parts: list[str] = []
 
     # Env vars from PROVIDER_REGISTRY for this slug
@@ -2775,12 +2847,10 @@ def _credential_fingerprint(provider: str) -> str:
         pcfg = PROVIDER_REGISTRY.get(provider)
         if pcfg is not None:
             for ev in getattr(pcfg, "api_key_env_vars", ()) or ():
-                parts.append(f"{ev}={_profile_env(ev)}")
+                parts.append(f"{ev}={_os.environ.get(ev, '')}")
             bev = getattr(pcfg, "base_url_env_var", "") or ""
             if bev:
-                parts.append(f"{bev}={_profile_env(bev)}")
-    except UnscopedSecretError:
-        raise
+                parts.append(f"{bev}={_os.environ.get(bev, '')}")
     except Exception:
         pass
 
@@ -2798,25 +2868,20 @@ def _credential_fingerprint(provider: str) -> str:
     except Exception:
         pass
 
-    # Ambient CLI credential caches are part of the legacy single-profile
-    # resolver only. In multiplex mode they must not select another profile's
-    # disk-cache identity.
-    from agent.secret_scope import current_secret_scope, is_multiplex_active
-
-    if current_secret_scope() is None and not is_multiplex_active():
-        for path in (
-            os.path.expanduser("~/.codex/auth.json"),
-            os.path.expanduser("~/.claude/.credentials.json"),
-            os.path.expanduser("~/.config/github-copilot/hosts.json"),
-            os.path.expanduser("~/.minimax/credentials.json"),
-        ):
-            try:
-                mt = os.stat(path).st_mtime_ns
-                parts.append(f"{path}@{mt}")
-            except FileNotFoundError:
-                parts.append(f"{path}@missing")
-            except Exception:
-                pass
+    # External well-known credential file locations
+    for path in (
+        _os.path.expanduser("~/.codex/auth.json"),
+        _os.path.expanduser("~/.claude/.credentials.json"),
+        _os.path.expanduser("~/.config/github-copilot/hosts.json"),
+        _os.path.expanduser("~/.minimax/credentials.json"),
+    ):
+        try:
+            mt = _os.stat(path).st_mtime_ns
+            parts.append(f"{path}@{mt}")
+        except FileNotFoundError:
+            parts.append(f"{path}@missing")
+        except Exception:
+            pass
 
     blob = "|".join(parts).encode("utf-8", errors="replace")
     # blake2b for cache-key fingerprinting only — not for credential storage.
@@ -3918,7 +3983,7 @@ _DEEPINFRA_CATALOG_NEG_TTL = 60.0  # seconds
 
 def _deepinfra_catalog_url() -> tuple[str, str]:
     """Return ``(cache_key, full_url)`` for the DeepInfra catalog endpoint."""
-    base = _profile_env("DEEPINFRA_BASE_URL").strip() or _DEEPINFRA_DEFAULT_BASE_URL
+    base = os.getenv("DEEPINFRA_BASE_URL", "").strip() or _DEEPINFRA_DEFAULT_BASE_URL
     cache_key = base.rstrip("/")
     return cache_key, f"{cache_key}/models?{_DEEPINFRA_MODELS_QUERY}"
 
@@ -3943,7 +4008,7 @@ def _fetch_deepinfra_catalog(
             return None
 
     headers: dict[str, str] = {"User-Agent": _HERMES_USER_AGENT}
-    api_key = _profile_env("DEEPINFRA_API_KEY").strip()
+    api_key = os.getenv("DEEPINFRA_API_KEY", "").strip()
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
 
@@ -4056,7 +4121,7 @@ def deepinfra_base_url(section: Optional[dict] = None) -> str:
     to re-code (with subtly divergent normalization).
     """
     candidate = section.get("base_url") if isinstance(section, dict) else None
-    value = candidate or _profile_env("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
+    value = candidate or os.getenv("DEEPINFRA_BASE_URL") or _DEEPINFRA_DEFAULT_BASE_URL
     return str(value).strip().rstrip("/")
 
 
@@ -4212,9 +4277,9 @@ def fetch_ollama_cloud_models(
 
     # 2. Live API probe
     if not api_key:
-        api_key = _profile_env("OLLAMA_API_KEY")
+        api_key = os.getenv("OLLAMA_API_KEY", "")
     if not base_url:
-        base_url = _profile_env("OLLAMA_BASE_URL") or "https://ollama.com/v1"
+        base_url = os.getenv("OLLAMA_BASE_URL", "") or "https://ollama.com/v1"
 
     live_models: list[str] = []
     if api_key:
@@ -4729,8 +4794,6 @@ def validate_requested_model(
                     f"{suggestion_text}"
                 ),
             }
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass  # Fall through to generic warning
 
@@ -4745,8 +4808,6 @@ def validate_requested_model(
     provider_label = _PROVIDER_LABELS.get(normalized, normalized)
     try:
         catalog_models = provider_model_ids(normalized)
-    except UnscopedSecretError:
-        raise
     except Exception:
         catalog_models = []
 

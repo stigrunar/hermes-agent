@@ -10,7 +10,6 @@ against the bundled Bitwarden source.
 from __future__ import annotations
 
 import sys
-import subprocess
 import time
 from pathlib import Path
 
@@ -257,20 +256,6 @@ class TestApplyAll:
         assert report.sources[0].result.error_kind is ErrorKind.INTERNAL
         assert "plugin bug" in report.sources[0].result.error
 
-    def test_source_errors_and_warnings_are_redacted(self, tmp_path):
-        marker = "sk-syntheticregistryerror123456789"
-        source = _make_source(
-            name="unsafe_diagnostic",
-            error=f"fetch failed {marker}",
-        )
-        reg.register_source(source)
-
-        report = reg.apply_all(
-            {"unsafe_diagnostic": {"enabled": True}}, tmp_path, environ={}
-        )
-
-        assert marker not in report.sources[0].result.error
-
     def test_wrong_return_type_contained(self, tmp_path):
         reg.register_source(
             _make_source(name="liar", fetch_fn=lambda cfg, home: {"not": "a result"})
@@ -354,14 +339,10 @@ class TestHelpers:
         assert lines[0] == "tok"
         assert lines[1] == ""
 
-    def test_run_secret_cli_timeout_raises_runtime_error(self, monkeypatch):
-        def _timeout(*_args, **_kwargs):
-            raise subprocess.TimeoutExpired(cmd="synthetic-helper", timeout=0.3)
-
-        monkeypatch.setattr("agent.secret_sources.base.subprocess.run", _timeout)
+    def test_run_secret_cli_timeout_raises_runtime_error(self):
         with pytest.raises(RuntimeError, match="timed out"):
             run_secret_cli(
-                ["synthetic-helper"],
+                [sys.executable, "-c", "import time; time.sleep(10)"],
                 timeout=0.3,
             )
 

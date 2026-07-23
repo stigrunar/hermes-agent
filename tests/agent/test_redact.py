@@ -4,12 +4,7 @@ import logging
 
 import pytest
 
-from agent.redact import (
-    RedactingFormatter,
-    redact_cdp_url,
-    redact_for_persistence,
-    redact_sensitive_text,
-)
+from agent.redact import redact_cdp_url, redact_sensitive_text, RedactingFormatter
 
 
 @pytest.fixture(autouse=True)
@@ -849,35 +844,6 @@ class TestXaiToken:
         assert result.startswith("xai-AB")
 
 
-class TestPersistenceRedaction:
-    def test_recursively_redacts_reusable_vendor_secrets_urls_and_paths(self):
-        value = {
-            "aws": "AKIAIOSFODNN7EXAMPLE",
-            "search": "tvly-abcdefghijklmnopqrstuvwxyz",
-            "google": "AIzaSyB-abc123def456ghi789jklmno0123456789",
-            "github": "ghp_abcdefghijklmnopqrstuvwxyz123456",
-            "openai": "sk-proj-abc123def456ghi789jkl0123456789",
-            "url": "https://user:password@example.test/x?token=opaque&safe=1",
-            "paths": ["/home/alice/project", "/run/user/1000/bus"],
-        }
-        result = redact_for_persistence(value)
-        rendered = repr(result)
-        for secret in value["aws"], value["search"], value["google"], value["github"], value["openai"]:
-            assert secret not in rendered
-        assert "password@example.test" not in rendered
-        assert "token=opaque" not in rendered
-        assert "<home>" in rendered
-        assert "<user-runtime>" in rendered
-        assert result["paths"] == ["<home>/project", "<user-runtime>"]
-
-    def test_preserves_non_diagnostic_shapes_recursively(self):
-        value = ("ordinary", {"count": 3}, ["nested"])
-        result = redact_for_persistence(value)
-        assert isinstance(result, tuple)
-        assert result[0] == "ordinary"
-        assert result[1]["count"] == 3
-
-
 class TestDbConnstrCodeOutput:
     """Regression tests for issue #33801 — _DB_CONNSTR_RE corrupting code output.
 
@@ -1131,61 +1097,3 @@ class TestRedactCdpUrl:
 
     def test_none_returns_empty(self):
         assert redact_cdp_url(None) == ""
-
-
-class TestDiagnosticPersistenceRedaction:
-    @pytest.mark.parametrize(
-        "value",
-        [
-            "CUSTOM_API_KEY=persistence-only-opaque-value",
-            '{"api_key":"persistence-only-opaque-value"}',
-            "api_key: persistence-only-opaque-value",
-        ],
-        ids=["env-assignment", "json-assignment", "yaml-assignment"],
-    )
-    def test_opaque_secret_assignments_are_fully_absent(self, value):
-        opaque = "persistence-only-opaque-value"
-
-        redacted = redact_for_persistence(value)
-
-        assert opaque not in redacted
-        assert "persistence-only" not in redacted
-
-    def test_forces_secret_and_url_credential_redaction(self, monkeypatch):
-        monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
-        opaque = "persistence-only-opaque-value"
-        value = (
-            "Authorization: Bearer synthetic-bearer-value "
-            f"https://user:synthetic-password@example.invalid/cb?token={opaque}"
-        )
-
-        redacted = redact_for_persistence(value)
-
-        assert opaque not in redacted
-        assert "synthetic-bearer-value" not in redacted
-        assert "synthetic-password" not in redacted
-        assert "token=***" in redacted
-
-    def test_recursively_redacts_structured_receipts(self):
-        marker = "sk-syntheticreceiptvalue123456"
-        value = {"nested": [marker, {"error": f"token={marker}"}], "count": 2}
-
-        redacted = redact_for_persistence(value)
-
-        assert marker not in str(redacted)
-        assert redacted["count"] == 2
-
-    def test_persistence_fully_masks_recognized_secret_and_phone_bytes(self):
-        secret = "sk-syntheticfullmaskvalue123456789"
-        phone = "+4798765432"
-
-        redacted = redact_for_persistence(
-            f"credential={secret}; caller={phone}"
-        )
-
-        assert secret not in redacted
-        assert "sk-syn" not in redacted
-        assert "6789" not in redacted
-        assert phone not in redacted
-        assert "+479" not in redacted
-        assert "5432" not in redacted

@@ -44,7 +44,6 @@ from agent.models_dev import (
     get_model_info,
     list_provider_models,
 )
-from agent.secret_scope import UnscopedSecretError, get_secret
 
 # Providers whose picker model list should NOT be capped by max_models.
 # OpenCode Zen / Go are aggregators whose full catalogs (70+ models each) must
@@ -52,11 +51,6 @@ from agent.secret_scope import UnscopedSecretError, get_secret
 _UNCAPPED_PICKER_PROVIDERS: frozenset[str] = frozenset({"opencode-zen", "opencode-go"})
 
 logger = logging.getLogger(__name__)
-
-
-def _profile_env(name: str, default: str = "") -> str:
-    value = get_secret(name, default)
-    return value if value is not None else default
 
 
 def _declared_model_ids(value: Any) -> list[str]:
@@ -844,6 +838,9 @@ def resolve_display_context_length(
     model_info: Optional[ModelInfo] = None,
     custom_providers: list | None = None,
     config_context_length: int | None = None,
+    configured_model: str | None = None,
+    configured_provider: str | None = None,
+    configured_base_url: str | None = None,
 ) -> Optional[int]:
     """Resolve the context length to show in /model output.
 
@@ -862,6 +859,24 @@ def resolve_display_context_length(
     Prefer the provider-aware value; fall back to ``model_info.context_window``
     only if the resolver returns nothing.
     """
+    if config_context_length is not None and (
+        configured_model or configured_provider or configured_base_url
+    ):
+        try:
+            from hermes_cli.route_identity import should_clear_context_pin
+
+            if should_clear_context_pin(
+                configured_model,
+                model,
+                configured_base_url,
+                base_url,
+                configured_provider,
+                provider,
+            ):
+                config_context_length = None
+        except Exception:
+            config_context_length = None
+
     try:
         from agent.model_metadata import get_model_context_length
         ctx = get_model_context_length(
@@ -1330,6 +1345,7 @@ def switch_model(
     api_mode = ""
 
     if provider_changed or explicit_provider:
+        import os
         # User-config providers (providers.<name> in config.yaml) carry their
         # own base_url + transport + key reference. resolve_runtime_provider()
         # resolves by provider NAME and doesn't know user-config slugs (e.g. a
@@ -1346,11 +1362,11 @@ def switch_model(
                 or (user_providers or {}).get(target_provider) or {}
             _ukey = str(_ucfg.get("api_key", "") or "").strip()
             if _ukey.startswith("${") and _ukey.endswith("}"):
-                _ukey = _profile_env(_ukey[2:-1]).strip()
+                _ukey = os.environ.get(_ukey[2:-1], "").strip()
             if not _ukey:
                 _kenv = str(_ucfg.get("key_env", "") or "").strip()
                 if _kenv:
-                    _ukey = _profile_env(_kenv).strip()
+                    _ukey = os.environ.get(_kenv, "").strip()
             try:
                 runtime = resolve_runtime_provider(
                     requested=target_provider,
@@ -1361,8 +1377,6 @@ def switch_model(
                 api_key = runtime.get("api_key", "") or _ukey
                 base_url = runtime.get("base_url", "") or _user_pdef.base_url
                 api_mode = runtime.get("api_mode", "")
-            except UnscopedSecretError:
-                raise
             except Exception:
                 api_key = _ukey
                 base_url = _user_pdef.base_url
@@ -1380,8 +1394,6 @@ def switch_model(
                 api_key = runtime.get("api_key", "")
                 base_url = runtime.get("base_url", "")
                 api_mode = runtime.get("api_mode", "")
-            except UnscopedSecretError:
-                raise
             except Exception as e:
                 return ModelSwitchResult(
                     success=False,
@@ -1406,8 +1418,6 @@ def switch_model(
             api_key = runtime.get("api_key", "")
             base_url = runtime.get("base_url", "")
             api_mode = runtime.get("api_mode", "")
-        except UnscopedSecretError:
-            raise
         except Exception:
             pass
 
@@ -1592,8 +1602,6 @@ def _credential_pool_is_usable(provider: str, *, raw_pool_present: bool = False)
         pool = load_pool(provider)
         if pool.has_credentials():
             return pool.has_available()
-    except UnscopedSecretError:
-        raise
     except Exception:
         pass
     return raw_pool_present
@@ -1706,6 +1714,7 @@ def list_authenticated_providers(
     matches the active provider without blocking on every saved/offline custom
     endpoint.
     """
+    import os
     from agent.models_dev import (
         PROVIDER_TO_MODELS_DEV,
         fetch_models_dev,
@@ -1768,7 +1777,7 @@ def list_authenticated_providers(
             return
         url = ""
         if getattr(pcfg, "base_url_env_var", ""):
-            url = _profile_env(pcfg.base_url_env_var)
+            url = os.environ.get(pcfg.base_url_env_var, "") or ""
         if not url:
             url = getattr(pcfg, "inference_base_url", "") or ""
         normed = _norm_url(url)
@@ -1783,15 +1792,15 @@ def list_authenticated_providers(
         botocore may otherwise probe EC2 IMDS (169.254.169.254) on local
         machines before returning no credentials.
         """
-        if _profile_env("AWS_BEARER_TOKEN_BEDROCK").strip():
+        if os.environ.get("AWS_BEARER_TOKEN_BEDROCK", "").strip():
             return True
         if (
-            _profile_env("AWS_ACCESS_KEY_ID").strip()
-            and _profile_env("AWS_SECRET_ACCESS_KEY").strip()
+            os.environ.get("AWS_ACCESS_KEY_ID", "").strip()
+            and os.environ.get("AWS_SECRET_ACCESS_KEY", "").strip()
         ):
             return True
         return any(
-            _profile_env(name).strip()
+            os.environ.get(name, "").strip()
             for name in (
                 "AWS_PROFILE",
                 "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
@@ -1811,8 +1820,6 @@ def list_authenticated_providers(
         try:
             from agent.bedrock_adapter import has_aws_credentials
             return bool(has_aws_credentials())
-        except UnscopedSecretError:
-            raise
         except Exception:
             return False
 
@@ -1838,21 +1845,19 @@ def list_authenticated_providers(
     # On auth rejection or unreachable server, fall back to the caller-supplied
     # current model so the picker still shows something when offline / mis-keyed.
     if "lmstudio" not in curated and (
-        _profile_env("LM_API_KEY")
-        or _profile_env("LM_BASE_URL")
-        or current_provider.strip().lower() == "lmstudio"
+        os.environ.get("LM_API_KEY") or os.environ.get("LM_BASE_URL") or current_provider.strip().lower() == "lmstudio"
     ):
         from hermes_cli.models import fetch_lmstudio_models
         from hermes_cli.auth import AuthError
         is_current_lmstudio = current_provider.strip().lower() == "lmstudio"
         lm_base = (
-            _profile_env("LM_BASE_URL")
+            os.environ.get("LM_BASE_URL")
             or (current_base_url if is_current_lmstudio and current_base_url else None)
             or "http://127.0.0.1:1234/v1"
         )
         try:
             live = fetch_lmstudio_models(
-                api_key=_profile_env("LM_API_KEY"),
+                api_key=os.environ.get("LM_API_KEY", ""),
                 base_url=lm_base,
                 timeout=1.5, # Smaller timeout for picker
             )
@@ -1935,7 +1940,7 @@ def list_authenticated_providers(
                 continue
 
         # Check if any env var is set
-        has_creds = any(_profile_env(ev) for ev in env_vars)
+        has_creds = any(os.environ.get(ev) for ev in env_vars)
         if not has_creds:
             try:
                 from hermes_cli.auth import _load_auth_store
@@ -2020,13 +2025,13 @@ def list_authenticated_providers(
         if overlay.auth_type == "aws_sdk":
             has_creds = _has_aws_sdk_creds_for_listing(hermes_slug)
         elif overlay.extra_env_vars:
-            has_creds = any(_profile_env(ev) for ev in overlay.extra_env_vars)
+            has_creds = any(os.environ.get(ev) for ev in overlay.extra_env_vars)
         # Also check api_key_env_vars from PROVIDER_REGISTRY for api_key auth_type
         if not has_creds and overlay.auth_type == "api_key":
             for _key in (pid, hermes_slug):
                 pcfg = _auth_registry.get(_key)
                 if pcfg and pcfg.api_key_env_vars:
-                    if any(_profile_env(ev) for ev in pcfg.api_key_env_vars):
+                    if any(os.environ.get(ev) for ev in pcfg.api_key_env_vars):
                         has_creds = True
                         break
         # Check auth store and credential pool for non-env-var credentials.
@@ -2040,8 +2045,6 @@ def list_authenticated_providers(
                 providers_store = store.get("providers", {})
                 if store and (pid in providers_store or hermes_slug in providers_store):
                     has_creds = True
-            except UnscopedSecretError:
-                raise
             except Exception as exc:
                 logger.debug("Auth store check failed for %s: %s", pid, exc)
         # Fallback: check the credential pool with full auto-seeding.
@@ -2064,12 +2067,8 @@ def list_authenticated_providers(
                         _pool = load_pool(hermes_slug)
                         if _pool.has_credentials():
                             has_creds = True
-                    except UnscopedSecretError:
-                        raise
                     except Exception:
                         pass
-            except UnscopedSecretError:
-                raise
             except Exception as exc:
                 logger.debug("Credential pool check failed for %s: %s", hermes_slug, exc)
         # Fallback: check external credential files directly.
@@ -2196,9 +2195,7 @@ def list_authenticated_providers(
         _cp_config = _auth_registry.get(_cp.slug)
         _cp_has_creds = False
         if _cp_config and _cp_config.api_key_env_vars:
-            _cp_has_creds = any(
-                _profile_env(ev) for ev in _cp_config.api_key_env_vars
-            )
+            _cp_has_creds = any(os.environ.get(ev) for ev in _cp_config.api_key_env_vars)
         # Also check auth store and credential pool
         if not _cp_has_creds:
             try:
@@ -2399,7 +2396,7 @@ def list_authenticated_providers(
             api_key = str(ep_cfg.get("api_key", "") or "").strip()
             if not api_key:
                 key_env = str(ep_cfg.get("key_env", "") or "").strip()
-                api_key = _profile_env(key_env).strip() if key_env else ""
+                api_key = os.environ.get(key_env, "").strip() if key_env else ""
             discover = ep_cfg.get("discover_models", True)
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
@@ -2549,7 +2546,7 @@ def list_authenticated_providers(
             inline_api_key = (entry.get("api_key") or "").strip()
             key_env = (entry.get("key_env") or "").strip()
             api_key = inline_api_key or (
-                _profile_env(key_env).strip() if key_env else ""
+                os.environ.get(key_env, "").strip() if key_env else ""
             )
             api_mode = str(
                 entry.get("api_mode")

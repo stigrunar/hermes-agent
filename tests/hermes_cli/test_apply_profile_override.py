@@ -15,9 +15,6 @@ import os
 import sys
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
-
-import pytest
 
 
 
@@ -151,24 +148,6 @@ class TestApplyProfileOverrideHermesHomeGuard:
 
         assert os.environ.get("HERMES_HOME") == str(profile_dir)
         assert sys.argv == ["hermes", "gateway", "install", "--system"]
-
-    def test_explicit_profile_internal_failure_exits(self, tmp_path, monkeypatch):
-        """An explicit profile must not continue under the default home on bugs."""
-        monkeypatch.setattr(Path, "home", lambda: tmp_path)
-        monkeypatch.delenv("HERMES_HOME", raising=False)
-        monkeypatch.setattr(sys, "argv", ["hermes", "-p", "isolated", "chat"])
-
-        from hermes_cli.main import _apply_profile_override
-
-        with pytest.raises(SystemExit) as exc_info:
-            with patch(
-                "hermes_cli.profiles.resolve_profile_env",
-                side_effect=RuntimeError("synthetic resolver failure"),
-            ):
-                _apply_profile_override()
-
-        assert exc_info.value.code == 1
-        assert os.environ.get("HERMES_HOME") is None
 
     def test_hermes_home_unset_default_profile_no_redirect(self, tmp_path, monkeypatch):
         """active_profile=default must not redirect HERMES_HOME."""
@@ -343,3 +322,4 @@ class TestSupervisedChildIgnoresStickyProfile:
         result = os.environ.get("HERMES_HOME")
         assert result is not None
         assert result.endswith("coder")
+

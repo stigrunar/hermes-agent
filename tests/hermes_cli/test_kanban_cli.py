@@ -93,14 +93,7 @@ def test_run_slash_create_and_list(kanban_home):
 
 
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
-    repo = tmp_path / "repo"
-    subprocess.run(
-        ["git", "init", "-b", "main", str(repo)],
-        check=True,
-        capture_output=True,
-        text=True,
-    )
-    target = repo / ".worktrees" / "t6-wire"
+    target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
     out = kc.run_slash(
         f"create 'ship worktree' --workspace worktree:{target_arg} --branch wt/t6-wire"
@@ -113,13 +106,6 @@ def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     assert task.workspace_kind == "worktree"
     assert task.workspace_path == target_arg
     assert task.branch_name == "wt/t6-wire"
-
-
-def test_run_slash_rejects_relative_dir_before_insert(kanban_home):
-    out = kc.run_slash("create 'bad dir' --workspace dir:relative/path")
-    assert "absolute" in out.lower()
-    with kb.connect() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0] == 0
 
 
 def test_run_slash_rejects_branch_without_worktree(kanban_home):

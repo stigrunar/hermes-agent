@@ -17,12 +17,10 @@ forever. The fix gives ``block_task`` a typed ``kind`` and a persistent
 
 from __future__ import annotations
 
-from types import SimpleNamespace
 from pathlib import Path
 
 import pytest
 
-from hermes_cli import kanban as kanban_cli
 from hermes_cli import kanban_db as kb
 
 
@@ -140,119 +138,19 @@ def test_block_loop_detected_event_emitted(kanban_home: Path) -> None:
 def test_dependency_block_routes_to_todo(kanban_home: Path) -> None:
     """Dependency waits never enter the human 'blocked' bucket."""
     with kb.connect_closing() as conn:
-        parent = kb.create_task(conn, title="unfinished parent", assignee="worker")
         tid = _running_task(conn)
-        kb.link_tasks(conn, parent_id=parent, child_id=tid)
-        assert kb.block_task(conn, tid, reason="need X first", kind="dependency")
+        dependency = kb.create_task(conn, title="unfinished dependency", assignee="worker")
+        kb.link_tasks(conn, parent_id=dependency, child_id=tid)
+        assert kb.block_task(
+            conn,
+            tid,
+            reason="need X first",
+            kind="dependency",
+            dependency_task_id=dependency,
+        )
         t = kb.get_task(conn, tid)
         assert t.status == "todo"
         assert t.block_kind == "dependency"
-
-
-def test_dependency_wait_does_not_repromote_until_named_task_changes(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
-        upstream = kb.create_task(conn, title="upstream", assignee=None)
-        child = _running_task(conn, title="child")
-        assert kb.block_task(conn, child, reason=f"waiting for {upstream}",
-                             kind="dependency", dependency_task_id=upstream)
-        spawned = []
-        for _ in range(3):
-            result = kb.dispatch_once(
-                conn, spawn_fn=lambda task, workspace: spawned.append(task.id),
-                max_spawn=2,
-            )
-            assert child not in result.spawned
-            assert spawned == []
-            assert kb.get_task(conn, child).status == "todo"
-        with kb.write_txn(conn):
-            conn.execute("UPDATE tasks SET result = ? WHERE id = ?", ("approved", upstream))
-        assert kb.recompute_ready(conn) == 1
-        assert kb.get_task(conn, child).status == "ready"
-        assert kb.recompute_ready(conn) == 0
-
-
-def test_claim_rejects_stale_ready_dependency_wait(kanban_home: Path) -> None:
-    with kb.connect_closing() as conn:
-        upstream = kb.create_task(conn, title="upstream", assignee="reviewer")
-        child = _running_task(conn, title="child")
-        assert kb.block_task(conn, child, reason="wait", kind="dependency",
-                             dependency_task_id=upstream)
-        conn.execute("UPDATE tasks SET status = 'ready' WHERE id = ?", (child,))
-        conn.commit()
-        assert kb.claim_task(conn, child) is None
-        assert kb.get_task(conn, child).status == "todo"
-
-
-def test_dependency_block_without_unfinished_parent_is_atomic(kanban_home: Path) -> None:
-    """A dependency wait must not create a promotion/retry loop or mutate a run."""
-    with kb.connect_closing() as conn:
-        tid = _running_task(conn)
-        before_events = kb.list_events(conn, tid)
-        before_runs = kb.list_runs(conn, tid)
-        current_run_id = kb.get_task(conn, tid).current_run_id
-
-        with pytest.raises(ValueError, match="dependency_wait_requires_unfinished_parent"):
-            kb.block_task(conn, tid, reason="nothing to wait for", kind="dependency")
-
-        task = kb.get_task(conn, tid)
-        assert task.status == "running"
-        assert task.current_run_id == current_run_id
-        assert kb.list_events(conn, tid) == before_events
-        after_runs = kb.list_runs(conn, tid)
-        assert len(after_runs) == len(before_runs)
-        assert after_runs[-1].ended_at is None
-        assert after_runs[-1].outcome is None
-        assert not [e for e in after_runs if e.outcome == "blocked"]
-
-
-def test_dependency_block_with_only_terminal_parent_is_atomic(kanban_home: Path) -> None:
-    """A linked done parent is not a valid dependency release condition."""
-    with kb.connect_closing() as conn:
-        parent = kb.create_task(conn, title="finished parent", assignee="worker")
-        assert kb.complete_task(conn, parent, result="finished")
-        tid = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=tid)
-        before_events = kb.list_events(conn, tid)
-        before_runs = kb.list_runs(conn, tid)
-        current_run_id = kb.get_task(conn, tid).current_run_id
-
-        with pytest.raises(ValueError, match="dependency_wait_requires_unfinished_parent"):
-            kb.block_task(
-                conn,
-                tid,
-                reason="parent is already done",
-                kind="dependency",
-                dependency_task_id=parent,
-            )
-
-        task = kb.get_task(conn, tid)
-        assert task.status == "running"
-        assert task.current_run_id == current_run_id
-        assert kb.list_events(conn, tid) == before_events
-        assert kb.list_runs(conn, tid) == before_runs
-
-
-def test_cli_dependency_block_rejection_is_concise(kanban_home: Path, capsys) -> None:
-    """The selectable CLI kind reports the DB guard without a traceback."""
-    with kb.connect_closing() as conn:
-        parent = kb.create_task(conn, title="finished parent", assignee="worker")
-        assert kb.complete_task(conn, parent, result="finished")
-        tid = _running_task(conn, title="child")
-        kb.link_tasks(conn, parent_id=parent, child_id=tid)
-
-    result = kanban_cli._cmd_block(SimpleNamespace(
-        task_id=tid,
-        reason=["parent", "is", "done"],
-        kind="dependency",
-        ids=None,
-    ))
-    captured = capsys.readouterr()
-    assert result == 1
-    assert f"cannot block {tid}: dependency_wait_requires_unfinished_parent" in captured.err
-    assert "Traceback" not in captured.err
-    with kb.connect_closing() as conn:
-        assert kb.get_task(conn, tid).status == "running"
-        assert kb.list_comments(conn, tid) == []
 
 
 def test_dependency_then_parent_done_promotes(kanban_home: Path) -> None:

@@ -34,11 +34,8 @@ from __future__ import annotations
 import logging
 import math
 import os
-from contextvars import copy_context
 from dataclasses import dataclass, field
 from typing import Any, Optional
-
-from agent.secret_scope import UnscopedSecretError
 
 logger = logging.getLogger(__name__)
 
@@ -243,8 +240,6 @@ def build_usage_model(*, timeout: float = 10.0) -> UsageModel:
         tok = (get_provider_auth_state("nous") or {}).get("access_token")
         if not (isinstance(tok, str) and tok.strip()):
             return UsageModel(available=False)
-    except UnscopedSecretError:
-        raise
     except Exception:
         return UsageModel(available=False)
 
@@ -254,13 +249,8 @@ def build_usage_model(*, timeout: float = 10.0) -> UsageModel:
         from hermes_cli.nous_account import get_nous_portal_account_info
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-            context = copy_context()
-            account = pool.submit(
-                context.run, get_nous_portal_account_info, force_fresh=True
-            ).result(timeout=timeout)
+            account = pool.submit(get_nous_portal_account_info, force_fresh=True).result(timeout=timeout)
         return usage_model_from_account(account)
-    except UnscopedSecretError:
-        raise
     except Exception:
         logger.debug("usage ▸ portal fetch failed (fail-open)", exc_info=True)
         return UsageModel(available=False)

@@ -17,17 +17,11 @@ under the ``vertex:`` section; env vars take precedence over config.yaml.
 """
 
 import logging
-import hashlib
 import os
 import time
 from typing import Optional, Tuple
 
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope,
-    get_secret as _get_secret,
-    is_multiplex_active,
-)
+from agent.secret_scope import get_secret as _get_secret, is_multiplex_active
 
 # Ensure google-auth is installed before importing. The [vertex] extra is no
 # longer in [all] per the lazy-install policy added 2026-05-12 — lazy_deps
@@ -65,8 +59,6 @@ def _vertex_config() -> dict:
 
         section = load_config().get("vertex")
         return section if isinstance(section, dict) else {}
-    except UnscopedSecretError:
-        raise
     except Exception:
         return {}
 
@@ -127,29 +119,7 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
         return None, None
 
     resolved_path = _resolve_credentials_path(credentials_path)
-    if is_multiplex_active() and not resolved_path:
-        logger.warning(
-            "Vertex ADC is disabled in multiplex mode; configure a "
-            "profile-owned VERTEX_CREDENTIALS_PATH"
-        )
-        return None, None
-
-    owner_scope = current_secret_scope()
-    owner_material = ""
-    if owner_scope is not None:
-        owner_material = "\0".join(
-            str(owner_scope.get(name) or "")
-            for name in (
-                "VERTEX_CREDENTIALS_PATH",
-                "GOOGLE_APPLICATION_CREDENTIALS",
-                "VERTEX_PROJECT_ID",
-                "VERTEX_REGION",
-            )
-        )
-    owner_key = hashlib.blake2b(
-        owner_material.encode("utf-8", errors="replace"), digest_size=16
-    ).hexdigest()
-    cache_key = (resolved_path or "__adc__", owner_key)
+    cache_key = resolved_path or "__adc__"
 
     try:
         cached = _creds_cache.get(cache_key)
@@ -161,6 +131,24 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
                 )
                 project_id = creds.project_id
             else:
+                # google.auth.default() reads GOOGLE_APPLICATION_CREDENTIALS
+                # straight from os.environ internally — it has no notion of
+                # the profile secret scope. _resolve_credentials_path already
+                # confirmed (via get_secret) that *this* profile doesn't
+                # define the var, but python-dotenv's load_dotenv() mutates
+                # os.environ at boot for whichever profile happened to load
+                # first, so a raw os.environ read here can still pick up a
+                # different profile's service-account path. Refuse rather
+                # than silently authenticating under a stranger's identity.
+                if is_multiplex_active() and os.environ.get("GOOGLE_APPLICATION_CREDENTIALS"):
+                    logger.warning(
+                        "Vertex ADC skipped for this profile: "
+                        "GOOGLE_APPLICATION_CREDENTIALS is set in the process "
+                        "environment (from another profile's .env) but not in "
+                        "this profile's own config. Set VERTEX_CREDENTIALS_PATH "
+                        "in this profile's .env instead of relying on ADC."
+                    )
+                    return None, None
                 creds, project_id = google.auth.default(
                     scopes=["https://www.googleapis.com/auth/cloud-platform"]
                 )
@@ -184,15 +172,13 @@ def get_vertex_credentials(credentials_path: Optional[str] = None) -> Tuple[Opti
             project_id = override_project
 
         return creds.token, project_id
-    except UnscopedSecretError:
-        raise
     except Exception as e:
         logger.error(f"Failed to resolve Vertex AI credentials: {e}")
         _creds_cache.pop(cache_key, None)
 
         # If ADC failed (e.g. expired refresh token), try the SA file
         # before giving up — it may have been added after initial startup.
-        if cache_key[0] == "__adc__":
+        if cache_key == "__adc__":
             sa_path = _resolve_credentials_path(credentials_path)
             if sa_path:
                 logger.info("ADC failed, retrying with service account: %s", sa_path)

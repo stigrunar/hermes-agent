@@ -32,7 +32,6 @@ the raw strings the server sent (never re-parsed to float).
 
 from __future__ import annotations
 
-import contextvars
 import logging
 import os
 import re
@@ -40,11 +39,6 @@ import time
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from agent.secret_scope import (
-    UnscopedSecretError,
-    current_secret_scope,
-    is_multiplex_active,
-)
 from utils import is_truthy_value
 
 logger = logging.getLogger(__name__)
@@ -754,8 +748,7 @@ def seed_credits_at_session_start(agent) -> bool:
     real header has already populated _credits_state.
 
     Returns True if it seeded this call, False otherwise (not nous / already seeded /
-    fail-open error). Operational failures never block startup; the multiplex
-    ownership boundary remains fail-closed via ``UnscopedSecretError``.
+    fail-open error). Never raises — credits must never block session startup.
     """
     try:
         if getattr(agent, "provider", "") != "nous":
@@ -766,8 +759,6 @@ def seed_credits_at_session_start(agent) -> bool:
         fixture = None
         try:
             fixture = dev_fixture_credits_state()
-        except UnscopedSecretError:
-            raise
         except Exception:
             fixture = None
         if fixture is not None:
@@ -781,12 +772,6 @@ def seed_credits_at_session_start(agent) -> bool:
         # re-checking idempotency first (a live inference header may land before it).
         import threading
 
-        if is_multiplex_active() and current_secret_scope() is None:
-            raise UnscopedSecretError(
-                "Nous credits seed requires an owner profile scope while "
-                "multiplexing is active"
-            )
-
         def _bg_seed() -> None:
             try:
                 from hermes_cli.nous_account import get_nous_portal_account_info
@@ -796,21 +781,11 @@ def seed_credits_at_session_start(agent) -> bool:
                 state = _credits_state_from_account(info)
                 if state is not None:
                     _hydrate_seed_state(agent, state)
-            except UnscopedSecretError:
-                raise
             except Exception:
                 logger.debug("credits ▸ session-start seed (background) failed", exc_info=True)
 
-        owner_context = contextvars.copy_context()
-        threading.Thread(
-            target=owner_context.run,
-            args=(_bg_seed,),
-            name="credits-seed",
-            daemon=True,
-        ).start()
+        threading.Thread(target=_bg_seed, name="credits-seed", daemon=True).start()
         return True
-    except UnscopedSecretError:
-        raise
     except Exception:
         # Fail-open: any auth/portal hiccup leaves _credits_state as-is, never blocks.
         # Innermost log across all four call sites (TUI build / CLI build / first

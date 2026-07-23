@@ -15,6 +15,7 @@ computed for.
 
 from __future__ import annotations
 
+import json
 import subprocess
 from pathlib import Path
 
@@ -115,9 +116,22 @@ def test_genuine_crash_still_reclaims(conn, monkeypatch):
     host = kb._claimer_id().split(":", 1)[0]
     tid = kb.create_task(conn, title="legit", assignee="w")
     kb.claim_task(conn, tid, claimer=f"{host}:A")
+    run = conn.execute(
+        "SELECT current_run_id FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    run_id = int(run["current_run_id"])
     dead = subprocess.Popen(["true"])
     dead.wait()
-    kb._set_worker_pid(conn, tid, dead.pid)
+    identity = kp.ProcessIdentity(dead.pid, float(dead.pid) + 0.25)
+    identity_json = json.dumps(identity.to_dict(), sort_keys=True)
+    conn.execute(
+        "UPDATE tasks SET worker_pid=? WHERE id=?", (dead.pid, tid)
+    )
+    conn.execute(
+        "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? "
+        "WHERE id=?",
+        (dead.pid, identity_json, json.dumps([identity.to_dict()]), run_id),
+    )
     # Rewind started_at so the launch grace window doesn't skip the check.
     conn.execute("UPDATE tasks SET started_at = started_at - 9999 WHERE id=?", (tid,))
     conn.execute(
@@ -126,8 +140,6 @@ def test_genuine_crash_still_reclaims(conn, monkeypatch):
     conn.commit()
     kb._record_worker_exit(dead.pid, 1 << 8)  # nonzero exit → crash
 
-    crashed = kb.detect_crashed_workers(conn)
-    assert tid in crashed
     monkeypatch.setattr(
         kb,
         "_worker_scope_state",
@@ -136,6 +148,20 @@ def test_genuine_crash_still_reclaims(conn, monkeypatch):
             "systemd-user-scope", True,
         ),
     )
-    kb.reconcile_worker_reaps(conn, protected_pid_fn=lambda: set())
+    crashed = kb.detect_crashed_workers(conn)
+    assert tid in crashed
+    pending = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id=?", (tid,)
+    ).fetchone()
+    assert pending["status"] == "running"
+    assert conn.execute(
+        "SELECT reap_state FROM task_runs WHERE id=?", (run_id,)
+    ).fetchone()["reap_state"] == "terminal_requested"
+
+    decision = kb.reconcile_worker_reaps(
+        conn, now=1000, signal_fn=lambda *_a: None,
+        protected_pid_fn=lambda: set(),
+    )
+    assert decision[0]["state"] == "finalized"
     final = conn.execute("SELECT status FROM tasks WHERE id=?", (tid,)).fetchone()
-    assert final["status"] in ("ready", "blocked", "todo")
+    assert final["status"] == "ready"
