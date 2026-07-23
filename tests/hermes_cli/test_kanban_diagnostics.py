@@ -9,6 +9,9 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
 import time
 from pathlib import Path
 
@@ -445,6 +448,145 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
         assert "t_deadbeef1" in diags[0].data["phantom_ids"]
     finally:
         conn.close()
+
+
+def test_bulk_load_task_history_sorts_each_task_and_avoids_temp_sort(kanban_home):
+    """Fleet history keeps the single-task chronology contracts per task."""
+    conn = kb.connect()
+    try:
+        task_ids = [
+            kb.create_task(conn, title="first", assignee="w"),
+            kb.create_task(conn, title="second", assignee="w"),
+        ]
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id IN (?, ?)",
+            tuple(task_ids),
+        )
+        for task_id, event_rows, run_rows in (
+            (
+                task_ids[0],
+                ((30, "late"), (10, "early"), (20, "middle"), (20, "middle-2")),
+                ((30, "late"), (10, "early"), (30, "late-2")),
+            ),
+            (task_ids[1], ((25, "late"), (5, "early")), ((25, "late"), (5, "early"))),
+        ):
+            for created_at, kind in event_rows:
+                conn.execute(
+                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
+                    "VALUES (?, ?, ?, ?)",
+                    (task_id, kind, None, created_at),
+                )
+            for started_at, outcome in run_rows:
+                conn.execute(
+                    "INSERT INTO task_runs (task_id, status, started_at, outcome) "
+                    "VALUES (?, 'done', ?, ?)",
+                    (task_id, started_at, outcome),
+                )
+        conn.commit()
+
+        events_by_task, runs_by_task = kd.bulk_load_task_history(conn, task_ids)
+        first_events = events_by_task[task_ids[0]]
+        first_runs = runs_by_task[task_ids[0]]
+        assert [(row["created_at"], row["kind"]) for row in first_events] == [
+            (10, "early"), (20, "middle"), (20, "middle-2"), (30, "late"),
+        ]
+        assert [(row["started_at"], row["outcome"]) for row in first_runs] == [
+            (10, "early"), (30, "late"), (30, "late-2"),
+        ]
+        assert [row["id"] for row in first_events[1:3]] == sorted(
+            row["id"] for row in first_events[1:3]
+        )
+        assert [row["id"] for row in first_runs[1:3]] == sorted(
+            row["id"] for row in first_runs[1:3]
+        )
+        assert [row["created_at"] for row in events_by_task[task_ids[1]]] == [5, 25]
+        assert [row["started_at"] for row in runs_by_task[task_ids[1]]] == [5, 25]
+
+        placeholders = ",".join("?" for _ in task_ids)
+        for table in ("task_events", "task_runs"):
+            plan = conn.execute(
+                f"EXPLAIN QUERY PLAN SELECT * FROM {table} "
+                f"WHERE task_id IN ({placeholders})",
+                tuple(task_ids),
+            ).fetchall()
+            assert not any("TEMP B-TREE" in row[-1].upper() for row in plan)
+    finally:
+        conn.close()
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX RLIMIT_FSIZE")
+def test_bulk_load_task_history_works_without_file_backed_temp_storage():
+    """The old fleet sort fails when SQLite cannot write its temp B-tree."""
+    script = textwrap.dedent(
+        '''
+        import resource
+        import signal
+        import sqlite3
+
+        from hermes_cli import kanban_diagnostics as kd
+
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.executescript(
+            """
+            CREATE TABLE task_events (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                created_at INTEGER NOT NULL
+            );
+            CREATE INDEX idx_events_task ON task_events(task_id, created_at);
+            CREATE TABLE task_runs (
+                id INTEGER PRIMARY KEY,
+                task_id TEXT NOT NULL,
+                started_at INTEGER NOT NULL,
+                outcome TEXT
+            );
+            CREATE INDEX idx_runs_task ON task_runs(task_id, started_at);
+            """
+        )
+        task_ids = [f"t_{i}" for i in range(30)]
+        for i in range(3000):
+            conn.executemany(
+                "INSERT INTO task_events(task_id, kind, created_at) VALUES (?, 'x', ?)",
+                [(task_id, 3000 - i) for task_id in task_ids],
+            )
+            conn.executemany(
+                "INSERT INTO task_runs(task_id, started_at, outcome) VALUES (?, ?, 'x')",
+                [(task_id, 3000 - i) for task_id in task_ids],
+            )
+        conn.commit()
+        conn.execute("PRAGMA temp_store=FILE")
+        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
+        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
+
+        placeholders = ",".join("?" for _ in task_ids)
+        old_query_failed = 0
+        for table in ("task_events", "task_runs"):
+            try:
+                list(conn.execute(
+                    f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id",
+                    tuple(task_ids),
+                ))
+            except sqlite3.OperationalError:
+                old_query_failed += 1
+        assert old_query_failed == 2
+
+        events_by_task, runs_by_task = kd.bulk_load_task_history(conn, task_ids)
+        assert [row["created_at"] for row in events_by_task["t_0"]] == list(range(1, 3001))
+        assert [row["started_at"] for row in runs_by_task["t_17"]] == list(range(1, 3001))
+        '''
+    )
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=Path(__file__).resolve().parents[2],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
 
 
 # ---------------------------------------------------------------------------
