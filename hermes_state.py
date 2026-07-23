@@ -4999,6 +4999,7 @@ class SessionDB:
         self,
         source: str = None,
         exclude_sources: List[str] = None,
+        include_origin_sources: List[str] = None,
         cwd_prefix: str = None,
         limit: int = 20,
         offset: int = 0,
@@ -5073,12 +5074,31 @@ class SessionDB:
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
 
         if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
+            if include_origin_sources:
+                origin_placeholders = ",".join("?" for _ in include_origin_sources)
+                where_clauses.append(
+                    "(s.source = ? OR LOWER(TRIM(COALESCE(CASE WHEN json_valid(s.origin_json) "
+                    "THEN json_extract(s.origin_json, '$.platform') END, ''))) "
+                    f"IN ({origin_placeholders}))"
+                )
+                params.extend([source, *(item.lower().strip() for item in include_origin_sources)])
+            else:
+                where_clauses.append("s.source = ?")
+                params.append(source)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
+            source_clause = f"s.source NOT IN ({placeholders})"
+            source_params = list(exclude_sources)
+            if include_origin_sources:
+                origin_placeholders = ",".join("?" for _ in include_origin_sources)
+                source_clause = (
+                    f"({source_clause} OR LOWER(TRIM(COALESCE(CASE WHEN json_valid(s.origin_json) "
+                    "THEN json_extract(s.origin_json, '$.platform') END, ''))) "
+                    f"IN ({origin_placeholders}))"
+                )
+                source_params.extend(item.lower().strip() for item in include_origin_sources)
+            where_clauses.append(source_clause)
+            params.extend(source_params)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)
@@ -5295,6 +5315,7 @@ class SessionDB:
         recents_limit: int = 20,
         cron_limit: int = 50,
         messaging_exclude_sources: List[str] = None,
+        messaging_origin_sources: List[str] = None,
         messaging_limit: int = 100,
     ) -> Dict[str, Any]:
         """Return the three Desktop sidebar windows from one shared scan.
@@ -5313,6 +5334,7 @@ class SessionDB:
         """
         recents_exclude_sources = recents_exclude_sources or []
         messaging_exclude_sources = messaging_exclude_sources or []
+        messaging_origin_sources = messaging_origin_sources or []
 
         def _exclude_clause(column: str, values: List[str]) -> Tuple[str, List[Any]]:
             if not values:
@@ -5326,6 +5348,14 @@ class SessionDB:
         messaging_clause, messaging_params = _exclude_clause(
             "o.source", messaging_exclude_sources
         )
+        if messaging_origin_sources:
+            origin_placeholders = ",".join("?" for _ in messaging_origin_sources)
+            messaging_clause = (
+                f"({messaging_clause} OR LOWER(TRIM(COALESCE(CASE WHEN json_valid(o.origin_json) "
+                "THEN json_extract(o.origin_json, '$.platform') END, ''))) "
+                f"IN ({origin_placeholders}))"
+            )
+            messaging_params.extend(item.lower().strip() for item in messaging_origin_sources)
         selected_columns = self._compact_session_cols()
 
         query = f"""
@@ -5336,7 +5366,7 @@ class SessionDB:
                 GROUP BY session_id
             ),
             listable AS MATERIALIZED (
-                SELECT s.id, s.source, s.started_at
+                SELECT s.id, s.source, s.started_at, s.origin_json
                 FROM sessions s
                 WHERE {_LISTABLE_CHILD_SQL}
                   AND {_delegate_from_json('s.model_config')} IS NULL
@@ -5369,6 +5399,7 @@ class SessionDB:
                     l.id,
                     l.source,
                     l.started_at,
+                    l.origin_json,
                     COALESCE(cm.effective_last_active, l.started_at) AS effective_last_active
                 FROM listable l
                 LEFT JOIN chain_max cm ON cm.root_id = l.id
@@ -7877,6 +7908,7 @@ class SessionDB:
         archived_only: bool = False,
         exclude_children: bool = False,
         exclude_sources: List[str] = None,
+        include_origin_sources: List[str] = None,
     ) -> int:
         """Count sessions, optionally filtered by source.
 
@@ -7902,12 +7934,31 @@ class SessionDB:
             where_clauses.append(_LISTABLE_CHILD_SQL)
             where_clauses.append(f"{_delegate_from_json('s.model_config')} IS NULL")
         if source:
-            where_clauses.append("s.source = ?")
-            params.append(source)
+            if include_origin_sources:
+                origin_placeholders = ",".join("?" for _ in include_origin_sources)
+                where_clauses.append(
+                    "(s.source = ? OR LOWER(TRIM(COALESCE(CASE WHEN json_valid(s.origin_json) "
+                    "THEN json_extract(s.origin_json, '$.platform') END, ''))) "
+                    f"IN ({origin_placeholders}))"
+                )
+                params.extend([source, *(item.lower().strip() for item in include_origin_sources)])
+            else:
+                where_clauses.append("s.source = ?")
+                params.append(source)
         if exclude_sources:
             placeholders = ",".join("?" for _ in exclude_sources)
-            where_clauses.append(f"s.source NOT IN ({placeholders})")
-            params.extend(exclude_sources)
+            source_clause = f"s.source NOT IN ({placeholders})"
+            source_params = list(exclude_sources)
+            if include_origin_sources:
+                origin_placeholders = ",".join("?" for _ in include_origin_sources)
+                source_clause = (
+                    f"({source_clause} OR LOWER(TRIM(COALESCE(CASE WHEN json_valid(s.origin_json) "
+                    "THEN json_extract(s.origin_json, '$.platform') END, ''))) "
+                    f"IN ({origin_placeholders}))"
+                )
+                source_params.extend(item.lower().strip() for item in include_origin_sources)
+            where_clauses.append(source_clause)
+            params.extend(source_params)
         if cwd_prefix:
             clause, clause_params = _cwd_prefix_clause(cwd_prefix)
             where_clauses.append(clause)

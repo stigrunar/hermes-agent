@@ -4684,6 +4684,7 @@ def get_profiles_sessions(
     profile: str = "all",
     source: str = None,
     exclude_sources: str = None,
+    include_origin_sources: str = None,
     full: bool = False,
 ):
     """Unified, read-only session list aggregated across ALL profiles.
@@ -4728,6 +4729,7 @@ def get_profiles_sessions(
     # newest cron sessions can't starve the recents page.
     source_filter = source or None
     exclude_list = [s for s in (exclude_sources or "").split(",") if s.strip()]
+    include_origin_list = [s for s in (include_origin_sources or "").split(",") if s.strip()]
     # Over-fetch per profile so the merged+sorted window is correct for the
     # requested page. Capped so a huge profile can't blow up the response.
     per_profile = min(max(limit + offset, limit), 500)
@@ -4753,6 +4755,7 @@ def get_profiles_sessions(
             rows = db.list_sessions_rich(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
+                include_origin_sources=include_origin_list or None,
                 limit=per_profile,
                 offset=0,
                 min_message_count=min_message_count,
@@ -4765,6 +4768,7 @@ def get_profiles_sessions(
             profile_total = db.session_count(
                 source=source_filter,
                 exclude_sources=exclude_list or None,
+                include_origin_sources=include_origin_list or None,
                 min_message_count=min_message_count,
                 include_archived=include_archived,
                 archived_only=archived_only,
@@ -4809,6 +4813,7 @@ def get_profiles_sessions_sidebar(
     cron_limit: int = 50,
     messaging_limit: int = 100,
     messaging_exclude: str = None,
+    messaging_origin_sources: str = None,
 ):
     """Batched sidebar session slices — one profile-DB open per refresh.
 
@@ -4844,6 +4849,7 @@ def get_profiles_sessions_sidebar(
     recents_scope = (recents_profile or "all").strip() or "all"
     recents_exclude_list = [s for s in (recents_exclude or "").split(",") if s.strip()]
     messaging_exclude_list = [s for s in (messaging_exclude or "").split(",") if s.strip()]
+    messaging_origin_list = [s for s in (messaging_origin_sources or "").split(",") if s.strip()]
 
     recents_cap = min(max(recents_limit, 1), 500)
     cron_cap = min(max(cron_limit, 1), 500)
@@ -4885,6 +4891,7 @@ def get_profiles_sessions_sidebar(
                 recents_limit=recents_cap,
                 cron_limit=cron_cap,
                 messaging_exclude_sources=messaging_exclude_list or None,
+                messaging_origin_sources=messaging_origin_list or None,
                 messaging_limit=messaging_cap,
             )
             if include_recents:

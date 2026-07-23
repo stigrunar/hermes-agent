@@ -28,6 +28,8 @@ def test_methods_registered():
         "projects.set_primary",
         "projects.archive",
         "projects.set_active",
+        "projects.bind_conversation",
+        "projects.unbind_conversation",
         "projects.for_cwd",
     ):
         assert m in server._methods
@@ -36,6 +38,27 @@ def test_methods_registered():
 def test_for_cwd_is_a_long_handler():
     # git-probe handler must run off the dispatch thread.
     assert "projects.for_cwd" in server._LONG_HANDLERS
+
+
+def test_project_tree_row_preserves_messaging_metadata():
+    row = server._project_tree_row(
+        {
+            "id": "s1",
+            "chat_id": "chat",
+            "chat_type": "group",
+            "thread_id": "topic",
+            "display_name": "Team",
+            "origin_json": '{"platform":"telegram"}',
+        }
+    )
+
+    assert {key: row[key] for key in ("chat_id", "chat_type", "thread_id", "display_name", "origin_json")} == {
+        "chat_id": "chat",
+        "chat_type": "group",
+        "thread_id": "topic",
+        "display_name": "Team",
+        "origin_json": '{"platform":"telegram"}',
+    }
 
 
 def test_repo_root_cache_does_not_freeze_a_not_yet_repo(monkeypatch):
@@ -229,6 +252,64 @@ def test_update_and_archive(tmp_path):
 
     payload = _call("projects.archive", {"id": pid})
     assert all(p["id"] != pid or p["archived"] for p in payload["projects"])
+
+
+def test_bind_and_unbind_conversation_rpc(tmp_path):
+    first = _call("projects.create", {"name": "First", "folders": [str(tmp_path / "first")]})["project"]
+    second = _call("projects.create", {"name": "Second", "folders": [str(tmp_path / "second")]})["project"]
+
+    bound = _call(
+        "projects.bind_conversation",
+        {"id": first["id"], "platform": "Telegram", "chat_id": "chat", "thread_id": "", "alias": "Inbox"},
+    )
+    moved = _call(
+        "projects.bind_conversation",
+        {"id": second["id"], "platform": "telegram", "chat_id": "chat", "thread_id": None, "alias": "Moved"},
+    )
+
+    assert bound["binding"]["thread_id"] is None
+    assert bound["project"]["conversation_bindings"][0]["alias"] == "Inbox"
+    assert moved["binding"]["project_id"] == second["id"]
+    listing = _call("projects.list")
+    assert [len(p["conversation_bindings"]) for p in listing["projects"] if p["id"] in {first["id"], second["id"]}] == [
+        0,
+        1,
+    ]
+
+    removed = _call(
+        "projects.unbind_conversation",
+        {"id": second["id"], "platform": "telegram", "chat_id": "chat", "thread_id": None},
+    )
+    assert removed["removed"] is True
+    assert all(not p["conversation_bindings"] for p in _call("projects.list")["projects"])
+
+
+def test_bind_conversation_rpc_rejects_bad_target(tmp_path):
+    project = _call("projects.create", {"name": "P", "folders": [str(tmp_path)]})["project"]
+
+    resp = server._methods["projects.bind_conversation"](1, {"id": project["id"], "platform": "", "chat_id": "chat"})
+
+    assert "error" in resp
+
+
+def test_bind_conversation_rpc_rejects_archived_project(tmp_path):
+    project = _call("projects.create", {"name": "Archived", "folders": [str(tmp_path)]})["project"]
+    _call("projects.archive", {"id": project["id"]})
+
+    resp = server._methods["projects.bind_conversation"](
+        1,
+        {"id": project["id"], "platform": "telegram", "chat_id": "chat", "thread_id": "topic"},
+    )
+
+    assert "error" in resp
+
+
+def test_unbind_conversation_rpc_rejects_unknown_project():
+    resp = server._methods["projects.unbind_conversation"](
+        1, {"id": "p_missing", "platform": "telegram", "chat_id": "chat"}
+    )
+
+    assert "error" in resp
 
 
 def test_get_unknown_returns_error():
