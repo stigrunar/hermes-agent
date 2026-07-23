@@ -1839,19 +1839,7 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
             if not ids:
                 diags_by_task = {}
             else:
-                placeholders = ",".join(["?"] * len(ids))
-                ev_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    ev_by.setdefault(row["task_id"], []).append(row)
-                run_by = {i: [] for i in ids}
-                for row in conn.execute(
-                    f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(ids),
-                ):
-                    run_by.setdefault(row["task_id"], []).append(row)
+                ev_by, run_by = kd.bulk_load_task_history(conn, ids)
                 diags_by_task = {}
                 for r in rows:
                     tid = r["id"]

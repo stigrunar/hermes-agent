@@ -42,6 +42,45 @@ SEVERITY_ORDER = ("warning", "error", "critical")
 _TERMINAL_STATUSES = {"done", "archived", "failed", "cancelled"}
 
 
+def bulk_load_task_history(
+    conn: Any,
+    task_ids: Iterable[str],
+) -> tuple[dict[str, list[Any]], dict[str, list[Any]]]:
+    """Load event and run history for several tasks without a global sort.
+
+    The history contracts used by :func:`kanban_db.list_events` and
+    :func:`kanban_db.list_runs` are per-task chronological order.  A single
+    ``ORDER BY`` on a multi-task ``IN`` query instead asks SQLite to globally
+    sort rows from different tasks, which can require a file-backed temp
+    B-tree.  Keep the indexed lookup unordered and apply the canonical
+    per-task keys in memory.
+    """
+    ids = list(dict.fromkeys(task_ids))
+    if not ids:
+        return {}, {}
+
+    placeholders = ",".join(["?"] * len(ids))
+    events_by_task: dict[str, list[Any]] = {task_id: [] for task_id in ids}
+    for row in conn.execute(
+        f"SELECT * FROM task_events WHERE task_id IN ({placeholders})",
+        tuple(ids),
+    ):
+        events_by_task.setdefault(row["task_id"], []).append(row)
+
+    runs_by_task: dict[str, list[Any]] = {task_id: [] for task_id in ids}
+    for row in conn.execute(
+        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders})",
+        tuple(ids),
+    ):
+        runs_by_task.setdefault(row["task_id"], []).append(row)
+
+    for rows in events_by_task.values():
+        rows.sort(key=lambda row: (row["created_at"], row["id"]))
+    for rows in runs_by_task.values():
+        rows.sort(key=lambda row: (row["started_at"], row["id"]))
+    return events_by_task, runs_by_task
+
+
 def severity_at_or_above(severity: Optional[str], threshold: Optional[str]) -> bool:
     """Return True when ``severity`` meets or exceeds ``threshold``."""
     if threshold is None:
@@ -819,10 +858,9 @@ def _rule_block_unblock_cycling(task, events, runs, now, cfg) -> list[Diagnostic
     window_seconds = float(cfg.get("block_cycle_window_seconds", 24 * 3600))
     cycle_cutoff = now - window_seconds
 
-    # Walk events chronologically (arrival order — callers pre-sort by
-    # id, which is the canonical chronological order; ``created_at``
-    # alone is insufficient because multiple events can share the same
-    # second).  Count "blocked after unblocked" transitions: every time
+    # Walk events chronologically. Callers sort by ``(created_at, id)``;
+    # the id tie-breaker is required because multiple events can share
+    # the same second. Count "blocked after unblocked" transitions: every time
     # a blocked event follows at least one unblocked event since the
     # last cycle was counted, that's a new cycle.
     cycles = 0
