@@ -1037,12 +1037,31 @@ def _terminal_active_run_diagnostic(
             },
         )
 
+    run_ids = {
+        int(run_id)
+        for run in runs
+        if (run_id := _task_field(run, "id")) is not None
+    }
+
+    def is_superseded_closed_reclaim(run: Any) -> bool:
+        run_id = _task_field(run, "id")
+        return bool(
+            _task_field(run, "reap_state") == "manual_recovery_required"
+            and run_id is not None
+            and any(candidate_id > int(run_id) for candidate_id in run_ids)
+            and _task_field(run, "status") == "reclaimed"
+            and _task_field(run, "outcome") == "reclaimed"
+            and _task_field(run, "ended_at") is not None
+            and _task_field(run, "worker_pid") is None
+        )
+
     reap_run = next((
         run for run in reversed(runs)
         if str(_task_field(run, "reap_state") or "") in {
             "terminal_requested", "reap_pending", "reaping",
             "identity_unverifiable", "manual_recovery_required", "gave_up",
         }
+        and not is_superseded_closed_reclaim(run)
     ), None)
     if reap_run is not None:
         reap_state = str(_task_field(reap_run, "reap_state"))

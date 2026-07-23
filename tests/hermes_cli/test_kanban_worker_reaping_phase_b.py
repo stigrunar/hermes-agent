@@ -1812,6 +1812,152 @@ def test_rollback_preflight_refuses_live_new_action_and_drains_reaped(
         assert kb.get_task(conn, task_id).assignee is None
 
 
+def test_historical_reclaimed_manual_recovery_does_not_poison_current_run(
+    kanban_home, process_harness,
+):
+    with kb.connect() as conn:
+        task_id, old_run, old_identity = _active_worker(
+            conn, title="historical manual recovery", pid=42421,
+        )
+        terminal_payload = kb._normalize_terminal_intent(
+            "reclaimed",
+            {
+                "task_status": "ready",
+                "run_status": "reclaimed",
+                "outcome": "reclaimed",
+                "event_kind": "reclaimed",
+            },
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+            "ended_at=100, worker_pid=NULL, terminal_payload=?, "
+            "reap_state='manual_recovery_required', "
+            "reap_error='root_gone_before_tree_capture' WHERE id=?",
+            (json.dumps(terminal_payload, sort_keys=True), old_run),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (task_id,),
+        )
+        replacement = kb.claim_task(conn, task_id, claimer="replacement")
+        assert replacement is not None
+        new_run = replacement.current_run_id
+        assert new_run is not None and new_run > old_run
+        new_identity = kp.ProcessIdentity(42422, old_identity.create_time + 1)
+        conn.execute(
+            "UPDATE tasks SET worker_pid=? WHERE id=?",
+            (new_identity.pid, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_identity=?, worker_tree=? "
+            "WHERE id=?",
+            (
+                new_identity.pid,
+                json.dumps(new_identity.to_dict()),
+                json.dumps([new_identity.to_dict()]),
+                new_run,
+            ),
+        )
+        conn.commit()
+
+        assert kb.phase_b_rollback_preflight(conn) == {
+            "ok": True,
+            "drained_run_ids": [],
+        }
+        task = kb.get_task(conn, task_id)
+        runs = kb.list_runs(conn, task_id)
+        assert kd._terminal_active_run_diagnostic(task, runs, 200) is None
+
+        assert kb._request_terminal_transition(
+            conn,
+            task_id,
+            action="reclaimed",
+            payload={"receipt": "current replacement"},
+            expected_run_id=new_run,
+        )
+        assert kb.phase_b_rollback_preflight(conn) == {
+            "ok": False,
+            "reason": "phase_b_action_pending",
+            "run_id": new_run,
+            "task_id": task_id,
+        }
+        diagnostic = kd._terminal_active_run_diagnostic(
+            kb.get_task(conn, task_id), kb.list_runs(conn, task_id), 201,
+        )
+        assert diagnostic is not None
+        assert diagnostic.kind == "worker_reap_pending"
+        assert diagnostic.data["run_id"] == new_run
+
+
+@pytest.mark.parametrize(
+    ("ambiguous_field", "ambiguous_value", "create_later_run"),
+    [
+        pytest.param("status", "running", True, id="status-not-reclaimed"),
+        pytest.param("outcome", None, True, id="outcome-absent"),
+        pytest.param("ended_at", None, True, id="ended-at-absent"),
+        pytest.param("worker_pid", 42421, True, id="worker-pid-present"),
+        pytest.param(None, None, False, id="later-run-absent"),
+    ],
+)
+def test_ambiguous_historical_manual_recovery_remains_fail_closed(
+    kanban_home,
+    process_harness,
+    ambiguous_field,
+    ambiguous_value,
+    create_later_run,
+):
+    with kb.connect() as conn:
+        task_id, old_run, _identity = _active_worker(
+            conn, title="ambiguous historical manual recovery", pid=42421,
+        )
+        terminal_payload = kb._normalize_terminal_intent(
+            "reclaimed",
+            {
+                "task_status": "ready",
+                "run_status": "reclaimed",
+                "outcome": "reclaimed",
+                "event_kind": "reclaimed",
+            },
+        )
+        conn.execute(
+            "UPDATE task_runs SET status='reclaimed', outcome='reclaimed', "
+            "ended_at=100, worker_pid=NULL, terminal_payload=?, "
+            "reap_state='manual_recovery_required', "
+            "reap_error='root_gone_before_tree_capture' WHERE id=?",
+            (json.dumps(terminal_payload, sort_keys=True), old_run),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='ready', claim_lock=NULL, claim_expires=NULL, "
+            "worker_pid=NULL WHERE id=?",
+            (task_id,),
+        )
+        if create_later_run:
+            replacement = kb.claim_task(conn, task_id, claimer="replacement")
+            assert replacement is not None
+            assert replacement.current_run_id is not None
+            assert replacement.current_run_id > old_run
+        if ambiguous_field is not None:
+            conn.execute(
+                f"UPDATE task_runs SET {ambiguous_field}=? WHERE id=?",
+                (ambiguous_value, old_run),
+            )
+        conn.commit()
+
+        assert kb.phase_b_rollback_preflight(conn) == {
+            "ok": False,
+            "reason": "phase_b_action_pending",
+            "run_id": old_run,
+            "task_id": task_id,
+        }
+        diagnostic = kd._terminal_active_run_diagnostic(
+            kb.get_task(conn, task_id), kb.list_runs(conn, task_id), 200,
+        )
+        assert diagnostic is not None
+        assert diagnostic.kind == "worker_manual_recovery_required"
+        assert diagnostic.data["run_id"] == old_run
+
+
 @pytest.mark.parametrize(
     "action",
     [

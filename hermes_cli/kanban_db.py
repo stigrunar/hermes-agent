@@ -8439,6 +8439,24 @@ def _run_reap_state(conn: sqlite3.Connection, task_id: str) -> Optional[str]:
     return str(row["reap_state"]) if row and row["reap_state"] else None
 
 
+def _is_superseded_closed_reclaim(row: sqlite3.Row) -> bool:
+    """Return whether a fenced reap row is closed history, not live action.
+
+    A later run proves the task has already crossed the replacement boundary.
+    Only the narrow invariant-recovery shape is historical here: the old run
+    is durably reclaimed, ended, and no longer carries a live numeric PID.
+    Other pending or ambiguous rows continue to fail closed.
+    """
+    return bool(
+        row["reap_state"] == "manual_recovery_required"
+        and row["has_later_run"]
+        and row["status"] == "reclaimed"
+        and row["outcome"] == "reclaimed"
+        and row["ended_at"] is not None
+        and row["worker_pid"] is None
+    )
+
+
 def phase_b_rollback_preflight(conn: sqlite3.Connection) -> dict[str, Any]:
     """Drain or refuse rollback before old code can see Phase-B actions.
 
@@ -8452,12 +8470,17 @@ def phase_b_rollback_preflight(conn: sqlite3.Connection) -> dict[str, Any]:
     states = tuple(sorted(_REAP_PENDING_STATES | {"reaped"}))
     placeholders = ", ".join("?" for _ in states)
     rows = conn.execute(
-        "SELECT id, task_id, reap_state, terminal_payload FROM task_runs "
-        f"WHERE reap_state IN ({placeholders}) ORDER BY id",
+        "SELECT r.id, r.task_id, r.status, r.outcome, r.ended_at, r.worker_pid, "
+        "r.reap_state, r.terminal_payload, EXISTS ("
+        "SELECT 1 FROM task_runs newer WHERE newer.task_id=r.task_id "
+        "AND newer.id>r.id) AS has_later_run FROM task_runs r "
+        f"WHERE r.reap_state IN ({placeholders}) ORDER BY r.id",
         states,
     ).fetchall()
     drained: list[int] = []
     for row in rows:
+        if _is_superseded_closed_reclaim(row):
+            continue
         try:
             payload = json.loads(row["terminal_payload"] or "{}")
         except (TypeError, ValueError, json.JSONDecodeError):
