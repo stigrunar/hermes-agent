@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -308,6 +310,8 @@ def test_systemd_user_scope_argv_is_authenticated_and_board_bound(
         ]
         assert wrapped[5].startswith("--unit=hermes-kanban-worker-")
         assert wrapped[5].endswith(".scope")
+        assert "kanban.service" not in wrapped[5]
+        assert not any(part.startswith("--slice=") for part in wrapped)
         assert wrapped[6] == "--"
         assert wrapped[7:] == ["hermes", "chat", "-q", "work"]
 
@@ -355,6 +359,11 @@ def test_default_spawn_uses_authenticated_user_scope_and_returns_receipt(
     class FakeProc:
         pid = 4343
 
+        @staticmethod
+        def wait(timeout):
+            assert timeout == kb._WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            return 125
+
     def fake_popen(argv, **kwargs):
         captured["argv"] = list(argv)
         captured["kwargs"] = kwargs
@@ -367,7 +376,9 @@ def test_default_spawn_uses_authenticated_user_scope_and_returns_receipt(
         lambda candidate: target if candidate == cgroup else None,
     )
     monkeypatch.setattr(kb, "_systemd_user_scope_available", lambda *_a, **_kw: True)
-    monkeypatch.setattr(kb, "_await_scope_exec_ack", lambda *_a, **_kw: None)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_a, **_kw: FakeProc.pid,
+    )
     monkeypatch.setattr(kb.subprocess, "Popen", fake_popen)
 
     with kb.connect() as conn:
@@ -381,6 +392,8 @@ def test_default_spawn_uses_authenticated_user_scope_and_returns_receipt(
         assert launch.manager_kind == "systemd-user"
         assert launch.manager_uid == os.getuid()
         assert launch.launch_acknowledged is True
+        assert launch.gate_ready is True
+        assert launch.release_fd is not None
         assert launch.scope_unit == kb._worker_scope_unit_name(
             task_id,
             claimed.current_run_id,
@@ -394,9 +407,12 @@ def test_default_spawn_uses_authenticated_user_scope_and_returns_receipt(
     ]
     assert argv[5] == f"--unit={launch.scope_unit}"
     assert argv[6] == "--"
-    assert kwargs["pass_fds"]
+    assert argv[7] == sys.executable
+    assert argv[-3:] == ["chat", "-q", f"work kanban task {task_id}"]
+    assert len(kwargs["pass_fds"]) == 2
     assert kwargs["env"]["XDG_RUNTIME_DIR"] == str(target.runtime_dir)
     assert kwargs["env"]["DBUS_SESSION_BUS_ADDRESS"] == f"unix:path={target.bus_path}"
+    kb._abort_worker_launch(launch)
 
 
 def test_default_spawn_falls_back_to_direct_without_validated_user_manager(
@@ -406,6 +422,11 @@ def test_default_spawn_falls_back_to_direct_without_validated_user_manager(
 
     class FakeProc:
         pid = 4545
+
+        @staticmethod
+        def wait(timeout):
+            assert timeout == kb._WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            return 125
 
     def fake_popen(argv, **kwargs):
         captured["argv"] = list(argv)
@@ -424,6 +445,9 @@ def test_default_spawn_falls_back_to_direct_without_validated_user_manager(
     monkeypatch.setattr(
         kb, "_systemd_user_manager_target_for_cgroup", lambda _candidate: None,
     )
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_a, **_kw: FakeProc.pid,
+    )
     monkeypatch.setattr(kb.subprocess, "Popen", fake_popen)
 
     with kb.connect() as conn:
@@ -437,11 +461,92 @@ def test_default_spawn_falls_back_to_direct_without_validated_user_manager(
     assert launch.manager_kind is None
     assert launch.manager_uid is None
     assert launch.launch_acknowledged is None
-    assert captured["argv"][0] == "hermes"
-    assert "pass_fds" not in captured["kwargs"]
+    assert launch.gate_ready is True
+    assert captured["argv"][0] == sys.executable
+    assert "hermes" in captured["argv"]
+    assert len(captured["kwargs"]["pass_fds"]) == 2
+    kb._abort_worker_launch(launch)
 
 
-def test_scope_exec_ack_distinguishes_dead_from_uncertain_launcher():
+def test_default_spawn_handshake_failure_closes_every_pipe_and_launcher(
+    kanban_home, monkeypatch,
+):
+    first_pipe = os.pipe()
+    second_pipe = os.pipe()
+    pipe_pairs = iter((first_pipe, second_pipe))
+    cleanup: list[float] = []
+
+    class FakeProc:
+        pid = 4599
+
+        @staticmethod
+        def wait(timeout):
+            cleanup.append(timeout)
+            return 125
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kb, "_current_cgroup_path", lambda: None)
+    monkeypatch.setattr(kb.os, "pipe", lambda: next(pipe_pairs))
+    monkeypatch.setattr(kb.subprocess, "Popen", lambda *_a, **_kw: FakeProc())
+    monkeypatch.setattr(
+        kb,
+        "_await_worker_launch_ready",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            RuntimeError("synthetic handshake timeout")
+        ),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="handshake cleanup", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        with pytest.raises(RuntimeError, match="synthetic handshake timeout"):
+            kb._default_spawn(claimed, str(kanban_home))
+
+    for fd in (*first_pipe, *second_pipe):
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert cleanup == [kb._WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS]
+
+
+def test_worker_launch_gate_blocks_exec_until_parent_release(tmp_path):
+    marker = tmp_path / "worker-executed"
+    ready_read, ready_write = os.pipe()
+    release_read, release_write = os.pipe()
+    argv = kb._worker_launch_gate_argv(
+        [
+            sys.executable,
+            "-c",
+            "from pathlib import Path; import sys; Path(sys.argv[1]).write_text('ran')",
+            str(marker),
+        ],
+        ready_write,
+        release_read,
+    )
+    proc = subprocess.Popen(argv, pass_fds=(ready_write, release_read))
+    os.close(ready_write)
+    os.close(release_read)
+    try:
+        worker_pid = kb._await_worker_launch_ready(proc, ready_read)
+        assert worker_pid == proc.pid
+        assert not marker.exists()
+        launch = kb._WorkerLaunchPid(
+            worker_pid,
+            release_fd=release_write,
+            launcher=proc,
+            gate_ready=True,
+        )
+        kb._release_worker_launch(launch)
+        assert proc.wait(timeout=2) == 0
+        assert marker.read_text() == "ran"
+    finally:
+        kb._close_worker_launch_fd(ready_read)
+        kb._close_worker_launch_fd(release_write)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait(timeout=2)
+
+
+def test_worker_launch_ready_distinguishes_dead_from_uncertain_launcher():
     class DeadProc:
         pid = 4646
 
@@ -454,7 +559,7 @@ def test_scope_exec_ack_distinguishes_dead_from_uncertain_launcher():
     os.close(ready_write)
     try:
         with pytest.raises(RuntimeError, match="exited before"):
-            kb._await_scope_exec_ack(DeadProc(), ready_read)
+            kb._await_worker_launch_ready(DeadProc(), ready_read)
     finally:
         os.close(ready_read)
 
@@ -468,10 +573,188 @@ def test_scope_exec_ack_distinguishes_dead_from_uncertain_launcher():
     ready_read, ready_write = os.pipe()
     try:
         with pytest.raises(kb._WorkerLaunchUncertain):
-            kb._await_scope_exec_ack(UncertainProc(), ready_read, timeout=0)
+            os.write(ready_write, b"not-a-pid\n")
+            kb._await_worker_launch_ready(UncertainProc(), ready_read)
     finally:
         os.close(ready_read)
         os.close(ready_write)
+
+
+def test_dispatch_persists_exact_identity_and_scope_receipt_before_release(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    identity = kp.ProcessIdentity(4848, 1200.5)
+    monkeypatch.setattr(kp, "read_identity", lambda pid: identity if pid == 4848 else None)
+    release_read, release_write = os.pipe()
+    observed: list[str] = []
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="ordered launch", assignee="worker")
+
+        def spawn(claimed, _workspace):
+            unit = kb._worker_scope_unit_name(
+                claimed.id,
+                claimed.current_run_id,
+                db_path=kb._connection_main_db_path(conn),
+            )
+            return kb._WorkerLaunchPid(
+                identity.pid,
+                scope_unit=unit,
+                manager_kind="systemd-user",
+                manager_uid=os.getuid(),
+                launch_acknowledged=True,
+                release_fd=release_write,
+                launcher=object(),
+                gate_ready=True,
+                manager_target=object(),
+            )
+
+        real_release = kb._release_worker_launch
+
+        def assert_durable_then_release(launch):
+            task = kb.get_task(conn, task_id)
+            run = kb.get_run(conn, task.current_run_id)
+            assert run.worker_identity == identity.to_dict()
+            event = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id=? AND run_id=? AND kind='spawned'",
+                (task_id, run.id),
+            ).fetchone()
+            receipt = json.loads(event["payload"])
+            assert receipt["identity_verified"] is True
+            assert receipt["launch_acknowledged"] is True
+            assert receipt["scope_unit"] == launch.scope_unit
+            assert kd._terminal_active_run_diagnostic(task, [run], int(time.time())) is None
+            observed.append("durable")
+            real_release(launch)
+
+        monkeypatch.setattr(kb, "_release_worker_launch", assert_durable_then_release)
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+        assert result.spawned[0][0] == task_id
+        assert observed == ["durable"]
+        assert os.read(release_read, 1) == b"1"
+        assert kb.get_task(conn, task_id).worker_pid == identity.pid
+    os.close(release_read)
+
+
+def test_dispatch_aborts_gate_and_records_spawn_failure_when_identity_missing(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    monkeypatch.setattr(kp, "read_identity", lambda _pid: None)
+    release_read, release_write = os.pipe()
+    cleanup: list[float] = []
+
+    class Launcher:
+        @staticmethod
+        def wait(timeout):
+            cleanup.append(timeout)
+            return 125
+
+    def spawn(_claimed, _workspace):
+        return kb._WorkerLaunchPid(
+            4949,
+            release_fd=release_write,
+            launcher=Launcher(),
+            gate_ready=True,
+        )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="missing identity", assignee="worker")
+        result = kb.dispatch_once(conn, spawn_fn=spawn)
+
+        assert result.spawned == []
+        task = kb.get_task(conn, task_id)
+        assert task.status == "ready"
+        assert task.current_run_id is None
+        run = kb.latest_run(conn, task_id)
+        assert run.outcome == "spawn_failed"
+        assert run.worker_identity is None
+        assert os.read(release_read, 1) == b""
+        assert cleanup == [kb._WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS]
+    os.close(release_read)
+
+
+@pytest.mark.parametrize(
+    ("scope_unit", "manager_kind", "launch_acknowledged"),
+    [
+        ("hermes-kanban-worker-" + "0" * 32 + ".scope", "systemd-user", False),
+        ("wrong.scope", "systemd-user", True),
+        ("hermes-kanban-worker-" + "0" * 32 + ".scope", "system-manager", True),
+    ],
+)
+def test_gated_scope_receipt_mismatch_never_releases_worker(
+    kanban_home,
+    monkeypatch,
+    scope_unit,
+    manager_kind,
+    launch_acknowledged,
+):
+    identity = kp.ProcessIdentity(4999, 1250.5)
+    monkeypatch.setattr(kp, "read_identity", lambda _pid: identity)
+    release_read, release_write = os.pipe()
+
+    class Launcher:
+        @staticmethod
+        def wait(timeout):
+            assert timeout == kb._WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS
+            return 125
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="invalid scope receipt", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        launch = kb._WorkerLaunchPid(
+            identity.pid,
+            scope_unit=scope_unit,
+            manager_kind=manager_kind,
+            manager_uid=os.getuid(),
+            launch_acknowledged=launch_acknowledged,
+            release_fd=release_write,
+            launcher=Launcher(),
+            gate_ready=True,
+            manager_target=object(),
+        )
+
+        with pytest.raises(RuntimeError, match="identity/receipt CAS failed"):
+            kb._persist_and_release_worker_launch(conn, claimed, launch)
+
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert run.worker_pid is None
+        assert run.worker_identity is None
+        assert os.read(release_read, 1) == b""
+        assert conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind='spawned'",
+            (task_id,),
+        ).fetchone() is None
+    os.close(release_read)
+
+
+def test_dispatch_preserves_plain_integer_custom_spawn_contract(
+    kanban_home, monkeypatch,
+):
+    from hermes_cli import profiles
+
+    monkeypatch.setattr(profiles, "profile_exists", lambda _profile: True)
+    identity = kp.ProcessIdentity(5050, 1300.5)
+    monkeypatch.setattr(kp, "read_identity", lambda pid: identity if pid == 5050 else None)
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="custom spawn", assignee="worker")
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda _task, _workspace: identity.pid,
+        )
+
+        assert result.spawned[0][0] == task_id
+        run = kb.latest_run(conn, task_id)
+        assert run.worker_pid == identity.pid
+        assert run.worker_identity == identity.to_dict()
 
 
 def test_review_required_block_releases_registered_gate_after_worker_reap(
@@ -1540,6 +1823,83 @@ def test_accepted_dependency_block_finalizes_after_parent_completes(
         assert signals == []
 
 
+def test_dependency_wait_names_replacement_outside_graph_until_terminal(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        replacement = kb.create_task(
+            conn, title="replacement", assignee="worker",
+        )
+        replacement_claim = kb.claim_task(
+            conn, replacement, claimer="replacement",
+        )
+        assert replacement_claim is not None
+        source = kb.create_task(conn, title="source", assignee="worker")
+        source_claim = kb.claim_task(conn, source, claimer="source")
+        assert source_claim is not None
+
+        assert kb.block_task(
+            conn,
+            source,
+            reason=f"superseded by {replacement}; ignore t_deadbeef",
+            kind="dependency",
+            dependency_task_id=replacement,
+            expected_run_id=source_claim.current_run_id,
+        )
+        wait_event = [
+            event for event in kb.list_events(conn, source)
+            if event.kind == "dependency_wait"
+        ][-1]
+        assert set(wait_event.payload["dependency_fingerprints"]) == {replacement}
+        assert "t_deadbeef" in wait_event.payload["dependency_ids"]
+
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, source).status == "todo"
+        preview = kb.dispatch_once(conn, dry_run=True)
+        assert preview.promoted == 0
+        assert all(task_id != source for task_id, *_rest in preview.spawned)
+
+        # Even a stale/manual ready write cannot bypass the durable wait at
+        # the claim boundary. Include the false promoted event emitted by the
+        # old buggy scheduler: it is not dependency-terminal proof.
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (source,))
+        kb._append_event(conn, source, "promoted", None)
+        conn.commit()
+        assert kb.claim_task(conn, source, claimer="bypass") is None
+        assert kb.get_task(conn, source).status == "todo"
+
+        assert kb.complete_task(conn, replacement, result="replacement done")
+        assert kb.get_task(conn, source).status == "ready"
+
+
+def test_dependency_wait_requires_every_accepted_dependency_to_be_terminal(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        first = kb.create_task(conn, title="first replacement", assignee="worker")
+        second = kb.create_task(conn, title="second replacement", assignee="worker")
+        assert kb.claim_task(conn, first, claimer="first") is not None
+        assert kb.claim_task(conn, second, claimer="second") is not None
+        source = kb.create_task(conn, title="multi wait", assignee="worker")
+        source_claim = kb.claim_task(conn, source, claimer="source")
+        assert source_claim is not None
+
+        assert kb.block_task(
+            conn,
+            source,
+            reason=f"wait for {first} and {second}",
+            kind="dependency",
+            dependency_task_id=first,
+            expected_run_id=source_claim.current_run_id,
+        )
+        assert kb.complete_task(conn, first, result="first done")
+        assert kb.recompute_ready(conn) == 0
+        assert kb.get_task(conn, source).status == "todo"
+
+        assert kb.complete_task(conn, second, result="second done")
+        assert kb.get_task(conn, source).status == "ready"
+
+
 @pytest.mark.parametrize("parent_status", sorted(kb.TERMINAL_STATUSES))
 def test_active_dependency_block_rejects_terminal_parent_before_intent(
     kanban_home, process_harness, parent_status,
@@ -2053,6 +2413,14 @@ def test_legacy_pid_only_live_row_fails_closed(
         conn.execute("UPDATE tasks SET worker_pid=31337 WHERE id=?", (task_id,))
         conn.execute("UPDATE task_runs SET worker_pid=31337 WHERE id=?", (run_id,))
         conn.commit()
+        diagnostic = kd._terminal_active_run_diagnostic(
+            kb.get_task(conn, task_id),
+            kb.list_runs(conn, task_id),
+            2999,
+        )
+        assert diagnostic is not None
+        assert diagnostic.kind == "worker_identity_unverifiable"
+        assert diagnostic.severity == "critical"
         assert kb.complete_task(conn, task_id, result="unsafe", expected_run_id=run_id)
         assert kb.get_run(conn, run_id).reap_state == "identity_unverifiable"
         decision = kb.reconcile_worker_reaps(

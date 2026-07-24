@@ -4227,10 +4227,70 @@ def _has_sticky_block(conn: sqlite3.Connection, task_id: str) -> bool:
     return bool(row) and row["kind"] == "blocked"
 
 
+def _dependency_wait_blocks_promotion(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Return whether the latest accepted dependency wait is still active.
+
+    Dependency blocks can name replacements that are not ordinary graph
+    parents. ``block_task`` durably records every accepted, existing
+    dependency in ``dependency_fingerprints``. Treat those fingerprint keys as
+    the accepted dependency set: prose-only phantom ids never become gates,
+    while a missing or malformed accepted receipt remains fail-closed.
+
+    Promotion events are not treated as proof that the wait ended: older
+    dispatchers emitted exactly such a false promotion while the replacement
+    was still running. Current terminal state is the only release condition.
+    """
+    marker = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id=? AND kind='dependency_wait' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if marker is None:
+        return False
+    try:
+        payload = json.loads(marker["payload"]) if marker["payload"] else None
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+    if not isinstance(payload, dict) or payload.get("kind") != "dependency":
+        return True
+    dependency_ids = payload.get("dependency_ids")
+    fingerprints = payload.get("dependency_fingerprints")
+    if (
+        not isinstance(dependency_ids, list)
+        or not all(isinstance(dep_id, str) and dep_id for dep_id in dependency_ids)
+        or not isinstance(fingerprints, dict)
+        or not fingerprints
+    ):
+        return True
+    accepted_ids = list(fingerprints)
+    if not all(
+        isinstance(dep_id, str)
+        and dep_id in dependency_ids
+        and isinstance(fingerprints[dep_id], str)
+        and re.fullmatch(r"[0-9a-f]{64}", fingerprints[dep_id])
+        for dep_id in accepted_ids
+    ):
+        return True
+    placeholders = ",".join("?" for _ in accepted_ids)
+    rows = conn.execute(
+        f"SELECT id, status FROM tasks WHERE id IN ({placeholders})",
+        tuple(accepted_ids),
+    ).fetchall()
+    statuses = {row["id"]: row["status"] for row in rows}
+    return any(
+        statuses.get(dep_id) not in TERMINAL_STATUSES
+        for dep_id in accepted_ids
+    )
+
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
 ) -> int:
-    """Promote ``todo`` tasks to ``ready`` when all parents are ``done`` or ``archived``.
+    """Promote ``todo`` tasks after graph and durable dependency waits clear.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
     an existing transaction; it opens its own IMMEDIATE txn.
@@ -4269,6 +4329,11 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            if (
+                cur_status == "todo"
+                and _dependency_wait_blocks_promotion(conn, task_id)
+            ):
+                continue
             if cur_status == "blocked" and _has_sticky_block(conn, task_id):
                 # Worker / operator asked for human review — do not
                 # silently auto-recover.  ``unblock_task`` is the only
@@ -4360,7 +4425,17 @@ def claim_task(
         # 'todo' here — recompute_ready will re-promote when the parents
         # actually finish. See RCA at
         # kanban/boards/cookai/workspaces/t_a6acd07d/root-cause.md.
-        terminal_placeholders, terminal_statuses = _terminal_status_sql()
+        if _dependency_wait_blocks_promotion(conn, task_id):
+            conn.execute(
+                "UPDATE tasks SET status = 'todo' "
+                "WHERE id = ? AND status = 'ready'",
+                (task_id,),
+            )
+            _append_event(
+                conn, task_id, "claim_rejected",
+                {"reason": "dependency_wait"},
+            )
+            return None
         undone = conn.execute(
             "SELECT 1 FROM task_links l "
             "JOIN tasks p ON p.id = l.parent_id "
@@ -8556,10 +8631,11 @@ _SYSTEMD_USER_RUNTIME_ROOT = Path("/run/user")
 _SYSTEMD_SCOPE_MIN_VERSION = 236
 _SYSTEMD_PROBE_TIMEOUT_SECONDS = 2.0
 _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS = 5.0
+_WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 1.0
 
 
 class _WorkerLaunchUncertain(RuntimeError):
-    """A scoped launcher could not be acknowledged or safely stopped."""
+    """A launcher could not provide a trustworthy pre-exec identity."""
 
     def __init__(self, pid: int, message: str):
         super().__init__(message)
@@ -8575,7 +8651,12 @@ class _SystemdUserManagerTarget:
 
 
 class _WorkerLaunchPid(int):
-    """Integer-compatible PID carrying the authenticated launch receipt."""
+    """Integer-compatible PID carrying a gated authenticated launch receipt.
+
+    ``release_fd`` is parent-owned. While it remains open without a release
+    byte, the exact worker process is blocked in the launch shim and cannot
+    import or execute Hermes code.
+    """
 
     def __new__(
         cls,
@@ -8585,12 +8666,20 @@ class _WorkerLaunchPid(int):
         manager_kind: Optional[str] = None,
         manager_uid: Optional[int] = None,
         launch_acknowledged: Optional[bool] = None,
+        release_fd: Optional[int] = None,
+        launcher: Any = None,
+        gate_ready: bool = False,
+        manager_target: Any = None,
     ):
         value = int.__new__(cls, int(pid))
         value.scope_unit = scope_unit
         value.manager_kind = manager_kind
         value.manager_uid = manager_uid
         value.launch_acknowledged = launch_acknowledged
+        value.release_fd = release_fd
+        value.launcher = launcher
+        value.gate_ready = bool(gate_ready)
+        value.manager_target = manager_target
         return value
 
 
@@ -8760,60 +8849,144 @@ def _worker_scope_unit_name(
     return f"{_SYSTEMD_WORKER_SCOPE_PREFIX}{digest}.scope"
 
 
-def _scope_exec_ack_argv(cmd: list[str], ready_fd: int) -> list[str]:
+def _worker_launch_gate_argv(
+    cmd: list[str],
+    ready_fd: int,
+    release_fd: int,
+) -> list[str]:
+    """Wrap ``cmd`` in a two-way pre-exec identity/receipt barrier."""
     code = (
-        "import os,sys;fd=int(sys.argv[1]);os.write(fd,b'1');"
-        "os.close(fd);os.execvpe(sys.argv[2],sys.argv[2:],os.environ)"
+        "import os,sys\n"
+        "ready_fd=int(sys.argv[1]);release_fd=int(sys.argv[2])\n"
+        "os.write(ready_fd,(str(os.getpid())+'\\n').encode('ascii'))\n"
+        "os.close(ready_fd)\n"
+        "release=os.read(release_fd,1)\n"
+        "os.close(release_fd)\n"
+        "if release != b'1': raise SystemExit(125)\n"
+        "os.execvpe(sys.argv[3],sys.argv[3:],os.environ)\n"
     )
-    return [sys.executable, "-c", code, str(int(ready_fd)), *cmd]
+    return [
+        sys.executable,
+        "-c",
+        code,
+        str(int(ready_fd)),
+        str(int(release_fd)),
+        *cmd,
+    ]
 
 
-def _await_scope_exec_ack(
+def _await_worker_launch_ready(
     proc: subprocess.Popen,
     ready_fd: int,
     *,
     timeout: float = _SYSTEMD_SCOPE_EXEC_TIMEOUT_SECONDS,
-) -> None:
+) -> int:
+    """Return the exact gated worker PID or fail within ``timeout``."""
     import select
 
     readable, _, _ = select.select([ready_fd], [], [], max(0.0, float(timeout)))
     if readable:
-        if os.read(ready_fd, 1) == b"1":
-            return
+        raw_pid = os.read(ready_fd, 64)
+        try:
+            worker_pid = int(raw_pid.strip())
+        except (TypeError, ValueError):
+            worker_pid = 0
+        if worker_pid > 0 and raw_pid.endswith(b"\n"):
+            return worker_pid
         try:
             returncode = proc.wait(timeout=0.5)
         except (subprocess.TimeoutExpired, AttributeError):
-            returncode = proc.poll()
+            poll = getattr(proc, "poll", None)
+            returncode = poll() if poll is not None else None
         if returncode is None:
             raise _WorkerLaunchUncertain(
                 proc.pid,
-                "scope acknowledgement pipe closed while systemd-run remained alive",
+                "worker launch gate returned malformed identity while launcher remained alive",
             )
         raise RuntimeError(
-            "systemd-run exited before the Kanban worker exec acknowledgement "
+            "worker launcher exited before the Kanban identity acknowledgement "
             f"(status {returncode})"
         )
+    raise RuntimeError("worker launch identity acknowledgement timed out before release")
 
-    # A timed-out client may be wedged in manager setup. Release the DB claim
-    # only after proving that exact process stopped; otherwise retain its PID
-    # as an untrusted receipt so a later tick cannot launch a duplicate.
+
+def _close_worker_launch_fd(fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+def _cleanup_worker_launcher(
+    proc: Any,
+    release_fd: Optional[int],
+    *,
+    scope_unit: Optional[str] = None,
+    manager_target: Any = None,
+) -> None:
+    """Deny exec, then boundedly reap/stop only this exact launch boundary."""
+    _close_worker_launch_fd(release_fd)
+    if proc is None:
+        return
+    try:
+        proc.wait(timeout=_WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS)
+        return
+    except (subprocess.TimeoutExpired, AttributeError):
+        pass
+    if scope_unit is not None and manager_target is not None:
+        _stop_systemd_user_scope(
+            scope_unit,
+            manager_target=manager_target,
+        )
     try:
         proc.kill()
-    except ProcessLookupError:
+    except (ProcessLookupError, OSError, AttributeError):
         pass
-    except OSError as exc:
-        raise _WorkerLaunchUncertain(
-            proc.pid,
-            "systemd-run launch acknowledgement timed out and could not be stopped",
-        ) from exc
     try:
-        proc.wait(timeout=1.0)
-    except subprocess.TimeoutExpired as exc:
-        raise _WorkerLaunchUncertain(
-            proc.pid,
-            "systemd-run launch acknowledgement timed out and the client remained alive",
-        ) from exc
-    raise RuntimeError("systemd-run launch acknowledgement timed out before worker exec")
+        proc.wait(timeout=_WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS)
+    except (subprocess.TimeoutExpired, OSError, AttributeError):
+        pass
+
+
+def _abort_worker_launch(launch: _WorkerLaunchPid) -> None:
+    """Close a gated launch without ever allowing Hermes to execute."""
+    release_fd = getattr(launch, "release_fd", None)
+    launch.release_fd = None
+    proc = getattr(launch, "launcher", None)
+    launch.launcher = None
+    _cleanup_worker_launcher(
+        proc,
+        release_fd,
+        scope_unit=getattr(launch, "scope_unit", None),
+        manager_target=getattr(launch, "manager_target", None),
+    )
+
+
+def _release_worker_launch(launch: _WorkerLaunchPid) -> None:
+    """Release a gate only after the durable identity transaction commits."""
+    release_fd = getattr(launch, "release_fd", None)
+    if release_fd is None or not getattr(launch, "gate_ready", False):
+        raise RuntimeError("worker launch gate is not ready for release")
+    launch.release_fd = None
+    try:
+        if os.write(release_fd, b"1") != 1:
+            raise RuntimeError("worker launch gate release was not delivered")
+    except (OSError, RuntimeError) as exc:
+        _cleanup_worker_launcher(
+            getattr(launch, "launcher", None),
+            None,
+            scope_unit=getattr(launch, "scope_unit", None),
+            manager_target=getattr(launch, "manager_target", None),
+        )
+        launch.launcher = None
+        raise RuntimeError("worker exited before durable launch release") from exc
+    finally:
+        _close_worker_launch_fd(release_fd)
+    # The normal zombie reaper owns the now-running child. Do not retain a
+    # Popen object solely to keep a parent-side resource alive.
+    launch.launcher = None
 
 
 def _valid_worker_scope_unit(unit: str) -> bool:
@@ -10981,6 +11154,14 @@ def _set_worker_pid(
     from hermes_cli.kanban_worker_process import read_identity
 
     worker_identity = read_identity(int(pid))
+    launch_handle = pid if type(pid) is _WorkerLaunchPid else None
+    gated_launch = bool(
+        launch_handle is not None
+        and getattr(launch_handle, "release_fd", None) is not None
+        and getattr(launch_handle, "gate_ready", False)
+    )
+    if gated_launch and worker_identity is None:
+        return False
     identity_json = (
         json.dumps(worker_identity.to_dict(), sort_keys=True)
         if worker_identity is not None else None
@@ -10998,6 +11179,41 @@ def _set_worker_pid(
             return False
         run_id = int(expected_run_id) if expected_run_id is not None else row["current_run_id"]
         claim_lock = expected_claim_lock if expected_claim_lock is not None else row["claim_lock"]
+        scoped_launch = launch_handle is not None and launch_handle.scope_unit is not None
+        expected_unit = None
+        manager_identity_valid = False
+        if scoped_launch:
+            db_path = _connection_main_db_path(conn)
+            if db_path is not None and run_id is not None:
+                expected_unit = _worker_scope_unit_name(
+                    task_id, int(run_id), db_path=db_path,
+                )
+            manager_identity_valid = (
+                launch_handle.manager_kind == _SYSTEMD_USER_MANAGER_KIND
+                and type(launch_handle.manager_uid) is int
+                and launch_handle.manager_uid >= 0
+                and getattr(os, "getuid", None) is not None
+                and getattr(os, "geteuid", None) is not None
+                and launch_handle.manager_uid == int(os.getuid())
+                and launch_handle.manager_uid == int(os.geteuid())
+            )
+        if gated_launch and (
+            (scoped_launch and not (
+                launch_handle.scope_unit == expected_unit
+                and _valid_worker_scope_unit(launch_handle.scope_unit)
+                and manager_identity_valid
+                and launch_handle.launch_acknowledged is True
+            ))
+            or (
+                not scoped_launch
+                and (
+                    launch_handle.manager_kind is not None
+                    or launch_handle.manager_uid is not None
+                    or launch_handle.launch_acknowledged is not None
+                )
+            )
+        ):
+            return False
         cur = conn.execute(
             "UPDATE tasks SET worker_pid=? WHERE id=? AND status='running' "
             "AND current_run_id IS ? AND claim_lock IS ?",
@@ -11012,8 +11228,6 @@ def _set_worker_pid(
                 "AND claim_lock IS ?",
                 (int(pid), identity_json, tree_json, int(run_id), claim_lock),
             )
-        launch_handle = pid if type(pid) is _WorkerLaunchPid else None
-        scoped_launch = launch_handle is not None and launch_handle.scope_unit is not None
         # Preserve the historical custom/direct receipt shape exactly. Only
         # the private scoped launcher receives extra durable fields.
         payload: dict[str, Any] = {"pid": int(pid)}
@@ -11022,27 +11236,12 @@ def _set_worker_pid(
                 "launch_mode": "systemd-user-scope",
                 "identity_verified": worker_identity is not None,
             })
-            db_path = _connection_main_db_path(conn)
-            expected_unit = None
-            if db_path is not None and run_id is not None:
-                expected_unit = _worker_scope_unit_name(
-                    task_id, int(run_id), db_path=db_path,
-                )
             if (
                 isinstance(launch_handle.scope_unit, str)
                 and launch_handle.scope_unit == expected_unit
                 and _valid_worker_scope_unit(launch_handle.scope_unit)
             ):
                 payload["scope_unit"] = expected_unit
-            manager_identity_valid = (
-                launch_handle.manager_kind == _SYSTEMD_USER_MANAGER_KIND
-                and type(launch_handle.manager_uid) is int
-                and launch_handle.manager_uid >= 0
-                and getattr(os, "getuid", None) is not None
-                and getattr(os, "geteuid", None) is not None
-                and launch_handle.manager_uid == int(os.getuid())
-                and launch_handle.manager_uid == int(os.geteuid())
-            )
             if manager_identity_valid:
                 payload["manager_kind"] = _SYSTEMD_USER_MANAGER_KIND
                 payload["manager_uid"] = launch_handle.manager_uid
@@ -11054,6 +11253,34 @@ def _set_worker_pid(
                 payload.pop("scope_unit", None)
         _append_event(conn, task_id, "spawned", payload, run_id=run_id)
         return True
+
+
+def _persist_and_release_worker_launch(
+    conn: sqlite3.Connection,
+    task: Task,
+    pid: int,
+) -> bool:
+    """Persist exact launch evidence, then and only then release a gated worker."""
+    launch = pid if type(pid) is _WorkerLaunchPid else None
+    try:
+        stored = _set_worker_pid(
+            conn,
+            task.id,
+            pid,
+            expected_run_id=task.current_run_id,
+            expected_claim_lock=task.claim_lock,
+        )
+        if launch is not None and getattr(launch, "release_fd", None) is not None:
+            if not stored:
+                raise RuntimeError(
+                    "worker launch identity/receipt CAS failed before release"
+                )
+            _release_worker_launch(launch)
+        return stored
+    except Exception:
+        if launch is not None and getattr(launch, "release_fd", None) is not None:
+            _abort_worker_launch(launch)
+        raise
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -11424,6 +11651,11 @@ def _preview_dispatch_maintenance(
         "FROM tasks WHERE status IN ('todo', 'blocked')"
     ).fetchall()
     for row in candidates:
+        if (
+            row["status"] == "todo"
+            and _dependency_wait_blocks_promotion(conn, row["id"])
+        ):
+            continue
         if row["status"] == "blocked" and _has_sticky_block(conn, row["id"]):
             continue
         active_review = conn.execute(
@@ -11764,13 +11996,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(
-                    conn,
-                    claimed.id,
-                    pid,
-                    expected_run_id=claimed.current_run_id,
-                    expected_claim_lock=claimed.claim_lock,
-                )
+                _persist_and_release_worker_launch(conn, claimed, pid)
             # NOTE: we intentionally do NOT reset consecutive_failures
             # here. A successful spawn proves the worker can start but
             # doesn't prove the run will succeed. Under unified
@@ -11859,13 +12085,7 @@ def _dispatch_once_locked(
             except (TypeError, ValueError):
                 pid = _spawn(claimed, str(workspace))
             if pid:
-                _set_worker_pid(
-                    conn,
-                    claimed.id,
-                    pid,
-                    expected_run_id=claimed.current_run_id,
-                    expected_claim_lock=claimed.claim_lock,
-                )
+                _persist_and_release_worker_launch(conn, claimed, pid)
             result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
             spawned += 1
         except Exception as exc:
@@ -12311,9 +12531,7 @@ def _default_spawn(
         manager_target=scope_manager_target,
     )
     scope_unit: Optional[str] = None
-    scope_ready_read: Optional[int] = None
-    scope_ready_write: Optional[int] = None
-    scope_launch_acknowledged: Optional[bool] = None
+    scoped_prefix: Optional[list[str]] = None
     if cmd is not worker_cmd:
         delimiter = cmd.index("--")
         scope_unit = next(
@@ -12331,11 +12549,27 @@ def _default_spawn(
         ):
             env.pop(key, None)
         env.update(_systemd_user_manager_environment(scope_manager_target))
-        scope_ready_read, scope_ready_write = os.pipe()
-        cmd = [
-            *cmd[:delimiter + 1],
-            *_scope_exec_ack_argv(worker_cmd, scope_ready_write),
-        ]
+        scoped_prefix = cmd[:delimiter + 1]
+
+    # Two-way launch barrier. The child reports its exact post-boundary PID,
+    # then blocks before importing/executing Hermes until dispatch durably
+    # stores worker_identity and the authenticated scope receipt. ``pass_fds``
+    # is POSIX-only; Windows retains its historical direct-launch contract.
+    gated_launch = not _IS_WINDOWS
+    ready_read = ready_write = release_read = release_write = None
+    if gated_launch:
+        ready_read, ready_write = os.pipe()
+        release_read, release_write = os.pipe()
+        gated_worker_cmd = _worker_launch_gate_argv(
+            worker_cmd,
+            ready_write,
+            release_read,
+        )
+        cmd = (
+            [*scoped_prefix, *gated_worker_cmd]
+            if scoped_prefix is not None
+            else gated_worker_cmd
+        )
     # Redirect output to a per-task log under <board-root>/logs/.
     # Anchored at the board root (not the shared kanban root), so
     # `hermes kanban log` on a specific board reads its own file and
@@ -12357,52 +12591,47 @@ def _default_spawn(
         "start_new_session": True,
         "creationflags": subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
     }
-    if scope_ready_write is not None:
-        popen_kwargs["pass_fds"] = (scope_ready_write,)
+    if gated_launch:
+        popen_kwargs["pass_fds"] = (ready_write, release_read)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
             cmd,
             **popen_kwargs,
         )
     except FileNotFoundError:
-        if scope_ready_read is not None:
-            os.close(scope_ready_read)
-        if scope_ready_write is not None:
-            os.close(scope_ready_write)
+        for fd in (ready_read, ready_write, release_read, release_write):
+            _close_worker_launch_fd(fd)
         log_f.close()
         raise RuntimeError(
             "`hermes` executable not found on PATH. "
             "Install Hermes Agent or activate its venv before running the kanban dispatcher."
         )
     except Exception:
-        if scope_ready_read is not None:
-            os.close(scope_ready_read)
-        if scope_ready_write is not None:
-            os.close(scope_ready_write)
+        for fd in (ready_read, ready_write, release_read, release_write):
+            _close_worker_launch_fd(fd)
         log_f.close()
         raise
-    if scope_ready_write is not None:
-        os.close(scope_ready_write)
-    if scope_ready_read is not None:
-        try:
-            try:
-                _await_scope_exec_ack(proc, scope_ready_read)
-                scope_launch_acknowledged = True
-            except _WorkerLaunchUncertain:
-                scope_launch_acknowledged = False
-                _log.warning(
-                    "kanban worker launch state uncertain; claim retained "
-                    "for lifecycle recovery"
-                )
-        finally:
-            os.close(scope_ready_read)
-    # NOTE: we intentionally do NOT close log_f here — we want Popen's
-    # child process to keep writing after this function returns.  The
-    # handle is kept alive by the child's inheritance.  The parent's
-    # reference goes out of scope and is GC'd, but the OS-level FD stays
-    # open in the child until the child exits.
+    # Popen duplicated inheritable descriptors into the child. The parent
+    # retains only the readiness reader and release writer.
+    _close_worker_launch_fd(ready_write)
+    _close_worker_launch_fd(release_read)
+    log_f.close()
+    if not gated_launch:
+        return _WorkerLaunchPid(proc.pid)
+    try:
+        worker_pid = _await_worker_launch_ready(proc, ready_read)
+    except Exception:
+        _cleanup_worker_launcher(
+            proc,
+            release_write,
+            scope_unit=scope_unit,
+            manager_target=scope_manager_target if scope_unit is not None else None,
+        )
+        raise
+    finally:
+        _close_worker_launch_fd(ready_read)
     return _WorkerLaunchPid(
-        proc.pid,
+        worker_pid,
         scope_unit=scope_unit,
         manager_kind=(
             scope_manager_target.manager_kind
@@ -12412,7 +12641,13 @@ def _default_spawn(
             scope_manager_target.manager_uid
             if scope_unit is not None and scope_manager_target is not None else None
         ),
-        launch_acknowledged=scope_launch_acknowledged,
+        launch_acknowledged=True if scope_unit is not None else None,
+        release_fd=release_write,
+        launcher=proc,
+        gate_ready=True,
+        manager_target=(
+            scope_manager_target if scope_unit is not None else None
+        ),
     )
 
 
