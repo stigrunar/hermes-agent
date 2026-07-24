@@ -2148,6 +2148,16 @@ def test_board_param_in_all_schemas():
         )
 
 
+def test_kanban_link_schema_exposes_review_gate_repair_parameters():
+    from tools import kanban_tools as kt
+
+    props = kt.KANBAN_LINK_SCHEMA["parameters"]["properties"]
+    assert "replace_review_gate_id" in props
+    assert "repair_reason" in props
+    assert "replace_review_gate_id" not in kt.KANBAN_LINK_SCHEMA["parameters"]["required"]
+    assert "repair_reason" not in kt.KANBAN_LINK_SCHEMA["parameters"]["required"]
+
+
 # ---------------------------------------------------------------------------
 # kanban_create auto-subscribe behaviour
 #

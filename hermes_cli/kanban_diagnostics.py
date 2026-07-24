@@ -584,6 +584,11 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     """
     if _task_field(task, "status") in (_TERMINAL_STATUSES | {"running"}):
         return []
+    if any(_event_kind(ev) == "review_gate_invalid_workspace" for ev in events):
+        if not any(_event_kind(ev) == "review_gate_repaired" for ev in events):
+            # The dedicated review-gate diagnostic is more actionable than a
+            # generic retry count for this deterministic control-plane fault.
+            return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
         cfg.get("spawn_failure_threshold", 3),
@@ -686,6 +691,62 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
             "last_error": last_err,
             "failure_threshold": threshold,
             "failure_limit": failure_limit,
+        },
+    )]
+
+
+def _rule_review_gate_retry_storm(task, events, runs, now, cfg) -> list[Diagnostic]:
+    """Explain and route an active legacy invalid worktree review gate."""
+    if _task_field(task, "status") in _TERMINAL_STATUSES:
+        return []
+    invalid_events = [
+        ev for ev in events if _event_kind(ev) == "review_gate_invalid_workspace"
+    ]
+    if not invalid_events:
+        return []
+    repaired_after = [
+        ev for ev in events
+        if _event_kind(ev) in {"review_gate_repaired", "review_gate_replaced"}
+        and _event_ts(ev) >= _event_ts(invalid_events[-1])
+    ]
+    if repaired_after:
+        return []
+    event = invalid_events[-1]
+    payload = _parse_payload(event)
+    board = payload.get("board")
+    source_id = payload.get("source_task_id") or "<source_task_id>"
+    old_id = payload.get("review_task_id") or _task_field(task, "id") or "<old_gate_id>"
+    repair_command = (
+        f"hermes kanban --board {board} link {source_id} <replacement_task_id> "
+        f"--relationship review_gate --replace-review-gate {old_id} "
+        "--repair-reason 'replace invalid review gate workspace'"
+    )
+    return [Diagnostic(
+        kind="review_gate_retry_storm",
+        severity="critical",
+        title="Review gate parked: invalid worktree source",
+        detail=(
+            "This legacy active review gate cannot resolve a git worktree source, "
+            "so dispatch has parked it without creating another claim or run. "
+            "Pre-create a valid review task and use the auditable review-gate "
+            f"replacement path. {payload.get('error') or 'No source details were recorded.'}"
+        ),
+        actions=[DiagnosticAction(
+            kind="cli_hint",
+            label="Replace the invalid review gate",
+            payload={"command": repair_command},
+            suggested=True,
+        )],
+        first_seen_at=_event_ts(invalid_events[0]),
+        last_seen_at=_event_ts(invalid_events[-1]),
+        count=len(invalid_events),
+        data={
+            "classification": payload.get("classification", "invalid_worktree_source"),
+            "source_task_id": source_id,
+            "old_review_gate_id": old_id,
+            "next_task_id": payload.get("next_task_id"),
+            "board": board,
+            "repair_command": repair_command,
         },
     )]
 
@@ -1192,6 +1253,7 @@ _RULES: list[RuleFn] = [
     _rule_hallucinated_cards,
     _rule_triage_aux_unavailable,
     _rule_prose_phantom_refs,
+    _rule_review_gate_retry_storm,
     _rule_repeated_failures,
     _rule_repeated_crashes,
     _rule_stuck_in_blocked,
@@ -1206,6 +1268,7 @@ DIAGNOSTIC_KINDS = (
     "hallucinated_cards",
     "triage_aux_unavailable",
     "prose_phantom_refs",
+    "review_gate_retry_storm",
     "repeated_failures",
     "repeated_crashes",
     "stuck_in_blocked",

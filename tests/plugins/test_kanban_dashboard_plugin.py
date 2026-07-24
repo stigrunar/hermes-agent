@@ -740,6 +740,31 @@ def test_add_link_and_delete_link(client):
     assert r.json()["ok"] is True
 
 
+def test_add_link_plumbs_review_gate_repair_fields(client, monkeypatch):
+    seen = {}
+
+    def capture_link(conn, parent_id, child_id, **kwargs):
+        seen.update(parent_id=parent_id, child_id=child_id, **kwargs)
+
+    monkeypatch.setattr(kb, "link_tasks", capture_link)
+    r = client.post(
+        "/api/plugins/kanban/links?board=default",
+        json={
+            "parent_id": "t_source",
+            "child_id": "t_replacement",
+            "relationship": "review_gate",
+            "replace_review_gate_id": "t_old",
+            "repair_reason": "legacy gate had no repository",
+        },
+    )
+
+    assert r.status_code == 200
+    assert seen["relationship"] == "review_gate"
+    assert seen["replace_review_gate_id"] == "t_old"
+    assert seen["repair_reason"] == "legacy gate had no repository"
+    assert seen["board"] == "default"
+
+
 def test_add_link_cycle_rejected(client):
     a = client.post("/api/plugins/kanban/tasks", json={"title": "a"}).json()["task"]
     b = client.post("/api/plugins/kanban/tasks", json={"title": "b"}).json()["task"]

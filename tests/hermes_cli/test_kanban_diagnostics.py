@@ -366,6 +366,49 @@ def test_repeated_failures_surfaces_actual_error_in_title():
     assert "insufficient_quota" in d.detail
 
 
+def test_review_gate_retry_storm_classifies_legacy_invalid_workspace():
+    task = _task(
+        id="t_oldgate",
+        status="blocked",
+        consecutive_failures=4,
+        last_failure_error="workspace resolution failed",
+    )
+    events = [
+        _event(
+            "review_gate_invalid_workspace",
+            ts=100,
+            classification="invalid_worktree_source",
+            source_task_id="t_source",
+            review_task_id="t_oldgate",
+            next_task_id="t_next",
+            board="historical-review-board",
+            error="no board default_workdir",
+        ),
+    ]
+    diags = kd.compute_task_diagnostics(task, events, [], now=200)
+    assert [d.kind for d in diags] == ["review_gate_retry_storm"]
+    assert diags[0].severity == "critical"
+    assert "--replace-review-gate" in diags[0].actions[0].payload["command"]
+    assert "--board historical-review-board" in diags[0].actions[0].payload["command"]
+    assert diags[0].data["board"] == "historical-review-board"
+    assert diags[0].to_dict()["actions"][0]["payload"]["command"].startswith(
+        "hermes kanban --board historical-review-board"
+    )
+    assert "no board default_workdir" in diags[0].detail
+
+
+def test_review_gate_retry_storm_clears_after_repair_event():
+    task = _task(id="t_oldgate", status="archived")
+    events = [
+        _event(
+            "review_gate_invalid_workspace", ts=100,
+            source_task_id="t_source", review_task_id="t_oldgate",
+        ),
+        _event("review_gate_replaced", ts=200),
+    ]
+    assert kd.compute_task_diagnostics(task, events, [], now=300) == []
+
+
 def test_repeated_crashes_truncates_huge_tracebacks():
     """Full Python tracebacks can be tens of KB. The title stays one
     line (≤160 chars); the detail caps at 500 chars + ellipsis so the

@@ -3095,6 +3095,8 @@ def create_task(
         )
     if branch_name is not None:
         branch_name = str(branch_name).strip() or None
+    if workspace_path is not None:
+        workspace_path = str(workspace_path).strip() or None
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
@@ -3202,6 +3204,7 @@ def create_task(
             return row["id"]
 
     now = int(time.time())
+    board_default = None
 
     # Resolve workspace_path from board-level default_workdir when the
     # caller did not specify one explicitly. Board defaults represent
@@ -3219,9 +3222,20 @@ def create_task(
     ):
         board_slug = board if board else get_current_board()
         board_meta = read_board_metadata(board_slug)
-        board_default = board_meta.get("default_workdir")
+        board_default = str(board_meta.get("default_workdir") or "").strip() or None
         if board_default:
             workspace_path = str(board_default)
+
+    if (
+        workspace_kind == "worktree"
+        and not workspace_path
+        and project_repo is None
+        and not board_default
+    ):
+        raise ValueError(
+            "worktree tasks require an explicit workspace_path, a project with "
+            "a primary repository, or a board default_workdir"
+        )
 
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
@@ -3486,11 +3500,190 @@ def list_review_handoffs(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     ).fetchall()]
 
 
+def _project_primary_repo(project_id: Optional[str]) -> Optional[Path]:
+    """Return a project's primary repository without creating any workspace."""
+    if not project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        _pconn = _pdb.connect_readonly()
+        try:
+            project = _pdb.get_project(_pconn, project_id)
+        finally:
+            _pconn.close()
+        if project is not None and project.primary_path:
+            return Path(str(project.primary_path)).expanduser()
+    except Exception:
+        pass
+    return None
+
+
+def _worktree_source_error(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    board: Optional[str] = None,
+) -> Optional[str]:
+    """Return a deterministic source error without materialising a worktree."""
+    row = conn.execute(
+        "SELECT workspace_kind, workspace_path, project_id FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["workspace_kind"] != "worktree":
+        return None
+
+    workspace_path = (
+        str(row["workspace_path"]).strip() if row["workspace_path"] else ""
+    )
+    if workspace_path:
+        requested = Path(workspace_path).expanduser()
+        if not requested.is_absolute():
+            return f"task {task_id} has non-absolute worktree path {workspace_path!r}"
+        if requested.exists() and _is_linked_worktree_checkout(requested):
+            return None
+        if _git_toplevel(requested) is not None:
+            return None
+        if _repo_root_for_worktree_target(requested.parent) is not None:
+            return None
+        return (
+            f"task {task_id} worktree path {workspace_path!r} is not inside a git repo "
+            "and does not point at a git repo root"
+        )
+
+    project_repo = _project_primary_repo(row["project_id"])
+    if project_repo is not None and _git_toplevel(project_repo) is not None:
+        return None
+
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    board_default = str(
+        read_board_metadata(board_slug).get("default_workdir") or ""
+    ).strip()
+    if board_default:
+        anchor = Path(board_default).expanduser()
+        if not anchor.is_absolute():
+            return (
+                f"task {task_id} has board {board_slug!r} default_workdir "
+                f"{board_default!r}, which is not absolute"
+            )
+        if _git_toplevel(anchor) is not None:
+            return None
+        return (
+            f"task {task_id} board {board_slug!r} default_workdir "
+            f"{board_default!r} is not inside a git repo"
+        )
+    return (
+        f"task {task_id} has workspace_kind=worktree but no explicit "
+        f"workspace_path, project repository, or board {board_slug!r} default_workdir"
+    )
+
+
+def _park_invalid_review_gates(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> list[str]:
+    """Park active legacy invalid review gates before the claim loop."""
+    board_slug = _normalize_board_slug(board) or get_current_board()
+    rows = conn.execute(
+        "SELECT h.review_task_id FROM review_handoffs h "
+        "JOIN tasks t ON t.id=h.review_task_id "
+        "WHERE h.state='active' AND t.workspace_kind='worktree'"
+    ).fetchall()
+    parked: list[str] = []
+    for row in rows:
+        task_id = row["review_task_id"]
+        error = _worktree_source_error(conn, task_id, board=board_slug)
+        if error is None:
+            continue
+        with write_txn(conn):
+            task = conn.execute(
+                "SELECT status, claim_lock, worker_pid, current_run_id "
+                "FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            handoff = conn.execute(
+                "SELECT source_task_id, next_task_id, state, verdict "
+                "FROM review_handoffs WHERE review_task_id=? AND state='active'",
+                (task_id,),
+            ).fetchone()
+            if task is None or handoff is None:
+                continue
+            if (
+                task["claim_lock"] is not None
+                or task["worker_pid"] is not None
+                or task["current_run_id"] is not None
+                or task["status"] == "running"
+            ):
+                continue
+            already_parked = conn.execute(
+                "SELECT 1 FROM task_events WHERE task_id=? "
+                "AND kind='review_gate_invalid_workspace' LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if already_parked is not None:
+                if task["status"] != "blocked":
+                    conn.execute(
+                        "UPDATE tasks SET status='blocked', block_kind='capability' "
+                        "WHERE id=? AND status IN ('review','todo','ready')",
+                        (task_id,),
+                    )
+                continue
+            conn.execute(
+                "UPDATE tasks SET status='blocked', block_kind='capability', "
+                "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+                "WHERE id=? AND status IN ('review','todo','ready','blocked')",
+                (task_id,),
+            )
+            _append_diagnostic_event(
+                conn,
+                task_id,
+                "review_gate_invalid_workspace",
+                {
+                    "board": board_slug,
+                    "classification": "invalid_worktree_source",
+                    "error": error,
+                    "source_task_id": handoff["source_task_id"],
+                    "review_task_id": task_id,
+                    "next_task_id": handoff["next_task_id"],
+                    "state": handoff["state"],
+                    "verdict": handoff["verdict"],
+                    "repair": (
+                        "Pre-create a valid review task, then run kanban_link "
+                        "with replace_review_gate_id and repair_reason."
+                    ),
+                },
+            )
+            parked.append(task_id)
+    return parked
+
+
+def _invalid_active_review_gate_ids(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+) -> set[str]:
+    """Read-only classification of active review gates with bad worktree sources."""
+    rows = conn.execute(
+        "SELECT h.review_task_id FROM review_handoffs h "
+        "JOIN tasks t ON t.id=h.review_task_id "
+        "WHERE h.state='active' AND t.workspace_kind='worktree' "
+        "AND t.status='review' AND t.claim_lock IS NULL"
+    ).fetchall()
+    return {
+        row["review_task_id"]
+        for row in rows
+        if _worktree_source_error(conn, row["review_task_id"], board=board) is not None
+    }
+
+
 def _validate_review_handoff_graph(
     conn: sqlite3.Connection,
     source_task_id: str,
     review_task_id: str,
     next_task_id: Optional[str],
+    *,
+    board: Optional[str] = None,
 ) -> None:
     ids = [source_task_id, review_task_id]
     if next_task_id:
@@ -3549,6 +3742,13 @@ def _validate_review_handoff_graph(
             "review gate has ordinary downstream children; only the explicit "
             "next review gate may follow approval"
         )
+    workspace_error = _worktree_source_error(
+        conn, review_task_id, board=board,
+    )
+    if workspace_error is not None:
+        raise ValueError(
+            "review gate has no resolvable worktree source: " + workspace_error
+        )
 
 
 def register_review_handoff(
@@ -3557,6 +3757,7 @@ def register_review_handoff(
     review_task_id: str,
     *,
     next_task_id: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> dict[str, Any]:
     """Register one explicit source -> review -> optional-next lifecycle.
 
@@ -3606,7 +3807,7 @@ def register_review_handoff(
                     f"{next_owner['source_task_id']}"
                 )
         _validate_review_handoff_graph(
-            conn, source_task_id, review_task_id, next_task_id,
+            conn, source_task_id, review_task_id, next_task_id, board=board,
         )
         source_status = conn.execute(
             "SELECT status FROM tasks WHERE id=?", (source_task_id,),
@@ -3693,6 +3894,224 @@ def register_review_handoff(
         return dict(_review_handoff_row(conn, source_task_id=source_task_id))
 
 
+def replace_review_handoff(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    replacement_review_task_id: str,
+    *,
+    replace_review_gate_id: str,
+    repair_reason: str,
+    next_task_id: Optional[str] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Atomically replace one exact invalid registered review gate.
+
+    This is a repair/relink operation, not a verdict.  The existing handoff
+    row keeps its state and verdict (normally ``active``/``NULL``), while the
+    invalid task is archived and the pre-created replacement is either parked
+    or activated to match that state.
+    """
+    reason = str(repair_reason or "").strip()
+    if not reason:
+        raise ValueError("repair_reason is required for review-gate replacement")
+    if source_task_id == replacement_review_task_id:
+        raise ValueError("review handoff source and replacement gate must be distinct")
+
+    with write_txn(conn):
+        handoff = _review_handoff_row(conn, source_task_id=source_task_id)
+        if handoff is None:
+            raise ValueError(f"source {source_task_id} has no registered review handoff")
+        if handoff["review_task_id"] != replace_review_gate_id:
+            raise ValueError(
+                "stale replace_review_gate_id: the registered review gate is "
+                f"{handoff['review_task_id']}"
+            )
+        if handoff["state"] == "approved":
+            raise ValueError("approved review handoff cannot be repaired")
+        if next_task_id is not None and next_task_id != handoff["next_task_id"]:
+            raise ValueError(
+                "replacement must preserve the existing next_task_id "
+                f"{handoff['next_task_id']!r}"
+            )
+
+        ids = [source_task_id, replace_review_gate_id, replacement_review_task_id]
+        if handoff["next_task_id"]:
+            ids.append(handoff["next_task_id"])
+        if len(set(ids)) != len(ids):
+            raise ValueError("review repair source, old gate, replacement, and next gate must be distinct")
+        missing = _find_missing_parents(conn, ids)
+        if missing:
+            raise ValueError(f"unknown review repair task(s): {', '.join(missing)}")
+
+        source = conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (source_task_id,),
+        ).fetchone()
+        old = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id=?",
+            (replace_review_gate_id,),
+        ).fetchone()
+        replacement = conn.execute(
+            "SELECT status, claim_lock, worker_pid, current_run_id "
+            "FROM tasks WHERE id=?",
+            (replacement_review_task_id,),
+        ).fetchone()
+        if source["status"] in TERMINAL_STATUSES:
+            raise ValueError("review handoff source is already terminal")
+        if old["status"] == "running" or any(
+            old[key] is not None for key in ("claim_lock", "worker_pid", "current_run_id")
+        ):
+            raise ValueError("invalid old review gate is running or claimed")
+        if old["status"] not in ("todo", "ready", "blocked", "review") and not (
+            old["status"] == "done" and handoff["state"] == "changes_requested"
+        ):
+            raise ValueError("invalid old review gate is not an active unclaimed gate")
+        if replacement["status"] not in ("todo", "ready", "blocked"):
+            raise ValueError("replacement review gate must be pre-created and unclaimed")
+        if any(
+            replacement[key] is not None
+            for key in ("claim_lock", "worker_pid", "current_run_id")
+        ):
+            raise ValueError("replacement review gate is running or claimed")
+
+        old_error = _worktree_source_error(
+            conn, replace_review_gate_id, board=board,
+        )
+        if old_error is None:
+            raise ValueError(
+                "replace_review_gate_id must name the exact structurally invalid "
+                "worktree review gate"
+            )
+        replacement_error = _worktree_source_error(
+            conn, replacement_review_task_id, board=board,
+        )
+        if replacement_error is not None:
+            raise ValueError(
+                "replacement review gate has no resolvable worktree source: "
+                + replacement_error
+            )
+
+        next_id = handoff["next_task_id"]
+        source_children = {
+            row["child_id"] for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id=?",
+                (source_task_id,),
+            )
+        }
+        if source_children - {
+            replace_review_gate_id, replacement_review_task_id, next_id,
+        }:
+            raise ValueError("review repair graph is ambiguous: source has ordinary downstream children")
+        old_parents = {
+            row["parent_id"] for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id=?",
+                (replace_review_gate_id,),
+            )
+        }
+        if old_parents - {source_task_id}:
+            raise ValueError("review repair graph is ambiguous: old gate has additional parents")
+        old_children = {
+            row["child_id"] for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id=?",
+                (replace_review_gate_id,),
+            )
+        }
+        if old_children - ({next_id} if next_id is not None else set()):
+            raise ValueError(
+                "review repair graph is ambiguous: old gate has ordinary downstream children"
+            )
+        replacement_parents = {
+            row["parent_id"] for row in conn.execute(
+                "SELECT parent_id FROM task_links WHERE child_id=?",
+                (replacement_review_task_id,),
+            )
+        }
+        if replacement_parents - {source_task_id}:
+            raise ValueError("review repair graph is ambiguous: replacement has additional parents")
+        replacement_children = {
+            row["child_id"] for row in conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id=?",
+                (replacement_review_task_id,),
+            )
+        }
+        if replacement_children - {next_id}:
+            raise ValueError("review repair graph is ambiguous: replacement has downstream children")
+        if _would_cycle(conn, source_task_id, replacement_review_task_id):
+            raise ValueError("review repair would create a dependency cycle")
+        owner = conn.execute(
+            "SELECT source_task_id FROM review_handoffs "
+            "WHERE source_task_id=? OR review_task_id=? OR next_task_id=? LIMIT 1",
+            (replacement_review_task_id, replacement_review_task_id, replacement_review_task_id),
+        ).fetchone()
+        if owner is not None:
+            raise ValueError(
+                f"replacement review gate already belongs to source {owner['source_task_id']}"
+            )
+
+        now = int(time.time())
+        conn.execute(
+            "DELETE FROM task_links WHERE (parent_id=? AND child_id=?) "
+            "OR (parent_id=? AND child_id=?) "
+            "OR (parent_id=? AND child_id=?)",
+            (
+                source_task_id, replace_review_gate_id,
+                replace_review_gate_id, next_id,
+                replacement_review_task_id, next_id,
+            ),
+        )
+        if handoff["state"] == "active":
+            conn.execute(
+                "DELETE FROM task_links WHERE parent_id=? AND child_id=?",
+                (source_task_id, replacement_review_task_id),
+            )
+            replacement_status = "review"
+            replacement_event = "review_gate_replacement_activated"
+        else:
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (source_task_id, replacement_review_task_id),
+            )
+            replacement_status = "todo"
+            replacement_event = "review_gate_replacement_parked"
+        if next_id:
+            conn.execute(
+                "INSERT OR IGNORE INTO task_links (parent_id, child_id) VALUES (?, ?)",
+                (source_task_id, next_id),
+            )
+        conn.execute(
+            "UPDATE tasks SET status=?, completed_at=NULL, result=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL, "
+            "block_kind=NULL WHERE id=?",
+            (replacement_status, replacement_review_task_id),
+        )
+        conn.execute(
+            "UPDATE tasks SET status='archived', completed_at=?, result=NULL, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, current_run_id=NULL "
+            "WHERE id=?",
+            (now, replace_review_gate_id),
+        )
+        conn.execute(
+            "UPDATE review_handoffs SET review_task_id=?, updated_at=? WHERE source_task_id=?",
+            (replacement_review_task_id, now, source_task_id),
+        )
+        payload = {
+            "source_task_id": source_task_id,
+            "old_review_gate_id": replace_review_gate_id,
+            "replacement_review_gate_id": replacement_review_task_id,
+            "next_task_id": next_id,
+            "state": handoff["state"],
+            "verdict": handoff["verdict"],
+            "reason": reason,
+            "old_error": old_error,
+        }
+        _append_event(conn, source_task_id, "review_gate_repaired", payload)
+        _append_event(conn, replace_review_gate_id, "review_gate_replaced", payload)
+        _append_event(conn, replace_review_gate_id, "archived", {**payload, "verdict": None})
+        _append_event(conn, replacement_review_task_id, "review_gate_replacement_registered", payload)
+        _append_event(conn, replacement_review_task_id, replacement_event, payload)
+        return dict(_review_handoff_row(conn, source_task_id=source_task_id))
+
+
 def link_tasks(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -3700,14 +4119,36 @@ def link_tasks(
     *,
     relationship: str = "dependency",
     next_task_id: Optional[str] = None,
+    replace_review_gate_id: Optional[str] = None,
+    repair_reason: Optional[str] = None,
+    board: Optional[str] = None,
 ) -> None:
     if relationship == "review_gate":
+        if replace_review_gate_id is not None:
+            replace_review_handoff(
+                conn,
+                parent_id,
+                child_id,
+                replace_review_gate_id=replace_review_gate_id,
+                repair_reason=repair_reason or "",
+                next_task_id=next_task_id,
+                board=board,
+            )
+            return
+        if repair_reason is not None:
+            raise ValueError(
+                "repair_reason is valid only with replace_review_gate_id"
+            )
         register_review_handoff(
-            conn, parent_id, child_id, next_task_id=next_task_id,
+            conn, parent_id, child_id, next_task_id=next_task_id, board=board,
         )
         return
     if relationship != "dependency":
         raise ValueError("relationship must be 'dependency' or 'review_gate'")
+    if replace_review_gate_id is not None or repair_reason is not None:
+        raise ValueError(
+            "review-gate repair parameters require relationship='review_gate'"
+        )
     if parent_id == child_id:
         raise ValueError("a task cannot depend on itself")
     with write_txn(conn):
@@ -4411,6 +4852,7 @@ def _dependency_wait_blocks_promotion(
 
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
+    board: Optional[str] = None,
 ) -> int:
     """Promote ``todo`` tasks after graph and durable dependency waits clear.
 
@@ -4468,6 +4910,12 @@ def recompute_ready(
                 (task_id,),
             ).fetchone()
             if active_review:
+                # Legacy review gates with no resolvable worktree source are
+                # parked by dispatch before this function runs. Keep this
+                # defensive read-side guard as well so an explicit recompute
+                # cannot restore one into the spawnable review lane.
+                if _worktree_source_error(conn, task_id, board=board) is not None:
+                    continue
                 # An active review gate has a parent-agnostic lane. Never let
                 # a stale/manual todo or blocked value turn it into an
                 # ordinary ready worker; an explicit unblock or review retry
@@ -7779,20 +8227,25 @@ def _resolve_worktree_workspace(
 ) -> tuple[Path, str]:
     """Resolve + materialize a linked git worktree for ``task``.
 
-    When ``task.workspace_path`` is unset, the anchor is the board's
-    ``default_workdir`` (a persistent project checkout). This keeps every
-    worktree task under a meaningful, board-owned repo — ``<repo>/.worktrees/
-    <task-id>`` — instead of silently landing under the dispatcher's current
-    working directory (which is whatever directory the gateway happened to be
-    launched from, e.g. the Hermes checkout). If no anchor is configured
-    anywhere, we fail loudly rather than guess.
+    When ``task.workspace_path`` is unset, the anchor is the project's primary
+    repository, then the board's ``default_workdir``. This keeps every
+    worktree task under a meaningful checkout instead of silently landing
+    under the dispatcher's current working directory. If no anchor is
+    configured anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
     if not task.workspace_path:
-        # Anchor on the board's configured default_workdir, not Path.cwd().
-        # The dispatcher's CWD is incidental (gateway launch dir) and using it
-        # scatters worktrees under whatever repo the gateway started in.
-        board_slug = board if board else get_current_board()
+        # Prefer the linked project's primary repository, then the board's
+        # configured default_workdir, never Path.cwd().
+        board_slug = _normalize_board_slug(board) or get_current_board()
+        project_repo = _project_primary_repo(task.project_id)
+        if project_repo is not None:
+            repo_root = _git_toplevel(project_repo)
+            if repo_root is not None:
+                target = repo_root / ".worktrees" / task.id
+                _ensure_git_worktree(repo_root, target, branch_name)
+                return target, branch_name
+
         board_default = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
         if not board_default:
             raise ValueError(
@@ -11917,7 +12370,21 @@ def _dispatch_once_locked(
         result.maintenance_conflicts.extend(
             getattr(enforce_max_runtime, "_last_transition_conflicts", [])
         )
-        result.promoted = recompute_ready(conn, failure_limit=failure_limit)
+        _park_invalid_review_gates(conn, board=board)
+        result.promoted = recompute_ready(
+            conn, failure_limit=failure_limit, board=board,
+        )
+
+    # A dry-run must classify structural review-gate faults before any
+    # capacity path can return or break out of the ready queue. The live path
+    # already parked these gates above; the preview records the equivalent
+    # nonspawnable outcome without touching the database.
+    invalid_review_gate_ids = (
+        _invalid_active_review_gate_ids(conn, board=board)
+        if dry_run else set()
+    )
+    if invalid_review_gate_ids:
+        result.skipped_nonspawnable.extend(sorted(invalid_review_gate_ids))
 
     # Count tasks already running so max_spawn enforces concurrency rather
     # than a per-tick spawn budget. See the docstring above for the full
@@ -12193,6 +12660,10 @@ def _dispatch_once_locked(
             break
         if spawn_budget is not None and spawned >= spawn_budget:
             break
+        if row["id"] in invalid_review_gate_ids:
+            # Already classified before capacity handling; do not duplicate
+            # the id if the review loop is reached.
+            continue
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue

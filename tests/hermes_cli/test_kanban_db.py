@@ -2362,22 +2362,16 @@ def test_worktree_no_path_anchors_on_board_default_workdir(kanban_home, tmp_path
 
 
 def test_worktree_no_path_no_board_default_raises(kanban_home, tmp_path, monkeypatch):
-    """With neither an explicit workspace_path nor a board default_workdir,
-    resolution fails loudly pointing at default_workdir / worktree:<path> —
-    rather than silently materializing under the dispatcher's CWD (the old
-    behavior that scattered worktrees under whatever dir launched the
-    gateway)."""
+    """With neither an explicit path nor a board anchor, creation fails
+    before invalid worktree metadata can reach the dispatcher."""
     # Park the dispatcher CWD inside a real git repo so the OLD cwd-anchored
     # code would have "succeeded" — proving the new code does NOT use cwd.
     decoy_repo = tmp_path / "decoy"
     _init_git_repo(decoy_repo)
     monkeypatch.chdir(decoy_repo)
     with kb.connect() as conn:
-        t = kb.create_task(conn, title="ship", workspace_kind="worktree")
-        task = kb.get_task(conn, t)
-        assert task is not None
-        with pytest.raises(ValueError, match="default_workdir"):
-            kb.resolve_workspace(task)
+        with pytest.raises(ValueError, match="explicit workspace_path"):
+            kb.create_task(conn, title="ship", workspace_kind="worktree")
 
 
 def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_home, tmp_path):

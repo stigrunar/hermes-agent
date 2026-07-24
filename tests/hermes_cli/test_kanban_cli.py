@@ -300,6 +300,18 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_link_parser_exposes_review_gate_repair_flags():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "link", "t_source", "t_new", "--relationship", "review_gate",
+        "--replace-review-gate", "t_old", "--repair-reason", "legacy pathless gate",
+    ])
+    assert args.replace_review_gate_id == "t_old"
+    assert args.repair_reason == "legacy pathless gate"
+
+
 def test_dispatch_dry_run_cli_parser_is_strictly_read_only(tmp_path, monkeypatch):
     """The actual kanban parser path must not auto-init, migrate, or WAL-open."""
     home = tmp_path / ".hermes"

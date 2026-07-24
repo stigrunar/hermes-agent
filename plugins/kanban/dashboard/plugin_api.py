@@ -1191,6 +1191,8 @@ class LinkBody(BaseModel):
     child_id: str
     relationship: str = "dependency"
     next_task_id: Optional[str] = None
+    replace_review_gate_id: Optional[str] = None
+    repair_reason: Optional[str] = None
 
 
 @router.post("/links")
@@ -1204,8 +1206,15 @@ def add_link(payload: LinkBody, board: Optional[str] = Query(None)):
             payload.child_id,
             relationship=payload.relationship,
             next_task_id=payload.next_task_id,
+            replace_review_gate_id=payload.replace_review_gate_id,
+            repair_reason=payload.repair_reason,
+            board=board,
         )
-        return {"ok": True, "relationship": payload.relationship}
+        return {
+            "ok": True,
+            "relationship": payload.relationship,
+            "replace_review_gate_id": payload.replace_review_gate_id,
+        }
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     finally:

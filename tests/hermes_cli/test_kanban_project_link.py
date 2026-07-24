@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -53,6 +54,32 @@ def test_explicit_branch_overrides_project_default(kanban_conn, tmp_path):
     )
     task = kb.get_task(kanban_conn, tid)
     assert task.branch_name == "feature/custom"
+
+
+def test_legacy_pathless_project_linked_worktree_uses_project_anchor(
+    kanban_conn, tmp_path,
+):
+    repo = tmp_path / "legacy-webapp"
+    proj = _make_project(str(repo))
+    (repo / "README.md").write_text("legacy fixture\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "commit", "-m", "init"], check=True,
+        capture_output=True, text=True,
+    )
+    tid = kb.create_task(kanban_conn, title="legacy review", project_id=proj.slug)
+    kanban_conn.execute(
+        "UPDATE tasks SET workspace_path=NULL WHERE id=?", (tid,)
+    )
+    kanban_conn.commit()
+
+    task = kb.get_task(kanban_conn, tid)
+    assert task is not None
+    assert kb._worktree_source_error(kanban_conn, tid) is None
+    workspace = kb.resolve_workspace(task)
+
+    assert workspace == Path(proj.primary_path) / ".worktrees" / tid
+    assert workspace.exists()
 
 
 def test_unlinked_task_unchanged(kanban_conn):

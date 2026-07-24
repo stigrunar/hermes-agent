@@ -325,7 +325,7 @@ def test_active_review_reclaim_unblock_and_promote_stay_in_review_lane(kanban_ho
         assert kb.get_task(conn, source).status == "blocked"
 
 
-def test_active_review_workspace_auto_block_stays_blocked_across_ticks(
+def test_legacy_invalid_active_review_gate_is_parked_once_across_ticks(
     kanban_home, all_assignees_spawnable,
 ):
     board = "review-worktree-resolution-failure"
@@ -336,37 +336,50 @@ def test_active_review_workspace_auto_block_stays_blocked_across_ticks(
             title="verify",
             assignee="reviewer",
             parents=[source],
-            workspace_kind="worktree",
-            workspace_path=None,
-            board=board,
         )
-        kb.register_review_handoff(conn, source, review)
+        # Reproduce a legacy row that predates creation/registration guards:
+        # the task persisted as a pathless worktree and the one-to-one handoff
+        # row was inserted directly by the old control plane.
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (review,),
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO review_handoffs "
+            "(source_task_id, review_task_id, next_task_id, state, verdict, created_at, updated_at) "
+            "VALUES (?, ?, NULL, 'waiting', NULL, ?, ?)",
+            (source, review, now, now),
+        )
+        conn.commit()
         assert _activate(conn, source) == review
         assert kb.get_task(conn, review).status == "review"
 
         first = kb.dispatch_once(conn, board=board, failure_limit=2)
         assert first.auto_blocked == []
-        assert kb.get_task(conn, review).status == "review"
-        assert kb.get_task(conn, review).consecutive_failures == 1
+        assert kb.get_task(conn, review).status == "blocked"
+        assert kb.get_task(conn, review).consecutive_failures == 0
+        assert kb.list_runs(conn, review) == []
+        invalid_before = [
+            event for event in kb.list_events(conn, review)
+            if event.kind == "review_gate_invalid_workspace"
+        ]
+        assert len(invalid_before) == 1
 
         second = kb.dispatch_once(conn, board=board, failure_limit=2)
-        assert second.auto_blocked == [review]
+        assert second.auto_blocked == []
         assert kb.get_task(conn, review).status == "blocked"
         events_before = kb.list_events(conn, review)
         review_claims_before = [
             event for event in events_before if event.kind == "claimed"
         ]
-        gave_up_before = [
-            event for event in events_before if event.kind == "gave_up"
+        invalid_before = [
+            event for event in events_before
+            if event.kind == "review_gate_invalid_workspace"
         ]
-        restored_before = [
-            event
-            for event in events_before
-            if event.kind == "review_lane_restored"
-        ]
-        assert len(review_claims_before) == 2
-        assert len(gave_up_before) == 1
-        assert restored_before == []
+        assert len(review_claims_before) == 0
+        assert len(invalid_before) == 1
+        assert invalid_before[0].payload["board"] == board
         runs_before = conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,)
         ).fetchone()[0]
@@ -382,17 +395,372 @@ def test_active_review_workspace_auto_block_stays_blocked_across_ticks(
             event for event in events_after if event.kind == "claimed"
         ] == review_claims_before
         assert [
-            event for event in events_after if event.kind == "gave_up"
-        ] == gave_up_before
-        assert [
-            event for event in events_after if event.kind == "review_lane_restored"
-        ] == restored_before
+            event for event in events_after
+            if event.kind == "review_gate_invalid_workspace"
+        ] == invalid_before
         assert conn.execute(
             "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,)
         ).fetchone()[0] == runs_before
         handoff = kb.list_review_handoffs(conn)[0]
         assert handoff["state"] == "active"
         assert handoff["verdict"] is None
+
+
+def test_dry_run_classifies_invalid_review_gate_without_mutation(
+    kanban_home, all_assignees_spawnable,
+):
+    board = "review-dry-run-invalid"
+    with kb.connect(board=board) as conn:
+        source = kb.create_task(conn, title="implement", assignee="builder")
+        review = kb.create_task(
+            conn, title="verify", assignee="reviewer", parents=[source],
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (review,),
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO review_handoffs "
+            "(source_task_id, review_task_id, next_task_id, state, verdict, created_at, updated_at) "
+            "VALUES (?, ?, NULL, 'waiting', NULL, ?, ?)",
+            (source, review, now, now),
+        )
+        conn.commit()
+        assert _activate(conn, source) == review
+        db_path = kb.kanban_db_path(board=board)
+        before_bytes = db_path.read_bytes()
+        before_tasks = [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, claim_lock, current_run_id "
+            "FROM tasks ORDER BY id"
+        )]
+        before_events = [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, payload, created_at FROM task_events ORDER BY id"
+        )]
+        before_runs = [tuple(row) for row in conn.execute(
+            "SELECT id, task_id, status, outcome FROM task_runs ORDER BY id"
+        )]
+
+        result = kb.dispatch_once(conn, board=board, dry_run=True)
+
+        assert review not in [task_id for task_id, _, _ in result.spawned]
+        assert review in result.skipped_nonspawnable
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, claim_lock, current_run_id "
+            "FROM tasks ORDER BY id"
+        )] == before_tasks
+        assert [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, payload, created_at FROM task_events ORDER BY id"
+        )] == before_events
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, task_id, status, outcome FROM task_runs ORDER BY id"
+        )] == before_runs
+        assert db_path.read_bytes() == before_bytes
+
+
+@pytest.mark.parametrize("capacity", ["max_spawn", "max_in_progress"])
+def test_dry_run_classifies_invalid_review_gate_before_capacity_exit(
+    kanban_home, all_assignees_spawnable, capacity,
+):
+    board = f"review-capacity-{capacity.replace('_', '-')}"
+    with kb.connect(board=board) as conn:
+        source = kb.create_task(conn, title="implement", assignee="builder")
+        review = kb.create_task(
+            conn, title="verify", assignee="reviewer", parents=[source],
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (review,),
+        )
+        if capacity == "max_in_progress":
+            running = kb.create_task(conn, title="already running", assignee="builder")
+            ready = kb.create_task(conn, title="waiting ready", assignee="builder")
+            assert kb.claim_task(conn, running, claimer="builder:capacity") is not None
+            assert kb.get_task(conn, ready).status == "ready"
+        else:
+            kb.create_task(conn, title="waiting ready", assignee="builder")
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO review_handoffs "
+            "(source_task_id, review_task_id, next_task_id, state, verdict, created_at, updated_at) "
+            "VALUES (?, ?, NULL, 'waiting', NULL, ?, ?)",
+            (source, review, now, now),
+        )
+        conn.commit()
+        assert _activate(conn, source) == review
+
+        db_path = kb.kanban_db_path(board=board)
+        before_bytes = db_path.read_bytes()
+        before_tasks = [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, claim_lock, current_run_id "
+            "FROM tasks ORDER BY id"
+        )]
+        before_events = [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, payload, created_at FROM task_events ORDER BY id"
+        )]
+        before_runs = [tuple(row) for row in conn.execute(
+            "SELECT id, task_id, status, outcome FROM task_runs ORDER BY id"
+        )]
+
+        kwargs = {"max_spawn": 0} if capacity == "max_spawn" else {
+            "max_in_progress": 1,
+        }
+        result = kb.dispatch_once(conn, board=board, dry_run=True, **kwargs)
+
+        assert review not in [task_id for task_id, _, _ in result.spawned]
+        assert review in result.skipped_nonspawnable
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, claim_lock, current_run_id "
+            "FROM tasks ORDER BY id"
+        )] == before_tasks
+        assert [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, payload, created_at FROM task_events ORDER BY id"
+        )] == before_events
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, task_id, status, outcome FROM task_runs ORDER BY id"
+        )] == before_runs
+        assert db_path.read_bytes() == before_bytes
+
+
+def test_dry_run_invalid_project_linked_gate_does_not_initialize_projects_db(
+    kanban_home,
+):
+    board = "review-project-preview"
+    projects_path = kanban_home / "projects.db"
+    assert not projects_path.exists()
+    with kb.connect(board=board) as conn:
+        source = kb.create_task(conn, title="implement", assignee="builder")
+        review = kb.create_task(
+            conn, title="verify", assignee="reviewer", parents=[source],
+        )
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL, "
+            "project_id='p_legacy_missing' WHERE id=?",
+            (review,),
+        )
+        now = int(time.time())
+        conn.execute(
+            "INSERT INTO review_handoffs "
+            "(source_task_id, review_task_id, next_task_id, state, verdict, created_at, updated_at) "
+            "VALUES (?, ?, NULL, 'waiting', NULL, ?, ?)",
+            (source, review, now, now),
+        )
+        conn.commit()
+        assert _activate(conn, source) == review
+        db_path = kb.kanban_db_path(board=board)
+        before_bytes = db_path.read_bytes()
+        before_names = sorted(path.name for path in kanban_home.iterdir())
+
+        result = kb.dispatch_once(conn, board=board, dry_run=True, max_spawn=0)
+
+        assert review in result.skipped_nonspawnable
+        assert review not in [task_id for task_id, _, _ in result.spawned]
+        assert not projects_path.exists()
+        assert sorted(path.name for path in kanban_home.iterdir()) == before_names
+        assert db_path.read_bytes() == before_bytes
+
+
+def test_active_review_nonstructural_spawn_failure_keeps_bounded_breaker(
+    kanban_home, all_assignees_spawnable, tmp_path,
+):
+    def fail_spawn(task, workspace):
+        raise RuntimeError("review worker unavailable")
+
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="implement", assignee="builder")
+        review = kb.create_task(
+            conn,
+            title="verify",
+            assignee="reviewer",
+            parents=[source],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "review-workspace"),
+        )
+        kb.register_review_handoff(conn, source, review)
+        assert _activate(conn, source) == review
+
+        first = kb.dispatch_once(conn, spawn_fn=fail_spawn, failure_limit=2)
+        assert first.auto_blocked == []
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.get_task(conn, review).consecutive_failures == 1
+
+        second = kb.dispatch_once(conn, spawn_fn=fail_spawn, failure_limit=2)
+        assert second.auto_blocked == [review]
+        assert kb.get_task(conn, review).status == "blocked"
+        assert any(e.kind == "gave_up" for e in kb.list_events(conn, review))
+
+
+def test_registration_rejects_legacy_invalid_worktree_before_mutation(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source")
+        review = kb.create_task(conn, title="legacy review", parents=[source])
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (review,),
+        )
+        conn.commit()
+        with pytest.raises(ValueError, match="resolvable worktree source"):
+            kb.register_review_handoff(conn, source, review)
+        assert kb.list_review_handoffs(conn) == []
+        assert (source, review) in {
+            (row["parent_id"], row["child_id"])
+            for row in conn.execute("SELECT parent_id, child_id FROM task_links")
+        }
+
+
+def test_review_gate_repair_relinks_active_gate_without_verdict(
+    kanban_home, tmp_path,
+):
+    with kb.connect() as conn:
+        source, old, nxt = _registered_chain(conn)
+        _activate(conn, source)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (old,),
+        )
+        replacement = kb.create_task(
+            conn,
+            title="valid replacement",
+            assignee="reviewer",
+            parents=[source],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "replacement"),
+        )
+        conn.commit()
+
+        handoff = kb.link_tasks(
+            conn,
+            source,
+            replacement,
+            relationship="review_gate",
+            replace_review_gate_id=old,
+            repair_reason="legacy review gate had no resolvable repository",
+        )
+
+        row = kb.list_review_handoffs(conn)[0]
+        assert row["source_task_id"] == source
+        assert row["review_task_id"] == replacement
+        assert row["next_task_id"] == nxt
+        assert row["state"] == "active"
+        assert row["verdict"] is None
+        assert kb.get_task(conn, source).status == "blocked"
+        assert kb.get_task(conn, old).status == "archived"
+        assert kb.get_task(conn, replacement).status == "review"
+        assert kb.list_runs(conn, replacement) == []
+        for task_id, kinds in {
+            source: {"review_gate_repaired"},
+            old: {"review_gate_replaced", "archived"},
+            replacement: {
+                "review_gate_replacement_registered",
+                "review_gate_replacement_activated",
+            },
+        }.items():
+            assert kinds <= {event.kind for event in kb.list_events(conn, task_id)}
+
+
+def test_review_gate_repair_rejects_stale_valid_claimed_invalid_and_ambiguous(
+    kanban_home, tmp_path,
+):
+    with kb.connect() as conn:
+        source, old, _ = _registered_chain(conn)
+        _activate(conn, source)
+        valid_replacement = kb.create_task(
+            conn,
+            title="valid replacement",
+            parents=[source],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "valid"),
+        )
+        with pytest.raises(ValueError, match="stale replace_review_gate_id"):
+            kb.link_tasks(
+                conn, source, valid_replacement, relationship="review_gate",
+                replace_review_gate_id="t_stale", repair_reason="repair",
+            )
+        with pytest.raises(ValueError, match="repair_reason is required"):
+            kb.link_tasks(
+                conn, source, valid_replacement, relationship="review_gate",
+                replace_review_gate_id=old, repair_reason="",
+            )
+        with pytest.raises(ValueError, match="structurally invalid"):
+            kb.link_tasks(
+                conn, source, valid_replacement, relationship="review_gate",
+                replace_review_gate_id=old, repair_reason="repair",
+            )
+
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (old,),
+        )
+        conn.commit()
+        claimed = kb.claim_review_task(conn, old, claimer="reviewer:repair-test")
+        assert claimed is not None
+        with pytest.raises(ValueError, match="running or claimed"):
+            kb.link_tasks(
+                conn, source, valid_replacement, relationship="review_gate",
+                replace_review_gate_id=old, repair_reason="repair",
+            )
+
+        # The old gate is still active/claimed; an ambiguous replacement is
+        # rejected before it can alter the one-to-one row.
+        assert kb.list_review_handoffs(conn)[0]["review_task_id"] == old
+
+
+def test_review_gate_repair_rejects_extra_old_outgoing_edge_atomically(
+    kanban_home, tmp_path,
+):
+    with kb.connect() as conn:
+        source, old, nxt = _registered_chain(conn)
+        _activate(conn, source)
+        conn.execute(
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path=NULL WHERE id=?",
+            (old,),
+        )
+        unrelated = kb.create_task(conn, title="unrelated child", parents=[old])
+        replacement = kb.create_task(
+            conn,
+            title="valid replacement",
+            parents=[source],
+            workspace_kind="dir",
+            workspace_path=str(tmp_path / "replacement-extra-edge"),
+        )
+        conn.commit()
+
+        before_handoff = [tuple(row) for row in conn.execute(
+            "SELECT * FROM review_handoffs ORDER BY source_task_id"
+        )]
+        before_tasks = [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, completed_at, block_kind "
+            "FROM tasks ORDER BY id"
+        )]
+        before_edges = [tuple(row) for row in conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        )]
+        before_event_counts = [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, COUNT(*) FROM task_events "
+            "GROUP BY task_id, kind ORDER BY task_id, kind"
+        )]
+
+        with pytest.raises(ValueError, match="old gate has ordinary downstream children"):
+            kb.link_tasks(
+                conn, source, replacement, relationship="review_gate",
+                replace_review_gate_id=old, repair_reason="remove invalid gate",
+            )
+
+        assert [tuple(row) for row in conn.execute(
+            "SELECT * FROM review_handoffs ORDER BY source_task_id"
+        )] == before_handoff
+        assert [tuple(row) for row in conn.execute(
+            "SELECT id, status, result, completed_at, block_kind "
+            "FROM tasks ORDER BY id"
+        )] == before_tasks
+        assert [tuple(row) for row in conn.execute(
+            "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
+        )] == before_edges
+        assert [tuple(row) for row in conn.execute(
+            "SELECT task_id, kind, COUNT(*) FROM task_events "
+            "GROUP BY task_id, kind ORDER BY task_id, kind"
+        )] == before_event_counts
+        assert kb.get_task(conn, unrelated).status == "todo"
 
 
 @pytest.mark.parametrize("state", ["active", "changes_requested"])

@@ -508,6 +508,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         "--next-task", default=None,
         help="Successor released only by approval (review_gate only)",
     )
+    p_link.add_argument(
+        "--replace-review-gate", dest="replace_review_gate_id", default=None,
+        help="Exact structurally invalid review gate to replace (review_gate only)",
+    )
+    p_link.add_argument(
+        "--repair-reason", default=None,
+        help="Required audit reason for replacing an invalid review gate",
+    )
     p_verdict = sub.add_parser(
         "review-verdict", help="Close an explicit review gate with a verdict",
     )
@@ -1944,6 +1952,9 @@ def _cmd_link(args: argparse.Namespace) -> int:
             args.child_id,
             relationship=args.relationship,
             next_task_id=args.next_task,
+            replace_review_gate_id=getattr(args, "replace_review_gate_id", None),
+            repair_reason=getattr(args, "repair_reason", None),
+            board=getattr(args, "board", None),
         )
     print(f"Linked {args.parent_id} -> {args.child_id} ({args.relationship})")
     return 0

@@ -1534,7 +1534,7 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_link(args: dict, **kw) -> str:
-    """Add an ordinary dependency or explicit review-gate relationship."""
+    """Add a dependency, review gate, or auditable review-gate repair."""
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -1542,6 +1542,8 @@ def _handle_link(args: dict, **kw) -> str:
     board = args.get("board")
     relationship = args.get("relationship") or "dependency"
     next_task_id = args.get("next_task_id")
+    replace_review_gate_id = args.get("replace_review_gate_id")
+    repair_reason = args.get("repair_reason")
     try:
         kb, conn = _connect(board=board)
         try:
@@ -1551,12 +1553,16 @@ def _handle_link(args: dict, **kw) -> str:
                 child_id=child_id,
                 relationship=relationship,
                 next_task_id=next_task_id,
+                replace_review_gate_id=replace_review_gate_id,
+                repair_reason=repair_reason,
+                board=board,
             )
             return _ok(
                 parent_id=parent_id,
                 child_id=child_id,
                 relationship=relationship,
                 next_task_id=next_task_id,
+                replace_review_gate_id=replace_review_gate_id,
             )
         finally:
             conn.close()
@@ -2167,6 +2173,20 @@ KANBAN_LINK_SCHEMA = {
                 "description": (
                     "Optional successor released only by an approved verdict. "
                     "Valid only with relationship='review_gate'."
+                ),
+            },
+            "replace_review_gate_id": {
+                "type": "string",
+                "description": (
+                    "Exact structurally invalid registered review gate to replace. "
+                    "Valid only with relationship='review_gate'."
+                ),
+            },
+            "repair_reason": {
+                "type": "string",
+                "description": (
+                    "Explicit audit reason for replacing a structurally invalid "
+                    "review gate; required with replace_review_gate_id."
                 ),
             },
             "board": _board_schema_prop(),
