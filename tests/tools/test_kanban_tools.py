@@ -9,6 +9,7 @@ Verifies:
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 
 import pytest
@@ -2278,6 +2279,7 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
         "kanban:\n  auto_subscribe_on_create: false\n"
     )
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "discord")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "channel-1")
 
@@ -2765,3 +2767,351 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
         assert Path(atts[0].stored_path).read_bytes() == payload
     finally:
         conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Exact gateway topic -> Project -> Kanban board routing
+# ---------------------------------------------------------------------------
+
+
+def _seed_project_binding(*, platform="telegram", chat_id="chat-1", thread_id="topic-1", board_slug=None):
+    from hermes_cli import projects_db as pdb
+
+    conn = pdb.connect()
+    try:
+        project_id = pdb.create_project(
+            conn,
+            name=f"Bound {thread_id or 'chat'}",
+            board_slug=board_slug,
+        )
+        pdb.bind_conversation(
+            conn,
+            project_id,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        return project_id
+    finally:
+        conn.close()
+
+
+def _set_gateway_topic(monkeypatch, *, thread_id="topic-1", session_id="session-1"):
+    from gateway import session_context
+
+    session_context.reset_session_vars()
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-1")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", thread_id)
+    monkeypatch.setenv("HERMES_SESSION_ID", session_id)
+
+
+def test_create_unbound_gateway_topic_preserves_legacy_default(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _set_gateway_topic(monkeypatch)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "legacy", "assignee": "worker"}))
+    assert result["ok"] is True, result
+    assert result["board"] == "default"
+    assert result["project_id"] is None
+    with kb.connect() as conn:
+        assert kb.get_task(conn, result["task_id"]) is not None
+
+
+def test_create_exact_topic_auto_routes_to_bound_board_and_project(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    project_id = _seed_project_binding(board_slug="project-board")
+    _set_gateway_topic(monkeypatch)
+
+    from hermes_cli import projects_db as pdb
+    projects_path = pdb.projects_db_path()
+    before_sidecars = {
+        path.name for path in projects_path.parent.iterdir()
+        if path.name.startswith("projects.db-")
+    }
+    before_bytes = projects_path.read_bytes()
+    before_hash = hashlib.sha256(before_bytes).hexdigest()
+    before_mtime = projects_path.stat().st_mtime_ns
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "project work", "assignee": "worker"}))
+    assert result["ok"] is True, result
+    assert result["board"] == "project-board"
+    assert result["project_id"] == project_id
+    with kb.connect(board="project-board") as conn:
+        task = kb.get_task(conn, result["task_id"])
+        assert task is not None
+        assert task.project_id == project_id
+    with kb.connect() as conn:
+        assert kb.get_task(conn, result["task_id"]) is None
+    assert projects_path.read_bytes() == before_bytes
+    assert hashlib.sha256(projects_path.read_bytes()).hexdigest() == before_hash
+    assert projects_path.stat().st_mtime_ns == before_mtime
+    after_sidecars = {
+        path.name for path in projects_path.parent.iterdir()
+        if path.name.startswith("projects.db-")
+    }
+    assert after_sidecars == before_sidecars
+
+
+def test_create_exact_bound_topic_requires_trusted_session_id(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _seed_project_binding(board_slug="project-board")
+    _set_gateway_topic(monkeypatch, session_id="trusted-session")
+    monkeypatch.delenv("HERMES_SESSION_ID", raising=False)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "must refuse", "assignee": "worker"}))
+    assert "no trusted HERMES_SESSION_ID" in result["error"]
+    with kb.connect(board="project-board") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE title = ?", ("must refuse",)
+        ).fetchone()[0] == 0
+
+
+def test_create_topic_does_not_broad_fallback_to_chat_binding(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _seed_project_binding(thread_id=None, board_slug="chat-board")
+    _set_gateway_topic(monkeypatch, thread_id="topic-only")
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "topic without exact binding", "assignee": "worker"}))
+    assert result["ok"] is True, result
+    assert result["board"] == "default"
+    with kb.connect() as conn:
+        assert kb.get_task(conn, result["task_id"]) is not None
+    with kb.connect(board="chat-board") as conn:
+        assert kb.get_task(conn, result["task_id"]) is None
+
+
+def test_create_bound_topic_fails_closed_without_board_slug(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _seed_project_binding(board_slug=None)
+    _set_gateway_topic(monkeypatch)
+
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({"title": "must refuse", "assignee": "worker"}))
+    assert "without a board_slug" in result["error"]
+    with kb.connect() as conn:
+        assert kb.get_task(conn, result.get("task_id")) is None
+
+
+def test_create_bound_topic_rejects_wrong_board_and_project(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    bound_id = _seed_project_binding(board_slug="project-board")
+    from hermes_cli import projects_db as pdb
+
+    conn = pdb.connect()
+    try:
+        other_id = pdb.create_project(conn, name="Other", board_slug="other-board")
+        other_slug = pdb.get_project(conn, other_id).slug
+    finally:
+        conn.close()
+    _set_gateway_topic(monkeypatch)
+
+    from tools import kanban_tools as kt
+
+    wrong_board = json.loads(kt._handle_create({
+        "title": "wrong board", "assignee": "worker", "board": "other-board",
+    }))
+    assert "different board" in wrong_board["error"]
+    wrong_project = json.loads(kt._handle_create({
+        "title": "wrong project", "assignee": "worker", "project": other_slug,
+    }))
+    assert "bound to project" in wrong_project["error"]
+    assert bound_id != other_id
+
+
+def test_create_bound_topic_rejects_stale_session_id(worker_env, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+    _seed_project_binding(board_slug="project-board")
+    _set_gateway_topic(monkeypatch, session_id="trusted-session")
+
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "stale", "assignee": "worker", "session_id": "old-session",
+    }))
+    assert "stale session_id" in result["error"]
+
+
+def test_worker_create_bypasses_gateway_topic_and_inherits_board_project(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    project_conn = pdb.connect()
+    try:
+        worker_project = pdb.create_project(
+            project_conn, name="Worker project", board_slug="worker-board"
+        )
+        topic_project = pdb.create_project(
+            project_conn, name="Topic project", board_slug="topic-board"
+        )
+        pdb.bind_conversation(
+            project_conn,
+            topic_project,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="topic-1",
+        )
+    finally:
+        project_conn.close()
+
+    with kb.connect(board="worker-board") as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="worker parent",
+            assignee="test-worker",
+            project_id=worker_project,
+            workspace_kind="scratch",
+        )
+        kb.claim_task(conn, parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-board")
+    _set_gateway_topic(monkeypatch)
+    # _set_gateway_topic only changes gateway identity; restore worker scope
+    # because this test specifically proves the task-scoped bypass.
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+
+    result = json.loads(kt._handle_create({"title": "inherited child", "assignee": "worker"}))
+    assert result["ok"] is True, result
+    with kb.connect(board="worker-board") as conn:
+        child = kb.get_task(conn, result["task_id"])
+        assert child is not None
+        assert child.project_id == worker_project
+    with kb.connect(board="topic-board") as conn:
+        assert kb.get_task(conn, result["task_id"]) is None
+
+
+def _worker_parent_with_project(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+
+    project_conn = pdb.connect()
+    try:
+        parent_project = pdb.create_project(
+            project_conn, name="Pinned parent", board_slug="worker-board"
+        )
+        foreign_project = pdb.create_project(
+            project_conn, name="Foreign project", board_slug="foreign-board"
+        )
+    finally:
+        project_conn.close()
+    kb.create_board("worker-board")
+    kb.create_board("foreign-board")
+    with kb.connect(board="worker-board") as conn:
+        parent_id = kb.create_task(
+            conn,
+            title="pinned parent",
+            assignee="test-worker",
+            project_id=parent_project,
+        )
+        kb.claim_task(conn, parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_TASK", parent_id)
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "worker-board")
+    return parent_id, parent_project, foreign_project
+
+
+def test_worker_create_rejects_foreign_board_without_child_anywhere(worker_env, monkeypatch):
+    _parent_id, _parent_project, _foreign_project = _worker_parent_with_project(
+        worker_env, monkeypatch
+    )
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "foreign-board-child", "assignee": "worker", "board": "foreign-board",
+    }))
+    assert "pinned to board" in result["error"]
+    for board in ("worker-board", "foreign-board"):
+        with kb.connect(board=board) as conn:
+            assert not any(
+                task.title == "foreign-board-child"
+                for task in kb.list_tasks(conn, limit=100)
+            )
+
+
+def test_worker_create_rejects_foreign_project(worker_env, monkeypatch):
+    _parent_id, _parent_project, foreign_project = _worker_parent_with_project(
+        worker_env, monkeypatch
+    )
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db as pdb
+    from tools import kanban_tools as kt
+
+    with pdb.connect() as conn:
+        foreign_slug = pdb.get_project(conn, foreign_project).slug
+    result = json.loads(kt._handle_create({
+        "title": "foreign-project-child", "assignee": "worker", "project": foreign_slug,
+    }))
+    assert "refusing requested project" in result["error"]
+    with kb.connect(board="worker-board") as conn:
+        assert not any(
+            task.title == "foreign-project-child"
+            for task in kb.list_tasks(conn, limit=100)
+        )
+
+
+def test_worker_create_explicit_workspace_still_inherits_parent_project(worker_env, monkeypatch):
+    _parent_id, parent_project, _foreign_project = _worker_parent_with_project(
+        worker_env, monkeypatch
+    )
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "explicit workspace child",
+        "assignee": "worker",
+        "workspace_kind": "dir",
+        "workspace_path": "/tmp/explicit-worker-workspace",
+    }))
+    assert result["ok"] is True, result
+    with kb.connect(board="worker-board") as conn:
+        child = kb.get_task(conn, result["task_id"])
+        assert child.project_id == parent_project
+        assert child.workspace_kind == "dir"
+        assert child.workspace_path == "/tmp/explicit-worker-workspace"
+
+
+def test_worker_create_missing_parent_on_pinned_board_fails_closed(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    kb.create_board("pinned-board")
+    with kb.connect(board="pinned-board"):
+        pass
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "t_missing_on_pinned")
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "pinned-board")
+    result = json.loads(kt._handle_create({
+        "title": "missing-parent-child", "assignee": "worker", "board": "default",
+    }))
+    assert "not found on pinned board" in result["error"]
+    with kb.connect(board="default") as conn:
+        assert not any(t.title == "missing-parent-child" for t in kb.list_tasks(conn, limit=100))
+    with kb.connect(board="pinned-board") as conn:
+        assert not any(t.title == "missing-parent-child" for t in kb.list_tasks(conn, limit=100))
+
+
+def test_worker_create_same_board_normal_child_remains_green(worker_env, monkeypatch):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
+    result = json.loads(kt._handle_create({
+        "title": "same-board-child", "assignee": "worker", "board": "DEFAULT",
+    }))
+    assert result["ok"] is True, result
+    with kb.connect(board="default") as conn:
+        assert kb.get_task(conn, result["task_id"]).title == "same-board-child"

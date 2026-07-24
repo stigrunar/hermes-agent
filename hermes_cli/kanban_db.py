@@ -2303,6 +2303,128 @@ def connect_closing(
             pass
 
 
+_READONLY_REQUIRED_TABLES = (
+    "tasks",
+    "task_links",
+    "review_handoffs",
+    "task_comments",
+    "task_events",
+    "task_runs",
+    "task_attachments",
+    "kanban_notify_subs",
+)
+_READONLY_REQUIRED_COLUMNS = {
+    "tasks": {
+        "id", "title", "body", "assignee", "status", "priority",
+        "created_by", "created_at", "started_at", "completed_at",
+        "workspace_kind", "workspace_path", "branch_name", "project_id",
+        "claim_lock", "claim_expires", "tenant", "result", "idempotency_key",
+        "consecutive_failures", "worker_pid", "last_failure_error",
+        "max_runtime_seconds", "last_heartbeat_at", "current_run_id",
+        "workflow_template_id", "current_step_key", "skills", "model_override",
+        "max_retries", "goal_mode", "goal_max_turns", "session_id", "block_kind",
+        "block_recurrences",
+    },
+    "task_runs": {
+        "id", "task_id", "profile", "step_key", "status", "claim_lock",
+        "claim_expires", "worker_pid", "worker_identity", "worker_tree",
+        "terminal_payload", "terminal_requested_at", "reap_state",
+        "reap_attempt_uuid", "reap_lease_owner", "reap_lease_expires",
+        "reap_heartbeat_at", "reap_term_sent_at", "reap_kill_sent_at",
+        "reap_term_intent_at", "reap_kill_intent_at", "reap_signal_progress",
+        "reap_attempts", "reap_error", "reap_completed_at", "max_runtime_seconds",
+        "last_heartbeat_at", "started_at", "ended_at", "outcome", "summary",
+        "metadata", "error",
+    },
+}
+
+
+def connect_readonly(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> sqlite3.Connection:
+    """Open an already-initialized Kanban DB without any filesystem writes.
+
+    This is intentionally separate from :func:`connect`: SQLite ``mode=ro``
+    prevents database creation/WAL activation, while the schema check rejects
+    fresh and legacy databases instead of silently running migrations during a
+    dry-run preview.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(
+            f"read-only kanban database is missing: {path}; run `hermes kanban init`"
+        )
+    wal_path = Path(f"{path}-wal")
+    shm_path = Path(f"{path}-shm")
+    if wal_path.exists() and not shm_path.exists():
+        raise RuntimeError(
+            f"read-only kanban database has a WAL without its shared-memory "
+            f"index: {path}; refusing a preview that could create {shm_path}"
+        )
+    # An idle WAL database normally has no sidecars. immutable=1 keeps SQLite
+    # from creating a new -shm file merely to read that stable main file.
+    # When a WAL is active, use ordinary mode=ro so committed WAL frames are
+    # visible, but require the existing shared-memory index above.
+    uri = path.as_uri() + ("?mode=ro" if wal_path.exists() else "?mode=ro&immutable=1")
+    try:
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            isolation_level=None,
+            timeout=_resolve_busy_timeout_ms() / 1000.0,
+        )
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            )
+        }
+        missing_tables = [name for name in _READONLY_REQUIRED_TABLES if name not in tables]
+        if missing_tables:
+            raise RuntimeError(
+                f"read-only kanban database is uninitialized or legacy: "
+                f"missing table(s): {', '.join(missing_tables)}"
+            )
+        for table, required in _READONLY_REQUIRED_COLUMNS.items():
+            columns = {
+                row[1] for row in conn.execute(f"PRAGMA table_info({table})")
+            }
+            missing = sorted(required - columns)
+            if missing:
+                raise RuntimeError(
+                    f"read-only kanban database is legacy: {table} is missing "
+                    f"column(s): {', '.join(missing)}"
+                )
+        return conn
+    except Exception:
+        try:
+            conn.close()
+        except (UnboundLocalError, AttributeError):
+            pass
+        except Exception:
+            pass
+        raise
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open a strict read-only Kanban connection and close it on exit."""
+    conn = connect_readonly(db_path=db_path, board=board)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
 def init_db(
     db_path: Optional[Path] = None,
     *,
@@ -11504,6 +11626,7 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    spawn_budget: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -11536,6 +11659,7 @@ def dispatch_once(
             ttl_seconds=ttl_seconds,
             dry_run=True,
             max_spawn=max_spawn,
+            spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
@@ -11555,6 +11679,7 @@ def dispatch_once(
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
+            spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
@@ -11571,6 +11696,7 @@ def dispatch_once(
             ttl_seconds=ttl_seconds,
             dry_run=dry_run,
             max_spawn=max_spawn,
+            spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
@@ -11686,6 +11812,7 @@ def _dispatch_once_locked(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    spawn_budget: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
@@ -11716,6 +11843,11 @@ def _dispatch_once_locked(
     intent ("limit concurrent kanban tasks"). With a per-tick interpretation
     a 60-second tick interval could grow concurrency by N every minute on a
     busy board and accumulate without bound.
+
+    ``spawn_budget`` optionally bounds only new spawns from this invocation;
+    ``None`` preserves the historical behavior. It is deliberately separate
+    from ``max_spawn`` so reclaiming a task cannot turn a live cap into an
+    unlimited per-tick fan-out.
 
     ``spawn_fn`` defaults to ``_default_spawn``. Tests pass a stub.
     ``board`` pins workspace/log/db resolution for this tick to a specific
@@ -11780,6 +11912,10 @@ def _dispatch_once_locked(
     # board, since "running" tasks aren't reclaimed by completion alone —
     # they sit in status='running' until the worker calls
     # kanban_complete/kanban_block (or the dispatcher TTL-reclaims them).
+    if spawn_budget is not None:
+        if not isinstance(spawn_budget, int) or spawn_budget < 0:
+            raise ValueError("spawn_budget must be a non-negative integer")
+
     running_count = 0
     if max_spawn is not None:
         running_count = int(
@@ -11846,6 +11982,8 @@ def _dispatch_once_locked(
             _default_assignee_resolved = True
     for row in ready_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
+            break
+        if spawn_budget is not None and spawned >= spawn_budget:
             break
         row_assignee = row["assignee"]
         if not row_assignee:
@@ -11950,6 +12088,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row_assignee, ""))
+            spawned += 1
             # Increment per-profile counter even in dry_run so the cap
             # check sees the would-be spawn on subsequent iterations.
             # Without this, dry_run reports every task as spawnable and
@@ -12038,6 +12177,8 @@ def _dispatch_once_locked(
     for row in review_rows:
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
+        if spawn_budget is not None and spawned >= spawn_budget:
+            break
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
@@ -12050,6 +12191,7 @@ def _dispatch_once_locked(
             continue
         if dry_run:
             result.spawned.append((row["id"], row["assignee"], ""))
+            spawned += 1
             continue
         claimed = claim_review_task(conn, row["id"], ttl_seconds=ttl_seconds)
         if claimed is None:

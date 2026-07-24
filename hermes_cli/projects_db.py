@@ -215,6 +215,30 @@ def connect_closing(db_path: Optional[Path] = None):
             pass
 
 
+def connect_readonly(db_path: Optional[Path] = None) -> sqlite3.Connection:
+    """Open projects.db without creating directories, WAL, or schema objects."""
+    path = db_path if db_path is not None else projects_db_path()
+    path = path.expanduser().resolve()
+    if not path.is_file():
+        raise RuntimeError(f"read-only projects database is missing: {path}")
+    wal_path = Path(f"{path}-wal")
+    shm_path = Path(f"{path}-shm")
+    if wal_path.exists() and not shm_path.exists():
+        raise RuntimeError(
+            f"read-only projects database has a WAL without its shared-memory "
+            f"index: {path}"
+        )
+    uri = path.as_uri() + ("?mode=ro" if wal_path.exists() else "?mode=ro&immutable=1")
+    conn = sqlite3.connect(uri, uri=True, isolation_level=None)
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA query_only=ON")
+        return conn
+    except Exception:
+        conn.close()
+        raise
+
+
 # TEXT columns added to `projects` after v1; re-applied idempotently on every
 # open so a legacy DB upgrades in place.
 _OPTIONAL_PROJECT_COLUMNS = ("board_slug", "primary_path", "icon", "color")

@@ -300,6 +300,58 @@ def test_run_slash_dispatch_dry_run_counts(kanban_home):
     assert "Spawned:" in out
 
 
+def test_dispatch_dry_run_cli_parser_is_strictly_read_only(tmp_path, monkeypatch):
+    """The actual kanban parser path must not auto-init, migrate, or WAL-open."""
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    kb.init_db()
+    with kb.connect_closing() as conn:
+        kb.create_task(conn, title="preview", assignee="alice")
+    db_path = kb.kanban_db_path()
+    before_names = sorted(path.name for path in home.iterdir())
+    before_bytes = db_path.read_bytes()
+    before_hash = __import__("hashlib").sha256(before_bytes).hexdigest()
+    before_mtime = db_path.stat().st_mtime_ns
+    before_sidecars = {
+        path.name for path in home.iterdir()
+        if path.name.startswith("kanban.db-") or path.name.endswith(".init.lock")
+    }
+
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "--board", "default", "dispatch", "--dry-run", "--json",
+    ])
+    assert kc.kanban_command(args) == 0
+
+    assert sorted(path.name for path in home.iterdir()) == before_names
+    assert db_path.read_bytes() == before_bytes
+    assert __import__("hashlib").sha256(db_path.read_bytes()).hexdigest() == before_hash
+    assert db_path.stat().st_mtime_ns == before_mtime
+    after_sidecars = {
+        path.name for path in home.iterdir()
+        if path.name.startswith("kanban.db-") or path.name.endswith(".init.lock")
+    }
+    assert after_sidecars == before_sidecars
+
+
+def test_dispatch_dry_run_cli_missing_db_fails_without_initializing(tmp_path, monkeypatch, capsys):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args(["kanban", "dispatch", "--dry-run"])
+
+    assert kc.kanban_command(args) == 1
+    assert not kb.kanban_db_path().exists()
+    assert "read-only database" in capsys.readouterr().err
+
+
 def test_run_slash_context_output_format(kanban_home):
     out = kc.run_slash("create 'tech spec' --assignee alice --body 'write an RFC'")
     import re

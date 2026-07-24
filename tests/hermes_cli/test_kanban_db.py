@@ -1881,6 +1881,93 @@ def test_dispatch_max_spawn_fills_remaining_capacity(
         assert kb.get_task(conn, ready_b).status == "ready"
 
 
+def test_dispatch_spawn_budget_bounds_new_spawns_without_changing_live_cap(
+    kanban_home, all_assignees_spawnable
+):
+    """A one-shot budget limits this invocation while max_spawn remains live."""
+    spawns = []
+
+    def fake_spawn(task, workspace):
+        spawns.append(task.id)
+
+    with kb.connect() as conn:
+        running = kb.create_task(conn, title="already-running", assignee="alice")
+        first = kb.create_task(conn, title="first", assignee="bob")
+        second = kb.create_task(conn, title="second", assignee="carol")
+        kb.claim_task(conn, running)
+        res = kb.dispatch_once(
+            conn,
+            spawn_fn=fake_spawn,
+            max_spawn=3,
+            spawn_budget=1,
+        )
+        assert [item[0] for item in res.spawned] == [first]
+        assert spawns == [first]
+        assert kb.get_task(conn, second).status == "ready"
+
+
+def test_connect_readonly_rejects_missing_and_legacy_db_without_creating_files(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    missing = kb.kanban_db_path()
+    with pytest.raises(RuntimeError, match="missing"):
+        kb.connect_readonly()
+    assert not missing.exists()
+
+    with sqlite3.connect(missing) as conn:
+        conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY)")
+    before = {path.name for path in home.iterdir()}
+    with pytest.raises(RuntimeError, match="uninitialized or legacy"):
+        kb.connect_readonly()
+    assert {path.name for path in home.iterdir()} == before
+
+
+def test_connect_readonly_reads_existing_wal_frames_without_new_sidecars(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    writer = kb.connect(db_path=db_path)
+    try:
+        task_id = kb.create_task(writer, title="wal-visible", assignee="alice")
+        writer.commit()
+        sidecars = {
+            path.name
+            for path in tmp_path.iterdir()
+            if path.name.startswith("kanban.db-")
+        }
+        assert sidecars == {"kanban.db-wal", "kanban.db-shm"}
+
+        with kb.connect_readonly_closing(db_path=db_path) as reader:
+            row = reader.execute(
+                "SELECT title FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+            assert row["title"] == "wal-visible"
+
+        assert {
+            path.name
+            for path in tmp_path.iterdir()
+            if path.name.startswith("kanban.db-")
+        } == sidecars
+    finally:
+        writer.close()
+
+
+def test_connect_readonly_rejects_orphan_wal_without_creating_shm(tmp_path):
+    db_path = tmp_path / "kanban.db"
+    kb.init_db(db_path=db_path)
+    wal_path = Path(f"{db_path}-wal")
+    shm_path = Path(f"{db_path}-shm")
+    wal_path.write_bytes(b"orphan wal marker")
+
+    with pytest.raises(RuntimeError, match="WAL without its shared-memory"):
+        kb.connect_readonly(db_path=db_path)
+
+    assert wal_path.read_bytes() == b"orphan wal marker"
+    assert not shm_path.exists()
+
+
 def test_dispatch_reclaims_stale_before_spawning(kanban_home):
     with kb.connect() as conn:
         t = kb.create_task(conn, title="x", assignee="alice")
