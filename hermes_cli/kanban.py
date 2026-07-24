@@ -689,7 +689,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Per-board live concurrency cap")
+    p_disp.add_argument("--spawn-budget", type=int, default=None,
+                        help="Bound new spawns from this invocation only")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -704,7 +706,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_daemon.add_argument("--interval", type=float, default=60.0,
                           help="Seconds between dispatch ticks (default: 60)")
     p_daemon.add_argument("--max", type=int, default=None,
-                          help="Cap number of spawns per tick")
+                          help="Per-board live concurrency cap")
     p_daemon.add_argument("--failure-limit", type=int,
                           default=kb.DEFAULT_SPAWN_FAILURE_LIMIT)
     p_daemon.add_argument("--pidfile", default=None,
@@ -1002,6 +1004,15 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
+        # A dry-run dispatch is a strict preview: do not auto-init/migrate and
+        # do not open the normal WAL-enabled connection path.
+        if action == "dispatch" and bool(getattr(args, "dry_run", False)):
+            try:
+                with kb.connect_readonly_closing() as conn:
+                    return _cmd_dispatch(args, conn=conn)
+            except Exception as exc:
+                print(f"kanban: could not open read-only database: {exc}", file=sys.stderr)
+                return 1
         try:
             kb.init_db()
         except Exception as exc:
@@ -2425,17 +2436,20 @@ def _cmd_tail(args: argparse.Namespace) -> int:
         return 0
 
 
-def _cmd_dispatch(args: argparse.Namespace) -> int:
+def _cmd_dispatch(args: argparse.Namespace, *, conn=None) -> int:
     # Honour kanban.default_assignee as the fallback for unassigned ready
     # tasks (#27145), kanban.max_in_progress as the global concurrency cap
     # (#33488), kanban.max_in_progress_per_profile as the per-profile
-    # cap (#21582), and kanban.max_spawn as the per-tick spawn limit
+    # cap (#21582), and kanban.max_spawn as the per-board live cap
     # (#28805). Same semantics as the gateway dispatch path so behavior
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
     try:
-        from hermes_cli.config import load_config
-        _cfg = load_config()
+        from hermes_cli.config import load_config, read_raw_config
+        # The parser path supplies a strict read-only connection for dry-run;
+        # avoid load_config() there because its normal first-run home setup
+        # creates directories and SOUL.md unrelated to the preview.
+        _cfg = read_raw_config() if conn is not None and args.dry_run else load_config()
         _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
 
@@ -2458,16 +2472,23 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
             _kanban_cfg.get("max_spawn")
         )
+        raw_budget = getattr(args, "spawn_budget", None)
+        spawn_budget = (
+            raw_budget if isinstance(raw_budget, int) and raw_budget >= 0 else None
+        )
     except Exception:
         default_assignee = None
         max_in_progress_per_profile = None
         max_in_progress = None
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
+        spawn_budget = getattr(args, "spawn_budget", None)
+    connect_cm = contextlib.nullcontext(conn) if conn is not None else kb.connect_closing()
+    with connect_cm as dispatch_conn:
         res = kb.dispatch_once(
-            conn,
+            dispatch_conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,

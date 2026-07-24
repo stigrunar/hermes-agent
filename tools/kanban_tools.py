@@ -179,6 +179,213 @@ def _connect(board: Optional[str] = None):
     return kb, kb.connect(board=board)
 
 
+def _resolve_gateway_create_routing(args: dict) -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """Resolve a bound gateway topic for an orchestrator-side create.
+
+    Project conversation bindings are intentionally consulted only when the
+    caller is not a dispatcher-spawned worker.  Worker children must inherit
+    their parent's board and project; consulting the gateway context there
+    could move a child across boards and invalidate parent dependencies.
+
+    The projects DB is opened read-only.  In particular, do not use
+    ``projects_db.connect()`` here: that helper initializes/migrates the DB,
+    while a tool call must never mutate project configuration as a side effect
+    of routing.
+    """
+    legacy_board = args.get("board")
+    legacy_project = args.get("project") or args.get("project_id")
+    legacy_session = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    worker_task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    if worker_task_id:
+        # The dispatcher pins both variables, but the board env is the
+        # authoritative scope. Never let a model-supplied board choose the DB
+        # in which the worker parent is looked up.
+        from hermes_cli import kanban_db
+
+        raw_board = os.environ.get("HERMES_KANBAN_BOARD", "").strip()
+        if raw_board:
+            pinned_board = kanban_db._normalize_board_slug(raw_board)
+        else:
+            pinned_board = kanban_db.get_current_board()
+        if not pinned_board:
+            raise ValueError(
+                f"worker task {worker_task_id!r} has no trusted board scope; "
+                "refusing kanban_create"
+            )
+
+        # Parent lookup is read-only and fail-closed. In particular, do not
+        # let a missing parent fall through to the caller's board/project.
+        with kanban_db.connect_readonly_closing(board=pinned_board) as parent_conn:
+            parent = kanban_db.get_task(parent_conn, worker_task_id)
+        if parent is None:
+            raise ValueError(
+                f"worker task {worker_task_id!r} was not found on pinned board "
+                f"{pinned_board!r}; refusing kanban_create"
+            )
+
+        requested_board = args.get("board")
+        if requested_board is not None and str(requested_board).strip():
+            normalized_requested = kanban_db._normalize_board_slug(requested_board)
+            if normalized_requested != pinned_board:
+                raise ValueError(
+                    f"worker task {worker_task_id!r} is pinned to board "
+                    f"{pinned_board!r}; refusing requested board "
+                    f"{normalized_requested!r}"
+                )
+
+        requested_project = args.get("project") or args.get("project_id")
+        if requested_project is not None and str(requested_project).strip():
+            requested_project = str(requested_project).strip()
+            parent_project_id = parent.project_id
+            if not parent_project_id:
+                raise ValueError(
+                    f"worker task {worker_task_id!r} has no project_id; refusing "
+                    f"explicit project {requested_project!r}"
+                )
+            project_matches = requested_project == parent_project_id
+            if not project_matches:
+                # A slug is a valid project identity only when it resolves in
+                # the same read-only project registry to the exact parent id.
+                # Any unresolved or foreign value is rejected rather than
+                # allowing create_task() to silently drop or replace it.
+                from hermes_cli import projects_db
+                projects_path = projects_db.projects_db_path()
+                if projects_path.is_file():
+                    project_conn = projects_db.connect_readonly(projects_path)
+                    try:
+                        resolved_project = projects_db.get_project(
+                            project_conn, requested_project
+                        )
+                    finally:
+                        project_conn.close()
+                    project_matches = bool(
+                        resolved_project and resolved_project.id == parent_project_id
+                    )
+            if not project_matches:
+                raise ValueError(
+                    f"worker task {worker_task_id!r} is bound to project "
+                    f"{parent_project_id!r}; refusing requested project "
+                    f"{requested_project!r}"
+                )
+
+        # Board and project are inherited unconditionally. Workspace remains
+        # conditional in _handle_create, and the worker session id keeps its
+        # existing trusted-env behavior.
+        return pinned_board, parent.project_id, legacy_session
+
+    # These are trusted gateway ContextVars (with their documented env
+    # fallback), rather than caller-controlled tool arguments.
+    from gateway.session_context import get_session_env
+
+    platform = (get_session_env("HERMES_SESSION_PLATFORM", "") or "").strip()
+    chat_id = (get_session_env("HERMES_SESSION_CHAT_ID", "") or "").strip()
+    thread_id = (get_session_env("HERMES_SESSION_THREAD_ID", "") or "").strip() or None
+    current_session_id = get_session_env("HERMES_SESSION_ID", "") or None
+    if not platform or not chat_id:
+        return legacy_board, legacy_project, legacy_session
+
+    # Import projects_db lazily, and use its path/query helpers with a plain
+    # SQLite read-only connection so normal non-project contexts stay cheap
+    # and opening this tool cannot create or migrate projects.db.
+    from hermes_cli import projects_db
+
+    projects_path = projects_db.projects_db_path()
+    if not projects_path.exists():
+        return legacy_board, legacy_project, legacy_session
+
+    topic_label = f"{platform}/{chat_id}"
+    if thread_id is not None:
+        topic_label += f" thread {thread_id}"
+    conn = projects_db.connect_readonly(projects_path)
+    try:
+        binding = projects_db.get_conversation_binding(
+            conn,
+            platform=platform,
+            chat_id=chat_id,
+            thread_id=thread_id,
+        )
+        # A topic binding lookup is exact.  In particular, a thread-specific
+        # lookup must not fall back to the chat-level (threadless) binding.
+        if binding is None:
+            return legacy_board, legacy_project, legacy_session
+
+        if not current_session_id:
+            raise ValueError(
+                f"gateway topic {topic_label!r} is bound to project work but "
+                "has no trusted HERMES_SESSION_ID; retry from the active "
+                "gateway session"
+            )
+
+        bound_project = projects_db.get_project(conn, binding.project_id)
+        if bound_project is None:
+            raise ValueError(
+                f"gateway topic {topic_label!r} is bound to missing project "
+                f"{binding.project_id!r}; refusing kanban_create"
+            )
+        if bound_project.archived:
+            raise ValueError(
+                f"gateway topic {topic_label!r} is bound to archived project "
+                f"{bound_project.slug!r}; select an active project"
+            )
+
+        bound_board = str(bound_project.board_slug or "").strip()
+        if not bound_board:
+            raise ValueError(
+                f"gateway topic {topic_label!r} is bound to project "
+                f"{bound_project.slug!r} without a board_slug; refusing to "
+                "route onto the default triage board"
+            )
+
+        # Use the same validator as board connections, including lowercase
+        # normalization, before comparing or returning a board slug.
+        from hermes_cli import kanban_db
+
+        bound_board = kanban_db._normalize_board_slug(bound_board)
+        if not bound_board:
+            raise ValueError(
+                f"gateway topic {topic_label!r} has an empty board binding "
+                f"for project {bound_project.slug!r}"
+            )
+
+        requested_board = args.get("board")
+        if requested_board is not None and str(requested_board).strip():
+            requested_board = kanban_db._normalize_board_slug(requested_board)
+            if requested_board != bound_board:
+                raise ValueError(
+                    f"gateway topic {topic_label!r} is bound to board "
+                    f"{bound_board!r}, but kanban_create requested a different "
+                    f"board {requested_board!r}"
+                )
+        selected_board = bound_board
+
+        requested_project = args.get("project") or args.get("project_id")
+        if requested_project is not None and str(requested_project).strip():
+            requested_project = str(requested_project).strip()
+            explicit_project = projects_db.get_project(conn, requested_project)
+            if explicit_project is None:
+                raise ValueError(
+                    f"gateway topic {topic_label!r} is bound to project "
+                    f"{bound_project.slug!r}; requested project "
+                    f"{requested_project!r} does not exist"
+                )
+            if explicit_project.id != bound_project.id:
+                raise ValueError(
+                    f"gateway topic {topic_label!r} is bound to project "
+                    f"{bound_project.slug!r}; refusing requested project "
+                    f"{requested_project!r}"
+                )
+
+        supplied_session_id = args.get("session_id")
+        if supplied_session_id and supplied_session_id != current_session_id:
+            raise ValueError(
+                f"gateway topic {topic_label!r} has a different trusted "
+                "session_id; refusing a stale session_id"
+            )
+        return selected_board, bound_project.id, current_session_id
+    finally:
+        conn.close()
+
+
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
@@ -1137,8 +1344,8 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
         )
-    board = args.get("board")
     try:
+        board, project_id, session_id = _resolve_gateway_create_routing(args)
         kb, conn = _connect(board=board)
         try:
             # Inherit the spawning worker's own task workspace when the
@@ -1186,6 +1393,8 @@ def _handle_create(args: dict, **kw) -> str:
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
                 subscribed=subscribed,
+                board=kb.get_current_board() if board is None else board,
+                project_id=new_task.project_id if new_task else project_id,
             )
         finally:
             conn.close()
