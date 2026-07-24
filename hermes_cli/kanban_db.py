@@ -4350,6 +4350,20 @@ def recompute_ready(
                 # a stale/manual todo or blocked value turn it into an
                 # ordinary ready worker; an explicit unblock or review retry
                 # must restore ``review`` instead.
+                if cur_status == "blocked":
+                    # A dispatcher failure circuit breaker is also terminal
+                    # for the review lane. Preserve the blocked/auditable
+                    # state until an explicit unblock resets the counter;
+                    # otherwise this restore would re-claim the same broken
+                    # review task on every dispatcher tick.
+                    failures = int(row["consecutive_failures"] or 0)
+                    task_limit = row["max_retries"]
+                    effective_limit = (
+                        int(task_limit) if task_limit is not None
+                        else int(failure_limit)
+                    )
+                    if failures >= effective_limit:
+                        continue
                 if cur_status in ("todo", "blocked"):
                     conn.execute(
                         "UPDATE tasks SET status='review', block_kind=NULL "

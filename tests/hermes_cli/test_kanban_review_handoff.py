@@ -325,6 +325,76 @@ def test_active_review_reclaim_unblock_and_promote_stay_in_review_lane(kanban_ho
         assert kb.get_task(conn, source).status == "blocked"
 
 
+def test_active_review_workspace_auto_block_stays_blocked_across_ticks(
+    kanban_home, all_assignees_spawnable,
+):
+    board = "review-worktree-resolution-failure"
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="implement", assignee="builder")
+        review = kb.create_task(
+            conn,
+            title="verify",
+            assignee="reviewer",
+            parents=[source],
+            workspace_kind="worktree",
+            workspace_path=None,
+            board=board,
+        )
+        kb.register_review_handoff(conn, source, review)
+        assert _activate(conn, source) == review
+        assert kb.get_task(conn, review).status == "review"
+
+        first = kb.dispatch_once(conn, board=board, failure_limit=2)
+        assert first.auto_blocked == []
+        assert kb.get_task(conn, review).status == "review"
+        assert kb.get_task(conn, review).consecutive_failures == 1
+
+        second = kb.dispatch_once(conn, board=board, failure_limit=2)
+        assert second.auto_blocked == [review]
+        assert kb.get_task(conn, review).status == "blocked"
+        events_before = kb.list_events(conn, review)
+        review_claims_before = [
+            event for event in events_before if event.kind == "claimed"
+        ]
+        gave_up_before = [
+            event for event in events_before if event.kind == "gave_up"
+        ]
+        restored_before = [
+            event
+            for event in events_before
+            if event.kind == "review_lane_restored"
+        ]
+        assert len(review_claims_before) == 2
+        assert len(gave_up_before) == 1
+        assert restored_before == []
+        runs_before = conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,)
+        ).fetchone()[0]
+
+        for _ in range(3):
+            tick = kb.dispatch_once(conn, board=board, failure_limit=2)
+            assert tick.spawned == []
+            assert tick.auto_blocked == []
+            assert kb.get_task(conn, review).status == "blocked"
+
+        events_after = kb.list_events(conn, review)
+        assert [
+            event for event in events_after if event.kind == "claimed"
+        ] == review_claims_before
+        assert [
+            event for event in events_after if event.kind == "gave_up"
+        ] == gave_up_before
+        assert [
+            event for event in events_after if event.kind == "review_lane_restored"
+        ] == restored_before
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (review,)
+        ).fetchone()[0] == runs_before
+        handoff = kb.list_review_handoffs(conn)[0]
+        assert handoff["state"] == "active"
+        assert handoff["verdict"] is None
+
+
 @pytest.mark.parametrize("state", ["active", "changes_requested"])
 def test_review_successor_cannot_be_force_promoted_before_approval(kanban_home, state):
     with kb.connect() as conn:
