@@ -58,15 +58,12 @@ def _resolve_auto_decompose_settings(
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
-    """Take an exclusive, non-blocking advisory lock for the sole dispatcher.
+    """Take an exclusive, non-blocking gateway watcher lock.
 
-    Only one gateway process machine-wide may run the embedded kanban
-    dispatcher: concurrent dispatchers double the reclaim frequency (each
-    runs its own ``release_stale_claims`` → promote → dispatch loop), double
-    claim-attempt events in the event log, and — with ``wal_autocheckpoint=0`` —
-    concurrent manual WAL checkpoints can corrupt index pages. The
-    ``dispatch_in_gateway`` config flag is the primary control; this lock is the
-    backstop that survives config drift and same-profile restart races.
+    Multiple gateways can legitimately run on one machine while sharing one
+    kanban root. The dispatcher uses this helper as a backstop against config
+    drift and restart races; the notifier uses a separate lock as its primary
+    owner election, independent from dispatcher configuration.
 
     Delegates to :func:`gateway.status._try_acquire_file_lock` (``fcntl`` on
     POSIX, ``msvcrt`` on Windows) so the guard is cross-platform.
@@ -74,10 +71,12 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
     Returns ``(handle, "held")`` on success — the caller keeps the file handle
     for the process lifetime and **must** release it via
     :func:`_release_singleton_lock` when done. ``(None, "contended")`` when
-    another process holds the lock (caller must NOT dispatch). ``(None,
+    another process holds the lock (caller must not perform the guarded work).
+    ``(None,
     "unavailable")`` when locking cannot be performed (non-POSIX filesystem
-    without flock, or the status.py helpers are unimportable) — caller falls
-    back to config-only control.
+    without flock, or the status.py helpers are unimportable). Each caller
+    chooses its safety posture: dispatcher uses config-only control, while the
+    notifier waits rather than polling without ownership.
     """
     try:
         from gateway.status import _try_acquire_file_lock  # deferred; same package
@@ -95,7 +94,7 @@ def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":
 
 
 def _release_singleton_lock(handle) -> None:
-    """Release a dispatcher singleton lock acquired via :func:`_acquire_singleton_lock`."""
+    """Release a lock acquired via :func:`_acquire_singleton_lock`."""
     if handle is None:
         return
     try:
@@ -109,10 +108,100 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _has_connected_kanban_adapter(runner: object) -> bool:
+    """Return whether a default or multiplex-profile adapter is connected."""
+    if getattr(runner, "adapters", None):
+        return True
+    return any(
+        profile_adapters
+        for profile_adapters in getattr(runner, "_profile_adapters", {}).values()
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Elect one eligible notifier owner and keep retrying while running.
+
+        Notification delivery is independent from embedded dispatch. Only a
+        gateway with a connected default or multiplex-profile adapter may hold
+        the machine-global notifier lease. Non-owners remain available for
+        takeover without enumerating or opening board DBs.
+        """
+        try:
+            from hermes_cli.config import load_config as _load_config
+        except Exception:
+            logger.warning("kanban notifier: config loader unavailable; disabled")
+            return
+        try:
+            cfg = _load_config()
+        except Exception as exc:
+            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
+            return
+        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not kanban_cfg.get("notify_in_gateway", True):
+            logger.info(
+                "kanban notifier: disabled via config kanban.notify_in_gateway=false"
+            )
+            return
+
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning(
+                "kanban notifier: kanban_db not importable; notifier disabled"
+            )
+            return
+
+        # Let gateway startup finish wiring default and multiplex adapters.
+        await asyncio.sleep(5)
+        retry_delay = min(1.0, max(0.1, float(interval)))
+        notifier_lock_path = _kb.kanban_home() / "kanban" / ".notifier.lock"
+        self._kanban_notifier_lock_handle = getattr(
+            self, "_kanban_notifier_lock_handle", None
+        )
+        warned_unavailable = False
+
+        while self._running:
+            if not _has_connected_kanban_adapter(self):
+                logger.debug(
+                    "kanban notifier: no connected adapters; waiting to elect owner"
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            lock_handle, lock_state = _acquire_singleton_lock(notifier_lock_path)
+            if lock_state != "held":
+                if lock_state == "unavailable" and not warned_unavailable:
+                    logger.warning(
+                        "kanban notifier: singleton lock unavailable; waiting "
+                        "instead of polling board DBs without ownership"
+                    )
+                    warned_unavailable = True
+                elif lock_state == "contended":
+                    logger.debug(
+                        "kanban notifier: another gateway owns the notifier lease"
+                    )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            self._kanban_notifier_lock_handle = lock_handle
+            logger.info(
+                "kanban notifier: acquired machine-global lease (%s)",
+                notifier_lock_path,
+            )
+            try:
+                await self._kanban_notifier_owner_loop(interval=interval)
+            finally:
+                _release_singleton_lock(self._kanban_notifier_lock_handle)
+                self._kanban_notifier_lock_handle = None
+                logger.info("kanban notifier: released machine-global lease")
+
+            if self._running:
+                await asyncio.sleep(retry_delay)
+
+    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -130,31 +219,12 @@ class GatewayKanbanWatchersMixin:
         tick. Subscriptions live inside each board's own DB and cannot
         cross boards, so delivery semantics are unchanged — this is
         purely a fan-out of the single-DB poll.
+
+        Returning from this method relinquishes the notifier lease. In
+        particular, adapter loss returns control to the election loop so a
+        connected gateway can take over and this watcher can later re-elect
+        after reconnect.
         """
-        # Gate: only the dispatch-owning gateway opens kanban DBs for notifier polling.
-        # Non-dispatch gateways have no subscriptions to deliver — all kanban state lives
-        # in the dispatch owner's per-board DBs. This prevents N-gateway -shm contention.
-        # TODO: gate per-board when per-board dispatcher_owner tracking lands.
-        try:
-            from hermes_cli.config import load_config as _load_config
-        except Exception:
-            logger.warning("kanban notifier: config loader unavailable; disabled")
-            return
-        env_override = os.environ.get("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "").strip().lower()
-        if env_override in {"0", "false", "no", "off"}:
-            logger.info("kanban notifier: disabled via HERMES_KANBAN_DISPATCH_IN_GATEWAY env")
-            return
-        try:
-            cfg = _load_config()
-        except Exception as exc:
-            logger.warning("kanban notifier: cannot load config (%s); disabled", exc)
-            return
-        kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
-        if not kanban_cfg.get("dispatch_in_gateway", True):
-            logger.info(
-                "kanban notifier: disabled via config kanban.dispatch_in_gateway=false"
-            )
-            return
         from gateway.config import Platform as _Platform
         try:
             from hermes_cli import kanban_db as _kb
@@ -191,10 +261,13 @@ class GatewayKanbanWatchersMixin:
             notifier_profile = self._active_profile_name()
             self._kanban_notifier_profile = notifier_profile
 
-        # Initial delay so the gateway can finish wiring adapters.
-        await asyncio.sleep(5)
-
         while self._running:
+            if not _has_connected_kanban_adapter(self):
+                logger.info(
+                    "kanban notifier: owner has no connected adapters; "
+                    "releasing lease"
+                )
+                return
             try:
                 def _collect():
                     deliveries: list[dict] = []
@@ -202,6 +275,13 @@ class GatewayKanbanWatchersMixin:
                         getattr(platform, "value", str(platform)).lower()
                         for platform in self.adapters.keys()
                     }
+                    for profile_adapters in getattr(
+                        self, "_profile_adapters", {}
+                    ).values():
+                        active_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in profile_adapters.keys()
+                        )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -688,6 +768,12 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
+            if not _has_connected_kanban_adapter(self):
+                logger.info(
+                    "kanban notifier: owner lost all connected adapters; "
+                    "releasing lease"
+                )
+                return
             # Sleep with cancellation checks.
             for _ in range(int(max(1, interval))):
                 if not self._running:

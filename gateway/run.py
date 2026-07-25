@@ -3521,6 +3521,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # injected only when the live state differs from this value.
         self._session_vc_last: Dict[str, str] = {}
         self._kanban_notifier_profile = self._active_profile_name()
+        # Machine-global notifier ownership is independent from embedded
+        # dispatcher ownership and held only while an adapter is connected.
+        self._kanban_notifier_lock_handle = None
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
@@ -8568,9 +8571,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
 
-        # Start background kanban notifier — delivers `completed`, `blocked`,
-        # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
-        # so human-in-the-loop workflows hear back without polling.
+        # Start background kanban notifier — independently elects one connected
+        # gateway to deliver completion, blocked, and worker-failure events.
         self._spawn_supervised(self._kanban_notifier_watcher, "kanban_notifier_watcher")
 
         # Start background kanban dispatcher — spawns workers for ready

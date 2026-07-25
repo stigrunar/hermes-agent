@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path
+from unittest.mock import patch
 
 
 from gateway.config import Platform
@@ -25,6 +26,9 @@ class DisconnectedAdapters(dict):
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
     async def fake_sleep(delay):
         if delay == 5:
             return None
@@ -32,7 +36,16 @@ async def _run_one_notifier_tick(monkeypatch, runner):
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    lock_handle = object()
+    with (
+        patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(lock_handle, "held"),
+        ),
+        patch("gateway.kanban_watchers._release_singleton_lock"),
+        patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=fake_to_thread),
+    ):
+        await runner._kanban_notifier_watcher(interval=1)
 
 
 def _make_runner(adapter):
@@ -67,6 +80,65 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def test_notifier_delivers_with_dispatch_disabled(tmp_path, monkeypatch):
+    """Notifier ownership does not enable or depend on embedded dispatch."""
+    db_path = tmp_path / "notifier-only.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    monkeypatch.setenv("HERMES_KANBAN_DISPATCH_IN_GATEWAY", "false")
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    with (
+        patch(
+            "hermes_cli.config.load_config",
+            return_value={
+                "kanban": {
+                    "dispatch_in_gateway": False,
+                    "notify_in_gateway": True,
+                }
+            },
+        ),
+        patch.object(kb, "dispatch_once") as dispatch_once,
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert tid in adapter.sent[0]["text"]
+    dispatch_once.assert_not_called()
+    assert runner._kanban_notifier_lock_handle is None
+
+
+def test_notifier_owner_polls_multiple_boards(tmp_path, monkeypatch):
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    task_ids = []
+    for board in ("work-dev", "personal-dev"):
+        kb.create_board(board)
+        conn = kb.connect(board=board)
+        try:
+            tid = kb.create_task(
+                conn, title=f"{board} notification", assignee="worker",
+            )
+            task_ids.append(tid)
+            kb.add_notify_sub(
+                conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            )
+            kb.complete_task(conn, tid, summary=f"{board} complete")
+        finally:
+            conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 2
+    delivered = "\n".join(item["text"] for item in adapter.sent)
+    assert all(tid in delivered for tid in task_ids)
+    assert "[work-dev]" in delivered
+    assert "[personal-dev]" in delivered
 
 
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):

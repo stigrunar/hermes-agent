@@ -3529,6 +3529,9 @@ def test_config_default_dispatch_in_gateway_is_true():
     assert isinstance(interval, (int, float)) and interval >= 1, (
         f"dispatch_interval_seconds must be a positive number, got {interval!r}"
     )
+    assert kanban.get("notify_in_gateway") is True, (
+        "kanban.notify_in_gateway must default to True for backward compatibility"
+    )
 
 
 def test_check_dispatcher_presence_silent_when_gateway_running(monkeypatch):
