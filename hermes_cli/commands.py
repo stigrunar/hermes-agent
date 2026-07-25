@@ -207,6 +207,7 @@ COMMAND_REGISTRY: list[CommandDef] = [
                subcommands=("status", "run", "pause", "resume", "pin", "unpin", "restore", "list-archived")),
     CommandDef("kanban", "Multi-profile collaboration board (tasks, links, comments)",
                "Tools & Skills", args_hint="[subcommand]",
+               aliases=("kanban-list", "kanban_list"),
                subcommands=("init", "boards", "create", "list", "ls", "show", "assign",
                             "reclaim", "reassign", "diagnostics", "diag", "link", "unlink",
                             "claim", "comment", "complete", "edit", "block", "unblock",

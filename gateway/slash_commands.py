@@ -431,11 +431,48 @@ class GatewaySlashCommandsMixin:
         from hermes_cli.kanban import run_slash
 
         text = (event.text or "").strip()
+        command_args = (
+            event.get_command_args().strip()
+            if hasattr(event, "get_command_args")
+            else ""
+        )
+        if command_args or (
+            hasattr(event, "get_command") and event.get_command() is not None
+        ):
+            text = command_args
         # Strip the leading "/kanban" (with or without slash), leaving args.
         if text.startswith("/"):
             text = text.lstrip("/")
-        if text.startswith("kanban"):
-            text = text[len("kanban"):].lstrip()
+        for command_name in ("kanban-list", "kanban_list", "kanban"):
+            if text == command_name or text.startswith(command_name + " "):
+                text = text[len(command_name):].lstrip()
+                break
+
+        source = event.source
+        platform = getattr(source, "platform", None)
+        platform_str = (
+            platform.value if hasattr(platform, "value") else str(platform or "")
+        ).lower()
+        chat_id = str(getattr(source, "chat_id", "") or "").strip()
+        thread_id = str(getattr(source, "thread_id", "") or "").strip()
+        chat_type = str(getattr(source, "chat_type", "") or "").lower()
+        if (
+            platform_str == "telegram"
+            and chat_type not in {"dm", "direct", "private"}
+            and chat_id
+            and thread_id
+            and not text
+        ):
+            from gateway.kanban_topic_summary import render_mapped_topic_summary
+
+            output = await asyncio.to_thread(
+                render_mapped_topic_summary,
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+            if len(output) > 3800:
+                output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
+            return output or t("gateway.kanban.no_output")
 
         tokens = shlex.split(text) if text else []
         requested_board = None
