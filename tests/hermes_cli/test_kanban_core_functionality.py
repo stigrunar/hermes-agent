@@ -2876,6 +2876,7 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
         captured["env"] = kwargs.get("env", {})
+        os.write(kwargs["pass_fds"][0], b"99999\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -2920,6 +2921,7 @@ def test_default_spawn_raises_terminal_timeout_to_task_runtime(kanban_home, monk
 
     def fake_popen(cmd, **kwargs):
         captured["env"] = kwargs.get("env", {})
+        os.write(kwargs["pass_fds"][0], b"123\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -2954,6 +2956,7 @@ def test_default_spawn_preserves_longer_terminal_timeout(kanban_home, monkeypatc
 
     def fake_popen(cmd, **kwargs):
         captured["env"] = kwargs.get("env", {})
+        os.write(kwargs["pass_fds"][0], b"124\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -2987,6 +2990,7 @@ def test_default_spawn_leaves_terminal_timeout_without_runtime_cap(kanban_home, 
 
     def fake_popen(cmd, **kwargs):
         captured["env"] = kwargs.get("env", {})
+        os.write(kwargs["pass_fds"][0], b"125\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -3142,6 +3146,7 @@ def test_default_spawn_appends_per_task_skills(kanban_home, monkeypatch):
 
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
+        os.write(kwargs["pass_fds"][0], b"42\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
@@ -3189,6 +3194,7 @@ def test_default_spawn_passes_task_skills_verbatim(kanban_home, monkeypatch):
 
     def fake_popen(cmd, **kwargs):
         captured["cmd"] = cmd
+        os.write(kwargs["pass_fds"][0], b"1\n")
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
