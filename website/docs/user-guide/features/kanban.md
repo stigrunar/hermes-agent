@@ -225,6 +225,7 @@ up on the next tick (60s by default).
 # config.yaml
 kanban:
   dispatch_in_gateway: true        # default
+  notify_in_gateway: true          # default; independent notifier election
   dispatch_interval_seconds: 60    # default
 ```
 
@@ -241,6 +242,22 @@ policy forbids long-lived services, etc.) a `--force` escape hatch keeps
 the old standalone daemon alive for one release cycle, but running both
 a gateway-embedded dispatcher AND a standalone daemon against the same
 `kanban.db` causes claim races and is not supported.
+
+The gateway notification watcher has separate ownership. Eligible connected
+gateways contend for a machine-global `.notifier.lock`; only the owner
+enumerates and polls board DBs, while non-owners wait for takeover.
+`kanban.dispatch_in_gateway: false` therefore disables worker dispatch without
+disabling notifications. Set `kanban.notify_in_gateway: false` to keep a
+gateway out of notifier election.
+
+Notification subscriptions retain their creating `notifier_profile` and never
+fall back to a different profile's adapter. The designated notifier owner must
+host the required multiplex profile adapters for the boards it adopts; events
+for missing or disconnected profile adapters remain unseen for later delivery.
+In a multi-profile deployment, keep `notify_in_gateway: true` on that
+multiplex notifier and set it to `false` on single-profile gateways that cannot
+serve every adopted subscription. The lease is the exactly-one backstop among
+the gateways intentionally left eligible.
 
 ### Idempotent create (for automation / webhooks)
 

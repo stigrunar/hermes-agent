@@ -2836,6 +2836,9 @@ DEFAULT_CONFIG = {
         # only if you run the dispatcher as a separate systemd unit or
         # don't want the gateway to spawn workers.
         "dispatch_in_gateway": True,
+        # Run the notification watcher inside one eligible connected gateway.
+        # Ownership is elected independently from embedded task dispatch.
+        "notify_in_gateway": True,
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

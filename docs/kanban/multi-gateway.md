@@ -4,36 +4,66 @@ Hermes supports multiple gateway processes running concurrently — one per prof
 (default, writer, admin, coder, researcher). Each gateway opens its own connection
 to platform APIs and delivers messages for its profile's subscribers.
 
-## Single-dispatcher posture
+## Independent dispatcher and notifier ownership
 
-Only one gateway owns the kanban dispatcher. The owning gateway keeps
+Only one gateway owns the kanban dispatcher. The dispatch-owning gateway keeps
 `kanban.dispatch_in_gateway: true` (the default); every other gateway sets it
 to `false`.
 
-**Why this matters:** a gateway with `dispatch_in_gateway: true` opens per-board
-SQLite connections for both the dispatcher and the notifier watcher. Multiple
-gateways doing this concurrently multiplies the open file descriptors on each
-`kanban.db` and amplifies WAL `-shm` reader contention. Gating both paths on the
-same flag means exactly one process touches the kanban DBs.
+Notification ownership is separate and enabled by
+`kanban.notify_in_gateway: true` (the default). Every gateway with a connected
+default or multiplex-profile adapter is eligible for a machine-global notifier
+lease, regardless of `kanban.dispatch_in_gateway`. The first eligible gateway
+to acquire `<kanban-home>/kanban/.notifier.lock` polls all boards. Other
+gateways keep retrying the lease but do **not** enumerate or open board DBs
+while they are non-owners. Lock-unavailable gateways also fail closed. If the
+owner loses all adapters or exits, it releases the lease and a connected
+gateway can take over.
+
+Subscriptions remain stamped with the profile that created them
+(`notifier_profile`). The elected owner routes strictly through that profile's
+adapter, preserving profile isolation; it never falls back to another
+profile's adapter. The designated notifier owner is therefore expected to be a
+multiplex gateway hosting every profile adapter needed by the adopted boards.
 
 ## Configuration
 
-On the dispatch-owning gateway (typically the `default` profile), no change is
-needed. On every other profile gateway, add to `~/.hermes/config.yaml`:
+Choose one notifier-capable gateway that hosts the adapters for every profile
+whose subscriptions it must deliver. It may be the dispatch owner, or it may
+be a notifier-only multiplex gateway:
 
 ```yaml
 kanban:
   dispatch_in_gateway: false
+  notify_in_gateway: true
 ```
 
-Or set the env var: `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
+On other profile gateways, opt out of notifier election as well as embedded
+dispatch:
+
+```yaml
+kanban:
+  dispatch_in_gateway: false
+  notify_in_gateway: false
+```
+
+`notify_in_gateway` defaults to `true` for single-gateway compatibility. In a
+multi-profile deployment, explicitly selecting the multiplex notifier avoids a
+single-profile gateway winning the lease while lacking another profile's
+adapter. The lock remains the exactly-one safety boundary among all gateways
+that are intentionally eligible. `HERMES_KANBAN_DISPATCH_IN_GATEWAY=false`
+remains the env override for dispatcher execution only.
 
 ## What each gateway does
 
-| Gateway role | dispatch_in_gateway | Opens per-board DBs? | Runs dispatcher + notifier? |
-|---|---|---|---|
-| default (dispatch owner) | true (default) | yes | yes |
-| writer, admin, coder, etc. | false | no | no |
+| Gateway role | dispatch_in_gateway | Opens per-board DBs? | Runs dispatcher? | Runs notifier? |
+|---|---|---|---|---|
+| dispatch owner + notifier lease owner | true | yes | yes | yes |
+| dispatcher-only gateway | true | yes, for dispatch | yes | waits for lease |
+| notifier-only lease owner | false | yes | no | yes |
+| connected non-owner | false | no | no | waits for lease |
+| notifications disabled | any | no, for notifications | unchanged | no |
 
-Non-dispatch gateways still deliver messages for their own platform adapters
-(Telegram, Discord, etc.) — they just don't poll kanban boards.
+The notifier lease does not enable dispatch and the dispatcher flag does not
+grant the notifier lease. Set `notify_in_gateway: false` on every gateway that
+must not participate in notifier election.
