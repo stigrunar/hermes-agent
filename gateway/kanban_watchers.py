@@ -207,8 +207,9 @@ def _resolve_kanban_notification_events(
                 event for event in completions
                 if getattr(event, "run_id", None) == latest_run_id
             ]
-            if run_completions:
-                completions = run_completions
+            if not run_completions:
+                return []
+            completions = run_completions
         if (
             _completion_notification_kind(latest_run)
             in _KANBAN_SILENT_COMPLETION_KINDS
