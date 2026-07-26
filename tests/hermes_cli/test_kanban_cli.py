@@ -312,6 +312,29 @@ def test_link_parser_exposes_review_gate_repair_flags():
     assert args.repair_reason == "legacy pathless gate"
 
 
+def test_supersede_review_handoff_parser_exposes_operator_evidence_contract():
+    parser = argparse.ArgumentParser(prog="hermes", add_help=False)
+    sub = parser.add_subparsers(dest="command")
+    kc.build_parser(sub)
+    args = parser.parse_args([
+        "kanban", "supersede-review-handoff", "t_source", "t_review",
+        "--replacement-commit", "a" * 40,
+        "--replacement-tree", "b" * 40,
+        "--evidence", "t_design=approved",
+        "--evidence", "t_live=approved_live",
+        "--reason", "replacement exact candidate is canonical",
+    ])
+    assert args.kanban_action == "supersede-review-handoff"
+    assert args.evidence == ["t_design=approved", "t_live=approved_live"]
+    assert args.reason == "replacement exact candidate is canonical"
+
+
+def test_supersede_review_handoff_is_not_available_through_slash(kanban_home):
+    out = kc.run_slash("supersede-review-handoff t_source t_review")
+    assert "operator-only" in out
+    assert "local `hermes kanban` CLI" in out
+
+
 def test_dispatch_dry_run_cli_parser_is_strictly_read_only(tmp_path, monkeypatch):
     """The actual kanban parser path must not auto-init, migrate, or WAL-open."""
     home = tmp_path / ".hermes"

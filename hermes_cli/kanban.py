@@ -522,6 +522,20 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_verdict.add_argument("task_id", help="Review gate task id")
     p_verdict.add_argument("verdict", choices=["approved", "changes_requested"])
     p_verdict.add_argument("--summary", default=None)
+    p_supersede = sub.add_parser(
+        "supersede-review-handoff",
+        help="Operator-only: supersede one SHA-stale negative review handoff",
+    )
+    p_supersede.add_argument("source_task_id")
+    p_supersede.add_argument("review_task_id")
+    p_supersede.add_argument("--replacement-commit", required=True)
+    p_supersede.add_argument("--replacement-tree", required=True)
+    p_supersede.add_argument(
+        "--evidence", action="append", required=True, metavar="TASK_ID=VERDICT",
+        help="Terminal structured evidence assertion (repeatable)",
+    )
+    p_supersede.add_argument("--reason", required=True, help="Durable audit reason")
+    p_supersede.add_argument("--actor", default=None, help="Audit actor (default: active profile)")
     p_unlink = sub.add_parser("unlink", help="Remove a parent->child dependency")
     p_unlink.add_argument("parent_id")
     p_unlink.add_argument("child_id")
@@ -1041,6 +1055,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "diag":     _cmd_diagnostics,
             "link":     _cmd_link,
             "review-verdict": _cmd_review_verdict,
+            "supersede-review-handoff": _cmd_supersede_review_handoff,
             "unlink":   _cmd_unlink,
             "claim":    _cmd_claim,
             "comment":  _cmd_comment,
@@ -1966,6 +1981,31 @@ def _cmd_review_verdict(args: argparse.Namespace) -> int:
             conn, args.task_id, verdict=args.verdict, summary=args.summary,
         )
     print(f"Review verdict for {args.task_id}: {args.verdict}")
+    return 0
+
+
+def _cmd_supersede_review_handoff(args: argparse.Namespace) -> int:
+    evidence: list[tuple[str, str]] = []
+    for assertion in args.evidence:
+        task_id, separator, verdict = assertion.partition("=")
+        if not separator or not task_id.strip() or not verdict.strip():
+            raise ValueError("--evidence must use TASK_ID=VERDICT")
+        evidence.append((task_id.strip(), verdict.strip()))
+    with kb.connect_closing() as conn:
+        row = kb.supersede_review_handoff(
+            conn,
+            args.source_task_id,
+            args.review_task_id,
+            replacement_commit=args.replacement_commit,
+            replacement_tree=args.replacement_tree,
+            evidence=evidence,
+            reason=args.reason,
+            actor=args.actor or _profile_author(),
+        )
+    print(
+        f"Superseded review handoff {row['source_task_id']} -> "
+        f"{row['review_task_id']} (preserved verdict: {row['verdict']})"
+    )
     return 0
 
 
@@ -3312,6 +3352,11 @@ def run_slash(rest: str) -> str:
     # bubble).  Per-subcommand help still works via ``/kanban foo -h``.
     if not tokens or tokens[0] in {"help", "--help", "-h", "?"}:
         return _SLASH_KANBAN_HELP
+    if tokens[0] == "supersede-review-handoff":
+        return (
+            "⚠ /kanban supersede-review-handoff is operator-only. "
+            "Run it from the local `hermes kanban` CLI."
+        )
 
     # Single argparse tree rooted at "/kanban".  build_parser() expects a
     # subparsers action to attach to, so build a throwaway one and pull
