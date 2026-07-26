@@ -2,6 +2,8 @@ import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 
 from gateway.config import Platform
 from gateway.run import GatewayRunner
@@ -11,9 +13,13 @@ from hermes_cli import kanban_db as kb
 class RecordingAdapter:
     def __init__(self):
         self.sent = []
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+
+    async def handle_message(self, event):
+        self.handled.append(event)
 
 
 class DisconnectedAdapters(dict):
@@ -207,6 +213,322 @@ def test_kanban_db_path_is_test_isolated_from_real_home():
 
     assert kb.kanban_db_path().resolve().is_relative_to(hermes_home.resolve())
     assert kb.kanban_db_path().resolve() != production_db.resolve()
+
+
+def test_terminal_completion_wins_over_historical_failures(tmp_path, monkeypatch):
+    db_path = tmp_path / "terminal-completion-wins.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="eventually succeeds",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="historical blocker", kind="needs_input")
+        kb._append_event(
+            conn,
+            tid,
+            kind="gave_up",
+            payload={"error": "historical retries exhausted"},
+        )
+        kb.complete_task(conn, tid, summary="canonical success")
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "done" in adapter.sent[0]["text"].lower()
+    assert "canonical success" in adapter.sent[0]["text"]
+    assert "blocked" not in adapter.sent[0]["text"].lower()
+    assert "gave up" not in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1
+    wake = adapter.handled[0].text.lower()
+    assert "completed" in wake
+    assert "blocked" not in wake
+    assert "gave up" not in wake
+
+    conn = kb.connect()
+    try:
+        event_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (tid,),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert "blocked" in event_kinds
+    assert "gave_up" in event_kinds
+    assert "completed" in event_kinds
+
+
+def test_terminal_task_ignores_delayed_historical_failures(tmp_path, monkeypatch):
+    db_path = tmp_path / "terminal-delayed-history.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="already complete",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.complete_task(conn, tid, summary="finished before delayed events")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        completed_cursor = int(
+            conn.execute(
+                "SELECT MAX(id) AS id FROM task_events WHERE task_id=?",
+                (tid,),
+            ).fetchone()["id"]
+        )
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            new_cursor=completed_cursor,
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="blocked",
+            payload={"reason": "delayed old blocker"},
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="gave_up",
+            payload={"error": "delayed old retry failure"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+        delayed_kinds = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? AND id>? ORDER BY id",
+                (tid, completed_cursor),
+            ).fetchall()
+        ]
+    finally:
+        conn.close()
+    assert delayed_kinds == ["blocked", "gave_up"]
+
+
+@pytest.mark.parametrize(
+    ("current_kind", "expected_text"),
+    [("blocked", "blocked"), ("gave_up", "gave up")],
+)
+def test_current_failure_still_notifies_and_wakes(
+    current_kind, expected_text, tmp_path, monkeypatch,
+):
+    db_path = tmp_path / f"current-{current_kind}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title=f"currently {current_kind}",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        if current_kind == "blocked":
+            kb.block_task(conn, tid, reason="current blocker", kind="needs_input")
+        else:
+            kb._record_task_failure(
+                conn,
+                tid,
+                "current retries exhausted",
+                outcome="spawn_failed",
+                force_trip=True,
+                release_claim=True,
+                end_run=True,
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert expected_text in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1
+    assert expected_text in adapter.handled[0].text.lower()
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "metadata"),
+    [
+        ("notification-board-hygiene", {"notification": {"kind": "board_hygiene"}}),
+        ("notification-superseded", {"notification": {"kind": "superseded"}}),
+        ("closure-class-board-hygiene", {"closure_class": "board_hygiene"}),
+        (
+            "closure-class-superseded-by-replacement",
+            {"closure_class": "superseded_by_replacement"},
+        ),
+        (
+            "closure-class-duplicate-superseded",
+            {"closure_class": "duplicate_superseded"},
+        ),
+    ],
+    ids=[
+        "notification-board-hygiene",
+        "notification-superseded",
+        "closure-class-board-hygiene",
+        "closure-class-superseded-by-replacement",
+        "closure-class-duplicate-superseded",
+    ],
+)
+def test_structured_hygiene_completion_is_silent(
+    case_name, metadata, tmp_path, monkeypatch,
+):
+    db_path = tmp_path / f"{case_name}.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="continuity closeout",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="close duplicate continuity card",
+            metadata=metadata,
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+        completed_events = [
+            row["kind"]
+            for row in conn.execute(
+                "SELECT kind FROM task_events WHERE task_id=? ORDER BY id",
+                (tid,),
+            ).fetchall()
+            if row["kind"] == "completed"
+        ]
+    finally:
+        conn.close()
+    assert completed_events == ["completed"]
+
+
+def test_actionable_completion_prose_and_metadata_still_surface(tmp_path, monkeypatch):
+    db_path = tmp_path / "actionable-completion.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="real product follow-up",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.complete_task(
+            conn,
+            tid,
+            summary="Superseded one approach; changes requested remain actionable",
+            metadata={"closure_class": "changes_requested_no_deploy"},
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "changes requested remain actionable" in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1
+    assert "completed" in adapter.handled[0].text.lower()
+
+
+def test_superseded_terminal_status_silences_delayed_failures(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "superseded-terminal.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="duplicate continuity card",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            kind="blocked",
+            payload={"reason": "historical blocker"},
+        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='superseded' WHERE id=?",
+                (tid,),
+            )
+            kb._append_event(
+                conn,
+                tid,
+                kind="status",
+                payload={"status": "superseded"},
+            )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
 
 
 class FailingAdapter:

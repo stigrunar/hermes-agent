@@ -118,6 +118,165 @@ def _has_connected_kanban_adapter(runner: object) -> bool:
     )
 
 
+_KANBAN_VISIBLE_FINAL_STATUSES = {"done", "archived"}
+_KANBAN_FAILURE_KINDS = {"blocked", "gave_up", "crashed", "timed_out"}
+_KANBAN_OUTCOME_EVENT_KIND = {
+    "blocked": "blocked",
+    "gave_up": "gave_up",
+    "crashed": "crashed",
+    "timed_out": "timed_out",
+}
+_KANBAN_SILENT_COMPLETION_KINDS = {
+    "board_hygiene",
+    "continuity_closeout",
+    "duplicate",
+    "duplicate_closeout",
+    "duplicate_superseded",
+    "stale_continuity_only",
+    "superseded",
+    "superseded_by_replacement",
+}
+
+
+def _completion_notification_kind(latest_run: object) -> Optional[str]:
+    """Return an explicit structured completion-notification classification.
+
+    Completion prose is intentionally ignored: words such as "superseded" or
+    "changes requested" can describe real product work. Only exact structured
+    metadata fields opt a closeout into the silent board-hygiene lane.
+    """
+    metadata = getattr(latest_run, "metadata", None)
+    if not isinstance(metadata, dict):
+        return None
+    notification = metadata.get("notification")
+    if isinstance(notification, dict):
+        for key in ("kind", "classification"):
+            value = notification.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip().lower()
+    for key in (
+        "notification_kind",
+        "completion_kind",
+        "closure_kind",
+        "closure_class",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip().lower()
+    if metadata.get("board_hygiene") is True:
+        return "board_hygiene"
+    if metadata.get("superseded_by"):
+        return "superseded"
+    if metadata.get("duplicate_of"):
+        return "duplicate"
+    return None
+
+
+def _resolve_kanban_notification_events(
+    task: object,
+    events: list,
+    latest_run: object = None,
+    *,
+    terminal_statuses: set[str],
+) -> list:
+    """Resolve a claimed audit range to the task's current notification state.
+
+    SQLite keeps every attempt. Notification delivery must not treat that
+    audit history as a list of simultaneously-current outcomes: canonical task
+    status wins first, then the latest run/event supplies the current terminal
+    outcome. The returned events are the only ones eligible for both direct
+    sends and synthetic wakes; the caller still advances the cursor across the
+    full claimed range.
+    """
+    claimed = sorted(events, key=lambda event: int(getattr(event, "id", 0)))
+    if not claimed or task is None:
+        return claimed
+
+    status = str(getattr(task, "status", "") or "").lower()
+    if status in terminal_statuses:
+        if status not in _KANBAN_VISIBLE_FINAL_STATUSES:
+            return []
+        if latest_run is not None and getattr(latest_run, "outcome", None) != "completed":
+            return []
+        completions = [event for event in claimed if event.kind == "completed"]
+        if not completions:
+            return []
+        latest_run_id = getattr(latest_run, "id", None)
+        if latest_run_id is not None:
+            run_completions = [
+                event for event in completions
+                if getattr(event, "run_id", None) == latest_run_id
+            ]
+            if run_completions:
+                completions = run_completions
+        if (
+            _completion_notification_kind(latest_run)
+            in _KANBAN_SILENT_COMPLETION_KINDS
+        ):
+            return []
+        return [completions[-1]]
+
+    current_status_events = [
+        event
+        for event in claimed
+        if event.kind == "status"
+        and isinstance(getattr(event, "payload", None), dict)
+        and str(event.payload.get("status") or "").lower() == status
+    ]
+    current_status_event = current_status_events[-1:] if current_status_events else []
+    failures = [event for event in claimed if event.kind in _KANBAN_FAILURE_KINDS]
+
+    # A blocked card is currently actionable. Prefer the latest run-linked
+    # outcome, with a legacy newest-event fallback for pre-run/manual rows.
+    if status == "blocked":
+        latest_run_id = getattr(latest_run, "id", None)
+        expected_kind = _KANBAN_OUTCOME_EVENT_KIND.get(
+            getattr(latest_run, "outcome", None)
+        )
+        if latest_run_id is not None and expected_kind:
+            current = [
+                event for event in failures
+                if event.kind == expected_kind
+                and getattr(event, "run_id", None) == latest_run_id
+            ]
+            if current:
+                return [current[-1]]
+        return [failures[-1]] if failures else current_status_event
+
+    # Crash/timeout attempts return the task to ready for retry, but the latest
+    # closed run is still a genuinely current failure worth reporting. Other
+    # statuses (running, review, todo, triage) dominate old run failures.
+    if status == "ready":
+        latest_run_id = getattr(latest_run, "id", None)
+        expected_kind = _KANBAN_OUTCOME_EVENT_KIND.get(
+            getattr(latest_run, "outcome", None)
+        )
+        if expected_kind in {"crashed", "timed_out"}:
+            current = [
+                event for event in failures
+                if event.kind == expected_kind
+                and (
+                    latest_run_id is None
+                    or getattr(event, "run_id", None) in {None, latest_run_id}
+                )
+            ]
+            if current:
+                return [current[-1]]
+
+    # Preserve legacy run-less events used by older writers. A later unblocked
+    # transition proves the failure is no longer current.
+    if latest_run is None and failures:
+        newest_failure = failures[-1]
+        later_unblocked = any(
+            event.kind == "unblocked"
+            and int(getattr(event, "id", 0)) > int(getattr(newest_failure, "id", 0))
+            for event in claimed
+        )
+        if not later_unblocked:
+            return [newest_failure]
+    return current_status_event
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -208,8 +367,8 @@ class GatewayKanbanWatchersMixin:
         stored cursor with kind in the terminal set (``completed``,
         ``blocked``, ``gave_up``, ``crashed``, ``timed_out``). Sends one
         message per new event to ``(platform, chat_id, thread_id)``,
-        then advances the cursor. When a task reaches a terminal state
-        (``completed`` / ``archived``), the subscription is removed.
+        then advances the cursor. When a task reaches a canonical terminal
+        state, the subscription is removed.
 
         Runs in the gateway event loop; all SQLite work is pushed to a
         thread via ``asyncio.to_thread`` so the loop never blocks on the
@@ -235,8 +394,8 @@ class GatewayKanbanWatchersMixin:
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
         TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked")
-        # Subscriptions are removed only when the task reaches a truly final
-        # status (done / archived). We used to also unsub on any terminal
+        # Subscriptions are removed only when the task reaches a canonical
+        # final status. We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
         # silently dropped the user out of the loop whenever the dispatcher
         # respawned the task: a worker that crashes, gets reclaimed, runs
@@ -359,15 +518,22 @@ class GatewayKanbanWatchersMixin:
                                 if not events:
                                     continue
                                 task = _kb.get_task(conn, sub["task_id"])
+                                latest_run = _kb.latest_run(conn, sub["task_id"])
+                                resolved_events = _resolve_kanban_notification_events(
+                                    task,
+                                    events,
+                                    latest_run,
+                                    terminal_statuses=_kb.TERMINAL_STATUSES,
+                                )
                                 logger.debug(
-                                    "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                    len(events), sub["task_id"], slug, old_cursor, cursor,
+                                    "kanban notifier: claimed %d event(s), resolved %d current event(s) for %s on board %s cursor %s→%s",
+                                    len(events), len(resolved_events), sub["task_id"], slug, old_cursor, cursor,
                                 )
                                 deliveries.append({
                                     "sub": sub,
                                     "old_cursor": old_cursor,
                                     "cursor": cursor,
-                                    "events": events,
+                                    "events": resolved_events,
                                     "task": task,
                                     "board": slug,
                                 })
@@ -561,14 +727,16 @@ class GatewayKanbanWatchersMixin:
                         await asyncio.to_thread(
                             self._kanban_advance, sub, d["cursor"], board_slug,
                         )
-                        # Unsubscribe only when the task has reached a truly
-                        # final status (done / archived). For blocked /
+                        # Unsubscribe only when the task has reached a canonical
+                        # final status. For blocked /
                         # gave_up / crashed / timed_out the subscription is
                         # kept alive so the user gets notified again if the
                         # dispatcher respawns the task and it cycles into the
                         # same state. See the longer comment on TERMINAL_KINDS
                         # above for the failure mode this prevents.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = (
+                            task and task.status in _kb.TERMINAL_STATUSES
+                        )
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
