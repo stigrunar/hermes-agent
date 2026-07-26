@@ -4112,6 +4112,192 @@ def replace_review_handoff(
         return dict(_review_handoff_row(conn, source_task_id=source_task_id))
 
 
+def _structured_field_values(value: Any, field_names: set[str]) -> set[str]:
+    """Return string values for named fields in nested handoff metadata."""
+    if isinstance(value, dict):
+        out: set[str] = set()
+        for key, child in value.items():
+            if key in field_names and isinstance(child, str):
+                out.add(child)
+            out.update(_structured_field_values(child, field_names))
+        return out
+    if isinstance(value, (list, tuple)):
+        out = set()
+        for child in value:
+            out.update(_structured_field_values(child, field_names))
+        return out
+    return set()
+
+
+def supersede_review_handoff(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    review_task_id: str,
+    *,
+    replacement_commit: str,
+    replacement_tree: str,
+    evidence: Iterable[tuple[str, str]],
+    reason: str,
+    actor: str = "operator",
+) -> sqlite3.Row:
+    """Supersede one SHA-stale negative review handoff without rewriting it.
+
+    This narrow operator recovery primitive requires a terminal
+    ``changes_requested`` handoff. The stale review task and verdict remain
+    untouched. Each replacement-evidence task must be done and its latest
+    completed run's structured metadata must contain the exact replacement
+    commit, tree, and asserted verdict.
+    """
+    source_task_id = str(source_task_id or "").strip()
+    review_task_id = str(review_task_id or "").strip()
+    replacement_commit = str(replacement_commit or "").strip().lower()
+    replacement_tree = str(replacement_tree or "").strip().lower()
+    reason = str(reason or "").strip()
+    actor = str(actor or "").strip() or "operator"
+    if not source_task_id or not review_task_id:
+        raise ValueError("source_task_id and review_task_id are required")
+    if not re.fullmatch(r"[0-9a-f]{40}", replacement_commit):
+        raise ValueError("replacement_commit must be an exact 40-character git object id")
+    if not re.fullmatch(r"[0-9a-f]{40}", replacement_tree):
+        raise ValueError("replacement_tree must be an exact 40-character git object id")
+    if not reason:
+        raise ValueError("supersession reason is required")
+
+    evidence_rows: list[dict[str, str]] = []
+    seen_evidence: set[str] = set()
+    for raw_task_id, raw_verdict in evidence:
+        task_id = str(raw_task_id or "").strip()
+        verdict = str(raw_verdict or "").strip()
+        if not task_id or not verdict:
+            raise ValueError("each evidence assertion requires task_id and verdict")
+        if task_id in seen_evidence:
+            raise ValueError(f"duplicate evidence task: {task_id}")
+        seen_evidence.add(task_id)
+        evidence_rows.append({"task_id": task_id, "verdict": verdict})
+    if not evidence_rows:
+        raise ValueError("at least one replacement evidence task is required")
+    evidence_rows.sort(key=lambda item: item["task_id"])
+
+    audit_payload = {
+        "source_task_id": source_task_id,
+        "review_task_id": review_task_id,
+        "preserved_verdict": "changes_requested",
+        "replacement_commit": replacement_commit,
+        "replacement_tree": replacement_tree,
+        "evidence": evidence_rows,
+        "reason": reason,
+        "actor": actor,
+    }
+
+    with write_txn(conn):
+        source = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (source_task_id,)
+        ).fetchone()
+        if source is None:
+            raise ValueError(f"source task not found: {source_task_id}")
+        review = conn.execute(
+            "SELECT status, current_run_id, claim_lock, worker_pid FROM tasks WHERE id = ?",
+            (review_task_id,),
+        ).fetchone()
+        if review is None:
+            raise ValueError(f"review task not found: {review_task_id}")
+        handoff = conn.execute(
+            "SELECT * FROM review_handoffs WHERE source_task_id = ?",
+            (source_task_id,),
+        ).fetchone()
+        if handoff is None or handoff["review_task_id"] != review_task_id:
+            actual = handoff["review_task_id"] if handoff is not None else None
+            raise ValueError(
+                "source/review handoff mismatch: "
+                f"expected {source_task_id} -> {review_task_id}, found {actual or 'none'}"
+            )
+
+        if handoff["state"] == "superseded":
+            prior = conn.execute(
+                "SELECT payload FROM task_events "
+                "WHERE task_id = ? AND kind = 'review_handoff_superseded' "
+                "ORDER BY id DESC LIMIT 1",
+                (source_task_id,),
+            ).fetchone()
+            try:
+                prior_payload = json.loads(prior["payload"]) if prior and prior["payload"] else None
+            except (TypeError, ValueError):
+                prior_payload = None
+            if prior_payload == audit_payload:
+                return handoff
+            raise ValueError("review handoff was already superseded with different evidence")
+
+        if source["status"] in TERMINAL_STATUSES:
+            raise ValueError("terminal source task does not need review-handoff supersession")
+
+        if (
+            review["current_run_id"] is not None
+            or review["claim_lock"] is not None
+            or review["worker_pid"] is not None
+            or review["status"] in {"review", "running"}
+        ):
+            raise ValueError("active review task cannot be superseded")
+        if (
+            handoff["state"] != "changes_requested"
+            or handoff["verdict"] != "changes_requested"
+            or review["status"] != "done"
+        ):
+            raise ValueError(
+                "review handoff must have a terminal changes_requested verdict before supersession"
+            )
+
+        for asserted in evidence_rows:
+            task = conn.execute(
+                "SELECT status FROM tasks WHERE id = ?", (asserted["task_id"],)
+            ).fetchone()
+            if task is None:
+                raise ValueError(f"evidence task not found: {asserted['task_id']}")
+            if task["status"] != "done":
+                raise ValueError(f"evidence task is not done: {asserted['task_id']}")
+            run = conn.execute(
+                "SELECT metadata FROM task_runs "
+                "WHERE task_id = ? AND outcome = 'completed' AND ended_at IS NOT NULL "
+                "ORDER BY ended_at DESC, id DESC LIMIT 1",
+                (asserted["task_id"],),
+            ).fetchone()
+            try:
+                metadata = json.loads(run["metadata"]) if run and run["metadata"] else None
+            except (TypeError, ValueError):
+                metadata = None
+            commit_values = _structured_field_values(
+                metadata, {"commit", "candidate_commit"}
+            )
+            tree_values = _structured_field_values(
+                metadata, {"tree", "candidate_tree"}
+            )
+            verdict_values = _structured_field_values(metadata, {"verdict"})
+            if (
+                replacement_commit not in commit_values
+                or replacement_tree not in tree_values
+                or asserted["verdict"] not in verdict_values
+            ):
+                raise ValueError(
+                    f"evidence identity mismatch for {asserted['task_id']}: "
+                    "latest completed run metadata does not contain every asserted value"
+                )
+
+        now = int(time.time())
+        updated = conn.execute(
+            "UPDATE review_handoffs SET state = 'superseded', updated_at = ? "
+            "WHERE source_task_id = ? AND review_task_id = ? "
+            "AND state = 'changes_requested' AND verdict = 'changes_requested'",
+            (now, source_task_id, review_task_id),
+        )
+        if updated.rowcount != 1:
+            raise RuntimeError("review handoff changed during supersession")
+        _append_event(conn, source_task_id, "review_handoff_superseded", audit_payload)
+        _append_event(conn, review_task_id, "review_gate_superseded", audit_payload)
+        return conn.execute(
+            "SELECT * FROM review_handoffs WHERE source_task_id = ?",
+            (source_task_id,),
+        ).fetchone()
+
+
 def link_tasks(
     conn: sqlite3.Connection,
     parent_id: str,
@@ -7973,7 +8159,7 @@ def _protected_review_handoff_for_task(
         raise ValueError(f"unknown review handoff role: {role!r}")
     return conn.execute(
         "SELECT * FROM review_handoffs "
-        f"WHERE state != 'approved' AND ({clause}) "
+        f"WHERE state NOT IN ('approved', 'superseded') AND ({clause}) "
         "LIMIT 1",
         params,
     ).fetchone()

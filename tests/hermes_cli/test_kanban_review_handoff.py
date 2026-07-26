@@ -11,6 +11,10 @@ import pytest
 from hermes_cli import kanban_db as kb
 
 
+REPLACEMENT_COMMIT = "9d89df8043fc60cae7352c66037db0e8a7263c4e"
+REPLACEMENT_TREE = "d334f4a850cdc020dd4bd4e496aa9df5187c76d2"
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
@@ -41,6 +45,149 @@ def _activate(conn, source: str) -> str:
         expected_run_id=claimed.current_run_id,
     )
     return kb.list_review_handoffs(conn)[0]["review_task_id"]
+
+
+def _terminal_negative_handoff(conn):
+    source, review, nxt = _registered_chain(conn)
+    _activate(conn, source)
+    claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+    assert claimed is not None
+    assert kb.submit_review_verdict(
+        conn,
+        review,
+        verdict="changes_requested",
+        summary="stale exact candidate",
+        expected_run_id=claimed.current_run_id,
+    )
+    return source, review, nxt
+
+
+def _completed_evidence(conn, verdict: str = "approved") -> str:
+    task_id = kb.create_task(conn, title=f"evidence {verdict}")
+    assert kb.complete_task(
+        conn,
+        task_id,
+        summary="exact replacement evidence",
+        metadata={
+            "candidate": {
+                "commit": REPLACEMENT_COMMIT,
+                "tree": REPLACEMENT_TREE,
+            },
+            "result": {"verdict": verdict},
+        },
+    )
+    return task_id
+
+
+def test_supersede_review_handoff_is_audited_idempotent_and_preserves_verdict(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        design = _completed_evidence(conn, "approved_for_private_deploy_gate_not_live")
+        live = _completed_evidence(conn, "approved_live_private_read_only_test_identity")
+        evidence = [
+            (design, "approved_for_private_deploy_gate_not_live"),
+            (live, "approved_live_private_read_only_test_identity"),
+        ]
+
+        first = kb.supersede_review_handoff(
+            conn,
+            source,
+            review,
+            replacement_commit=REPLACEMENT_COMMIT,
+            replacement_tree=REPLACEMENT_TREE,
+            evidence=evidence,
+            reason="new exact candidate has terminal independent evidence",
+            actor="release-operator",
+        )
+        second = kb.supersede_review_handoff(
+            conn,
+            source,
+            review,
+            replacement_commit=REPLACEMENT_COMMIT,
+            replacement_tree=REPLACEMENT_TREE,
+            evidence=reversed(evidence),
+            reason="new exact candidate has terminal independent evidence",
+            actor="release-operator",
+        )
+
+        assert first["state"] == second["state"] == "superseded"
+        assert first["review_task_id"] == review
+        assert first["verdict"] == "changes_requested"
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None
+        assert review_task.status == "done"
+        review_run = kb.latest_run(conn, review)
+        assert review_run is not None
+        assert review_run.metadata is not None
+        assert review_run.metadata["review_verdict"] == "changes_requested"
+        assert [
+            event.kind for event in kb.list_events(conn, source)
+        ].count("review_handoff_superseded") == 1
+        assert [
+            event.kind for event in kb.list_events(conn, review)
+        ].count("review_gate_superseded") == 1
+
+        assert kb.complete_task(conn, source, summary="canonical source closeout")
+        source_task = kb.get_task(conn, source)
+        review_task = kb.get_task(conn, review)
+        assert source_task is not None and source_task.status == "done"
+        assert review_task is not None and review_task.status == "done"
+        replay = kb.supersede_review_handoff(
+            conn,
+            source,
+            review,
+            replacement_commit=REPLACEMENT_COMMIT,
+            replacement_tree=REPLACEMENT_TREE,
+            evidence=evidence,
+            reason="new exact candidate has terminal independent evidence",
+            actor="release-operator",
+        )
+        assert replay["state"] == "superseded"
+
+
+def test_supersede_review_handoff_rejects_source_gate_and_active_review_mismatches(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        evidence_task = _completed_evidence(conn)
+        other_review = kb.create_task(conn, title="other review")
+        kwargs = {
+            "replacement_commit": REPLACEMENT_COMMIT,
+            "replacement_tree": REPLACEMENT_TREE,
+            "evidence": [(evidence_task, "approved")],
+            "reason": "bounded repair",
+        }
+        with pytest.raises(ValueError, match="source/review handoff mismatch"):
+            kb.supersede_review_handoff(conn, source, other_review, **kwargs)
+
+        active_source, active_review, _ = _registered_chain(conn)
+        _activate(conn, active_source)
+        with pytest.raises(ValueError, match="active review task cannot be superseded"):
+            kb.supersede_review_handoff(
+                conn, active_source, active_review, **kwargs,
+            )
+
+
+def test_supersede_review_handoff_rejects_evidence_identity_mismatch(kanban_home):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        evidence_task = _completed_evidence(conn, "approved")
+        with pytest.raises(ValueError, match="evidence identity mismatch"):
+            kb.supersede_review_handoff(
+                conn,
+                source,
+                review,
+                replacement_commit="a" * 40,
+                replacement_tree=REPLACEMENT_TREE,
+                evidence=[(evidence_task, "approved")],
+                reason="wrong replacement identity",
+            )
+        handoff = kb.list_review_handoffs(conn)[0]
+        assert handoff["state"] == "changes_requested"
+        assert handoff["verdict"] == "changes_requested"
 
 
 def test_register_is_idempotent_and_rejects_ambiguous_graph(kanban_home):
