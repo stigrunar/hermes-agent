@@ -154,14 +154,10 @@ def test_resolve_worktree_same_branch_still_reuses(kanban_home, tmp_path):
     repo = _make_repo(tmp_path)
 
     with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="returning task",
-            workspace_kind="worktree",
-        )
+        tid = kb.create_task(conn, title="returning task")
         own = _add_worktree(repo, repo / ".worktrees" / tid, f"wt/{tid}")
         conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path = ? WHERE id = ?",
             (str(own), tid),
         )
         conn.commit()
@@ -178,14 +174,10 @@ def test_resolve_worktree_own_path_on_foreign_branch_keeps_legacy_reuse(
     repo = _make_repo(tmp_path)
 
     with kb.connect() as conn:
-        tid = kb.create_task(
-            conn,
-            title="foreign-branch checkout",
-            workspace_kind="worktree",
-        )
+        tid = kb.create_task(conn, title="foreign-branch checkout")
         own = _add_worktree(repo, repo / ".worktrees" / tid, "wt/foreign")
         conn.execute(
-            "UPDATE tasks SET workspace_path = ? WHERE id = ?",
+            "UPDATE tasks SET workspace_kind='worktree', workspace_path = ? WHERE id = ?",
             (str(own), tid),
         )
         conn.commit()
