@@ -333,6 +333,97 @@ def test_terminal_task_ignores_delayed_historical_failures(tmp_path, monkeypatch
     assert delayed_kinds == ["blocked", "gave_up"]
 
 
+def test_terminal_task_ignores_delayed_historical_completion(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "terminal-delayed-completion.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="completed after retry",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+
+        old_claim = kb.claim_task(conn, tid, claimer="old-worker")
+        assert old_claim is not None
+        old_run_id = old_claim.current_run_id
+        assert old_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="old completion",
+            expected_run_id=old_run_id,
+        )
+
+        conn.execute(
+            "UPDATE tasks SET status='ready', completed_at=NULL WHERE id=?",
+            (tid,),
+        )
+        current_claim = kb.claim_task(conn, tid, claimer="current-worker")
+        assert current_claim is not None
+        current_run_id = current_claim.current_run_id
+        assert current_run_id is not None
+        assert kb.complete_task(
+            conn,
+            tid,
+            summary="current completion",
+            expected_run_id=current_run_id,
+        )
+        assert kb.latest_run(conn, tid).id == current_run_id
+
+        current_completion_cursor = int(
+            conn.execute(
+                "SELECT MAX(id) AS id FROM task_events WHERE task_id=?",
+                (tid,),
+            ).fetchone()["id"]
+        )
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            new_cursor=current_completion_cursor,
+        )
+        kb._append_event(
+            conn,
+            tid,
+            kind="completed",
+            payload={"summary": "delayed old completion"},
+            run_id=old_run_id,
+        )
+        delayed_event_id = int(
+            conn.execute(
+                "SELECT MAX(id) AS id FROM task_events WHERE task_id=?",
+                (tid,),
+            ).fetchone()["id"]
+        )
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    with patch.object(
+        runner, "_kanban_advance", wraps=runner._kanban_advance,
+    ) as advance:
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    advance.assert_called_once()
+    assert advance.call_args.args[1] == delayed_event_id
+    conn = kb.connect()
+    try:
+        assert kb.list_notify_subs(conn, tid) == []
+    finally:
+        conn.close()
+
+
 @pytest.mark.parametrize(
     ("current_kind", "expected_text"),
     [("blocked", "blocked"), ("gave_up", "gave up")],
