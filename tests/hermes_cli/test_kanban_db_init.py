@@ -120,8 +120,16 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
         assert conn.execute("SELECT body FROM task_comments").fetchone()["body"] == "hi"
         assert len(conn.execute("SELECT * FROM task_runs").fetchall()) == 1
-        # Non-numeric legacy cursor ("e-1") casts to 0.
-        assert conn.execute("SELECT last_event_id FROM kanban_notify_subs").fetchone()["last_event_id"] == 0
+        # The non-numeric legacy cursor cannot be preserved, so this legacy
+        # row is safely baselined after event ids have been rebuilt.
+        sub = conn.execute(
+            "SELECT last_event_id, baseline_event_id FROM kanban_notify_subs"
+        ).fetchone()
+        task_max = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id='task-1'"
+        ).fetchone()[0]
+        assert sub["last_event_id"] == task_max
+        assert sub["baseline_event_id"] == task_max
 
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
@@ -161,6 +169,11 @@ def test_migration_is_idempotent(tmp_path, monkeypatch):
         id_col = {r["name"]: r for r in conn.execute("PRAGMA table_info(task_events)")}["id"]
         assert id_col["type"].upper() == "INTEGER"
         assert len(conn.execute("SELECT * FROM task_events").fetchall()) == 2
+        sub = conn.execute(
+            "SELECT last_event_id, baseline_event_id FROM kanban_notify_subs"
+        ).fetchone()
+        assert sub["last_event_id"] == 2
+        assert sub["baseline_event_id"] == 2
 
 
 def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
@@ -174,4 +187,128 @@ def test_unseen_events_for_sub_survives_migrated_db(tmp_path, monkeypatch):
             conn, task_id="task-1", platform="telegram", chat_id="123"
         )
         assert isinstance(cursor, int)
-        assert isinstance(events, list)
+        assert events == []
+
+
+def test_current_schema_legacy_rows_are_baselined_once(tmp_path, monkeypatch):
+    """Rows created before the marker migration skip old history exactly once.
+
+    The no-event row proves marker value 0 is durable: an event appended after
+    migration remains unseen after a second initialization instead of being
+    swallowed by another baseline.
+    """
+    db_path = _setup_home(tmp_path, monkeypatch)
+    with kb.connect(db_path) as conn:
+        history_task = kb.create_task(conn, title="history")
+        kb._append_event(conn, history_task, kind="completed")
+        no_event_task = "task-no-events"
+        conn.execute(
+            "INSERT INTO tasks (id, title, status, created_at) "
+            "VALUES (?, 'no events', 'ready', 1000)",
+            (no_event_task,),
+        )
+        audit_count = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (history_task,)
+        ).fetchone()[0]
+        conn.execute("ALTER TABLE kanban_notify_subs RENAME TO notify_current")
+        conn.execute(
+            """
+            CREATE TABLE kanban_notify_subs (
+                task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,
+                thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,
+                notifier_profile TEXT, created_at INTEGER NOT NULL,
+                last_event_id INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (task_id, platform, chat_id, thread_id)
+            )
+            """
+        )
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, created_at, last_event_id) "
+            "VALUES (?, 'telegram', 'history-chat', 1000, 0), "
+            "       (?, 'telegram', 'empty-chat', 1000, 0)",
+            (history_task, no_event_task),
+        )
+        conn.execute("DROP TABLE notify_current")
+        conn.execute(
+            "CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)"
+        )
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        rows = {
+            row["task_id"]: row
+            for row in conn.execute(
+                "SELECT task_id, last_event_id, baseline_event_id "
+                "FROM kanban_notify_subs"
+            )
+        }
+        history_max = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (history_task,)
+        ).fetchone()[0]
+        assert rows[history_task]["last_event_id"] == history_max
+        assert rows[history_task]["baseline_event_id"] == history_max
+        assert rows[no_event_task]["last_event_id"] == 0
+        assert rows[no_event_task]["baseline_event_id"] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (history_task,)
+        ).fetchone()[0] == audit_count
+        kb._append_event(conn, no_event_task, kind="crashed")
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    with kb.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT last_event_id, baseline_event_id FROM kanban_notify_subs "
+            "WHERE task_id=?",
+            (no_event_task,),
+        ).fetchone()
+        assert row["last_event_id"] == 0
+        assert row["baseline_event_id"] == 0
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=no_event_task,
+            platform="telegram",
+            chat_id="empty-chat",
+            kinds=["crashed"],
+        )
+        assert [event.kind for event in events] == ["crashed"]
+
+
+def test_legacy_nonzero_cursor_preserves_events_recorded_during_downtime(
+    tmp_path, monkeypatch,
+):
+    """Migration marks an advanced row without swallowing newer events."""
+    _setup_home(tmp_path, monkeypatch)
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="advanced subscription")
+        prior_cursor = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+        conn.execute(
+            "INSERT INTO kanban_notify_subs "
+            "(task_id, platform, chat_id, created_at, last_event_id) "
+            "VALUES (?, 'telegram', 'advanced-chat', 1000, ?)",
+            (task_id, prior_cursor),
+        )
+        kb._append_event(conn, task_id, kind="crashed")
+        post_baseline_event = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (task_id,)
+        ).fetchone()[0]
+
+        kb._baseline_legacy_notify_subs(conn)
+
+        sub = conn.execute(
+            "SELECT last_event_id, baseline_event_id FROM kanban_notify_subs "
+            "WHERE task_id=?",
+            (task_id,),
+        ).fetchone()
+        assert sub["last_event_id"] == prior_cursor
+        assert sub["baseline_event_id"] == post_baseline_event
+        _, events = kb.unseen_events_for_sub(
+            conn,
+            task_id=task_id,
+            platform="telegram",
+            chat_id="advanced-chat",
+            kinds=["crashed"],
+        )
+        assert [event.id for event in events] == [post_baseline_event]

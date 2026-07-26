@@ -119,32 +119,124 @@ def test_notifier_delivers_with_dispatch_disabled(tmp_path, monkeypatch):
     assert runner._kanban_notifier_lock_handle is None
 
 
-def test_notifier_owner_polls_multiple_boards(tmp_path, monkeypatch):
+def test_subscription_after_terminal_history_starts_from_now(tmp_path, monkeypatch):
+    db_path = tmp_path / "from-now.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(conn, title="already finished", assignee="worker")
+        kb.complete_task(conn, tid, summary="historical completion")
+        audit_rows = conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+        task_max = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+        sub = kb.list_notify_subs(conn, tid)[0]
+        assert sub["last_event_id"] == task_max
+        assert sub["baseline_event_id"] == task_max
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=?", (tid,)
+        ).fetchone()[0] == audit_rows
+        assert kb.list_notify_subs(conn, tid)[0]["last_event_id"] == task_max
+    finally:
+        conn.close()
+
+
+def test_post_baseline_event_delivers_once_after_restart(tmp_path, monkeypatch):
+    db_path = tmp_path / "post-baseline-restart.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="restart delivery",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb._append_event(conn, tid, kind="crashed")
+        kb.add_notify_sub(
+            conn, task_id=tid, platform="telegram", chat_id="chat-1",
+        )
+    finally:
+        conn.close()
+
+    # The notifier is down while this genuinely new event is appended.
+    conn = kb.connect()
+    try:
+        kb._append_event(conn, tid, kind="crashed")
+    finally:
+        conn.close()
+
+    kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    assert "crashed" in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1
+
+
+def test_notifier_baselines_legacy_rows_across_multiple_boards(tmp_path, monkeypatch):
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
     task_ids = []
     for board in ("work-dev", "personal-dev"):
         kb.create_board(board)
+        db_path = kb.kanban_db_path(board=board)
         conn = kb.connect(board=board)
         try:
             tid = kb.create_task(
                 conn, title=f"{board} notification", assignee="worker",
             )
             task_ids.append(tid)
-            kb.add_notify_sub(
-                conn, task_id=tid, platform="telegram", chat_id="chat-1",
+            kb._append_event(conn, tid, kind="crashed")
+            # Simulate a subscription row written before baseline_event_id
+            # existed. The next connect must baseline it once per board.
+            conn.execute(
+                "INSERT INTO kanban_notify_subs "
+                "(task_id, platform, chat_id, created_at, last_event_id) "
+                "VALUES (?, 'telegram', 'chat-1', 1000, 0)",
+                (tid,),
             )
-            kb.complete_task(conn, tid, summary=f"{board} complete")
         finally:
             conn.close()
+        kb._INITIALIZED_PATHS.discard(str(db_path.resolve()))
 
     adapter = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert adapter.sent == []
+    assert adapter.handled == []
 
-    assert len(adapter.sent) == 2
-    delivered = "\n".join(item["text"] for item in adapter.sent)
-    assert all(tid in delivered for tid in task_ids)
+    conn = kb.connect(board="work-dev")
+    try:
+        kb._append_event(conn, task_ids[0], kind="crashed")
+    finally:
+        conn.close()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 1
+    delivered = adapter.sent[0]["text"]
+    assert task_ids[0] in delivered
+    assert task_ids[1] not in delivered
     assert "[work-dev]" in delivered
-    assert "[personal-dev]" in delivered
 
 
 def test_kanban_notifier_dedupes_board_slugs_pointing_to_same_db(tmp_path, monkeypatch):
@@ -656,6 +748,13 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     # still returns the event for retry on the next tick.
     assert adapter.attempts >= 1, "send should have been attempted at least once"
     assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.sent) == 1
+    assert recovered.handled == []
+    assert _unseen_terminal_events(tid) == []
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):

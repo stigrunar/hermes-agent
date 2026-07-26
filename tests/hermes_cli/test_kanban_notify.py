@@ -22,6 +22,7 @@ def kanban_home(tmp_path, monkeypatch):
     # test silently drops files because ``tmp_path`` isn't inside the
     # default ``MEDIA_DELIVERY_SAFE_ROOTS`` cache dirs.
     monkeypatch.setenv("HERMES_MEDIA_ALLOW_DIRS", str(tmp_path))
+
     kb.init_db()
     return home
 
@@ -347,6 +348,9 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
             chat_id="chat1",
             notifier_profile="default",
         )
+        subscription_baseline = int(
+            kb.list_notify_subs(conn, tid)[0]["last_event_id"]
+        )
         kb.complete_task(conn, tid, result="done")
     finally:
         conn.close()
@@ -383,7 +387,9 @@ async def test_notifier_skips_subscription_owned_by_other_profile(kanban_home):
     finally:
         conn.close()
     assert len(subs) == 1
-    assert int(subs[0]["last_event_id"]) == 0, "wrong profile must not claim the event"
+    assert int(subs[0]["last_event_id"]) == subscription_baseline, (
+        "wrong profile must not advance the post-subscription baseline"
+    )
 
 
 @pytest.mark.asyncio

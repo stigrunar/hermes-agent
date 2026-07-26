@@ -1406,6 +1406,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     notifier_profile TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    baseline_event_id INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2336,6 +2337,10 @@ _READONLY_REQUIRED_COLUMNS = {
         "last_heartbeat_at", "started_at", "ended_at", "outcome", "summary",
         "metadata", "error",
     },
+    "kanban_notify_subs": {
+        "task_id", "platform", "chat_id", "thread_id", "user_id",
+        "notifier_profile", "created_at", "last_event_id", "baseline_event_id",
+    },
 }
 
 
@@ -2632,6 +2637,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "notifier_profile", "notifier_profile TEXT"
             )
+        if "baseline_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "baseline_event_id", "baseline_event_id INTEGER"
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2704,6 +2713,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _baseline_legacy_notify_subs(conn)
 
     # Ultra Phase B: additive, backward-compatible terminal worker-reaping
     # journal. Keep this after drift rebuilds because a legacy task_runs table
@@ -2745,7 +2755,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
 # ``kanban_notify_subs``, a nullable ``TEXT last_event_id``). The current
 # schema uses ``INTEGER PRIMARY KEY AUTOINCREMENT`` / ``INTEGER NOT NULL
-# DEFAULT 0``. ``CREATE TABLE IF NOT EXISTS`` skips existing tables
+# DEFAULT 0`` and a durable nullable baseline marker. ``CREATE TABLE IF NOT
+# EXISTS`` skips existing tables
 # regardless of schema and ``_add_column_if_missing`` only adds columns, so
 # neither can fix a drifted column type — the table must be rebuilt. See
 # #35096.
@@ -2800,7 +2811,7 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
         " notifier_profile TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, baseline_event_id INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -2831,9 +2842,9 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
     rebuilt with the standard SQLite pattern — CREATE new → INSERT shared
     columns → DROP old → RENAME — recreating its indexes too (DROP TABLE takes
     them down). The legacy TEXT ids are dropped (they aren't valid integers);
-    AUTOINCREMENT assigns fresh ones and ``last_event_id`` cursors reset to 0,
-    so the first post-migration tick replays a task's event history once —
-    the safe failure mode for a feature that was already fully broken.
+    AUTOINCREMENT assigns fresh ones. Notification cursors are normalized by
+    :func:`_baseline_legacy_notify_subs` after every affected table has its
+    final integer ids, so migration never replays historical task events.
 
     The whole pass runs in one transaction so an interruption can't leave a
     table half-renamed, and under ``connect()``'s init locks so nothing races
@@ -2880,6 +2891,55 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+
+
+def _baseline_legacy_notify_subs(conn: sqlite3.Connection) -> None:
+    """Apply the one-time from-now baseline to pre-marker subscriptions.
+
+    ``baseline_event_id IS NULL`` is the durable upgrade marker. Existing
+    nonzero cursors are preserved; zero cursors advance to the task's current
+    event maximum. A task with no events records marker value 0, preventing a
+    later event from being mistaken for pre-upgrade history on restart.
+    """
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone()
+    if table_exists is None:
+        return
+
+    def _apply_baseline() -> None:
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET last_event_id = CASE
+                       WHEN last_event_id = 0 THEN COALESCE(
+                           (SELECT MAX(e.id)
+                              FROM task_events AS e
+                             WHERE e.task_id = kanban_notify_subs.task_id),
+                           0
+                       )
+                       ELSE last_event_id
+                   END,
+                   baseline_event_id = COALESCE(
+                       (SELECT MAX(e.id)
+                          FROM task_events AS e
+                         WHERE e.task_id = kanban_notify_subs.task_id),
+                       0
+                   )
+             WHERE baseline_event_id IS NULL
+            """
+        )
+
+    # ``connect()`` uses an autocommit connection, but migration helpers are
+    # also called directly with ordinary sqlite connections in tests and by
+    # embedders. Join an existing transaction instead of trying to nest
+    # ``BEGIN IMMEDIATE``; otherwise retain the normal serialized write path.
+    if conn.in_transaction:
+        _apply_baseline()
+    else:
+        with write_txn(conn):
+            _apply_baseline()
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -13939,17 +13999,27 @@ def add_notify_sub(
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
 ) -> None:
-    """Register a gateway source that wants terminal-state notifications
-    for ``task_id``. Idempotent on (task, platform, chat, thread)."""
+    """Register from-now terminal-state notifications for ``task_id``.
+
+    The initial cursor and durable baseline marker atomically snapshot the
+    task's current event maximum. Idempotent re-subscribe preserves an
+    existing row's cursor on (task, platform, chat, thread).
+    """
     now = int(time.time())
     with write_txn(conn):
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
-                (task_id, platform, chat_id, thread_id, user_id, notifier_profile, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+                (task_id, platform, chat_id, thread_id, user_id, notifier_profile,
+                 created_at, last_event_id, baseline_event_id)
+            SELECT ?, ?, ?, ?, ?, ?, ?, COALESCE(MAX(id), 0), COALESCE(MAX(id), 0)
+              FROM task_events
+             WHERE task_id = ?
             """,
-            (task_id, platform, chat_id, thread_id or "", user_id, notifier_profile, now),
+            (
+                task_id, platform, chat_id, thread_id or "", user_id,
+                notifier_profile, now, task_id,
+            ),
         )
         if notifier_profile:
             # Self-heal legacy rows that predate notifier ownership by

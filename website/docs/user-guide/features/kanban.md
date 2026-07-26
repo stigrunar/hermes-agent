@@ -889,7 +889,14 @@ hermes kanban notify-unsubscribe t_abcd \
     --platform telegram --chat-id 12345678 --thread-id 7
 ```
 
-A subscription removes itself automatically once the task reaches `done` or `archived`; no cleanup needed.
+A subscription starts from now: activation snapshots the task's current event
+position and does not backfill earlier completion, block, or failure history.
+New events recorded after activation are still delivered after a notifier
+restart or a temporary send failure.
+
+After a subscription observes a new event that leaves the task `done` or
+`archived`, it removes itself automatically; no cleanup is needed for normal
+active-task subscriptions.
 
 ## Runs — one row per attempt
 

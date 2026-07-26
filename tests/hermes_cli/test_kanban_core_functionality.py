@@ -590,11 +590,24 @@ def test_notify_sub_crud(kanban_home):
         assert len(subs) == 1
         assert subs[0]["platform"] == "telegram"
         assert subs[0]["notifier_profile"] == "default"
+        task_max = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id=?", (tid,)
+        ).fetchone()[0]
+        assert subs[0]["last_event_id"] == task_max
+        assert subs[0]["baseline_event_id"] == task_max
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="123",
+            new_cursor=task_max + 10,
+        )
         # Duplicate add is a no-op.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
         )
         assert len(kb.list_notify_subs(conn, tid)) == 1
+        assert kb.list_notify_subs(conn, tid)[0]["last_event_id"] == task_max + 10
         # Distinct thread is a new row.
         kb.add_notify_sub(
             conn, task_id=tid, platform="telegram", chat_id="123",
@@ -650,6 +663,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
     try:
         tid = kb.create_task(conn1, title="x", assignee="w")
         kb.add_notify_sub(conn1, task_id=tid, platform="telegram", chat_id="123")
+        baseline = kb.list_notify_subs(conn1, tid)[0]["last_event_id"]
         kb.complete_task(conn1, tid, result="ok")
 
         old_cursor, claimed_cursor, events = kb.claim_unseen_events_for_sub(
@@ -659,7 +673,7 @@ def test_notify_claim_is_single_owner_and_rewindable(kanban_home):
             chat_id="123",
             kinds=["completed", "blocked"],
         )
-        assert old_cursor == 0
+        assert old_cursor == baseline
         assert claimed_cursor > old_cursor
         assert [ev.kind for ev in events] == ["completed"]
 

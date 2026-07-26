@@ -25,6 +25,10 @@ Subscriptions remain stamped with the profile that created them
 adapter, preserving profile isolation; it never falls back to another
 profile's adapter. The designated notifier owner is therefore expected to be a
 multiplex gateway hosting every profile adapter needed by the adopted boards.
+New subscriptions start from the task's current event position. Activating
+notifications does not backfill or deliver terminal-event history that already
+exists; events recorded after activation remain eligible across notifier
+restart or temporary delivery failure.
 
 ## Configuration
 
