@@ -1436,7 +1436,7 @@ export function ChatSidebar({
                         platformName={group.label}
                       />
                     }
-                    labelMeta={countLabel(group.sessions.length, group.total)}
+                    labelMeta={String(shownSessions.length)}
                     messagingConversations={shownConversations}
                     onArchiveSession={onArchiveSession}
                     onDeleteSession={onDeleteSession}
