@@ -1,0 +1,12 @@
+name: execution_envelope_telemetry
+version: "0.1.0"
+description: "Opt-in local-only execution-envelope telemetry. Writes deterministic privacy-safe JSONL records for completed turns; never stores prompts, tool arguments, results, or network data."
+author: NousResearch
+kind: standalone
+hooks:
+  - pre_llm_call
+  - post_api_request
+  - api_request_error
+  - post_tool_call
+  - post_llm_call
+  - subagent_start
