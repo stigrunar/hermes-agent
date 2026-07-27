@@ -275,42 +275,15 @@ def _compute_task_diagnostics(
 
     diag_config = kd.config_from_runtime_config(load_config())
 
-    # Build the candidate task list. We need each task's row + its
-    # events + its runs. Doing N separate queries works but scales
-    # poorly; do three aggregate queries instead.
-    if task_ids is not None:
-        if not task_ids:
-            return {}
-        placeholders = ",".join(["?"] * len(task_ids))
-        rows = conn.execute(
-            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
-            tuple(task_ids),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
-        ).fetchall()
-
-    if not rows:
-        return {}
-
-    row_ids = [r["id"] for r in rows]
-    # Keep the bulk lookup and per-task chronological ordering identical to
-    # the CLI fleet diagnostics path.
-    events_by_task, runs_by_task = kd.bulk_load_task_history(conn, row_ids)
-
-    out: dict[str, list[dict]] = {}
-    for r in rows:
-        tid = r["id"]
-        diags = kd.compute_task_diagnostics(
-            r,
-            events_by_task.get(tid, []),
-            runs_by_task.get(tid, []),
-            config=diag_config,
-        )
-        if diags:
-            out[tid] = [d.to_dict() for d in diags]
-    return out
+    diagnostics = kd.compute_database_diagnostics(
+        conn,
+        task_ids,
+        config=diag_config,
+    )
+    return {
+        task_id: [diagnostic.to_dict() for diagnostic in task_diagnostics]
+        for task_id, task_diagnostics in diagnostics.items()
+    }
 
 
 def _warnings_summary_from_diagnostics(

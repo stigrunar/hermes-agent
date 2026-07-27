@@ -1417,6 +1417,8 @@ CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
 CREATE INDEX IF NOT EXISTS idx_review_handoffs_state ON review_handoffs(state, updated_at);
 CREATE INDEX IF NOT EXISTS idx_comments_task         ON task_comments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_events_task           ON task_events(task_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_task_kind_id   ON task_events(task_id, kind, id);
+CREATE INDEX IF NOT EXISTS idx_events_task_kind_time ON task_events(task_id, kind, created_at, id);
 CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, started_at);
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
@@ -2625,6 +2627,14 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_events_run "
         "ON task_events(run_id, id)"
     )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_kind_id "
+        "ON task_events(task_id, kind, id)"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_task_kind_time "
+        "ON task_events(task_id, kind, created_at, id)"
+    )
 
     notify_table_exists = conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name='kanban_notify_subs'"
@@ -2713,6 +2723,12 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    # Legacy task_runs tables can lack ``outcome`` until the rebuild above, so
+    # this diagnostic index must be created after schema repair.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_runs_task_outcome_id "
+        "ON task_runs(task_id, outcome, id)"
+    )
     _baseline_legacy_notify_subs(conn)
 
     # Ultra Phase B: additive, backward-compatible terminal worker-reaping
@@ -2775,6 +2791,8 @@ _REBUILD_SPECS = {
         (
             "CREATE INDEX idx_events_task ON task_events(task_id, created_at)",
             "CREATE INDEX idx_events_run ON task_events(run_id, id)",
+            "CREATE INDEX idx_events_task_kind_id ON task_events(task_id, kind, id)",
+            "CREATE INDEX idx_events_task_kind_time ON task_events(task_id, kind, created_at, id)",
         ),
     ),
     "task_comments": (
@@ -2802,6 +2820,7 @@ _REBUILD_SPECS = {
         " error TEXT)",
         (
             "CREATE INDEX idx_runs_task ON task_runs(task_id, started_at)",
+            "CREATE INDEX idx_runs_task_outcome_id ON task_runs(task_id, outcome, id)",
             "CREATE INDEX idx_runs_status ON task_runs(status)",
             "CREATE INDEX idx_runs_reap ON task_runs(reap_state, reap_lease_expires, id)",
         ),

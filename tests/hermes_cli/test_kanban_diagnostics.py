@@ -9,9 +9,7 @@ engine works on sqlite3.Row objects as well as dataclasses.
 
 from __future__ import annotations
 
-import subprocess
-import sys
-import textwrap
+import sqlite3
 import time
 from pathlib import Path
 
@@ -63,6 +61,17 @@ def _run(outcome="completed", run_id=1, error=None):
         "outcome": outcome,
         "error": error,
     }
+
+
+def _diagnostic_conn():
+    conn = sqlite3.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.executescript(kb.SCHEMA_SQL)
+    conn.execute(
+        "CREATE INDEX idx_runs_task_outcome_id "
+        "ON task_runs(task_id, outcome, id)"
+    )
+    return conn
 
 
 # ---------------------------------------------------------------------------
@@ -493,143 +502,327 @@ def test_engine_works_on_sqlite_row_objects(kanban_home):
         conn.close()
 
 
-def test_bulk_load_task_history_sorts_each_task_and_avoids_temp_sort(kanban_home):
-    """Fleet history keeps the single-task chronology contracts per task."""
-    conn = kb.connect()
+def test_bounded_history_loader_ignores_retained_audit_lifetime():
+    """Irrelevant retained rows do not change selected history or active rules."""
+    now = 2_000_000
+    conn = _diagnostic_conn()
     try:
-        task_ids = [
-            kb.create_task(conn, title="first", assignee="w"),
-            kb.create_task(conn, title="second", assignee="w"),
-        ]
+        task_id = kb.create_task(conn, title="bounded", assignee="worker")
         conn.execute(
-            "DELETE FROM task_events WHERE task_id IN (?, ?)",
-            tuple(task_ids),
+            "UPDATE tasks SET status='ready', consecutive_failures=1, "
+            "created_at=? WHERE id=?",
+            (now - 100, task_id),
         )
-        for task_id, event_rows, run_rows in (
-            (
-                task_ids[0],
-                ((30, "late"), (10, "early"), (20, "middle"), (20, "middle-2")),
-                ((30, "late"), (10, "early"), (30, "late-2")),
-            ),
-            (task_ids[1], ((25, "late"), (5, "early")), ((25, "late"), (5, "early"))),
-        ):
-            for created_at, kind in event_rows:
-                conn.execute(
-                    "INSERT INTO task_events (task_id, kind, payload, created_at) "
-                    "VALUES (?, ?, ?, ?)",
-                    (task_id, kind, None, created_at),
-                )
-            for started_at, outcome in run_rows:
-                conn.execute(
-                    "INSERT INTO task_runs (task_id, status, started_at, outcome) "
-                    "VALUES (?, 'done', ?, ?)",
-                    (task_id, started_at, outcome),
-                )
+        conn.execute("DELETE FROM task_events WHERE task_id=?", (task_id,))
+
+        def add_event(kind, created_at, payload=None):
+            cursor = conn.execute(
+                "INSERT INTO task_events(task_id, kind, payload, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (task_id, kind, payload, created_at),
+            )
+            return int(cursor.lastrowid)
+
+        def add_run(outcome, error=None):
+            cursor = conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, "
+                "outcome, error) VALUES (?, 'done', ?, ?, ?, ?)",
+                (task_id, now - 10, now - 5, outcome, error),
+            )
+            return int(cursor.lastrowid)
+
+        conn.executemany(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) "
+            "VALUES (?, 'commented', NULL, ?)",
+            [(task_id, now - 200_000 + i) for i in range(2_000)],
+        )
+        add_event(
+            "completion_blocked_hallucination",
+            now - 1_000,
+            '{"phantom_cards":["t_resolved000"]}',
+        )
+        add_event("completed", now - 900)
+        active_warning = add_event(
+            "completion_blocked_hallucination",
+            now - 800,
+            '{"phantom_cards":["t_active0000"]}',
+        )
+        active_prose = add_event(
+            "suspected_hallucinated_references",
+            now - 700,
+            '{"phantom_refs":["t_deadbeef00"]}',
+        )
+        cycle_cutoff = now - 24 * 3600
+        boundary_unblock = add_event("unblocked", cycle_cutoff)
+        boundary_block = add_event("blocked", cycle_cutoff)
+        latest_ready = add_event("promoted", now - 100)
+
+        for _ in range(1_000):
+            add_run("crashed", "resolved")
+        add_run("completed")
+        active_crash_1 = add_run("crashed", "first active")
+        active_crash_2 = add_run("crashed", "latest active")
+        latest_failure = add_run("timed_out", "timeout")
         conn.commit()
 
-        events_by_task, runs_by_task = kd.bulk_load_task_history(conn, task_ids)
-        first_events = events_by_task[task_ids[0]]
-        first_runs = runs_by_task[task_ids[0]]
-        assert [(row["created_at"], row["kind"]) for row in first_events] == [
-            (10, "early"), (20, "middle"), (20, "middle-2"), (30, "late"),
+        history = kd.load_diagnostic_history(conn, [task_id], now=now)
+        assert history.event_ids[task_id] == [
+            boundary_unblock,
+            boundary_block,
+            active_warning,
+            active_prose,
+            latest_ready,
         ]
-        assert [(row["started_at"], row["outcome"]) for row in first_runs] == [
-            (10, "early"), (30, "late"), (30, "late-2"),
+        assert history.run_ids[task_id] == [
+            active_crash_1,
+            active_crash_2,
+            latest_failure,
         ]
-        assert [row["id"] for row in first_events[1:3]] == sorted(
-            row["id"] for row in first_events[1:3]
-        )
-        assert [row["id"] for row in first_runs[1:3]] == sorted(
-            row["id"] for row in first_runs[1:3]
-        )
-        assert [row["created_at"] for row in events_by_task[task_ids[1]]] == [5, 25]
-        assert [row["started_at"] for row in runs_by_task[task_ids[1]]] == [5, 25]
+        assert history.selected_event_count == 5
+        assert history.selected_run_count == 3
 
-        placeholders = ",".join("?" for _ in task_ids)
-        for table in ("task_events", "task_runs"):
-            plan = conn.execute(
-                f"EXPLAIN QUERY PLAN SELECT * FROM {table} "
-                f"WHERE task_id IN ({placeholders})",
-                tuple(task_ids),
-            ).fetchall()
-            assert not any("TEMP B-TREE" in row[-1].upper() for row in plan)
+        before = [
+            diagnostic.to_dict()
+            for diagnostic in kd.compute_database_diagnostics(
+                conn, [task_id], now=now,
+            )[task_id]
+        ]
+        task = conn.execute(
+            "SELECT * FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        full_history = [
+            diagnostic.to_dict()
+            for diagnostic in kd.compute_task_diagnostics(
+                task,
+                conn.execute(
+                    "SELECT * FROM task_events WHERE task_id=? "
+                    "ORDER BY created_at, id",
+                    (task_id,),
+                ).fetchall(),
+                conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=? ORDER BY started_at, id",
+                    (task_id,),
+                ).fetchall(),
+                now=now,
+            )
+        ]
+        assert before == full_history
+
+        conn.executemany(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) "
+            "VALUES (?, 'commented', NULL, ?)",
+            [(task_id, now - 300_000 + i) for i in range(5_000)],
+        )
+        conn.commit()
+        grown = kd.load_diagnostic_history(conn, [task_id], now=now)
+        after = [
+            diagnostic.to_dict()
+            for diagnostic in kd.compute_database_diagnostics(
+                conn, [task_id], now=now,
+            )[task_id]
+        ]
+
+        assert grown.event_ids == history.event_ids
+        assert grown.run_ids == history.run_ids
+        assert grown.selected_event_count == 5
+        assert grown.selected_run_count == 3
+        assert len(kb.list_events(conn, task_id)) == 7_007
+        assert len(kb.list_runs(conn, task_id)) == 1_004
+        assert after == before
     finally:
         conn.close()
 
 
-@pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX RLIMIT_FSIZE")
-def test_bulk_load_task_history_works_without_file_backed_temp_storage():
-    """The old fleet sort fails when SQLite cannot write its temp B-tree."""
-    script = textwrap.dedent(
-        '''
-        import resource
-        import signal
-        import sqlite3
-
-        from hermes_cli import kanban_diagnostics as kd
-
-        conn = sqlite3.connect(":memory:")
-        conn.row_factory = sqlite3.Row
-        conn.executescript(
-            """
-            CREATE TABLE task_events (
-                id INTEGER PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                kind TEXT NOT NULL,
-                payload TEXT,
-                created_at INTEGER NOT NULL
-            );
-            CREATE INDEX idx_events_task ON task_events(task_id, created_at);
-            CREATE TABLE task_runs (
-                id INTEGER PRIMARY KEY,
-                task_id TEXT NOT NULL,
-                started_at INTEGER NOT NULL,
-                outcome TEXT
-            );
-            CREATE INDEX idx_runs_task ON task_runs(task_id, started_at);
-            """
+def test_bounded_history_matches_fleet_chronology_and_id_ties():
+    """Bounded rows use the base's timestamp chronology with id tie-breaks."""
+    now = 400
+    conn = _diagnostic_conn()
+    try:
+        chronology_task = kb.create_task(
+            conn, title="backfilled chronology", assignee="worker",
         )
-        task_ids = [f"t_{i}" for i in range(30)]
-        for i in range(3000):
-            conn.executemany(
-                "INSERT INTO task_events(task_id, kind, created_at) VALUES (?, 'x', ?)",
-                [(task_id, 3000 - i) for task_id in task_ids],
-            )
-            conn.executemany(
-                "INSERT INTO task_runs(task_id, started_at, outcome) VALUES (?, ?, 'x')",
-                [(task_id, 3000 - i) for task_id in task_ids],
-            )
+        tie_task = kb.create_task(conn, title="id ties", assignee="worker")
+        conn.execute(
+            "DELETE FROM task_events WHERE task_id IN (?, ?)",
+            (chronology_task, tie_task),
+        )
+        chronology_ids = []
+        for kind, created_at in (
+            ("blocked", 100),
+            ("unblocked", 300),
+            ("blocked", 200),
+        ):
+            chronology_ids.append(int(conn.execute(
+                "INSERT INTO task_events(task_id, kind, created_at) "
+                "VALUES (?, ?, ?)",
+                (chronology_task, kind, created_at),
+            ).lastrowid))
+
+        tie_event_ids = []
+        for kind, created_at in (
+            ("blocked", 100),
+            ("unblocked", 200),
+            ("blocked", 200),
+        ):
+            tie_event_ids.append(int(conn.execute(
+                "INSERT INTO task_events(task_id, kind, created_at) "
+                "VALUES (?, ?, ?)",
+                (tie_task, kind, created_at),
+            ).lastrowid))
+        tie_run_ids = []
+        for started_at in (300, 200, 200):
+            tie_run_ids.append(int(conn.execute(
+                "INSERT INTO task_runs(task_id, status, started_at, ended_at, "
+                "outcome, error) VALUES (?, 'crashed', ?, ?, 'crashed', 'boom')",
+                (tie_task, started_at, started_at + 1),
+            ).lastrowid))
         conn.commit()
-        conn.execute("PRAGMA temp_store=FILE")
-        signal.signal(signal.SIGXFSZ, signal.SIG_IGN)
-        resource.setrlimit(resource.RLIMIT_FSIZE, (0, 0))
 
-        placeholders = ",".join("?" for _ in task_ids)
-        old_query_failed = 0
-        for table in ("task_events", "task_runs"):
-            try:
-                list(conn.execute(
-                    f"SELECT * FROM {table} WHERE task_id IN ({placeholders}) ORDER BY id",
-                    tuple(task_ids),
-                ))
-            except sqlite3.OperationalError:
-                old_query_failed += 1
-        assert old_query_failed == 2
+        config = {
+            "block_cycle_threshold": 1,
+            "block_cycle_window_seconds": 1_000,
+        }
+        history = kd.load_diagnostic_history(
+            conn,
+            [chronology_task, tie_task],
+            now=now,
+            config=config,
+        )
+        assert history.event_ids[chronology_task] == [
+            chronology_ids[0],
+            chronology_ids[2],
+            chronology_ids[1],
+        ]
+        assert history.event_ids[tie_task] == tie_event_ids
+        assert history.run_ids[tie_task] == [
+            tie_run_ids[1],
+            tie_run_ids[2],
+            tie_run_ids[0],
+        ]
 
-        events_by_task, runs_by_task = kd.bulk_load_task_history(conn, task_ids)
-        assert [row["created_at"] for row in events_by_task["t_0"]] == list(range(1, 3001))
-        assert [row["started_at"] for row in runs_by_task["t_17"]] == list(range(1, 3001))
-        '''
-    )
-    completed = subprocess.run(
-        [sys.executable, "-c", script],
-        cwd=Path(__file__).resolve().parents[2],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=30,
-    )
-    assert completed.returncode == 0, completed.stderr or completed.stdout
+        for task_id in (chronology_task, tie_task):
+            bounded = kd.compute_database_diagnostics(
+                conn, [task_id], now=now, config=config,
+            )
+            task = conn.execute(
+                "SELECT * FROM tasks WHERE id=?",
+                (task_id,),
+            ).fetchone()
+            full = kd.compute_task_diagnostics(
+                task,
+                conn.execute(
+                    "SELECT * FROM task_events WHERE task_id=? "
+                    "ORDER BY created_at, id",
+                    (task_id,),
+                ).fetchall(),
+                conn.execute(
+                    "SELECT * FROM task_runs WHERE task_id=? "
+                    "ORDER BY started_at, id",
+                    (task_id,),
+                ).fetchall(),
+                now=now,
+                config=config,
+            )
+            assert [
+                diagnostic.to_dict()
+                for diagnostic in bounded.get(task_id, [])
+            ] == [diagnostic.to_dict() for diagnostic in full]
+
+        assert chronology_task not in kd.compute_database_diagnostics(
+            conn, [chronology_task], now=now, config=config,
+        )
+        assert {
+            diagnostic.kind
+            for diagnostic in kd.compute_database_diagnostics(
+                conn, [tie_task], now=now, config=config,
+            )[tie_task]
+        } == {
+            "block_unblock_cycling",
+            "repeated_crashes",
+        }
+    finally:
+        conn.close()
+
+
+def test_bounded_history_preserves_review_gate_and_terminal_run_diagnostics():
+    conn = _diagnostic_conn()
+    try:
+        task_id = kb.create_task(conn, title="landed rules", assignee="worker")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', consecutive_failures=4 WHERE id=?",
+            (task_id,),
+        )
+        conn.execute(
+            "INSERT INTO task_events(task_id, kind, payload, created_at) "
+            "VALUES (?, 'review_gate_invalid_workspace', ?, 100)",
+            (task_id, '{"board":"release","source_task_id":"t_source"}'),
+        )
+        run = conn.execute(
+            "INSERT INTO task_runs(task_id, status, worker_pid, started_at, "
+            "reap_state, terminal_requested_at) "
+            "VALUES (?, 'running', 1234, 90, 'reap_pending', 95)",
+            (task_id,),
+        ).lastrowid
+        conn.execute(
+            "UPDATE tasks SET current_run_id=?, worker_pid=1234 WHERE id=?",
+            (run, task_id),
+        )
+        conn.commit()
+
+        history = kd.load_diagnostic_history(conn, [task_id], now=200)
+        assert any(
+            row["kind"] == "review_gate_invalid_workspace"
+            for row in history.events_by_task[task_id]
+        )
+        assert [row["id"] for row in history.runs_by_task[task_id]] == [run]
+        diagnostics = kd.compute_database_diagnostics(
+            conn, [task_id], now=200,
+        )[task_id]
+        assert {diagnostic.kind for diagnostic in diagnostics} == {
+            "review_gate_retry_storm",
+            "worker_identity_unverifiable",
+        }
+    finally:
+        conn.close()
+
+
+def test_bounded_history_query_plans_use_diagnostic_indexes():
+    conn = _diagnostic_conn()
+    try:
+        task_id = kb.create_task(conn, title="plans", assignee="worker")
+        plans = kd.diagnostic_history_query_plans(conn, [task_id])
+        details = [
+            detail
+            for group in plans.values()
+            for plan in group
+            for detail in plan
+        ]
+        assert not any("USE TEMP B-TREE" in detail for detail in details)
+        assert not any("SCAN task_events" in detail for detail in details)
+        assert not any("SCAN task_runs" in detail for detail in details)
+        assert any("idx_events_task_kind_id" in detail for detail in details)
+        assert any("idx_events_task_kind_time" in detail for detail in details)
+        assert any("idx_runs_task_outcome_id" in detail for detail in details)
+    finally:
+        conn.close()
+
+
+def test_bounded_history_loader_chunks_large_fleets():
+    conn = _diagnostic_conn()
+    try:
+        task_ids = [
+            kb.create_task(conn, title=f"chunk {i}", assignee="worker")
+            for i in range(1_005)
+        ]
+        history = kd.load_diagnostic_history(conn, task_ids)
+        assert set(history.events_by_task) == set(task_ids)
+        assert set(history.runs_by_task) == set(task_ids)
+        assert history.selected_event_count == len(task_ids)
+        assert history.selected_run_count == 0
+        assert kd.compute_database_diagnostics(conn, task_ids) == {}
+    finally:
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

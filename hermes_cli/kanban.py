@@ -1850,41 +1850,23 @@ def _cmd_diagnostics(args: argparse.Namespace) -> int:
     diag_config = kd.config_from_runtime_config(load_config())
 
     with kb.connect_closing() as conn:
-        # Either one-task mode or fleet mode.
+        # The shared loader bounds retained history for both single-task and
+        # fleet diagnostics; explicit audit commands still return full history.
         if getattr(args, "task", None):
             task = kb.get_task(conn, args.task)
             if task is None:
                 print(f"no such task: {args.task}", file=sys.stderr)
                 return 1
-            diags_by_task = {
-                args.task: kd.compute_task_diagnostics(
-                    task,
-                    kb.list_events(conn, args.task),
-                    kb.list_runs(conn, args.task),
-                    config=diag_config,
-                )
-            }
+            diags_by_task = kd.compute_database_diagnostics(
+                conn,
+                [args.task],
+                config=diag_config,
+            )
         else:
-            # Fleet mode: pull all non-archived tasks + their events/runs.
-            rows = list(conn.execute(
-                "SELECT * FROM tasks WHERE status != 'archived'"
-            ).fetchall())
-            ids = [r["id"] for r in rows]
-            if not ids:
-                diags_by_task = {}
-            else:
-                ev_by, run_by = kd.bulk_load_task_history(conn, ids)
-                diags_by_task = {}
-                for r in rows:
-                    tid = r["id"]
-                    dl = kd.compute_task_diagnostics(
-                        r,
-                        ev_by.get(tid, []),
-                        run_by.get(tid, []),
-                        config=diag_config,
-                    )
-                    if dl:
-                        diags_by_task[tid] = dl
+            diags_by_task = kd.compute_database_diagnostics(
+                conn,
+                config=diag_config,
+            )
 
         # Severity filter.
         sev = getattr(args, "severity", None)
