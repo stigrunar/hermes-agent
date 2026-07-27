@@ -52,6 +52,7 @@ from __future__ import annotations
 import functools
 import json
 import logging
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -62,6 +63,24 @@ from utils import atomic_json_write
 _log = logging.getLogger(__name__)
 
 _DRAIN_REQUEST_FILENAME = ".drain_request.json"
+
+
+def _drain_request_payload(
+    *,
+    principal: str,
+    suppress_notification: bool,
+    owner_token: Optional[str] = None,
+) -> dict[str, Any]:
+    payload = {
+        "action": "drain",
+        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "principal": principal,
+        "epoch": current_instantiation_epoch(),
+        "suppress_notification": bool(suppress_notification),
+    }
+    if owner_token is not None:
+        payload["owner_token"] = owner_token
+    return payload
 
 
 @functools.lru_cache(maxsize=1)
@@ -159,15 +178,60 @@ def write_drain_request(
     of which drain causes set the flag lives entirely in the caller (NAS). The
     field defaults False so legacy/operator drains behave exactly as before.
     """
-    payload = {
-        "action": "drain",
-        "requested_at": datetime.now(timezone.utc).isoformat(),
-        "principal": principal,
-        "epoch": current_instantiation_epoch(),
-        "suppress_notification": bool(suppress_notification),
-    }
+    payload = _drain_request_payload(
+        principal=principal,
+        suppress_notification=suppress_notification,
+    )
     atomic_json_write(drain_request_path(home), payload)
     return payload
+
+
+def create_owned_drain_request(
+    owner_token: str,
+    *,
+    principal: str = "drain-control",
+    suppress_notification: bool = False,
+    home: Optional[Path] = None,
+) -> Optional[dict[str, Any]]:
+    """Create a drain marker only when none exists.
+
+    The exclusive create establishes ownership for a bounded CLI operation
+    without overwriting a pre-existing external drain. Returns ``None`` when a
+    marker already exists.
+    """
+    path = drain_request_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = _drain_request_payload(
+        principal=principal,
+        suppress_notification=suppress_notification,
+        owner_token=owner_token,
+    )
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        return None
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as marker:
+            json.dump(payload, marker, separators=(",", ":"))
+            marker.flush()
+            os.fsync(marker.fileno())
+    except Exception:
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        raise
+    return payload
+
+
+def clear_owned_drain_request(
+    owner_token: str, *, home: Optional[Path] = None
+) -> bool:
+    """Remove the marker only when it still carries ``owner_token``."""
+    body = read_drain_request(home=home)
+    if not body or body.get("owner_token") != owner_token:
+        return False
+    return clear_drain_request(home=home)
 
 
 def clear_drain_request(*, home: Optional[Path] = None) -> bool:
