@@ -3067,9 +3067,8 @@ def _blank_slate_minimize_config(config: dict):
     mem["memory_enabled"] = False
     mem["user_profile_enabled"] = False
 
-    # No filesystem checkpoints, no smart model routing, no auto session reset.
+    # No filesystem checkpoints or auto session reset.
     config.setdefault("checkpoints", {})["enabled"] = False
-    config.setdefault("smart_model_routing", {})["enabled"] = False
     config.setdefault("session_reset", {})["mode"] = "none"
 
     # Quiet, minimal display.

@@ -122,7 +122,6 @@ class TestBlankSlateMinimizeConfig:
         assert cfg["memory"]["memory_enabled"] is False
         assert cfg["memory"]["user_profile_enabled"] is False
         assert cfg["checkpoints"]["enabled"] is False
-        assert cfg["smart_model_routing"]["enabled"] is False
         assert cfg["session_reset"]["mode"] == "none"
 
     def test_does_not_clobber_unrelated_keys(self):

@@ -592,7 +592,7 @@ Reference: #2810 (bounds pass), #9801 (SHA pinning + audit CI).
 ### Top-level `config.yaml` sections (non-exhaustive):
 
 `model`, `agent`, `terminal`, `compression`, `display`, `stt`, `tts`,
-`memory`, `security`, `delegation`, `smart_model_routing`, `checkpoints`,
+`memory`, `security`, `delegation`, `checkpoints`,
 `auxiliary`, `curator`, `skills`, `gateway`, `logging`, `cron`, `profiles`,
 `plugins`, `honcho`.
 
