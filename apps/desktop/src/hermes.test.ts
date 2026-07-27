@@ -149,7 +149,8 @@ describe('Hermes REST helpers', () => {
       recentsExclude: ['cron', 'tool'],
       cronLimit: 50,
       messagingLimit: 100,
-      messagingExclude: ['cron', 'desktop']
+      messagingExclude: ['cron', 'desktop'],
+      messagingOriginSources: ['telegram', 'discord']
     })
 
     // Slices reassembled from the legacy per-slice route with the same
@@ -167,6 +168,7 @@ describe('Hermes REST helpers', () => {
     expect(paths).toContainEqual(expect.stringContaining('profile=work'))
     expect(paths).toContainEqual(expect.stringContaining('source=cron'))
     expect(paths).toContainEqual(expect.stringContaining('exclude_sources=cron%2Ctool'))
+    expect(paths).toContainEqual(expect.stringContaining('include_origin_sources=telegram%2Cdiscord'))
   })
 
   it('remembers endpoint-missing and skips re-probing the batched route on later refreshes', async () => {
@@ -182,7 +184,8 @@ describe('Hermes REST helpers', () => {
       recentsExclude: [],
       cronLimit: 50,
       messagingLimit: 100,
-      messagingExclude: []
+      messagingExclude: [],
+      messagingOriginSources: []
     }
 
     await listSidebarSessions(req)
@@ -211,7 +214,8 @@ describe('Hermes REST helpers', () => {
       recentsExclude: [],
       cronLimit: 50,
       messagingLimit: 100,
-      messagingExclude: []
+      messagingExclude: [],
+      messagingOriginSources: []
     }
 
     await listSidebarSessions(req)
@@ -239,7 +243,8 @@ describe('Hermes REST helpers', () => {
         recentsExclude: [],
         cronLimit: 50,
         messagingLimit: 100,
-        messagingExclude: []
+        messagingExclude: [],
+        messagingOriginSources: []
       })
     ).rejects.toThrow('timed out')
 
@@ -254,7 +259,8 @@ describe('Hermes REST helpers', () => {
       recentsExclude: [],
       cronLimit: 50,
       messagingLimit: 100,
-      messagingExclude: []
+      messagingExclude: [],
+      messagingOriginSources: []
     })
 
     expect((api.mock.calls[1][0] as { path: string }).path).toMatch(/^\/api\/profiles\/sessions\/sidebar\?/)

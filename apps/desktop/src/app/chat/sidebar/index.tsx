@@ -1497,6 +1497,7 @@ export function ChatSidebar({
                         platformName={group.label}
                       />
                     }
+                    labelMeta={String(shownSessions.length)}
                     messagingConversations={shownConversations}
                     onArchiveSession={onArchiveSession}
                     onDeleteSession={onDeleteSession}

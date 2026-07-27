@@ -256,7 +256,7 @@ describe('refreshSessions batches slices into one request', () => {
       origin_json: JSON.stringify({ platform: 'telegram', chat_id: 'chat', thread_id: 'topic' })
     })
 
-    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [], total: 0, profile_totals: {} }, [], [handoff]))
+    listSidebarSessions.mockResolvedValue(sidebar({ sessions: [] }, [], [handoff]))
     const { result } = renderHook(() => useSessionListActions({ profileScope: 'default' }))
 
     await act(async () => {
