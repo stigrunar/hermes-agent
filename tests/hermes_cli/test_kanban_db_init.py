@@ -127,7 +127,9 @@ def test_legacy_text_pk_tables_rebuilt_to_integer_autoincrement(tmp_path, monkey
         # Indexes restored, including idx_events_run (added by the additive pass).
         indexes = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type='index'")}
         for name in ("idx_events_task", "idx_events_run", "idx_comments_task",
-                     "idx_runs_task", "idx_runs_status", "idx_notify_task"):
+                     "idx_events_task_kind_id", "idx_events_task_kind_time",
+                     "idx_runs_task", "idx_runs_task_outcome_id",
+                     "idx_runs_status", "idx_notify_task"):
             assert name in indexes
 
         # AUTOINCREMENT actually works after the rebuild.

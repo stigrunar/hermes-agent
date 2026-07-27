@@ -261,56 +261,15 @@ def _compute_task_diagnostics(
 
     diag_config = kd.config_from_runtime_config(load_config())
 
-    # Build the candidate task list. We need each task's row + its
-    # events + its runs. Doing N separate queries works but scales
-    # poorly; do three aggregate queries instead.
-    if task_ids is not None:
-        if not task_ids:
-            return {}
-        placeholders = ",".join(["?"] * len(task_ids))
-        rows = conn.execute(
-            f"SELECT * FROM tasks WHERE id IN ({placeholders})",
-            tuple(task_ids),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            "SELECT * FROM tasks WHERE status != 'archived'",
-        ).fetchall()
-
-    if not rows:
-        return {}
-
-    # Index events + runs by task id. For very large boards this will
-    # slurp a lot — acceptable on the dashboard's typical working set
-    # (hundreds of tasks), but we can add pagination / filtering later
-    # if profiling shows it's a hotspot.
-    row_ids = [r["id"] for r in rows]
-    placeholders = ",".join(["?"] * len(row_ids))
-    events_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for ev_row in conn.execute(
-        f"SELECT * FROM task_events WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
-        events_by_task.setdefault(ev_row["task_id"], []).append(ev_row)
-    runs_by_task: dict[str, list] = {tid: [] for tid in row_ids}
-    for run_row in conn.execute(
-        f"SELECT * FROM task_runs WHERE task_id IN ({placeholders}) ORDER BY id",
-        tuple(row_ids),
-    ).fetchall():
-        runs_by_task.setdefault(run_row["task_id"], []).append(run_row)
-
-    out: dict[str, list[dict]] = {}
-    for r in rows:
-        tid = r["id"]
-        diags = kd.compute_task_diagnostics(
-            r,
-            events_by_task.get(tid, []),
-            runs_by_task.get(tid, []),
-            config=diag_config,
-        )
-        if diags:
-            out[tid] = [d.to_dict() for d in diags]
-    return out
+    diagnostics = kd.compute_database_diagnostics(
+        conn,
+        task_ids,
+        config=diag_config,
+    )
+    return {
+        task_id: [diagnostic.to_dict() for diagnostic in task_diagnostics]
+        for task_id, task_diagnostics in diagnostics.items()
+    }
 
 
 def _warnings_summary_from_diagnostics(

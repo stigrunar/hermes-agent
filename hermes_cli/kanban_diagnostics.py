@@ -30,8 +30,9 @@ Design goals:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable, Optional
+from typing import Any, Callable, Iterable, Iterator, Optional
 import json
+import sqlite3
 import time
 
 
@@ -1041,6 +1042,327 @@ DEFAULT_CONFIG = {
     # next dispatcher tick (default 60s) and would just be noise.
     "stranded_threshold_seconds": 30 * 60,
 }
+
+
+# SQLite defaults to 999 bound parameters on older builds. Keep enough room
+# for query-specific parameters while avoiding a dependency on the runtime's
+# compile-time SQLITE_MAX_VARIABLE_NUMBER.
+_DIAGNOSTIC_ID_CHUNK_SIZE = 400
+
+
+@dataclass
+class DiagnosticHistory:
+    """The bounded event/run rows needed by the current diagnostic rules."""
+
+    events_by_task: dict[str, list[Any]]
+    runs_by_task: dict[str, list[Any]]
+
+    @property
+    def event_ids(self) -> dict[str, list[int]]:
+        return {
+            task_id: [int(_task_field(row, "id", 0)) for row in rows]
+            for task_id, rows in self.events_by_task.items()
+        }
+
+    @property
+    def run_ids(self) -> dict[str, list[int]]:
+        return {
+            task_id: [int(_task_field(row, "id", 0)) for row in rows]
+            for task_id, rows in self.runs_by_task.items()
+        }
+
+    @property
+    def selected_event_count(self) -> int:
+        return sum(len(rows) for rows in self.events_by_task.values())
+
+    @property
+    def selected_run_count(self) -> int:
+        return sum(len(rows) for rows in self.runs_by_task.values())
+
+
+def _chunks(values: list[str]) -> Iterator[list[str]]:
+    for start in range(0, len(values), _DIAGNOSTIC_ID_CHUNK_SIZE):
+        yield values[start:start + _DIAGNOSTIC_ID_CHUNK_SIZE]
+
+
+def _add_history_rows(
+    destination: dict[str, dict[int, Any]],
+    rows: Iterable[Any],
+) -> None:
+    """Merge query results without duplicating rows selected for two rules."""
+    for row in rows:
+        destination.setdefault(row["task_id"], {})[int(row["id"])] = row
+
+
+def _event_history_queries(placeholders: str) -> tuple[tuple[str, tuple[Any, ...]], ...]:
+    """Return targeted event queries and their non-task-id parameters."""
+    return (
+        (
+            f"""
+            SELECT e.*
+            FROM tasks task
+            JOIN task_events e INDEXED BY idx_events_task_kind_id
+              ON e.task_id = task.id
+             AND e.kind IN (
+                  'completion_blocked_hallucination',
+                  'suspected_hallucinated_references'
+              )
+             AND e.id > COALESCE((
+                  SELECT MAX(reset.id)
+                  FROM task_events reset INDEXED BY idx_events_task_kind_id
+                  WHERE reset.task_id = task.id
+                    AND reset.kind IN ('completed', 'edited')
+              ), 0)
+            WHERE task.id IN ({placeholders})
+            """,
+            (),
+        ),
+        (
+            f"""
+            SELECT e.*
+            FROM tasks task
+            JOIN task_events e ON e.id = (
+                  SELECT MAX(latest.id)
+                  FROM task_events latest
+                       INDEXED BY idx_events_task_kind_time
+                  WHERE latest.task_id = task.id
+                    AND latest.kind = 'blocked'
+                    AND latest.created_at = (
+                        SELECT MAX(ts.created_at)
+                        FROM task_events ts
+                             INDEXED BY idx_events_task_kind_time
+                        WHERE ts.task_id = task.id
+                          AND ts.kind = 'blocked'
+                    )
+              )
+            WHERE task.id IN ({placeholders})
+            """,
+            (),
+        ),
+        (
+            f"""
+            SELECT e.*
+            FROM tasks task
+            JOIN task_events e ON e.id = (
+                  SELECT response.id
+                  FROM task_events response
+                       INDEXED BY idx_events_task_kind_time
+                  WHERE response.task_id = task.id
+                    AND response.kind IN ('commented', 'unblocked')
+                    AND response.created_at > (
+                        SELECT MAX(blocked.created_at)
+                        FROM task_events blocked
+                             INDEXED BY idx_events_task_kind_time
+                        WHERE blocked.task_id = task.id
+                          AND blocked.kind = 'blocked'
+                    )
+                  LIMIT 1
+              )
+            WHERE task.id IN ({placeholders})
+            """,
+            (),
+        ),
+        (
+            f"""
+            SELECT e.* FROM task_events e
+                 INDEXED BY idx_events_task_kind_time
+            WHERE e.task_id IN ({placeholders})
+              AND e.kind IN ('blocked', 'unblocked')
+              AND e.created_at >= ?
+            """,
+            ("cycle_cutoff",),
+        ),
+        (
+            f"""
+            SELECT e.*
+            FROM tasks task
+            JOIN task_events e ON e.id = (
+                  SELECT MAX(latest.id)
+                  FROM task_events latest
+                       INDEXED BY idx_events_task_kind_time
+                  WHERE latest.task_id = task.id
+                    AND latest.kind IN (
+                        'created', 'promoted', 'reclaimed', 'unblocked'
+                    )
+                    AND latest.created_at = (
+                        SELECT MAX(ts.created_at)
+                        FROM task_events ts
+                             INDEXED BY idx_events_task_kind_time
+                        WHERE ts.task_id = task.id
+                          AND ts.kind IN (
+                              'created', 'promoted', 'reclaimed', 'unblocked'
+                          )
+                    )
+              )
+            WHERE task.id IN ({placeholders})
+            """,
+            (),
+        ),
+    )
+
+
+def _run_history_queries(placeholders: str) -> tuple[str, ...]:
+    return (
+        f"""
+        SELECT r.*
+        FROM tasks task
+        JOIN task_runs r ON r.id = (
+              SELECT MAX(latest.id)
+              FROM task_runs latest
+              WHERE latest.task_id = task.id
+                AND latest.outcome IN ('spawn_failed', 'timed_out', 'crashed')
+          )
+        WHERE task.id IN ({placeholders})
+        """,
+        f"""
+        SELECT r.*
+        FROM tasks task
+        JOIN task_runs r
+          ON r.task_id = task.id
+         AND r.outcome = 'crashed'
+         AND r.id > COALESCE((
+              SELECT MAX(breaker.id)
+              FROM task_runs breaker
+              WHERE breaker.task_id = task.id
+                AND breaker.outcome IN ('completed', 'reclaimed')
+          ), 0)
+        WHERE task.id IN ({placeholders})
+        """,
+    )
+
+
+def load_diagnostic_history(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict] = None,
+) -> DiagnosticHistory:
+    """Load only rows that can affect an active diagnostic.
+
+    Audit/detail APIs intentionally continue to use ``list_events`` and
+    ``list_runs``; this loader is only for on-demand diagnostics.
+    """
+    ids = list(dict.fromkeys(str(task_id) for task_id in task_ids))
+    events: dict[str, dict[int, Any]] = {task_id: {} for task_id in ids}
+    runs: dict[str, dict[int, Any]] = {task_id: {} for task_id in ids}
+    if not ids:
+        return DiagnosticHistory(
+            events_by_task={},
+            runs_by_task={},
+        )
+
+    now_ts = int(now if now is not None else time.time())
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    cycle_cutoff = now_ts - float(
+        cfg.get("block_cycle_window_seconds", 24 * 3600)
+    )
+
+    for chunk in _chunks(ids):
+        placeholders = ",".join("?" for _ in chunk)
+        for sql, extra_params in _event_history_queries(placeholders):
+            resolved = tuple(
+                cycle_cutoff if value == "cycle_cutoff" else value
+                for value in extra_params
+            )
+            _add_history_rows(events, conn.execute(sql, (*chunk, *resolved)))
+        for sql in _run_history_queries(placeholders):
+            _add_history_rows(runs, conn.execute(sql, tuple(chunk)))
+
+    return DiagnosticHistory(
+        events_by_task={
+            task_id: [rows[row_id] for row_id in sorted(rows)]
+            for task_id, rows in events.items()
+        },
+        runs_by_task={
+            task_id: [rows[row_id] for row_id in sorted(rows)]
+            for task_id, rows in runs.items()
+        },
+    )
+
+
+def diagnostic_history_query_plans(
+    conn: sqlite3.Connection,
+    task_ids: Iterable[str],
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict] = None,
+) -> dict[str, list[list[str]]]:
+    """Expose query plans for regression tests and benchmark receipts."""
+    ids = list(dict.fromkeys(str(task_id) for task_id in task_ids))
+    if not ids:
+        return {"events": [], "runs": []}
+    chunk = ids[:_DIAGNOSTIC_ID_CHUNK_SIZE]
+    placeholders = ",".join("?" for _ in chunk)
+    now_ts = int(now if now is not None else time.time())
+    cfg = {**DEFAULT_CONFIG, **(config or {})}
+    cycle_cutoff = now_ts - float(
+        cfg.get("block_cycle_window_seconds", 24 * 3600)
+    )
+    plans: dict[str, list[list[str]]] = {"events": [], "runs": []}
+    for sql, extra_params in _event_history_queries(placeholders):
+        resolved = tuple(
+            cycle_cutoff if value == "cycle_cutoff" else value
+            for value in extra_params
+        )
+        rows = conn.execute(
+            f"EXPLAIN QUERY PLAN {sql}",
+            (*chunk, *resolved),
+        ).fetchall()
+        plans["events"].append([str(row[-1]) for row in rows])
+    for sql in _run_history_queries(placeholders):
+        rows = conn.execute(
+            f"EXPLAIN QUERY PLAN {sql}",
+            tuple(chunk),
+        ).fetchall()
+        plans["runs"].append([str(row[-1]) for row in rows])
+    return plans
+
+
+def compute_database_diagnostics(
+    conn: sqlite3.Connection,
+    task_ids: Optional[Iterable[str]] = None,
+    *,
+    now: Optional[int] = None,
+    config: Optional[dict] = None,
+) -> dict[str, list[Diagnostic]]:
+    """Compute diagnostics for a task subset or every non-archived task."""
+    if task_ids is None:
+        tasks = conn.execute(
+            "SELECT * FROM tasks WHERE status != 'archived'"
+        ).fetchall()
+    else:
+        ids = list(dict.fromkeys(str(task_id) for task_id in task_ids))
+        tasks = []
+        for chunk in _chunks(ids):
+            placeholders = ",".join("?" for _ in chunk)
+            tasks.extend(conn.execute(
+                f"SELECT * FROM tasks WHERE id IN ({placeholders})",
+                tuple(chunk),
+            ).fetchall())
+    if not tasks:
+        return {}
+
+    now_ts = int(now if now is not None else time.time())
+    history = load_diagnostic_history(
+        conn,
+        [task["id"] for task in tasks],
+        now=now_ts,
+        config=config,
+    )
+    result: dict[str, list[Diagnostic]] = {}
+    for task in tasks:
+        task_id = task["id"]
+        diagnostics = compute_task_diagnostics(
+            task,
+            history.events_by_task.get(task_id, []),
+            history.runs_by_task.get(task_id, []),
+            now=now_ts,
+            config=config,
+        )
+        if diagnostics:
+            result[task_id] = diagnostics
+    return result
 
 
 def config_from_kanban_config(kanban_cfg: Optional[dict]) -> dict:
