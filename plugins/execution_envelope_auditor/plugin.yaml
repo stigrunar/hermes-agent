@@ -1,0 +1,5 @@
+name: execution-envelope-auditor
+version: "0.1.0"
+description: "Deterministic, read-only shadow auditor for execution-envelope drift. Emits structural JSON findings and never blocks dispatch or mutates Kanban/runtime state."
+author: NousResearch
+kind: standalone
