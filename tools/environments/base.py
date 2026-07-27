@@ -595,6 +595,14 @@ class BaseEnvironment(ABC):
         """
         return shlex.quote(path)
 
+    def _command_env_statements(self) -> list[str]:
+        """Return transient env statements inserted after snapshot sourcing.
+
+        Remote/container backends intentionally return no statements. The local
+        backend overrides this for task-local gateway session metadata.
+        """
+        return []
+
     def _wrap_command(self, command: str, cwd: str) -> str:
         """Build the full bash script that sources snapshot, cd's, runs command,
         re-dumps env vars, and emits CWD markers."""
@@ -624,6 +632,11 @@ class BaseEnvironment(ABC):
             parts.append(
                 f"source {_quoted_snap} >/dev/null 2>&1 || true"
             )
+
+        # Transient per-command values must be applied after the persistent
+        # snapshot, otherwise a prior command's exported value wins. Local
+        # session metadata uses this hook; remote backends keep the no-op.
+        parts.extend(self._command_env_statements())
 
         # Preserve bare ``~`` expansion, but rewrite ``~/...`` through
         # ``$HOME`` so suffixes with spaces remain a single shell word.

@@ -66,6 +66,31 @@ def session_context_engaged() -> bool:
     """
     return _session_context_engaged
 
+
+def session_subprocess_env_updates() -> dict[str, str | None]:
+    """Return per-spawn updates for ``HERMES_SESSION_*`` environment vars.
+
+    A string value must be exported into the child (including an explicit
+    empty string). ``None`` means the child must remove that variable.  An
+    unengaged single-session process returns no updates so the legacy
+    ``os.environ`` fallback remains intact for CLI/one-shot callers.
+
+    This is intentionally an update set rather than a complete environment:
+    local foreground shells apply it *after* sourcing their persistent shell
+    snapshot, while background/PTY spawns apply it to a fresh environment
+    copy. Remote/container backends do not consume this helper.
+    """
+    if not _session_context_engaged:
+        return {}
+
+    updates: dict[str, str | None] = {}
+    for name, var in _VAR_MAP.items():
+        value = var.get()
+        updates[name] = (
+            None if value is _UNSET else "" if value is None else str(value)
+        )
+    return updates
+
 # ---------------------------------------------------------------------------
 # Per-task session variables
 # ---------------------------------------------------------------------------

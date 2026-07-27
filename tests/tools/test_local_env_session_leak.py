@@ -23,7 +23,13 @@ single-process CLI/one-shot that never engaged the session-context system keeps
 the ``os.environ`` fallback.
 """
 
+import json
 import os
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
+import shlex
+import sys
+import threading
 
 import pytest
 
@@ -302,3 +308,125 @@ def test_hermes_subprocess_env_unengaged_preserves_fallback(monkeypatch):
     # not engaged (autouse fixture leaves _session_context_engaged False)
     env = hermes_subprocess_env()
     assert env.get("HERMES_SESSION_KEY") == "cli-fallback-key"
+
+
+# --------------------------------------------------------------------------- #
+# Real local shell snapshot regressions
+# --------------------------------------------------------------------------- #
+
+def _set_topic_vars(topic: str):
+    return set_session_vars(
+        platform="telegram",
+        chat_id="-1003828321118",
+        thread_id=topic,
+        session_key=f"agent:main:telegram:group:-1003828321118:{topic}",
+        session_id=f"session-{topic}",
+    )
+
+
+def test_foreground_snapshot_rebinds_two_concurrent_telegram_topics(monkeypatch, tmp_path):
+    """A reused foreground shell must not let its snapshot choose the topic.
+
+    The environment is bootstrapped while process-global metadata points at a
+    stale topic, exactly like the live gateway reproduction. Two worker
+    contexts then execute concurrently through that same local environment.
+    """
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "20211")
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-project-session")
+    monkeypatch.setenv(
+        "HERMES_SESSION_KEY",
+        "agent:main:telegram:group:-1003828321118:20211",
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    barrier = threading.Barrier(2)
+
+    def run_topic(topic: str) -> tuple[str, str, str]:
+        tokens = _set_topic_vars(topic)
+        try:
+            barrier.wait(timeout=5)
+            result = env.execute(
+                "printf '%s|%s|%s' \"$HERMES_SESSION_THREAD_ID\" "
+                "\"$HERMES_SESSION_ID\" \"$HERMES_SESSION_KEY\"",
+                timeout=10,
+            )
+            assert result["returncode"] == 0, result
+            return tuple(result["output"].split("|"))
+        finally:
+            clear_session_vars(tokens)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            observed = dict(zip(
+                ("36194", "38572"),
+                pool.map(run_topic, ("36194", "38572")),
+            ))
+    finally:
+        env.cleanup()
+
+    for topic, values in observed.items():
+        assert values == (
+            topic,
+            f"session-{topic}",
+            f"agent:main:telegram:group:-1003828321118:{topic}",
+        )
+
+
+def test_foreground_goal_helper_writes_each_topics_session(monkeypatch, tmp_path):
+    """Portable goal helpers must persist against the invoking topic session."""
+    from hermes_cli.goals import GoalManager
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "20211")
+    monkeypatch.setenv("HERMES_SESSION_ID", "stale-project-session")
+    helper = tmp_path / "goal_helper.py"
+    helper.write_text(
+        "import json, os\n"
+        "from hermes_cli.goals import GoalManager\n"
+        "sid = os.environ['HERMES_SESSION_ID']\n"
+        "goal = 'goal-for-' + os.environ['HERMES_SESSION_THREAD_ID']\n"
+        "GoalManager(sid).set(goal)\n"
+        "print(json.dumps({'session_id': sid, 'goal': goal}))\n",
+        encoding="utf-8",
+    )
+    repo_root = Path(__file__).resolve().parents[2]
+    command = (
+        f"PYTHONPATH={shlex.quote(str(repo_root))} "
+        f"{shlex.quote(sys.executable)} {shlex.quote(str(helper))}"
+    )
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15)
+
+    try:
+        for topic in ("36194", "38572"):
+            tokens = _set_topic_vars(topic)
+            try:
+                result = env.execute(command, timeout=15)
+            finally:
+                clear_session_vars(tokens)
+            assert result["returncode"] == 0, result
+            assert json.loads(result["output"]) == {
+                "session_id": f"session-{topic}",
+                "goal": f"goal-for-{topic}",
+            }
+    finally:
+        env.cleanup()
+
+    state_36194 = GoalManager("session-36194").state
+    state_38572 = GoalManager("session-38572").state
+    assert state_36194 is not None and state_36194.goal == "goal-for-36194"
+    assert state_38572 is not None and state_38572.goal == "goal-for-38572"
+    assert not GoalManager("stale-project-session").has_goal()
+
+
+def test_foreground_unengaged_cli_keeps_process_env_fallback(monkeypatch, tmp_path):
+    """The snapshot repair must preserve legacy CLI/one-shot env behavior."""
+    from tools.environments.local import LocalEnvironment
+
+    monkeypatch.setenv("HERMES_SESSION_ID", "cli-session")
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=10)
+    try:
+        result = env.execute("printf '%s' \"$HERMES_SESSION_ID\"", timeout=10)
+    finally:
+        env.cleanup()
+    assert result["output"] == "cli-session"

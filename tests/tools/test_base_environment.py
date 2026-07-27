@@ -58,6 +58,27 @@ class TestBoundedOutputCollector:
 
 
 class TestWrapCommand:
+    def test_remote_base_does_not_forward_local_session_context(self):
+        """Base wrappers used by remote/container backends keep prior behavior."""
+        import gateway.session_context as sc
+
+        env = _TestableEnv()
+        env._snapshot_ready = False
+        stale_engaged = sc._session_context_engaged
+        tokens = sc.set_session_vars(
+            platform="telegram",
+            thread_id="36194",
+            session_id="session-36194",
+        )
+        try:
+            wrapped = env._wrap_command("env", "/tmp")
+        finally:
+            sc.clear_session_vars(tokens)
+            sc._session_context_engaged = stale_engaged
+
+        assert "HERMES_SESSION_THREAD_ID" not in wrapped
+        assert "session-36194" not in wrapped
+
     def test_basic_shape(self):
         env = _TestableEnv()
         env._snapshot_ready = True

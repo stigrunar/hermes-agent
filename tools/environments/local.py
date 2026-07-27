@@ -7,6 +7,7 @@ import platform
 import re
 import shutil
 import signal
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -428,24 +429,15 @@ def _inject_session_context_env(env: dict) -> None:
     tests/tools/test_local_env_session_leak.py.
     """
     try:
-        from gateway.session_context import (
-            _UNSET,
-            _VAR_MAP,
-            session_context_engaged,
-        )
+        from gateway.session_context import session_subprocess_env_updates
     except Exception:
         return
 
-    _engaged = session_context_engaged()
-    for var_name, var in _VAR_MAP.items():
-        value = var.get()
-        if value is not _UNSET:
-            # Explicitly bound (including "") — authoritative for this task.
-            env[var_name] = "" if value is None else str(value)
-        elif _engaged:
-            # Unset for THIS task while a concurrent host is engaged: drop any
-            # inherited global so a sibling session's value can't leak in.
+    for var_name, value in session_subprocess_env_updates().items():
+        if value is None:
             env.pop(var_name, None)
+        else:
+            env[var_name] = value
 
 
 def _sanitize_subprocess_env(base_env: dict | None, extra_env: dict | None = None) -> dict:
@@ -1329,6 +1321,28 @@ class LocalEnvironment(BaseEnvironment):
     def _quote_shell_path(self, path: str) -> str:
         """Rewrite native/mixed Windows paths before quoting for Git Bash."""
         return _quote_bash_path(path)
+
+    def _command_env_statements(self) -> list[str]:
+        """Rebind task-local session metadata after sourcing the shell snapshot.
+
+        The persistent local snapshot can contain ``HERMES_SESSION_*`` values
+        captured by a previous gateway topic. Applying the current ContextVar
+        values only to ``Popen(env=...)`` is insufficient because ``source``
+        immediately overwrites them. These statements run after that source and
+        before the user's command. Remote backends inherit the base no-op.
+        """
+        try:
+            from gateway.session_context import session_subprocess_env_updates
+        except Exception:
+            return []
+
+        statements: list[str] = []
+        for name, value in session_subprocess_env_updates().items():
+            if value is None:
+                statements.append(f"unset {name}")
+            else:
+                statements.append(f"export {name}={shlex.quote(value)}")
+        return statements
 
     def _run_bash(self, cmd_string: str, *, login: bool = False,
                   timeout: int = 120,

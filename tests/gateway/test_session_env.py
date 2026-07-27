@@ -231,12 +231,14 @@ def test_set_session_env_includes_session_key():
         connected_platforms=[],
         home_channels={},
         session_key="tg:-1001:17585",
+        session_id="session-17585",
     )
 
     # Capture baseline value before setting (may be non-empty from another
     # test in the same pytest-xdist worker sharing the context).
     tokens = runner._set_session_env(context)
     assert get_session_env("HERMES_SESSION_KEY") == "tg:-1001:17585"
+    assert get_session_env("HERMES_SESSION_ID") == "session-17585"
     runner._clear_session_env(tokens)
     # After clearing, the session key must not retain the value we just set.
     # The exact post-clear value depends on context propagation from other

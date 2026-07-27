@@ -657,6 +657,53 @@ class TestPruning:
 # =========================================================================
 
 class TestSpawnEnvSanitization:
+    @pytest.mark.parametrize("use_pty", [False, True], ids=["background", "pty"])
+    def test_spawn_local_uses_current_session_context(self, registry, monkeypatch, use_pty):
+        """Both local detached spawn modes receive the invoking topic identity."""
+        import gateway.session_context as sc
+
+        captured = {}
+        stale_engaged = sc._session_context_engaged
+        tokens = sc.set_session_vars(
+            platform="telegram",
+            chat_id="-1003828321118",
+            thread_id="36194",
+            session_key="agent:main:telegram:group:-1003828321118:36194",
+            session_id="session-36194",
+        )
+
+        fake_thread = MagicMock()
+        fake_proc = MagicMock()
+        fake_proc.pid = 4321
+        fake_proc.stdout = iter([])
+        fake_proc.stdin = MagicMock()
+        fake_proc.poll.return_value = None
+
+        def fake_popen(_cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            return fake_proc
+
+        def fake_pty_spawn(_cmd, **kwargs):
+            captured["env"] = kwargs["env"]
+            return fake_proc
+
+        monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "20211")
+        monkeypatch.setenv("HERMES_SESSION_ID", "stale-project-session")
+        try:
+            with patch("tools.process_registry._find_shell", return_value="/bin/bash"), \
+                patch("subprocess.Popen", side_effect=fake_popen), \
+                patch("ptyprocess.PtyProcess.spawn", side_effect=fake_pty_spawn), \
+                patch("threading.Thread", return_value=fake_thread), \
+                patch.object(registry, "_write_checkpoint"):
+                registry.spawn_local("echo hello", cwd="/tmp", use_pty=use_pty)
+        finally:
+            sc.clear_session_vars(tokens)
+            sc._session_context_engaged = stale_engaged
+
+        assert captured["env"]["HERMES_SESSION_THREAD_ID"] == "36194"
+        assert captured["env"]["HERMES_SESSION_ID"] == "session-36194"
+        assert captured["env"]["HERMES_SESSION_KEY"].endswith(":36194")
+
     def test_spawn_local_strips_blocked_vars_from_background_env(self, registry):
         captured = {}
 
