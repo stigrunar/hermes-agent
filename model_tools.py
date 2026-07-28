@@ -326,16 +326,25 @@ def get_tool_definitions(
         )
         cached = _tool_defs_cache.get(cache_key)
         if cached is not None:
+            from agent.profile_runtime_policy import filter_tool_definitions
+            effective_cached = filter_tool_definitions(list(cached))
             # Update _last_resolved_tool_names so downstream callers see
             # consistent state even on a cache hit.
             global _last_resolved_tool_names
-            _last_resolved_tool_names = [t["function"]["name"] for t in cached]
+            _last_resolved_tool_names = [
+                t["function"]["name"] for t in effective_cached
+            ]
             # Return a shallow copy of the list but share the dict references —
             # schemas are treated as read-only by all known callers.
-            return list(cached)
+            return effective_cached
 
     result = _compute_tool_definitions(enabled_toolsets, disabled_toolsets, quiet_mode,
                                        skip_tool_search_assembly=skip_tool_search_assembly)
+    from agent.profile_runtime_policy import filter_tool_definitions
+    effective_result = filter_tool_definitions(list(result))
+    _last_resolved_tool_names = [
+        t["function"]["name"] for t in effective_result
+    ]
     if quiet_mode:
         # Cache the freshly-computed list, but hand callers a shallow copy so
         # downstream mutations (e.g. run_agent appending memory/LCM tool
@@ -350,8 +359,8 @@ def get_tool_definitions(
         if len(_tool_defs_cache) >= _TOOL_DEFS_CACHE_MAX:
             _tool_defs_cache.pop(next(iter(_tool_defs_cache)))  # evict oldest
         _tool_defs_cache[cache_key] = result
-        return list(result)
-    return result
+        return effective_result
+    return effective_result
 
 
 def _compute_tool_definitions(

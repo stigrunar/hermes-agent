@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DollyArchitect five-package candidate-local measurement receipt",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "scope",
+    "telemetry_activation",
+    "packages"
+  ],
+  "properties": {
+    "scope": {
+      "const": "candidate_local"
+    },
+    "telemetry_activation": {
+      "const": false
+    },
+    "packages": {
+      "type": "array",
+      "minItems": 5,
+      "maxItems": 5,
+      "uniqueItems": true,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "package_id",
+          "metrics"
+        ],
+        "properties": {
+          "package_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "metrics": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "implementation_without_redesign",
+              "first_pass_QA",
+              "architecture_related_escaped_defects",
+              "role_leakage",
+              "timeout",
+              "architecture_to_green_code_time"
+            ],
+            "properties": {
+              "implementation_without_redesign": {
+                "type": "boolean"
+              },
+              "first_pass_QA": {
+                "type": "boolean"
+              },
+              "architecture_related_escaped_defects": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "role_leakage": {
+                "type": "boolean"
+              },
+              "timeout": {
+                "type": "boolean"
+              },
+              "architecture_to_green_code_time": {
+                "type": "number",
+                "minimum": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

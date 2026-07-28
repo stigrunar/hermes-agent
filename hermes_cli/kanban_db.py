@@ -13303,6 +13303,27 @@ def _default_spawn(
         env["HERMES_TENANT"] = task.tenant
     env["HERMES_KANBAN_TASK"] = task.id
     env["HERMES_KANBAN_WORKSPACE"] = workspace
+    # Profile-runtime policy is resolved against the *child's* explicit
+    # profile/home identity before Popen. Ordinary profiles return None. The
+    # DollyArchitect policy validates its strict machine-readable dispatch
+    # contract and emits one canonical child-only payload; malformed,
+    # contradictory, implementation, and operations work fail here before a
+    # process or task mutation can occur.
+    from agent.profile_runtime_policy import (
+        INTERNAL_POLICY_ENV,
+        prepare_dollyarchitect_spawn_env,
+    )
+
+    _policy_payload = prepare_dollyarchitect_spawn_env(
+        task=task,
+        workspace=workspace,
+        profile_name=profile_arg,
+        hermes_home=env.get("HERMES_HOME", ""),
+    )
+    if _policy_payload is not None:
+        env[INTERNAL_POLICY_ENV] = _policy_payload
+    else:
+        env.pop(INTERNAL_POLICY_ENV, None)
     # Pin TERMINAL_CWD to the task's workspace so the worker's file tools and
     # context-file loader anchor on the workspace, not whatever cwd the
     # dispatching gateway happened to export. The worker subprocess is already

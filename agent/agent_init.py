@@ -2412,6 +2412,14 @@ def init_agent(
             agent._context_engine_tool_names.add(_tname)
             _existing_tool_names.add(_tname)
 
+    # Agent-level memory/context providers append schemas after
+    # model_tools.get_tool_definitions(). Re-apply the profile-local runtime
+    # policy once at this final assembly point so an active DollyArchitect
+    # surface cannot regain a disabled tool through either extension path.
+    from agent.profile_runtime_policy import enforce_agent_tool_surface
+
+    enforce_agent_tool_surface(agent)
+
     # Notify context engine of session start
     if hasattr(agent, "context_compressor") and agent.context_compressor:
         try:

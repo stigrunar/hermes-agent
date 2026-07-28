@@ -1,0 +1,70 @@
+{
+  "manifest_version": 1,
+  "contract_id": "ARCHITECT-HARDEN-01-RUNTIME-WIRING-R1",
+  "status": "inactive_candidate",
+  "activation": false,
+  "exact_files": [
+    "profile_candidates/dollyarchitect/__init__.py",
+    "profile_candidates/dollyarchitect/hardening.py",
+    "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/measurement_schema.json",
+    "profile_candidates/dollyarchitect/install_rollback_manifest.json",
+    "profile_candidates/dollyarchitect/README.md",
+    "agent/profile_runtime_policy.py",
+    "agent/agent_init.py",
+    "model_tools.py",
+    "hermes_cli/middleware.py",
+    "hermes_cli/kanban_db.py",
+    "tests/profile_candidates/test_dollyarchitect_hardening.py",
+    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py"
+  ],
+  "source_files": [
+    "profile_candidates/dollyarchitect/__init__.py",
+    "profile_candidates/dollyarchitect/hardening.py",
+    "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/measurement_schema.json",
+    "profile_candidates/dollyarchitect/install_rollback_manifest.json",
+    "profile_candidates/dollyarchitect/README.md",
+    "agent/profile_runtime_policy.py",
+    "agent/agent_init.py",
+    "model_tools.py",
+    "hermes_cli/middleware.py",
+    "hermes_cli/kanban_db.py"
+  ],
+  "verification_files": [
+    "tests/profile_candidates/test_dollyarchitect_hardening.py",
+    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py"
+  ],
+  "install_destination_concept": "After closeout approval only, DollyOps copies the four code-hash-pinned immutable overlay files to <resolved DollyArchitect HERMES_HOME>/runtime_policy/dollyarchitect and adds the exact profile-local agent.runtime_policy activation mapping; shared skills remain untouched.",
+  "install_actions": [
+    "verify a Hermes-created candidate commit and tree after closeout",
+    "review the candidate package and scoped verification receipts",
+    "have DollyOps copy the four reviewed immutable files into the fixed profile-local overlay",
+    "have DollyOps add the exact two-field agent.runtime_policy activation mapping and required model/agent/Telegram invariants",
+    "run profile-load, schema, rejected-dispatch, and accepted no-side-effect smoke checks before scheduling a real card"
+  ],
+  "rollback_actions": [
+    "set agent.runtime_policy.enabled to false or remove the exact mapping before overlay removal",
+    "verify the policy no longer loads, then remove only runtime_policy/dollyarchitect",
+    "restore the prior profile-local overlay snapshot if one existed",
+    "rerun profile load and no-live-mutation checks"
+  ],
+  "candidate_commit_policy": {
+    "local_candidate_commit_permitted": true,
+    "commit_is_activation": false,
+    "remote_or_public_push_permitted": false
+  },
+  "live_no_mutation_boundary": [
+    "a local candidate commit is permitted for provenance and does not install or activate the candidate",
+    "no live profile or shared skill changes",
+    "no live profile activation, gateway/notifier mutation, or Kanban schema change",
+    "no credentials, provider, model, auth, service, product-chain, or telemetry mutation",
+    "no remote or public push, pull request, release, or deploy"
+  ],
+  "post_closeout_sequence": [
+    "Hermes creates and records the exact candidate commit and tree",
+    "independent review validates the closed candidate",
+    "DollyOps performs any approved profile-local install and explicit config activation",
+    "DollyOps runs the documented activation smoke checks"
+  ]
+}
