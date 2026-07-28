@@ -11,7 +11,6 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import logging
 import os
 import sqlite3
@@ -117,38 +116,6 @@ def _has_connected_kanban_adapter(runner: object) -> bool:
         profile_adapters
         for profile_adapters in getattr(runner, "_profile_adapters", {}).values()
     )
-
-
-def _active_kanban_profile(runner: object) -> str:
-    active_profile_fn = getattr(runner, "_active_profile_name", None)
-    if callable(active_profile_fn):
-        try:
-            return str(active_profile_fn() or "default")
-        except Exception:
-            pass
-    return "default"
-
-
-def _kanban_adapters_for_profile(runner: object, profile: str) -> dict:
-    """Return only adapters owned by ``profile``; never borrow another bot."""
-    if profile == _active_kanban_profile(runner):
-        return getattr(runner, "adapters", None) or {}
-    return (getattr(runner, "_profile_adapters", None) or {}).get(profile) or {}
-
-
-def _connected_kanban_profiles(runner: object) -> set[str]:
-    profiles: set[str] = set()
-    if getattr(runner, "adapters", None):
-        profiles.add(_active_kanban_profile(runner))
-    for profile, adapters in (getattr(runner, "_profile_adapters", None) or {}).items():
-        if adapters:
-            profiles.add(str(profile))
-    return profiles
-
-
-def _profile_notifier_lock_path(kanban_home: Path, profile: str) -> Path:
-    digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:20]
-    return kanban_home / "kanban" / f".notifier-{digest}.lock"
 
 
 _KANBAN_VISIBLE_FINAL_STATUSES = {"done", "archived"}
@@ -350,95 +317,51 @@ class GatewayKanbanWatchersMixin:
         # Let gateway startup finish wiring default and multiplex adapters.
         await asyncio.sleep(5)
         retry_delay = min(1.0, max(0.1, float(interval)))
-        workers: dict[str, asyncio.Task] = {}
-        try:
-            while self._running:
-                connected = _connected_kanban_profiles(self)
-                for profile in sorted(connected):
-                    worker = workers.get(profile)
-                    if worker is None or worker.done():
-                        workers[profile] = asyncio.create_task(
-                            self._kanban_notifier_profile_worker(
-                                profile=profile,
-                                kanban_home=_kb.kanban_home(),
-                                interval=interval,
-                            )
-                        )
-                for profile, worker in list(workers.items()):
-                    if not worker.done():
-                        continue
-                    try:
-                        worker.result()
-                    except asyncio.CancelledError:
-                        pass
-                    except Exception as exc:
-                        logger.warning(
-                            "kanban notifier: profile worker %s failed: %s",
-                            profile,
-                            exc,
-                        )
-                    workers.pop(profile, None)
-                await asyncio.sleep(retry_delay)
-        finally:
-            # A normal gateway stop flips ``_running`` to false. Let an
-            # in-flight profile tick finish its send + cursor/unsubscribe
-            # transaction instead of cancelling immediately after the adapter
-            # send returns; otherwise shutdown can redeliver a successfully
-            # sent event on restart. Explicit task cancellation still tears
-            # workers down promptly.
-            if self._running:
-                for worker in workers.values():
-                    worker.cancel()
-            if workers:
-                await asyncio.gather(*workers.values(), return_exceptions=True)
-
-    async def _kanban_notifier_profile_worker(
-        self,
-        *,
-        profile: str,
-        kanban_home: Path,
-        interval: float,
-    ) -> None:
-        """Elect the one process allowed to deliver one profile's rows."""
-        retry_delay = min(1.0, max(0.1, float(interval)))
-        lock_path = _profile_notifier_lock_path(kanban_home, profile)
+        notifier_lock_path = _kb.kanban_home() / "kanban" / ".notifier.lock"
+        self._kanban_notifier_lock_handle = getattr(
+            self, "_kanban_notifier_lock_handle", None
+        )
         warned_unavailable = False
-        while self._running and _kanban_adapters_for_profile(self, profile):
-            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+
+        while self._running:
+            if not _has_connected_kanban_adapter(self):
+                logger.debug(
+                    "kanban notifier: no connected adapters; waiting to elect owner"
+                )
+                await asyncio.sleep(retry_delay)
+                continue
+
+            lock_handle, lock_state = _acquire_singleton_lock(notifier_lock_path)
             if lock_state != "held":
                 if lock_state == "unavailable" and not warned_unavailable:
                     logger.warning(
-                        "kanban notifier: profile %s lock unavailable; waiting",
-                        profile,
+                        "kanban notifier: singleton lock unavailable; waiting "
+                        "instead of polling board DBs without ownership"
                     )
                     warned_unavailable = True
+                elif lock_state == "contended":
+                    logger.debug(
+                        "kanban notifier: another gateway owns the notifier lease"
+                    )
                 await asyncio.sleep(retry_delay)
                 continue
+
+            self._kanban_notifier_lock_handle = lock_handle
             logger.info(
-                "kanban notifier: acquired profile lease profile=%s (%s)",
-                profile,
-                lock_path,
+                "kanban notifier: acquired machine-global lease (%s)",
+                notifier_lock_path,
             )
             try:
-                await self._kanban_notifier_owner_loop(
-                    interval=interval,
-                    notifier_profile=profile,
-                )
+                await self._kanban_notifier_owner_loop(interval=interval)
             finally:
-                _release_singleton_lock(lock_handle)
-                logger.info(
-                    "kanban notifier: released profile lease profile=%s",
-                    profile,
-                )
+                _release_singleton_lock(self._kanban_notifier_lock_handle)
+                self._kanban_notifier_lock_handle = None
+                logger.info("kanban notifier: released machine-global lease")
+
             if self._running:
                 await asyncio.sleep(retry_delay)
 
-    async def _kanban_notifier_owner_loop(
-        self,
-        interval: float = 5.0,
-        *,
-        notifier_profile: str,
-    ) -> None:
+    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -493,11 +416,16 @@ class GatewayKanbanWatchersMixin:
             self, "_kanban_sub_fail_counts", {}
         )
         self._kanban_sub_fail_counts = sub_fail_counts
+        notifier_profile = getattr(self, "_kanban_notifier_profile", None)
+        if not notifier_profile:
+            notifier_profile = self._active_profile_name()
+            self._kanban_notifier_profile = notifier_profile
+
         while self._running:
-            if not _kanban_adapters_for_profile(self, notifier_profile):
+            if not _has_connected_kanban_adapter(self):
                 logger.info(
-                    "kanban notifier: profile %s has no connected adapters; releasing lease",
-                    notifier_profile,
+                    "kanban notifier: owner has no connected adapters; "
+                    "releasing lease"
                 )
                 return
             try:
@@ -505,10 +433,15 @@ class GatewayKanbanWatchersMixin:
                     deliveries: list[dict] = []
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
-                        for platform in _kanban_adapters_for_profile(
-                            self, notifier_profile
-                        ).keys()
+                        for platform in self.adapters.keys()
                     }
+                    for profile_adapters in getattr(
+                        self, "_profile_adapters", {}
+                    ).values():
+                        active_platforms.update(
+                            getattr(platform, "value", str(platform)).lower()
+                            for platform in profile_adapters.keys()
+                        )
                     if not active_platforms:
                         logger.debug("kanban notifier: no connected adapters; skipping tick")
                         return deliveries
@@ -559,20 +492,15 @@ class GatewayKanbanWatchersMixin:
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
-                                owner_profile = str(
-                                    sub.get("notifier_profile") or ""
-                                ).strip()
-                                # Unknown legacy ownership is ambiguous. Refuse
-                                # it before claiming so no gateway can consume
-                                # the row through whichever bot won a lease.
-                                if not owner_profile:
-                                    logger.warning(
-                                        "kanban notifier: subscription for %s has no notifier_profile; refusing delivery",
-                                        sub.get("task_id"),
-                                    )
-                                    continue
-                                if owner_profile != notifier_profile:
-                                    continue
+                                owner_profile = sub.get("notifier_profile") or None
+                                if owner_profile and owner_profile != notifier_profile:
+                                    _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
+                                    if not _owner_adapters:
+                                        logger.debug(
+                                            "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
+                                            sub.get("task_id"), owner_profile, notifier_profile,
+                                        )
+                                        continue
                                 platform = (sub.get("platform") or "").lower()
                                 if platform not in active_platforms:
                                     logger.debug(
@@ -724,11 +652,9 @@ class GatewayKanbanWatchersMixin:
                             # internal transition. They are also excluded from
                             # _WAKE_KINDS below, so they never wake the creator.
                             continue
-                        metadata: dict[str, Any] = dict(
-                            sub.get("delivery_metadata") or {}
-                        )
+                        metadata: dict[str, Any] = {}
                         if sub.get("thread_id"):
-                            metadata.setdefault("thread_id", sub["thread_id"])
+                            metadata["thread_id"] = sub["thread_id"]
                         sub_key = (
                             sub["task_id"], sub["platform"],
                             sub["chat_id"], sub.get("thread_id") or "",
@@ -816,9 +742,8 @@ class GatewayKanbanWatchersMixin:
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         if _wake_kinds:
                             try:
-                                _session_key = str(sub.get("session_key") or "").strip()
-                                _chat_type = str(sub.get("chat_type") or "").strip()
-                                if _session_key and _chat_type:
+                                _session_key = getattr(task, "session_id", None) or ""
+                                if _session_key:
                                     _title = (task.title if task else sub["task_id"])[:120]
                                     _assignee = task.assignee if task else ""
                                     _parts = []
@@ -838,25 +763,31 @@ class GatewayKanbanWatchersMixin:
                                     )
                                     from gateway.session import SessionSource
                                     from gateway.platforms.base import MessageEvent, MessageType
+                                    # KNOWN LIMITATION (tracked follow-up): the
+                                    # subscription row does not persist the
+                                    # creator's chat_type, and it is not carried
+                                    # on the session-context bridge, so we cannot
+                                    # faithfully reconstruct the creator's real
+                                    # session key here. build_session_key() keys
+                                    # DMs (":dm:<chat_id>") on a wholly different
+                                    # shape from group/thread, so any hardcoded
+                                    # value mis-routes some creators. "group" is
+                                    # the least-surprising default for the
+                                    # dashboard/group flows this wake primarily
+                                    # serves; DM-originated creators are handled
+                                    # by the follow-up that stamps + persists
+                                    # chat_type end-to-end. handle_message()
+                                    # get_or_create_session's the target, so a
+                                    # mismatch degrades to "wake lands in a fresh
+                                    # group session" — never an exception.
                                     _source = SessionSource(
                                         platform=plat,
                                         chat_id=sub["chat_id"],
-                                        chat_type=_chat_type,
+                                        chat_type="group",
                                         thread_id=sub.get("thread_id") or None,
                                         user_id=sub.get("user_id"),
                                         profile=sub_profile or None,
                                     )
-                                    _resolved_session_key = self._session_key_for_source(_source)
-                                    if _resolved_session_key != _session_key:
-                                        logger.warning(
-                                            "kanban notifier: refusing wake for %s; persisted provenance resolves to %s, expected %s",
-                                            sub["task_id"],
-                                            _resolved_session_key,
-                                            _session_key,
-                                        )
-                                        raise ValueError(
-                                            "persisted notifier session provenance mismatch"
-                                        )
                                     _synth_event = MessageEvent(
                                         text=_synth,
                                         message_type=MessageType.TEXT,
@@ -885,10 +816,10 @@ class GatewayKanbanWatchersMixin:
                             )
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
-            if not _kanban_adapters_for_profile(self, notifier_profile):
+            if not _has_connected_kanban_adapter(self):
                 logger.info(
-                    "kanban notifier: profile %s lost connected adapters; releasing lease",
-                    notifier_profile,
+                    "kanban notifier: owner lost all connected adapters; "
+                    "releasing lease"
                 )
                 return
             # Sleep with cancellation checks.

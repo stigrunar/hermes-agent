@@ -1966,18 +1966,10 @@ def _configured_home_channels() -> list[dict]:
         if not pcfg or not pcfg.home_channel:
             continue
         hc = pcfg.home_channel
-        chat_id = str(hc.chat_id)
-        thread_id = str(hc.thread_id or "")
-        chat_type = "group"
-        if platform.value == "telegram":
-            chat_type = "dm" if not chat_id.startswith("-") else (
-                "forum" if thread_id else "group"
-            )
         result.append({
             "platform": platform.value,
-            "chat_id": chat_id,
-            "chat_type": chat_type,
-            "thread_id": thread_id,
+            "chat_id": hc.chat_id,
+            "thread_id": hc.thread_id or "",
             "name": hc.name or "Home",
         })
     # Stable order for deterministic UI — platform name alphabetical.
@@ -2064,14 +2056,8 @@ def subscribe_home(task_id: str, platform: str, board: Optional[str] = Query(Non
             task_id=task_id,
             platform=platform,
             chat_id=home["chat_id"],
-            chat_type=home["chat_type"],
             thread_id=home["thread_id"] or None,
             notifier_profile=_active_profile_name(),
-            delivery_metadata=(
-                {"thread_id": home["thread_id"]}
-                if home["thread_id"]
-                else None
-            ),
         )
         return {"ok": True, "task_id": task_id, "home_channel": home}
     finally:

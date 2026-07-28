@@ -1810,8 +1810,6 @@ def test_home_subscribe_creates_notify_sub_row(client, with_home_channels):
     assert subs[0]["chat_id"] == "1234567"
     assert subs[0]["thread_id"] == "42"
     assert subs[0]["notifier_profile"] == "default"
-    assert subs[0]["chat_type"] == "dm"
-    assert subs[0]["delivery_metadata"] == {"thread_id": "42"}
 
 
 def test_home_subscribe_flips_subscribed_flag_in_subsequent_get(client, with_home_channels):

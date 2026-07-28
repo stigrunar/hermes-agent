@@ -77,24 +77,13 @@ class GatewayAuthorizationMixin:
         if not platform:
             return None
         profile_name = (profile or "").strip() or None
-        if profile_name:
-            active_profile_fn = getattr(self, "_active_profile_name", None)
-            active_profile = None
-            if callable(active_profile_fn):
-                try:
-                    active_profile = active_profile_fn()
-                except Exception:
-                    active_profile = None
-            if profile_name == active_profile:
-                adapters = getattr(self, "adapters", None) or {}
-                return adapters.get(platform)
+        if profile_name and profile_name != "default":
             profile_adapters = getattr(self, "_profile_adapters", None) or {}
             if profile_name in profile_adapters:
                 return profile_adapters[profile_name].get(platform)
-            # Fail closed: any explicitly stamped profile with no matching
-            # active or multiplex adapter must NOT fall back to this process's
-            # primary adapter.  A specialist gateway's ``self.adapters`` owns
-            # that specialist, not the default profile.
+            # Fail closed: a stamped secondary profile with no registry entry
+            # (e.g. its adapter failed to connect) must NOT fall back to the
+            # default profile's adapter — that sends replies out the wrong bot.
             return None
         adapters = getattr(self, "adapters", None) or {}
         return adapters.get(platform)

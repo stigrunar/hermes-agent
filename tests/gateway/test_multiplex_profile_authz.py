@@ -84,26 +84,6 @@ def test_default_profile_still_trusts_own_allowlist(monkeypatch):
     assert runner._is_user_authorized(source) is True
 
 
-def test_explicit_default_profile_does_not_borrow_specialist_primary_adapter():
-    """A standalone specialist process must fail closed for default routes."""
-    from gateway.run import GatewayRunner
-
-    runner = object.__new__(GatewayRunner)
-    specialist_adapter = MagicMock()
-    runner.adapters = {Platform.TELEGRAM: specialist_adapter}
-    runner._profile_adapters = {}
-    runner._active_profile_name = lambda: "dollydesign"
-
-    assert runner._authorization_adapter(
-        Platform.TELEGRAM,
-        profile="default",
-    ) is None
-    assert runner._authorization_adapter(
-        Platform.TELEGRAM,
-        profile="dollydesign",
-    ) is specialist_adapter
-
-
 def test_secondary_allowlist_still_authorized(monkeypatch):
     """Secondary profile with allowlist policy is trusted on its own adapter."""
     runner, _default_adapter, secondary_adapter = _make_multiplex_runner(monkeypatch)

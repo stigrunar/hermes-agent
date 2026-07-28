@@ -1482,64 +1482,18 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_id = session_key
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
-        chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        session_key = get_session_env("HERMES_SESSION_KEY", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or None
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
         )
-        if not notifier_profile:
-            try:
-                from hermes_cli.profiles import get_active_profile_name
-                notifier_profile = get_active_profile_name() or "default"
-            except Exception:
-                notifier_profile = "default"
-        notifier_profile = str(notifier_profile or "").strip()
-
-        # Gateway subscriptions must be a complete provenance tuple.  A
-        # partial row can still send text, but cannot safely prove which bot
-        # owns the route or reconstruct the creator session for a wake.  Do
-        # not claim ``subscribed=true`` in that state.  TUI rows deliberately
-        # use their local session key as ``chat_id`` and have no chat type.
-        if platform.lower() != "tui" and (
-            not notifier_profile or not chat_type or not session_key
-        ):
-            logger.warning(
-                "_maybe_auto_subscribe refused incomplete gateway provenance "
-                "(platform=%r profile_set=%r chat_type_set=%r session_key_set=%r)",
-                platform,
-                bool(notifier_profile),
-                bool(chat_type),
-                bool(session_key),
-            )
-            return False
-
-        delivery_metadata: dict[str, Any] = {}
-        if thread_id:
-            delivery_metadata["thread_id"] = thread_id
-        if chat_type:
-            delivery_metadata["chat_type"] = chat_type
-        if (
-            platform.lower() == "telegram"
-            and thread_id
-            and (chat_type or "").lower() in {"dm", "direct", "private"}
-        ):
-            delivery_metadata["telegram_dm_topic_reply_fallback"] = True
-            if str(thread_id) not in {"", "1"}:
-                delivery_metadata["direct_messages_topic_id"] = str(thread_id)
-            if message_id:
-                delivery_metadata["telegram_reply_to_message_id"] = str(message_id)
 
         # Lazy-import to keep the module-level dependency light
         from hermes_cli import kanban_db as _kb
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
-            chat_type=chat_type, thread_id=thread_id, user_id=user_id,
+            thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
-            session_key=session_key,
-            delivery_metadata=delivery_metadata or None,
         )
         return True
     except Exception as _exc:

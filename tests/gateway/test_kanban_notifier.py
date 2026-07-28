@@ -1,5 +1,4 @@
 import asyncio
-import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -9,21 +8,6 @@ import pytest
 from gateway.config import Platform
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
-
-_REAL_ADD_NOTIFY_SUB = kb.add_notify_sub
-
-
-def _add_notify_sub(conn, **kwargs):
-    kwargs.setdefault("notifier_profile", "default")
-    kwargs.setdefault("chat_type", "group")
-    kwargs.setdefault("session_key", "test-session")
-    return _REAL_ADD_NOTIFY_SUB(conn, **kwargs)
-
-
-@pytest.fixture(autouse=True)
-def _stamp_default_profile_on_legacy_test_fixtures(monkeypatch):
-    """Keep old fixtures routable while dedicated tests cover NULL fail-close."""
-    monkeypatch.setattr(kb, "add_notify_sub", _add_notify_sub)
 
 
 class RecordingAdapter:
@@ -45,24 +29,29 @@ class DisconnectedAdapters(dict):
         return None
 
 
-async def _run_one_notifier_tick(monkeypatch, runner, *, profile="default"):
+async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
     async def fake_to_thread(fn, *args, **kwargs):
         return fn(*args, **kwargs)
 
-    async def fake_sleep(_delay):
+    async def fake_sleep(delay):
+        if delay == 5:
+            return None
         runner._running = False
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    with patch(
-        "gateway.kanban_watchers.asyncio.to_thread", side_effect=fake_to_thread,
+    lock_handle = object()
+    with (
+        patch(
+            "gateway.kanban_watchers._acquire_singleton_lock",
+            return_value=(lock_handle, "held"),
+        ),
+        patch("gateway.kanban_watchers._release_singleton_lock"),
+        patch("gateway.kanban_watchers.asyncio.to_thread", side_effect=fake_to_thread),
     ):
-        await runner._kanban_notifier_owner_loop(
-            interval=1,
-            notifier_profile=profile,
-        )
+        await runner._kanban_notifier_watcher(interval=1)
 
 
 def _make_runner(adapter):
@@ -70,8 +59,6 @@ def _make_runner(adapter):
     runner._running = True
     runner.adapters = {Platform.TELEGRAM: adapter}
     runner._kanban_sub_fail_counts = {}
-    runner._active_profile_name = lambda: "default"
-    runner._session_key_for_source = lambda _source: "test-session"
     return runner
 
 
@@ -129,6 +116,7 @@ def test_notifier_delivers_with_dispatch_disabled(tmp_path, monkeypatch):
     assert len(adapter.sent) == 1
     assert tid in adapter.sent[0]["text"]
     dispatch_once.assert_not_called()
+    assert runner._kanban_notifier_lock_handle is None
 
 
 def test_subscription_after_terminal_history_starts_from_now(tmp_path, monkeypatch):
@@ -224,8 +212,8 @@ def test_notifier_baselines_legacy_rows_across_multiple_boards(tmp_path, monkeyp
             # existed. The next connect must baseline it once per board.
             conn.execute(
                 "INSERT INTO kanban_notify_subs "
-                "(task_id, platform, chat_id, notifier_profile, created_at, last_event_id) "
-                "VALUES (?, 'telegram', 'chat-1', 'default', 1000, 0)",
+                "(task_id, platform, chat_id, created_at, last_event_id) "
+                "VALUES (?, 'telegram', 'chat-1', 1000, 0)",
                 (tid,),
             )
         finally:
@@ -765,7 +753,7 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
     assert len(recovered.sent) == 1
-    assert len(recovered.handled) == 1
+    assert recovered.handled == []
     assert _unseen_terminal_events(tid) == []
 
 
@@ -875,7 +863,7 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     runner._profile_adapters = {"beta": {Platform.DISCORD: other_adapter}}
     runner._kanban_sub_fail_counts = {}
 
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner, profile="beta"))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
 
     # The default profile's adapter must never receive beta's notification.
     assert default_adapter.sent == [], (
@@ -888,308 +876,6 @@ def test_notifier_owning_profile_adapter_no_default_fallback(tmp_path, monkeypat
     # The claim is rewound (adapter resolved to None → treated as disconnected),
     # so the event is still unseen and will deliver once beta's adapter connects.
     assert [ev.kind for ev in _unseen_terminal_events_for(tid, "chat-beta")] == ["completed"]
-
-
-def test_notifier_refuses_unstamped_legacy_subscription(tmp_path, monkeypatch):
-    db_path = tmp_path / "unstamped-profile.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="ambiguous legacy route", assignee="worker")
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-1",
-            notifier_profile=None,
-        )
-        kb.complete_task(conn, tid, summary="must not route")
-    finally:
-        conn.close()
-
-    adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert adapter.sent == []
-    assert adapter.handled == []
-    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
-
-
-def test_notifier_refuses_wake_when_persisted_session_key_mismatches(
-    tmp_path, monkeypatch,
-):
-    db_path = tmp_path / "mismatched-session.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="wrong wake target", assignee="worker")
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="chat-1",
-            notifier_profile="default",
-            chat_type="group",
-            session_key="different-session",
-        )
-        kb.complete_task(conn, tid, summary="notification only")
-    finally:
-        conn.close()
-
-    adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert len(adapter.sent) == 1
-    assert adapter.handled == []
-    assert _unseen_terminal_events(tid) == []
-
-
-def test_notifier_missing_chat_type_sends_without_creating_wake_session(
-    tmp_path, monkeypatch,
-):
-    db_path = tmp_path / "missing-chat-type.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    conn = kb.connect()
-    try:
-        tid = kb.create_task(conn, title="legacy delivery only", assignee="worker")
-        kb.add_notify_sub(
-            conn,
-            task_id=tid,
-            platform="telegram",
-            chat_id="8099892548",
-            notifier_profile="default",
-            chat_type="",
-            session_key="agent:main:telegram:dm:8099892548",
-        )
-        kb.complete_task(conn, tid, summary="notification only")
-    finally:
-        conn.close()
-
-    adapter = RecordingAdapter()
-    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
-
-    assert len(adapter.sent) == 1
-    assert adapter.handled == []
-
-
-def test_notify_subscription_migration_is_idempotent_and_preserves_legacy_row(
-    tmp_path, monkeypatch,
-):
-    db_path = tmp_path / "legacy-notify-schema.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    legacy = sqlite3.connect(db_path)
-    try:
-        legacy.execute(
-            """
-            CREATE TABLE kanban_notify_subs (
-                task_id TEXT NOT NULL,
-                platform TEXT NOT NULL,
-                chat_id TEXT NOT NULL,
-                thread_id TEXT NOT NULL DEFAULT '',
-                user_id TEXT,
-                notifier_profile TEXT,
-                created_at INTEGER NOT NULL,
-                last_event_id INTEGER NOT NULL DEFAULT 0,
-                PRIMARY KEY (task_id, platform, chat_id, thread_id)
-            )
-            """
-        )
-        legacy.execute(
-            """
-            INSERT INTO kanban_notify_subs
-                (task_id, platform, chat_id, created_at, last_event_id)
-            VALUES ('t_legacy', 'telegram', '8099892548', 1, 7)
-            """
-        )
-        legacy.commit()
-    finally:
-        legacy.close()
-
-    kb.init_db()
-    kb.init_db()
-    conn = kb.connect()
-    try:
-        columns = {
-            row["name"]
-            for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")
-        }
-        assert {
-            "chat_type", "notifier_profile", "session_key",
-            "delivery_metadata", "baseline_event_id",
-        } <= columns
-        [legacy_sub] = kb.list_notify_subs(conn, "t_legacy")
-    finally:
-        conn.close()
-
-    assert legacy_sub["last_event_id"] == 7
-    assert legacy_sub["notifier_profile"] is None
-    assert legacy_sub["chat_type"] is None
-    assert legacy_sub["session_key"] is None
-    assert legacy_sub["delivery_metadata"] == {}
-
-
-def test_project_topic_provenance_survives_create_inherit_delivery_and_wake(
-    tmp_path, monkeypatch,
-):
-    from gateway.session import SessionSource, build_session_key
-
-    db_path = tmp_path / "project-topic.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-
-    source = SessionSource(
-        platform=Platform.TELEGRAM,
-        chat_id="-1003828321118",
-        chat_type="group",
-        thread_id="20211",
-        user_id="8099892548",
-        profile="default",
-    )
-    session_key = build_session_key(source, profile="default")
-    metadata = {"chat_type": "group", "thread_id": "20211"}
-
-    conn = kb.connect()
-    try:
-        parent = kb.create_task(conn, title="project parent", assignee="default")
-        kb.add_notify_sub(
-            conn,
-            task_id=parent,
-            platform="telegram",
-            chat_id="-1003828321118",
-            chat_type="group",
-            thread_id="20211",
-            user_id="8099892548",
-            notifier_profile="default",
-            session_key=session_key,
-            delivery_metadata=metadata,
-        )
-        child = kb.create_task(
-            conn,
-            title="project child",
-            assignee="worker",
-            parents=(parent,),
-        )
-        [inherited] = kb.list_notify_subs(conn, child)
-        assert {
-            key: inherited[key]
-            for key in (
-                "platform", "chat_id", "chat_type", "thread_id", "user_id",
-                "notifier_profile", "session_key", "delivery_metadata",
-            )
-        } == {
-            "platform": "telegram",
-            "chat_id": "-1003828321118",
-            "chat_type": "group",
-            "thread_id": "20211",
-            "user_id": "8099892548",
-            "notifier_profile": "default",
-            "session_key": session_key,
-            "delivery_metadata": metadata,
-        }
-        kb.remove_notify_sub(
-            conn,
-            task_id=parent,
-            platform="telegram",
-            chat_id="-1003828321118",
-            thread_id="20211",
-        )
-        kb.complete_task(conn, parent, summary="dependency done")
-        kb.recompute_ready(conn)
-        kb.complete_task(conn, child, summary="child done")
-    finally:
-        conn.close()
-
-    adapter = RecordingAdapter()
-    runner = _make_runner(adapter)
-    runner._session_key_for_source = lambda source: build_session_key(
-        source,
-        profile=source.profile,
-    )
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
-
-    assert len(adapter.sent) == 1
-    assert adapter.sent[0]["chat_id"] == "-1003828321118"
-    assert adapter.sent[0]["metadata"] == metadata
-    assert len(adapter.handled) == 1
-    assert adapter.handled[0].source.chat_type == "group"
-    assert adapter.handled[0].source.thread_id == "20211"
-    assert adapter.handled[0].source.profile == "default"
-
-
-def test_four_profile_workers_route_only_owned_rows_without_duplicates(
-    tmp_path, monkeypatch,
-):
-    db_path = tmp_path / "four-profiles.db"
-    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
-    kb.init_db()
-    profiles = ("default", "dollydesign", "dollyops", "dollyprivate")
-
-    conn = kb.connect()
-    try:
-        for profile in profiles:
-            tid = kb.create_task(
-                conn,
-                title=f"owned by {profile}",
-                assignee=profile,
-            )
-            kb.add_notify_sub(
-                conn,
-                task_id=tid,
-                platform="telegram",
-                chat_id=f"chat-{profile}",
-                notifier_profile=profile,
-                chat_type="group",
-                session_key="",
-            )
-            kb.complete_task(conn, tid, summary="done")
-    finally:
-        conn.close()
-
-    runners = []
-    adapters = {}
-    for profile in profiles:
-        adapter = RecordingAdapter()
-        runner = _make_runner(adapter)
-        runner._active_profile_name = lambda profile=profile: profile
-        runners.append(runner)
-        adapters[profile] = adapter
-
-    real_sleep = asyncio.sleep
-
-    async def finish_after_first_tick(_delay):
-        for runner in runners:
-            runner._running = False
-        await real_sleep(0)
-
-    async def run_all():
-        await asyncio.gather(*(
-            runner._kanban_notifier_owner_loop(
-                interval=1,
-                notifier_profile=profile,
-            )
-            for runner, profile in zip(runners, profiles)
-        ))
-
-    monkeypatch.setattr(asyncio, "sleep", finish_after_first_tick)
-    asyncio.run(run_all())
-
-    for profile in profiles:
-        assert [item["chat_id"] for item in adapters[profile].sent] == [
-            f"chat-{profile}"
-        ]
-        assert adapters[profile].handled == []
-
-    conn = kb.connect()
-    try:
-        assert kb.list_notify_subs(conn) == []
-    finally:
-        conn.close()
 
 
 def _unseen_terminal_events_for(tid, chat_id):
