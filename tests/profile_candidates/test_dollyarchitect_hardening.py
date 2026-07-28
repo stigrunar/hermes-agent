@@ -597,7 +597,7 @@ def test_install_manifest_allows_local_commit_without_activation_or_external_wri
     assert manifest["activation"] is False
     assert "candidate_commit" not in manifest
     assert "candidate_tree" not in manifest
-    assert manifest["deferred_runtime_wiring_seam"]
+    assert "deferred_runtime_wiring_seam" not in manifest
     assert manifest["rollback_actions"]
     assert manifest["candidate_commit_policy"] == {
         "local_candidate_commit_permitted": True,
@@ -619,7 +619,13 @@ def test_install_manifest_allows_local_commit_without_activation_or_external_wri
         "profile_candidates/dollyarchitect/measurement_schema.json",
         "profile_candidates/dollyarchitect/install_rollback_manifest.json",
         "profile_candidates/dollyarchitect/README.md",
+        "agent/profile_runtime_policy.py",
+        "agent/agent_init.py",
+        "model_tools.py",
+        "hermes_cli/middleware.py",
+        "hermes_cli/kanban_db.py",
         "tests/profile_candidates/test_dollyarchitect_hardening.py",
+        "tests/profile_candidates/test_dollyarchitect_runtime_policy.py",
     ]
     assert manifest["source_files"] == [
         "profile_candidates/dollyarchitect/__init__.py",
@@ -628,6 +634,11 @@ def test_install_manifest_allows_local_commit_without_activation_or_external_wri
         "profile_candidates/dollyarchitect/measurement_schema.json",
         "profile_candidates/dollyarchitect/install_rollback_manifest.json",
         "profile_candidates/dollyarchitect/README.md",
+        "agent/profile_runtime_policy.py",
+        "agent/agent_init.py",
+        "model_tools.py",
+        "hermes_cli/middleware.py",
+        "hermes_cli/kanban_db.py",
     ]
 
 

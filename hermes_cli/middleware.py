@@ -8,6 +8,8 @@ contract helpers here so agent-loop call sites and plugins share one vocabulary.
 from __future__ import annotations
 
 import logging
+import json
+from contextvars import ContextVar
 from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional
@@ -32,6 +34,10 @@ VALID_MIDDLEWARE: set[str] = {
     LLM_REQUEST_MIDDLEWARE,
     LLM_EXECUTION_MIDDLEWARE,
 }
+
+_PROFILE_GUARD_DEPTH: ContextVar[int] = ContextVar(
+    "_PROFILE_GUARD_DEPTH", default=0
+)
 
 
 @dataclass
@@ -195,14 +201,48 @@ def run_tool_execution_middleware(
     next_call: Callable[[Dict[str, Any]], Any],
     **context: Any,
 ) -> Any:
-    """Run tool execution through registered tool execution middleware."""
+    """Run tool execution through middleware and the built-in profile guard.
+
+    The profile guard wraps the actual terminal callback, so middleware cannot
+    rewrite arguments after policy validation.  The depth token prevents the
+    agent-runtime bridge and registry dispatcher from double-reserving a
+    stateful policy action when one calls through the other.
+    """
+    def guarded_terminal_call(payload: Dict[str, Any]) -> Any:
+        if _PROFILE_GUARD_DEPTH.get() > 0:
+            return next_call(payload)
+        try:
+            from agent.profile_runtime_policy import (
+                ProfileRuntimePolicyError,
+                finish_guarded_tool_call,
+                guard_tool_call,
+            )
+
+            guarded = guard_tool_call(tool_name, payload)
+        except ProfileRuntimePolicyError as exc:
+            return json.dumps(
+                {"error": f"profile runtime policy denied tool call: {exc}"},
+                ensure_ascii=False,
+            )
+        token = _PROFILE_GUARD_DEPTH.set(_PROFILE_GUARD_DEPTH.get() + 1)
+        try:
+            try:
+                result = next_call(guarded.args)
+            except BaseException:
+                finish_guarded_tool_call(guarded, None)
+                raise
+        finally:
+            _PROFILE_GUARD_DEPTH.reset(token)
+        finish_guarded_tool_call(guarded, result)
+        return result
+
     callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
     if not callbacks:
-        return next_call(args)
+        return guarded_terminal_call(args)
     return _run_execution_chain(
         TOOL_EXECUTION_MIDDLEWARE,
         callbacks,
-        next_call,
+        guarded_terminal_call,
         tool_name=tool_name,
         args=args,
         original_args=context.pop("original_args", args),
