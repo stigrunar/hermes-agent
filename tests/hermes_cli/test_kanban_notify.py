@@ -3,6 +3,7 @@ import pytest
 
 from pathlib import Path
 from types import SimpleNamespace
+from gateway.platforms.base import SendResult
 from hermes_cli import kanban_db as kb
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -65,6 +66,7 @@ async def test_notifier_unsubs_after_completed_event(kanban_home):
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
+        return SendResult(success=True)
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
@@ -436,6 +438,7 @@ async def test_notifier_delivers_subscription_owned_by_current_profile(kanban_ho
 
     async def _send_and_stop(chat_id, msg, metadata=None):
         runner._running = False
+        return SendResult(success=True)
 
     fake_adapter.send = AsyncMock(side_effect=_send_and_stop)
     runner.adapters = {Platform.TELEGRAM: fake_adapter}
@@ -580,6 +583,7 @@ async def test_notifier_uploads_artifacts_on_completion(kanban_home, tmp_path, m
     async def _send(chat_id, msg, metadata=None):
         sends.append((chat_id, msg))
         runner._running = False
+        return SendResult(success=True)
 
     async def _send_images(chat_id, images, metadata=None, **_kw):
         images_uploaded.extend(p for p, _ in images)
@@ -661,6 +665,7 @@ async def test_notifier_artifact_delivery_skips_missing_files(kanban_home, tmp_p
 
     async def _send(chat_id, msg, metadata=None):
         runner._running = False
+        return SendResult(success=True)
 
     async def _send_document(chat_id, file_path, metadata=None, **_kw):
         documents_uploaded.append(file_path)
