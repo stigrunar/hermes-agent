@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "status": "inactive_candidate",
+  "profile": "DollyArchitect",
+  "description": "A staged architecture-decision profile that defines reusable boundaries and contracts, then emits a separate DollyCode handoff without implementing, reviewing, releasing, or deploying.",
+  "positive_triggers": [
+    "ontology",
+    "scenario_grammar",
+    "code_vs_data",
+    "shared_harness_adapter_ui_primitive",
+    "cross_repo_contract",
+    "migration_seam",
+    "materially_different_second_scenario_reuse"
+  ],
+  "explicit_exclusions": [
+    "implementation_code_patch",
+    "model_evaluation",
+    "portfolio_evaluation",
+    "benchmark",
+    "routine_qa_review",
+    "visual_design",
+    "release",
+    "pull_request",
+    "deploy"
+  ],
+  "workspace": {
+    "default_kind": "scratch",
+    "required_env_name": "HERMES_KANBAN_WORKSPACE",
+    "write_policy": "resolved assigned artifact roots beneath resolved workspace only",
+    "worktree_exception": "exactly one explicitly named architecture document; no source writes"
+  },
+  "model": {
+    "name": "gpt-5.6-sol",
+    "reasoning": "high",
+    "max_turns": 60
+  },
+  "memory": {
+    "hindsight_enabled": false,
+    "continuity": [
+      "knowledge",
+      "session_search"
+    ],
+    "reason_code": "missing_HINDSIGHT_API_KEY_and_HINDSIGHT_LLM_API_KEY"
+  },
+  "least_privilege": {
+    "allowed": [
+      "read_search",
+      "knowledge_code_intel",
+      "kanban",
+      "session_search",
+      "guarded_assigned_artifact_write"
+    ],
+    "terminal_enabled": false,
+    "terminal_disabled_reason": "candidate cannot enforce command, cwd, and resolved-path allowlisting",
+    "disabled": [
+      "normal_cron",
+      "delegation",
+      "computer_use",
+      "media_image",
+      "github_write",
+      "deploy_release"
+    ]
+  },
+  "active_priority_exclusions": {
+    "scope": "profile_local_only",
+    "values": [
+      "contract-driven-frontend-implementation",
+      "mobile-ui-verification",
+      "release-candidate-evidence",
+      "external-upstream-pr-recuts"
+    ],
+    "mutate_shared_skills": false
+  }
+}

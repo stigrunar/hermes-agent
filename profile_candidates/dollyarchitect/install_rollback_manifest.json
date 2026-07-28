@@ -1,0 +1,56 @@
+{
+  "manifest_version": 1,
+  "contract_id": "ARCHITECT-HARDEN-01-R2",
+  "status": "inactive_candidate",
+  "activation": false,
+  "exact_files": [
+    "profile_candidates/dollyarchitect/__init__.py",
+    "profile_candidates/dollyarchitect/hardening.py",
+    "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/measurement_schema.json",
+    "profile_candidates/dollyarchitect/install_rollback_manifest.json",
+    "profile_candidates/dollyarchitect/README.md",
+    "tests/profile_candidates/test_dollyarchitect_hardening.py"
+  ],
+  "source_files": [
+    "profile_candidates/dollyarchitect/__init__.py",
+    "profile_candidates/dollyarchitect/hardening.py",
+    "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/measurement_schema.json",
+    "profile_candidates/dollyarchitect/install_rollback_manifest.json",
+    "profile_candidates/dollyarchitect/README.md"
+  ],
+  "verification_file": "tests/profile_candidates/test_dollyarchitect_hardening.py",
+  "install_destination_concept": "After closeout approval only, copy an immutable reviewed overlay into the resolved DollyArchitect profile directory beneath that profile's HERMES_HOME; do not modify shared skills.",
+  "deferred_runtime_wiring_seam": "A later reviewed change may teach the profile loader and Kanban dispatcher to consume the installed overlay. This candidate does not register or call that seam.",
+  "install_actions": [
+    "verify a Hermes-created candidate commit and tree after closeout",
+    "review the candidate package and scoped verification receipts",
+    "have DollyOps install the reviewed files into a profile-local inactive overlay",
+    "separately approve and implement runtime wiring only in a later change"
+  ],
+  "rollback_actions": [
+    "disable any later profile-local loader reference before removal",
+    "remove only the installed DollyArchitect candidate overlay",
+    "restore the prior profile-local overlay snapshot if one existed",
+    "rerun profile load and no-live-mutation checks"
+  ],
+  "candidate_commit_policy": {
+    "local_candidate_commit_permitted": true,
+    "commit_is_activation": false,
+    "remote_or_public_push_permitted": false
+  },
+  "live_no_mutation_boundary": [
+    "a local candidate commit is permitted for provenance and does not install or activate the candidate",
+    "no live profile or shared skill changes",
+    "no dispatcher, Kanban schema, gateway, notifier, or runtime registration",
+    "no credentials, provider, model, auth, service, product-chain, or telemetry mutation",
+    "no remote or public push, pull request, release, or deploy"
+  ],
+  "post_closeout_sequence": [
+    "Hermes creates and records the exact candidate commit and tree",
+    "independent review validates the closed candidate",
+    "DollyOps performs any approved profile-local install",
+    "runtime wiring remains a separate reviewed change"
+  ]
+}
