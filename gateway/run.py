@@ -4990,34 +4990,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
+            active_agents = self._running_agent_count()
+            active_cron_jobs = self._active_cron_job_count()
+            active_api_runs = self._active_api_run_count()
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
-                active_agents=self._active_work_count(),
+                active_agents=active_agents,
+                active_cron_jobs=active_cron_jobs,
+                active_api_runs=active_api_runs,
             )
         except Exception:
             pass
 
     def _persist_active_agents(self) -> None:
-        """Persist the live in-flight agent count to ``gateway_state.json``.
+        """Persist all live gateway-owned work counts together.
 
-        Called at every turn boundary (a running-agent slot is claimed or
-        released) so the dashboard ``/api/status`` readout reflects in-flight
-        gateway turns in near-real-time.  Without this the file is only
-        rewritten on lifecycle transitions, so any ``active_agents`` read
-        between transitions is stale (a turn could start and finish without the
-        file ever moving).
+        Called at lifecycle/turn boundaries and every external-drain watcher
+        tick. Messaging, cron, and API work have independent owners, so a safe
+        lifecycle decision must observe one coherent snapshot of all three.
 
-        Deliberately passes ONLY ``active_agents`` — ``gateway_state`` and the
-        other fields stay ``_UNSET`` so ``write_runtime_status``'s
+        Deliberately leaves lifecycle fields ``_UNSET`` so the writer's
         read-merge-write preserves the current lifecycle state (``running`` /
-        ``draining`` / …).  Passing ``gateway_state=None`` here would clobber it.
-        Best-effort: a failed status write must never disrupt a turn.
+        ``draining`` / …). Best-effort: a failed write must never disrupt work.
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(active_agents=self._active_work_count())
+            write_runtime_status(
+                active_agents=self._running_agent_count(),
+                active_cron_jobs=self._active_cron_job_count(),
+                active_api_runs=self._active_api_run_count(),
+            )
         except Exception:
             pass
 
@@ -5095,9 +5099,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
-                    # API and cron work live outside messaging's
-                    # _running_agents map. Refresh the aggregate while an
-                    # external caller polls this reversible drain state.
+                    # Refresh the split counts while an external caller polls
+                    # this reversible drain state.
                     self._persist_active_agents()
                 else:
                     self._exit_external_drain()
@@ -16746,13 +16749,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             platform=context.source.platform.value,
             chat_id=context.source.chat_id,
             chat_name=context.source.chat_name or "",
+            chat_type=context.source.chat_type or "",
             thread_id=str(context.source.thread_id) if context.source.thread_id else "",
             user_id=str(context.source.user_id) if context.source.user_id else "",
             user_name=str(context.source.user_name) if context.source.user_name else "",
             session_key=context.session_key,
             session_id=context.session_id,
             message_id=str(context.source.message_id) if context.source.message_id else "",
-            profile=getattr(context.source, "profile", "") or "",
+            profile=(
+                getattr(context.source, "profile", "")
+                or self._active_profile_name()
+            ),
             async_delivery=_async_delivery,
         )
 

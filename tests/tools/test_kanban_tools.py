@@ -2206,8 +2206,11 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     from tools import kanban_tools as kt
     monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
     monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
     monkeypatch.setenv("HERMES_SESSION_USER_ID", "user-9")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:forum:chat-42:thread-7")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
 
     out = kt._handle_create({
         "title": "auto-sub gateway",
@@ -2223,8 +2226,66 @@ def test_create_subscribes_gateway_session(monkeypatch, worker_env):
     s = subs[0]
     assert s["platform"] == "telegram"
     assert s["chat_id"] == "chat-42"
+    assert s["chat_type"] == "forum"
     assert s["thread_id"] == "thread-7"
     assert s["user_id"] == "user-9"
+    assert s["session_key"] == "agent:main:telegram:forum:chat-42:thread-7"
+    assert s["notifier_profile"] == "default"
+    assert s["delivery_metadata"] == {
+        "chat_type": "forum",
+        "thread_id": "thread-7",
+    }
+
+
+def test_create_refuses_incomplete_gateway_subscription(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "default")
+    monkeypatch.delenv("HERMES_SESSION_CHAT_TYPE", raising=False)
+    monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
+
+    out = kt._handle_create({
+        "title": "incomplete auto-sub",
+        "assignee": "peer",
+    })
+    payload = json.loads(out)
+
+    assert payload["ok"] is True
+    assert payload["subscribed"] is False
+    assert _list_subs_for_task(payload["task_id"]) == []
+
+
+def test_create_uses_active_profile_when_session_profile_blank(
+    monkeypatch, worker_env,
+):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "forum")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "thread-7")
+    monkeypatch.setenv(
+        "HERMES_SESSION_KEY",
+        "agent:main:telegram:forum:chat-42:thread-7",
+    )
+    monkeypatch.setenv("HERMES_SESSION_PROFILE", "")
+    monkeypatch.delenv("HERMES_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.profiles.get_active_profile_name",
+        lambda: "default",
+    )
+
+    out = kt._handle_create({
+        "title": "active-profile auto-sub",
+        "assignee": "peer",
+    })
+    payload = json.loads(out)
+    [sub] = _list_subs_for_task(payload["task_id"])
+
+    assert payload["subscribed"] is True
+    assert sub["notifier_profile"] == "default"
 
 
 def test_create_subscribes_tui_session_via_session_key(monkeypatch, worker_env):

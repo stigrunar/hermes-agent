@@ -826,7 +826,9 @@ class TestHealthDetailedEndpoint:
         with patch("gateway.status.read_runtime_status", return_value={
             "gateway_state": "running",
             "platforms": {"telegram": {"state": "connected"}},
-            "active_agents": 2,
+            "active_agents": 0,
+            "active_cron_jobs": 2,
+            "active_api_runs": 1,
             "exit_reason": None,
             "updated_at": "2026-04-14T00:00:00Z",
         }), patch("gateway.run._resolve_gateway_model", return_value="test/model"):
@@ -838,9 +840,12 @@ class TestHealthDetailedEndpoint:
                 assert data["platform"] == "hermes-agent"
                 assert data["gateway_state"] == "running"
                 assert data["platforms"] == {"telegram": {"state": "connected"}}
-                assert data["active_agents"] == 2
-                # Derived busy/drainable: this endpoint is served BY the live
-                # gateway, so running + 2 agents ⇒ busy and drainable.
+                assert data["active_agents"] == 0
+                assert data["active_cron_jobs"] == 2
+                assert data["active_api_runs"] == 1
+                assert data["active_work"] == 3
+                # This endpoint is served BY the live gateway, so any split active
+                # work makes it busy while it remains a valid drain target.
                 assert data["gateway_busy"] is True
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
