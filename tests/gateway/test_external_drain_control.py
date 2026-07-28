@@ -72,21 +72,6 @@ class TestMarkerContract:
         data = json.loads(dc.drain_request_path().read_text())
         assert data["action"] == "drain"
 
-    def test_owned_create_refuses_existing_marker(self, home):
-        dc.write_drain_request(principal="nas")
-
-        assert dc.create_owned_drain_request("cli-token") is None
-        assert dc.read_drain_request()["principal"] == "nas"
-
-    def test_owned_clear_only_removes_matching_marker(self, home):
-        payload = dc.create_owned_drain_request("cli-token")
-        assert payload is not None
-
-        assert dc.clear_owned_drain_request("other-token") is False
-        assert dc.drain_requested() is True
-        assert dc.clear_owned_drain_request("cli-token") is True
-        assert dc.drain_requested() is False
-
 
 class TestSuppressNotification:
     """The generic suppress_notification flag on the drain marker.
@@ -263,25 +248,6 @@ class TestDrainStateMachine:
         monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: {"job-1"})
 
         assert runner._active_work_count() == 4
-
-    def test_persist_writes_split_work_counts_together(self, monkeypatch):
-        runner, _ = _drain_runner()
-        runner._persist_active_agents = GatewayRunner._persist_active_agents.__get__(
-            runner, GatewayRunner
-        )
-        runner._running_agents = {"session": MagicMock()}
-        monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 2)
-        monkeypatch.setattr(runner, "_active_api_run_count", lambda: 3)
-        write = MagicMock()
-        monkeypatch.setattr("gateway.status.write_runtime_status", write)
-
-        runner._persist_active_agents()
-
-        write.assert_called_once_with(
-            active_agents=1,
-            active_cron_jobs=2,
-            active_api_runs=3,
-        )
 
     def test_enter_sets_flag_and_flips_state(self):
         runner, _ = _drain_runner()

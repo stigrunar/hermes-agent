@@ -582,9 +582,6 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "exit_reason": None,
         "restart_requested": False,
         "active_agents": 0,
-        "active_cron_jobs": 0,
-        "active_api_runs": 0,
-        "active_work": 0,
         "platforms": {},
         "updated_at": _utc_now_iso(),
     })
@@ -981,8 +978,6 @@ def write_runtime_status(
     exit_reason: Any = _UNSET,
     restart_requested: Any = _UNSET,
     active_agents: Any = _UNSET,
-    active_cron_jobs: Any = _UNSET,
-    active_api_runs: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -1008,19 +1003,6 @@ def write_runtime_status(
         payload["restart_requested"] = bool(restart_requested)
     if active_agents is not _UNSET:
         payload["active_agents"] = parse_active_agents(active_agents)
-    if active_cron_jobs is not _UNSET:
-        payload["active_cron_jobs"] = parse_active_agents(active_cron_jobs)
-    if active_api_runs is not _UNSET:
-        payload["active_api_runs"] = parse_active_agents(active_api_runs)
-    if (
-        active_agents is not _UNSET
-        or active_cron_jobs is not _UNSET
-        or active_api_runs is not _UNSET
-    ):
-        payload["active_work"] = sum(
-            parse_active_agents(payload.get(field, 0))
-            for field in ("active_agents", "active_cron_jobs", "active_api_runs")
-        )
     if served_profiles is not _UNSET:
         # Profiles this gateway multiplexes (multi-profile mode). Absent/empty
         # for a single-profile gateway. Lets `hermes status` show per-profile
@@ -1120,30 +1102,28 @@ _DRAINABLE_GATEWAY_STATES = frozenset({"running"})
 
 
 def derive_gateway_busy(
-    *,
-    gateway_running: bool,
-    gateway_state: Any,
-    active_agents: Any,
-    active_cron_jobs: Any = 0,
-    active_api_runs: Any = 0,
+    *, gateway_running: bool, gateway_state: Any, active_agents: Any
 ) -> bool:
-    """Whether the gateway is actively processing gateway-owned work.
+    """Whether the gateway is actively processing in-flight turns.
 
-    Busy iff the gateway is live, is running or draining, and at least one
-    messaging agent, cron job, or API run is active. Each count degrades to
-    zero when absent/unparseable so older status records remain readable.
+    The contract NAS gates lifecycle actions on.  Busy iff the gateway is live
+    (``gateway_running``), in the ``running`` state, AND at least one agent is
+    mid-turn (``active_agents > 0``).  Degrades to ``False`` whenever liveness
+    is unknown, the state is anything but ``running``, or the count is
+    absent/unparseable — i.e. a down or file-absent gateway reads "not busy",
+    never a spurious "busy".
 
     NOTE: liveness keys off ``gateway_running`` (a live PID / health probe),
     NEVER ``updated_at`` — a healthy idle gateway never advances that timestamp.
     """
     if not gateway_running:
         return False
-    if gateway_state not in {"running", "draining"}:
+    if gateway_state not in _DRAINABLE_GATEWAY_STATES:
         return False
-    return any(
-        parse_active_agents(count) > 0
-        for count in (active_agents, active_cron_jobs, active_api_runs)
-    )
+    try:
+        return int(active_agents) > 0
+    except (TypeError, ValueError):
+        return False
 
 
 def derive_gateway_drainable(*, gateway_running: bool, gateway_state: Any) -> bool:

@@ -5,12 +5,9 @@ Handles: hermes gateway [run|start|stop|restart|status|install|uninstall|setup]
 """
 
 import asyncio
-import copy
 import json
 import logging
-import math
 import os
-import secrets
 import shlex
 import shutil
 import signal
@@ -304,127 +301,6 @@ def _graceful_restart_via_sigusr1(pid: int, drain_timeout: float) -> bool:
         _time.sleep(0.5)
     # Drain didn't finish in time.
     return False
-
-
-def _restart_gateway_when_idle(args) -> None:
-    """Quiesce the live gateway, then invoke the existing restart dispatch.
-
-    This opt-in shell path never signals or calls a service manager until the
-    matching live gateway has acknowledged the owned drain marker and persisted
-    zero messaging, cron, and API work. The owned marker remains present
-    through restart initiation and is released on every exit path.
-    """
-    from gateway.drain_control import (
-        clear_owned_drain_request,
-        create_owned_drain_request,
-    )
-    from gateway.status import (
-        get_running_pid,
-        get_runtime_status_running_pid,
-        read_runtime_status,
-    )
-
-    work_fields = ("active_agents", "active_cron_jobs", "active_api_runs")
-
-    def work_counts(record) -> tuple[int, int, int] | None:
-        values = tuple(record.get(field) for field in work_fields)
-        if any(
-            isinstance(value, bool)
-            or not isinstance(value, int)
-            or value < 0
-            for value in values
-        ):
-            return None
-        return values
-
-    if getattr(args, "all", False):
-        print_error("Refusing --when-idle with --all; select one gateway profile.")
-        sys.exit(1)
-
-    timeout_arg = getattr(args, "timeout", None)
-    timeout = _get_restart_drain_timeout() if timeout_arg is None else timeout_arg
-    timeout = float(timeout) if timeout is not None else None
-    if timeout is None or not math.isfinite(timeout) or timeout <= 0:
-        print_error("--when-idle timeout must be a finite positive number of seconds.")
-        sys.exit(1)
-
-    pid = get_running_pid(cleanup_stale=False)
-    runtime = read_runtime_status()
-    if (
-        pid is None
-        or not isinstance(runtime, dict)
-        or get_runtime_status_running_pid(runtime) != pid
-        or runtime.get("gateway_state") != "running"
-        or work_counts(runtime) is None
-    ):
-        print_error(
-            "Safe restart refused: no matching live gateway in running state "
-            "with split workload counts."
-        )
-        sys.exit(1)
-
-    owner_token = secrets.token_hex(16)
-    marker = create_owned_drain_request(
-        owner_token,
-        principal="gateway-restart-when-idle",
-    )
-    if marker is None:
-        print_error(
-            "Safe restart refused: a drain marker already exists and is owned "
-            "by another operation."
-        )
-        sys.exit(1)
-
-    deadline = time.monotonic() + float(timeout)
-    last_counts = (0, 0, 0)
-    try:
-        while True:
-            runtime = read_runtime_status()
-            if not isinstance(runtime, dict):
-                print_error("Safe restart refused: gateway status is unreadable.")
-                sys.exit(1)
-            if get_runtime_status_running_pid(runtime) != pid:
-                print_error(
-                    "Safe restart refused: gateway PID/status changed while draining."
-                )
-                sys.exit(1)
-
-            counts = work_counts(runtime)
-            if counts is None:
-                print_error(
-                    "Safe restart refused: gateway split workload counts are "
-                    "missing or invalid."
-                )
-                sys.exit(1)
-            last_counts = counts
-            if runtime.get("gateway_state") == "draining" and not any(last_counts):
-                print_info(
-                    "Gateway is draining and idle "
-                    "(agents=0, cron=0, api=0); initiating restart."
-                )
-                immediate_args = copy.copy(args)
-                immediate_args.when_idle = False
-                immediate_args.timeout = None
-                immediate_args._when_idle_owner_token = owner_token
-                _gateway_command_inner(immediate_args)
-                return
-
-            if runtime.get("gateway_state") not in {"running", "draining"}:
-                print_error(
-                    "Safe restart refused: gateway entered unexpected state "
-                    f"{runtime.get('gateway_state')!r}."
-                )
-                sys.exit(1)
-            if time.monotonic() >= deadline:
-                agents, cron_jobs, api_runs = last_counts
-                print_error(
-                    "Safe restart refused: timed out waiting for gateway work "
-                    f"(agents={agents}, cron={cron_jobs}, api={api_runs})."
-                )
-                sys.exit(1)
-            time.sleep(0.1)
-    finally:
-        clear_owned_drain_request(owner_token)
 
 
 def _get_ancestor_pids() -> set[int]:
@@ -3479,9 +3355,7 @@ def systemd_stop(system: bool = False):
     print(f"✓ {_service_scope_label(system).capitalize()} service stopped")
 
 
-def systemd_restart(
-    system: bool = False, *, allow_force_fallback: bool = True
-):
+def systemd_restart(system: bool = False):
     system = _select_systemd_scope(system)
     if system:
         _require_root_for_system_service("restart")
@@ -3522,21 +3396,8 @@ def systemd_restart(
             )
             if _wait_for_systemd_service_restart(system=system, previous_pid=pid):
                 return
-            if not allow_force_fallback:
-                print_error(
-                    "Safe restart refused: the graceful systemd restart did not "
-                    "produce a ready replacement; no forced restart was attempted."
-                )
-                return False
             if _systemd_service_is_start_limited(system=system):
                 return
-
-        if not allow_force_fallback:
-            print_error(
-                "Safe restart refused: the graceful systemd restart did not "
-                "complete; no forced restart was attempted."
-            )
-            return False
 
         print(
             f"⚠ Graceful restart did not complete within {int(drain_timeout + 5)}s; "
@@ -3566,13 +3427,6 @@ def systemd_restart(
             return
         _wait_for_systemd_service_restart(system=system, previous_pid=pid)
         return
-
-    if not allow_force_fallback:
-        print_error(
-            "Safe restart refused: the live gateway PID disappeared before "
-            "the graceful systemd restart request."
-        )
-        return False
 
     if _recover_pending_systemd_restart(system=system, previous_pid=pid):
         return
@@ -4544,7 +4398,7 @@ def _wait_for_gateway_exit(
     return True
 
 
-def launchd_restart(*, allow_force_fallback: bool = True):
+def launchd_restart():
     label = get_launchd_label()
     target = f"{_launchd_domain()}/{label}"
     drain_timeout = _get_restart_drain_timeout()
@@ -4556,12 +4410,6 @@ def launchd_restart(*, allow_force_fallback: bool = True):
             print("✓ Service restart requested")
             _clear_launchd_unsupported_marker()
             return
-        if not allow_force_fallback:
-            print_error(
-                "Safe restart refused: the launchd gateway could not accept "
-                "the graceful self-restart request; no forced restart was attempted."
-            )
-            return False
         if pid is not None:
             # Announce the drain BEFORE waiting on it. This wait can run for
             # the full drain budget (180s by default) while the old gateway
@@ -5544,8 +5392,6 @@ def _runtime_health_lines() -> list[str]:
     gateway_state = state.get("gateway_state")
     exit_reason = state.get("exit_reason")
     active_agents = state.get("active_agents")
-    active_cron_jobs = state.get("active_cron_jobs")
-    active_api_runs = state.get("active_api_runs")
     restart_requested = state.get("restart_requested")
     platforms = state.get("platforms", {}) or {}
 
@@ -5576,13 +5422,8 @@ def _runtime_health_lines() -> list[str]:
         action = "restart" if restart_requested else "shutdown"
         from gateway.status import parse_active_agents
 
-        agents = parse_active_agents(active_agents)
-        cron_jobs = parse_active_agents(active_cron_jobs)
-        api_runs = parse_active_agents(active_api_runs)
-        lines.append(
-            f"⏳ Gateway draining for {action} "
-            f"(agents={agents}, cron={cron_jobs}, api={api_runs})"
-        )
+        count = parse_active_agents(active_agents)
+        lines.append(f"⏳ Gateway draining for {action} ({count} active agent(s))")
     elif gateway_state == "stopped" and exit_reason:
         lines.append(f"⚠ Last shutdown reason: {exit_reason}")
 
@@ -7211,15 +7052,10 @@ def _gateway_command_inner(args):
             )
             sys.exit(1)
 
-        if getattr(args, "when_idle", False):
-            _restart_gateway_when_idle(args)
-            return
-
         # Try service first, fall back to killing and restarting
         service_available = False
         system = getattr(args, "system", False)
         restart_all = getattr(args, "all", False)
-        safe_restart = bool(getattr(args, "_when_idle_owner_token", None))
         service_configured = False
 
         # Phase 4: inside a container with s6, dispatch via the service
@@ -7294,26 +7130,14 @@ def _gateway_command_inner(args):
         ):
             service_configured = True
             try:
-                restart_result = (
-                    systemd_restart(system=system, allow_force_fallback=False)
-                    if safe_restart
-                    else systemd_restart(system=system)
-                )
-                if restart_result is False:
-                    sys.exit(1)
+                systemd_restart(system=system)
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
         elif is_macos() and get_launchd_plist_path().exists():
             service_configured = True
             try:
-                restart_result = (
-                    launchd_restart(allow_force_fallback=False)
-                    if safe_restart
-                    else launchd_restart()
-                )
-                if restart_result is False:
-                    sys.exit(1)
+                launchd_restart()
                 service_available = True
             except subprocess.CalledProcessError:
                 pass
@@ -7363,13 +7187,6 @@ def _gateway_command_inner(args):
                     "  The service definition exists, but the service manager did not recover it."
                 )
                 print("  Fix the service, then retry: hermes gateway start")
-                sys.exit(1)
-
-            if getattr(args, "_when_idle_owner_token", None):
-                print_error(
-                    "Safe restart refused: no supported service-managed restart "
-                    "path is available for this gateway."
-                )
                 sys.exit(1)
 
             # Manual restart: stop only this profile's gateway

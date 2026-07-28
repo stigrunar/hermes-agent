@@ -4990,38 +4990,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
         try:
             from gateway.status import write_runtime_status
-            active_agents = self._running_agent_count()
-            active_cron_jobs = self._active_cron_job_count()
-            active_api_runs = self._active_api_run_count()
             write_runtime_status(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
-                active_agents=active_agents,
-                active_cron_jobs=active_cron_jobs,
-                active_api_runs=active_api_runs,
+                active_agents=self._active_work_count(),
             )
         except Exception:
             pass
 
     def _persist_active_agents(self) -> None:
-        """Persist all live gateway-owned work counts together.
+        """Persist the live in-flight agent count to ``gateway_state.json``.
 
-        Called at lifecycle/turn boundaries and every external-drain watcher
-        tick. Messaging, cron, and API work have independent owners, so a safe
-        lifecycle decision must observe one coherent snapshot of all three.
+        Called at every turn boundary (a running-agent slot is claimed or
+        released) so the dashboard ``/api/status`` readout reflects in-flight
+        gateway turns in near-real-time.  Without this the file is only
+        rewritten on lifecycle transitions, so any ``active_agents`` read
+        between transitions is stale (a turn could start and finish without the
+        file ever moving).
 
-        Deliberately leaves lifecycle fields ``_UNSET`` so the writer's
+        Deliberately passes ONLY ``active_agents`` — ``gateway_state`` and the
+        other fields stay ``_UNSET`` so ``write_runtime_status``'s
         read-merge-write preserves the current lifecycle state (``running`` /
-        ``draining`` / …). Best-effort: a failed write must never disrupt work.
+        ``draining`` / …).  Passing ``gateway_state=None`` here would clobber it.
+        Best-effort: a failed status write must never disrupt a turn.
         """
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(
-                active_agents=self._running_agent_count(),
-                active_cron_jobs=self._active_cron_job_count(),
-                active_api_runs=self._active_api_run_count(),
-            )
+            write_runtime_status(active_agents=self._active_work_count())
         except Exception:
             pass
 
@@ -5099,8 +5095,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
-                    # Refresh the split counts while an external caller polls
-                    # this reversible drain state.
+                    # API and cron work live outside messaging's
+                    # _running_agents map. Refresh the aggregate while an
+                    # external caller polls this reversible drain state.
                     self._persist_active_agents()
                 else:
                     self._exit_external_drain()

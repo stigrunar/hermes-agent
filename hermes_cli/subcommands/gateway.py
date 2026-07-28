@@ -141,17 +141,6 @@ def build_gateway_parser(
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
     )
-    gateway_restart.add_argument(
-        "--when-idle",
-        action="store_true",
-        help="Drain new gateway work and restart only after all active work finishes",
-    )
-    gateway_restart.add_argument(
-        "--timeout",
-        type=float,
-        metavar="SECONDS",
-        help="Maximum wait for --when-idle (default: configured restart drain timeout)",
-    )
     _add_compat_platform_flag(gateway_restart)
 
     # gateway status
