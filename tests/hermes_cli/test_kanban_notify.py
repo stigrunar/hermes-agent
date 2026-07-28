@@ -182,6 +182,7 @@ async def test_notifier_second_blocked_delivers(kanban_home):
 
     async def _capture_send(chat_id, msg, metadata=None):
         delivered_msgs.append(msg)
+        return SendResult(success=True)
 
     fake_adapter = MagicMock()
     fake_adapter.send = AsyncMock(side_effect=_capture_send)
