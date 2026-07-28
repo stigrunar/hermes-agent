@@ -7,6 +7,7 @@ import pytest
 
 
 from gateway.config import Platform
+from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
 from hermes_cli import kanban_db as kb
 
@@ -33,6 +34,7 @@ class RecordingAdapter:
 
     async def send(self, chat_id, text, metadata=None):
         self.sent.append({"chat_id": chat_id, "text": text, "metadata": metadata or {}})
+        return SendResult(success=True, message_id="test-message-id")
 
     async def handle_message(self, event):
         self.handled.append(event)
@@ -737,6 +739,25 @@ class FailingAdapter:
         raise RuntimeError("simulated send failure")
 
 
+class UnsuccessfulAdapter:
+    """Adapter whose send() reports failure without raising."""
+
+    def __init__(self):
+        self.attempts = 0
+        self.handled = []
+
+    async def send(self, chat_id, text, metadata=None):
+        self.attempts += 1
+        return SendResult(
+            success=False,
+            error="send_path_degraded",
+            retryable=True,
+        )
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
 def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     """A raising adapter rewinds the claim so the next tick can retry.
 
@@ -767,6 +788,37 @@ def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
     assert len(recovered.sent) == 1
     assert len(recovered.handled) == 1
     assert _unseen_terminal_events(tid) == []
+
+
+def test_kanban_notifier_rewinds_nonthrowing_unsuccessful_send_result(
+    tmp_path, monkeypatch,
+):
+    """An unsuccessful SendResult is a delivery failure, not an acknowledgement."""
+    db_path = tmp_path / "unsuccessful-send-result.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = UnsuccessfulAdapter()
+    runner = _make_runner(adapter)
+    with (
+        patch.object(runner, "_kanban_advance", wraps=runner._kanban_advance) as advance,
+        patch.object(runner, "_kanban_unsub", wraps=runner._kanban_unsub) as unsub,
+        patch.object(runner, "_kanban_rewind", wraps=runner._kanban_rewind) as rewind,
+    ):
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts == 1
+    assert adapter.handled == []
+    advance.assert_not_called()
+    unsub.assert_not_called()
+    rewind.assert_called_once()
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
+    conn = kb.connect()
+    try:
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+    finally:
+        conn.close()
 
 
 def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
