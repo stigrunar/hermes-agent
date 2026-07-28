@@ -515,8 +515,26 @@ class GatewaySlashCommandsMixin:
                         platform.value if hasattr(platform, "value") else str(platform or "")
                     ).lower()
                     chat_id = str(getattr(source, "chat_id", "") or "")
+                    chat_type = str(getattr(source, "chat_type", "") or "") or None
                     thread_id = str(getattr(source, "thread_id", "") or "")
                     user_id = str(getattr(source, "user_id", "") or "") or None
+                    session_key = self._session_key_for_source(source)
+                    delivery_metadata: dict[str, Any] = {}
+                    if thread_id:
+                        delivery_metadata["thread_id"] = thread_id
+                    if chat_type:
+                        delivery_metadata["chat_type"] = chat_type
+                    if (
+                        platform_str == "telegram"
+                        and thread_id
+                        and (chat_type or "").lower() in {"dm", "direct", "private"}
+                    ):
+                        delivery_metadata["telegram_dm_topic_reply_fallback"] = True
+                        if thread_id != "1":
+                            delivery_metadata["direct_messages_topic_id"] = thread_id
+                        message_id = str(getattr(event, "message_id", "") or "")
+                        if message_id:
+                            delivery_metadata["telegram_reply_to_message_id"] = message_id
                     if platform_str and chat_id:
                         def _sub():
                             from hermes_cli import kanban_db as _kb
@@ -525,9 +543,15 @@ class GatewaySlashCommandsMixin:
                                 _kb.add_notify_sub(
                                     conn, task_id=task_id,
                                     platform=platform_str, chat_id=chat_id,
+                                    chat_type=chat_type,
                                     thread_id=thread_id or None,
                                     user_id=user_id,
-                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                    notifier_profile=(
+                                        getattr(source, "profile", None)
+                                        or self._active_profile_name()
+                                    ),
+                                    session_key=session_key,
+                                    delivery_metadata=delivery_metadata or None,
                                 )
                             finally:
                                 conn.close()

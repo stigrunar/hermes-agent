@@ -410,6 +410,26 @@ def test_gateway_run_force_flag_survives_parser_extraction():
     assert args.force is True
 
 
+def test_gateway_restart_when_idle_flags_survive_parser_extraction():
+    from hermes_cli.subcommands.gateway import build_gateway_parser
+
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command")
+    build_gateway_parser(
+        subparsers,
+        cmd_gateway=lambda _args: None,
+        cmd_proxy=lambda _args: None,
+        cmd_gateway_enroll=lambda _args: None,
+    )
+
+    args = parser.parse_args(
+        ["gateway", "restart", "--when-idle", "--timeout", "12.5"]
+    )
+
+    assert args.when_idle is True
+    assert args.timeout == 12.5
+
+
 def test_run_gateway_windows_foreground_keeps_ctrl_c_enabled(monkeypatch):
     calls = []
 
@@ -595,7 +615,9 @@ def test_gateway_start_ignores_legacy_platform_selector(monkeypatch):
     assert calls == [False]
 
 
-def test_gateway_restart_on_windows_without_service_uses_detached_backend(monkeypatch):
+def test_gateway_restart_on_windows_without_service_uses_detached_backend(
+    monkeypatch, tmp_path
+):
     """Windows manual restart must not fall back to foreground run_gateway().
 
     A Telegram-hosted agent may run `hermes gateway restart` via the terminal
@@ -606,8 +628,10 @@ def test_gateway_restart_on_windows_without_service_uses_detached_backend(monkey
     Scheduled Task / Startup item is installed.
     """
     import hermes_cli.gateway_windows as gateway_windows
+    from gateway.drain_control import drain_request_path
 
     calls = []
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
     monkeypatch.setattr(gateway, "is_macos", lambda: False)
@@ -629,6 +653,7 @@ def test_gateway_restart_on_windows_without_service_uses_detached_backend(monkey
     gateway.gateway_command(args)
 
     assert calls == ["restart"]
+    assert not drain_request_path().exists()
 
 
 def test_gateway_restart_on_windows_preserves_failure_fallback(monkeypatch):
@@ -654,6 +679,232 @@ def test_gateway_restart_on_windows_preserves_failure_fallback(monkeypatch):
     gateway.gateway_command(args)
 
     assert calls == ["restart", "stop", "wait", "run"]
+
+
+def test_safe_restart_dispatch_disables_systemd_force_fallback(monkeypatch):
+    calls = []
+    unit = SimpleNamespace(exists=lambda: True)
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: True)
+    monkeypatch.setattr(gateway, "get_systemd_unit_path", lambda system=False: unit)
+    monkeypatch.setattr(
+        gateway, "_dispatch_via_service_manager_if_s6", lambda _action: False
+    )
+    monkeypatch.setattr(
+        gateway,
+        "systemd_restart",
+        lambda system=False, allow_force_fallback=True: calls.append(
+            (system, allow_force_fallback)
+        ),
+    )
+
+    gateway.gateway_command(
+        SimpleNamespace(
+            gateway_command="restart",
+            system=False,
+            all=False,
+            when_idle=False,
+            _when_idle_owner_token="owned",
+        )
+    )
+
+    assert calls == [(False, False)]
+
+
+def test_safe_restart_dispatch_disables_launchd_force_fallback(
+    monkeypatch, tmp_path
+):
+    calls = []
+    plist = tmp_path / "ai.hermes.gateway.plist"
+    plist.write_text("plist", encoding="utf-8")
+    monkeypatch.setattr(gateway, "supports_systemd_services", lambda: False)
+    monkeypatch.setattr(gateway, "is_macos", lambda: True)
+    monkeypatch.setattr(gateway, "get_launchd_plist_path", lambda: plist)
+    monkeypatch.setattr(
+        gateway, "_dispatch_via_service_manager_if_s6", lambda _action: False
+    )
+    monkeypatch.setattr(
+        gateway,
+        "launchd_restart",
+        lambda allow_force_fallback=True: calls.append(allow_force_fallback),
+    )
+
+    gateway.gateway_command(
+        SimpleNamespace(
+            gateway_command="restart",
+            system=False,
+            all=False,
+            when_idle=False,
+            _when_idle_owner_token="owned",
+        )
+    )
+
+    assert calls == [False]
+
+
+@pytest.mark.parametrize("active_field", ("active_cron_jobs", "active_api_runs"))
+def test_when_idle_restart_refuses_split_work_and_cleans_owned_drain(
+    monkeypatch, tmp_path, active_field
+):
+    import gateway.status as gateway_status
+    from gateway.drain_control import drain_request_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runtime = {
+        "pid": 321,
+        "gateway_state": "draining",
+        "active_agents": 0,
+        "active_cron_jobs": 0,
+        "active_api_runs": 0,
+    }
+    runtime[active_field] = 2
+    monkeypatch.setattr(gateway_status, "get_running_pid", lambda **_kw: 321)
+    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: runtime)
+    monkeypatch.setattr(
+        gateway_status,
+        "get_runtime_status_running_pid",
+        lambda record: record.get("pid"),
+    )
+    monotonic = iter((0.0, 2.0))
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: next(monotonic))
+    restart = []
+    monkeypatch.setattr(
+        gateway, "_gateway_command_inner", lambda _args: restart.append(True)
+    )
+
+    # Initial validation requires running; the watcher transition is modelled
+    # by changing the same live record after the first read.
+    reads = iter(
+        (
+            {**runtime, "gateway_state": "running"},
+            runtime,
+        )
+    )
+    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: next(reads))
+
+    with pytest.raises(SystemExit) as exc:
+        gateway._restart_gateway_when_idle(
+            SimpleNamespace(
+                gateway_command="restart",
+                when_idle=True,
+                timeout=1.0,
+                all=False,
+            )
+        )
+
+    assert exc.value.code == 1
+    assert restart == []
+    assert not drain_request_path().exists()
+
+
+def test_when_idle_restart_proceeds_only_after_split_counts_zero(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+    from gateway.drain_control import drain_request_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    running = {
+        "pid": 321,
+        "gateway_state": "running",
+        "active_agents": 0,
+        "active_cron_jobs": 0,
+        "active_api_runs": 0,
+    }
+    draining = {**running, "gateway_state": "draining"}
+    reads = iter((running, draining))
+    monkeypatch.setattr(gateway_status, "get_running_pid", lambda **_kw: 321)
+    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: next(reads))
+    monkeypatch.setattr(
+        gateway_status,
+        "get_runtime_status_running_pid",
+        lambda record: record.get("pid"),
+    )
+    restart = []
+
+    def record_restart(args):
+        assert args.when_idle is False
+        assert drain_request_path().exists()
+        restart.append(True)
+
+    monkeypatch.setattr(gateway, "_gateway_command_inner", record_restart)
+
+    gateway._restart_gateway_when_idle(
+        SimpleNamespace(
+            gateway_command="restart",
+            when_idle=True,
+            timeout=1.0,
+            all=False,
+        )
+    )
+
+    assert restart == [True]
+    assert not drain_request_path().exists()
+
+
+def test_when_idle_restart_refuses_legacy_status_without_split_counts(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+    from gateway.drain_control import drain_request_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    runtime = {
+        "pid": 321,
+        "gateway_state": "running",
+        "active_agents": 0,
+    }
+    monkeypatch.setattr(gateway_status, "get_running_pid", lambda **_kw: 321)
+    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: runtime)
+    monkeypatch.setattr(
+        gateway_status,
+        "get_runtime_status_running_pid",
+        lambda record: record.get("pid"),
+    )
+    restart = []
+    monkeypatch.setattr(
+        gateway, "_gateway_command_inner", lambda _args: restart.append(True)
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        gateway._restart_gateway_when_idle(
+            SimpleNamespace(
+                gateway_command="restart",
+                when_idle=True,
+                timeout=1.0,
+                all=False,
+            )
+        )
+
+    assert exc.value.code == 1
+    assert restart == []
+    assert not drain_request_path().exists()
+
+
+def test_when_idle_restart_rejects_nan_timeout_before_creating_drain(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+    from gateway.drain_control import drain_request_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(
+        gateway_status,
+        "get_running_pid",
+        lambda **_kw: pytest.fail("NaN timeout must fail before status lookup"),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        gateway._restart_gateway_when_idle(
+            SimpleNamespace(
+                gateway_command="restart",
+                when_idle=True,
+                timeout=float("nan"),
+                all=False,
+            )
+        )
+
+    assert exc.value.code == 1
+    assert not drain_request_path().exists()
 
 
 def test_systemd_status_warns_when_linger_disabled(monkeypatch, tmp_path, capsys):

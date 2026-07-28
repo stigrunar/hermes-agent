@@ -903,6 +903,38 @@ class TestLaunchdServiceRecovery:
         assert calls == [("self", 321)]
         assert "restart requested" in capsys.readouterr().out.lower()
 
+    def test_launchd_safe_restart_refuses_without_terminate_or_kickstart(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(gateway_cli, "_launchd_domain", lambda: "gui/501")
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 321)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_request_gateway_self_restart",
+            lambda pid: calls.append(("self", pid)) or False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "terminate_pid",
+            lambda *_args, **_kwargs: pytest.fail(
+                "safe launchd restart must not terminate the gateway"
+            ),
+        )
+        monkeypatch.setattr(
+            gateway_cli.subprocess,
+            "run",
+            lambda *_args, **_kwargs: pytest.fail(
+                "safe launchd restart must not call launchctl fallback"
+            ),
+        )
+
+        result = gateway_cli.launchd_restart(allow_force_fallback=False)
+
+        assert result is False
+        assert calls == [("self", 321)]
+        assert "no forced restart was attempted" in capsys.readouterr().out.lower()
+
     def test_launchd_stop_uses_bootout_not_kill(self, monkeypatch):
         """launchd_stop must bootout the service so KeepAlive doesn't respawn it."""
         label = gateway_cli.get_launchd_label()
@@ -1583,6 +1615,76 @@ class TestGatewaySystemServiceRouting:
         assert ("wait", False, 654) in calls
         out = capsys.readouterr().out.lower()
         assert "restarting gracefully" in out
+
+    def test_systemd_safe_restart_refuses_without_forced_fallback(
+        self, monkeypatch, capsys
+    ):
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli, "_select_systemd_scope", lambda system=False: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_require_service_installed",
+            lambda action, system=False: None,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None
+        )
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli,
+            "_graceful_restart_via_sigusr1",
+            lambda pid, timeout: calls.append(("graceful", pid, timeout)) or False,
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_run_systemctl",
+            lambda *args, **kwargs: pytest.fail(
+                "safe restart must not call systemctl after graceful failure"
+            ),
+        )
+
+        result = gateway_cli.systemd_restart(allow_force_fallback=False)
+
+        assert result is False
+        assert calls == [("graceful", 654, 10.0)]
+        assert "no forced restart was attempted" in capsys.readouterr().out.lower()
+
+    def test_systemd_ordinary_restart_keeps_forced_fallback(self, monkeypatch):
+        calls = []
+        monkeypatch.setattr(
+            gateway_cli, "_select_systemd_scope", lambda system=False: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_require_service_installed",
+            lambda action, system=False: None,
+        )
+        monkeypatch.setattr(
+            gateway_cli, "refresh_systemd_unit_if_needed", lambda system=False: None
+        )
+        monkeypatch.setattr(gateway_cli, "_get_restart_drain_timeout", lambda: 5.0)
+        monkeypatch.setattr("gateway.status.get_running_pid", lambda: 654)
+        monkeypatch.setattr(
+            gateway_cli, "_graceful_restart_via_sigusr1", lambda *_args: False
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_run_systemctl",
+            lambda args, **kwargs: calls.append(args)
+            or SimpleNamespace(returncode=0, stdout="", stderr=""),
+        )
+        monkeypatch.setattr(
+            gateway_cli,
+            "_wait_for_systemd_service_restart",
+            lambda **_kwargs: True,
+        )
+
+        gateway_cli.systemd_restart()
+
+        assert ["restart", gateway_cli.get_service_name()] in calls
 
     def test_systemd_restart_uses_systemd_main_pid_when_pid_file_is_missing(self, monkeypatch, capsys):
         calls = []
