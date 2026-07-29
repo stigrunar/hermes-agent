@@ -844,12 +844,26 @@ class TestHealthDetailedEndpoint:
                 assert data["active_cron_jobs"] == 2
                 assert data["active_api_runs"] == 1
                 assert data["active_work"] == 3
+                assert data["gateway_drain_quiesced"] is False
                 # This endpoint is served BY the live gateway, so any split active
                 # work makes it busy while it remains a valid drain target.
                 assert data["gateway_busy"] is True
                 assert data["gateway_drainable"] is True
                 assert isinstance(data["pid"], int)
                 assert "updated_at" in data
+
+    @pytest.mark.asyncio
+    async def test_health_detailed_exposes_quiesced_drain(self, adapter):
+        app = _create_app(adapter)
+        runtime = {
+            "gateway_state": "draining",
+            "drain_quiesced": True,
+        }
+        with patch("gateway.status.read_runtime_status", return_value=runtime):
+            async with TestClient(TestServer(app)) as cli:
+                data = await (await cli.get("/health/detailed")).json()
+
+        assert data["gateway_drain_quiesced"] is True
 
     @pytest.mark.asyncio
     async def test_health_detailed_no_runtime_status(self, adapter):

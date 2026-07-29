@@ -367,6 +367,7 @@ def _restart_gateway_when_idle(args) -> None:
     marker = create_owned_drain_request(
         owner_token,
         principal="gateway-restart-when-idle",
+        target_pid=pid,
     )
     if marker is None:
         print_error(
@@ -397,9 +398,13 @@ def _restart_gateway_when_idle(args) -> None:
                 )
                 sys.exit(1)
             last_counts = counts
-            if runtime.get("gateway_state") == "draining" and not any(last_counts):
+            if (
+                runtime.get("gateway_state") == "draining"
+                and runtime.get("drain_quiesced") is True
+                and not any(last_counts)
+            ):
                 print_info(
-                    "Gateway is draining and idle "
+                    "Gateway drain is quiesced and idle "
                     "(agents=0, cron=0, api=0); initiating restart."
                 )
                 immediate_args = copy.copy(args)

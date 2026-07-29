@@ -70,6 +70,7 @@ def _drain_request_payload(
     principal: str,
     suppress_notification: bool,
     owner_token: Optional[str] = None,
+    target_pid: Optional[int] = None,
 ) -> dict[str, Any]:
     payload = {
         "action": "drain",
@@ -80,6 +81,8 @@ def _drain_request_payload(
     }
     if owner_token is not None:
         payload["owner_token"] = owner_token
+    if target_pid is not None:
+        payload["target_pid"] = int(target_pid)
     return payload
 
 
@@ -191,13 +194,16 @@ def create_owned_drain_request(
     *,
     principal: str = "drain-control",
     suppress_notification: bool = False,
+    target_pid: Optional[int] = None,
     home: Optional[Path] = None,
 ) -> Optional[dict[str, Any]]:
     """Create a drain marker only when none exists.
 
     The exclusive create establishes ownership for a bounded CLI operation
-    without overwriting a pre-existing external drain. Returns ``None`` when a
-    marker already exists.
+    without overwriting a pre-existing external drain. ``target_pid`` scopes a
+    restart drain to the old gateway so its replacement cannot inherit the
+    marker and wait forever for the owner CLI to clear it. Returns ``None``
+    when a marker already exists.
     """
     path = drain_request_path(home)
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -205,6 +211,7 @@ def create_owned_drain_request(
         principal=principal,
         suppress_notification=suppress_notification,
         owner_token=owner_token,
+        target_pid=target_pid,
     )
     try:
         fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
@@ -251,17 +258,26 @@ def clear_drain_request(*, home: Optional[Path] = None) -> bool:
 
 
 def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
-    """True iff ``body``'s epoch is a *definite* mismatch with this process.
+    """True iff ``body`` definitely belongs to another process lifetime.
 
-    Lenient by design — returns False (i.e. "not stale, honour it") whenever it
-    can't be sure:
+    Epoch handling is lenient by design — returns False (i.e. "not stale,
+    honour it") whenever it can't be sure:
       * the current epoch can't be computed ("" fallback, no /proc), OR
       * the marker carries no epoch (legacy marker, or a corrupt/contentless
         ``{}`` body).
-    Only a marker whose epoch is present AND differs from the current
-    instantiation epoch is considered stale. This preserves the
-    fail-safe-toward-quiescing contract for malformed markers.
+    An explicit valid ``target_pid`` mismatch is stale; owned restart markers
+    use it so a replacement gateway in the same host epoch does not inherit the
+    old process's drain. A malformed target remains active, preserving the
+    fail-safe-toward-quiescing contract for corrupted markers.
     """
+    target_pid = body.get("target_pid")
+    if target_pid is not None:
+        try:
+            if int(target_pid) != os.getpid():
+                return True
+        except (TypeError, ValueError):
+            return False
+
     current = current_instantiation_epoch()
     if not current:
         return False
@@ -272,7 +288,7 @@ def _marker_epoch_is_stale(body: dict[str, Any]) -> bool:
 
 
 def drain_requested(*, home: Optional[Path] = None) -> bool:
-    """True iff a begin-drain marker for THIS instantiation is present.
+    """True iff a begin-drain marker applies to this gateway process.
 
     A marker whose ``epoch`` does not match the current instantiation epoch is
     treated as absent: it survived a container/VM restart (HERMES_HOME is a
@@ -281,6 +297,8 @@ def drain_requested(*, home: Optional[Path] = None) -> bool:
     freshly-restarted gateway in ``draining`` (NS-570). The staleness check is
     lenient (see :func:`_marker_epoch_is_stale`): a legacy/corrupt marker with
     no epoch, or an environment without ``/proc``, still reads as drain-active.
+    An owned restart marker may additionally target the old gateway PID so the
+    replacement process does not inherit the drain in the same host epoch.
     """
     body = read_drain_request(home=home)
     if body is None:

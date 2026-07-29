@@ -3093,6 +3093,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _exit_code: Optional[int] = None
     _draining: bool = False
     _external_drain_active: bool = False
+    _external_drain_quiesced: bool = False
     _restart_requested: bool = False
     _restart_task_started: bool = False
     _restart_detached: bool = False
@@ -3201,6 +3202,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # process exit; this one is a steady state NAS polls during its
         # request -> poll -> proceed loop.
         self._external_drain_active = False
+        self._external_drain_quiesced = False
         self._restart_requested = False
         # Set by shutdown_signal_handler when a SIGTERM/SIGINT arrived
         # WITHOUT a planned-stop / takeover marker — i.e. an unexpected
@@ -4987,13 +4989,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("goal continuation: active-state recheck failed: %s", exc)
             return False
 
-    def _update_runtime_status(self, gateway_state: Optional[str] = None, exit_reason: Optional[str] = None) -> None:
+    def _update_runtime_status(
+        self,
+        gateway_state: Optional[str] = None,
+        exit_reason: Optional[str] = None,
+        *,
+        drain_quiesced: Optional[bool] = None,
+    ) -> None:
         try:
             from gateway.status import write_runtime_status
             active_agents = self._running_agent_count()
             active_cron_jobs = self._active_cron_job_count()
             active_api_runs = self._active_api_run_count()
-            write_runtime_status(
+            status_fields = dict(
                 gateway_state=gateway_state,
                 exit_reason=exit_reason,
                 restart_requested=self._restart_requested,
@@ -5001,6 +5009,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 active_cron_jobs=active_cron_jobs,
                 active_api_runs=active_api_runs,
             )
+            if drain_quiesced is not None:
+                status_fields["drain_quiesced"] = drain_quiesced
+            write_runtime_status(**status_fields)
         except Exception:
             pass
 
@@ -5031,9 +5042,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     # ``.drain_request.json`` marker (gateway/drain_control.py); this watcher
     # observes the marker and flips the gateway between accepting and refusing
     # NEW turns, WITHOUT exiting the process. Reversible by design (D4a): NAS
-    # POSTs begin-drain, polls /api/status until active_agents hits 0, proceeds
-    # with its lifecycle action, then (on cancel/abort) the marker is removed
-    # and the gateway re-accepts turns.
+    # POSTs begin-drain, polls /api/status until the explicit quiescence
+    # handshake is sealed with all split work counts at zero, proceeds with
+    # its lifecycle action, then (on cancel/abort) the marker is removed and
+    # the gateway re-accepts turns.
     # ------------------------------------------------------------------
     def _enter_external_drain(self) -> None:
         """Begin external drain: stop accepting new turns, flip state.
@@ -5045,6 +5057,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if self._external_drain_active:
             return
         self._external_drain_active = True
+        self._external_drain_quiesced = False
         logger.info(
             "External drain ENGAGED (.drain_request.json present) — refusing "
             "new turns; %d in-flight turn(s) will finish. Process stays up.",
@@ -5053,7 +5066,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Flip the persisted lifecycle state so /api/status.gateway_busy /
         # gateway_drainable track the drain. Preserve active_agents (the
         # read-merge keeps the live count); only the state changes.
-        self._update_runtime_status("draining")
+        self._update_runtime_status("draining", drain_quiesced=False)
 
     def _exit_external_drain(self) -> None:
         """Cancel external drain: revert state, re-accept new turns.
@@ -5065,6 +5078,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if not self._external_drain_active:
             return
         self._external_drain_active = False
+        self._external_drain_quiesced = False
         if self._draining or not self._running:
             # A shutdown drain is in progress / the loop has stopped — do not
             # clobber the terminal state back to running.
@@ -5077,7 +5091,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "External drain RELEASED (.drain_request.json removed) — "
             "re-accepting new turns; gateway_state -> running."
         )
-        self._update_runtime_status("running")
+        self._update_runtime_status("running", drain_quiesced=False)
 
     async def _drain_control_watcher(self, interval: float = 1.0) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
@@ -5099,9 +5113,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             try:
                 if drain_requested():
                     self._enter_external_drain()
-                    # Refresh the split counts while an external caller polls
-                    # this reversible drain state.
-                    self._persist_active_agents()
+                    # Seal only after one event-loop tick atomically observes
+                    # zero work. Until then internal completion events may
+                    # still start turns; afterwards the message gate refuses
+                    # every new turn. The persisted handshake removes the
+                    # zero-count TOCTOU from lifecycle callers.
+                    if (
+                        not self._external_drain_quiesced
+                        and self._active_work_count() == 0
+                    ):
+                        self._external_drain_quiesced = True
+                        logger.info(
+                            "External drain QUIESCED — zero active work observed; "
+                            "all new turns are now sealed."
+                        )
+                        self._update_runtime_status(
+                            "draining", drain_quiesced=True
+                        )
+                    else:
+                        self._persist_active_agents()
                 else:
                     self._exit_external_drain()
             except asyncio.CancelledError:
@@ -7532,7 +7562,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         try:
             from gateway.status import write_runtime_status
-            write_runtime_status(gateway_state="starting", exit_reason=None)
+            write_runtime_status(
+                gateway_state="starting",
+                exit_reason=None,
+                drain_quiesced=False,
+            )
         except Exception:
             pass
 
@@ -8034,7 +8068,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._wire_teams_pipeline_runtime()
 
         self._running = True
-        self._update_runtime_status("running")
+        self._update_runtime_status("running", drain_quiesced=False)
 
         # Loop-liveness heartbeat (#66892): an asyncio task so a frozen loop
         # stops refreshing ``state/gateway.heartbeat``. Cancelled with the
@@ -11721,14 +11755,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (D4a: stop accepting new turns FIRST, then NAS polls until
         # active_agents==0). In-flight turns are untouched; this only blocks the
         # claim of a NEW session slot. Internal/system events (restart-recovery
-        # replays, background-process completions) bypass the gate — they are
-        # not user-initiated new work and must still flow during a drain.
+        # replays, background-process completions) may finish the drain while
+        # it is converging, but are also refused after the watcher atomically
+        # seals and publishes ``drain_quiesced``.
         # Reversible: once the marker is removed the gate opens again.
-        if self._external_drain_active and not is_internal:
+        if self._external_drain_active and (
+            not is_internal or self._external_drain_quiesced
+        ):
             logger.info(
                 "Refusing new turn for session %s — external drain active.",
                 _quick_key,
             )
+            if is_internal:
+                # Internal events may finish already-accounted work while the
+                # drain converges, but cannot reopen a quiesced drain.
+                return None
             return (
                 "⏳ This agent is draining for a maintenance action and isn't "
                 "accepting new turns right now. It'll be back in a moment — "

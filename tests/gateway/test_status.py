@@ -1889,6 +1889,22 @@ class TestActiveAgentsTurnBoundaryWrite:
         assert rec["active_api_runs"] == 3
         assert rec["active_work"] == 5
 
+    def test_drain_quiesced_is_explicit_and_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="draining",
+            active_agents=0,
+            active_cron_jobs=0,
+            active_api_runs=0,
+            drain_quiesced=True,
+        )
+        status.write_runtime_status(active_agents=0)
+
+        rec = status.read_runtime_status()
+        assert rec["gateway_state"] == "draining"
+        assert rec["drain_quiesced"] is True
+
     def test_active_agents_only_write_preserves_draining_state(self, tmp_path, monkeypatch):
         """Same invariant while draining — a turn finishing mid-drain (count
         falling) must not flip the state back to running."""

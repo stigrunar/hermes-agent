@@ -3106,6 +3106,11 @@ async def get_status(profile: Optional[str] = None):
         active_api_runs = parse_active_agents(
             (runtime or {}).get("active_api_runs", 0)
         )
+        gateway_drain_quiesced = bool(
+            gateway_running
+            and gateway_state == "draining"
+            and (runtime or {}).get("drain_quiesced") is True
+        )
         gateway_busy = derive_gateway_busy(
             gateway_running=gateway_running,
             gateway_state=gateway_state,
@@ -3195,6 +3200,7 @@ async def get_status(profile: Optional[str] = None):
             "active_cron_jobs": active_cron_jobs,
             "active_api_runs": active_api_runs,
             "active_work": active_agents + active_cron_jobs + active_api_runs,
+            "gateway_drain_quiesced": gateway_drain_quiesced,
             "gateway_busy": gateway_busy,
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,

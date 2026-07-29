@@ -7578,8 +7578,26 @@ class TestGatewayBusyReadout:
         assert data["active_cron_jobs"] == 3
         assert data["active_api_runs"] == 1
         assert data["active_work"] == 4
+        assert data["gateway_drain_quiesced"] is False
         assert data["gateway_busy"] is True
         assert data["gateway_drainable"] is False
+
+    def test_quiesced_drain_requires_live_draining_handshake(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+            "gateway_state": "draining",
+            "platforms": {},
+            "active_agents": 0,
+            "active_cron_jobs": 0,
+            "active_api_runs": 0,
+            "drain_quiesced": True,
+        })
+
+        data = self.client.get("/api/status").json()
+        assert data["active_work"] == 0
+        assert data["gateway_drain_quiesced"] is True
 
     def test_down_gateway_degrades_to_safe_falsy(self, monkeypatch):
         """Gateway down (no PID, no remote probe): busy/drainable False,

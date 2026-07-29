@@ -585,6 +585,8 @@ def _build_runtime_status_record() -> dict[str, Any]:
         "active_cron_jobs": 0,
         "active_api_runs": 0,
         "active_work": 0,
+        # Zero counts are transient until the drain watcher seals the gate.
+        "drain_quiesced": False,
         "platforms": {},
         "updated_at": _utc_now_iso(),
     })
@@ -983,6 +985,7 @@ def write_runtime_status(
     active_agents: Any = _UNSET,
     active_cron_jobs: Any = _UNSET,
     active_api_runs: Any = _UNSET,
+    drain_quiesced: Any = _UNSET,
     platform: Any = _UNSET,
     platform_state: Any = _UNSET,
     error_code: Any = _UNSET,
@@ -1012,6 +1015,8 @@ def write_runtime_status(
         payload["active_cron_jobs"] = parse_active_agents(active_cron_jobs)
     if active_api_runs is not _UNSET:
         payload["active_api_runs"] = parse_active_agents(active_api_runs)
+    if drain_quiesced is not _UNSET:
+        payload["drain_quiesced"] = bool(drain_quiesced)
     if (
         active_agents is not _UNSET
         or active_cron_jobs is not _UNSET

@@ -2011,6 +2011,10 @@ class APIServerAdapter(BasePlatformAdapter):
             "active_cron_jobs": gw_active_cron,
             "active_api_runs": gw_active_api,
             "active_work": gw_active + gw_active_cron + gw_active_api,
+            "gateway_drain_quiesced": bool(
+                gw_state == "draining"
+                and runtime.get("drain_quiesced") is True
+            ),
             "gateway_busy": derive_gateway_busy(
                 gateway_running=True,
                 gateway_state=gw_state,

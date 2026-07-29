@@ -810,7 +810,11 @@ def test_when_idle_restart_proceeds_only_after_split_counts_zero(
         "active_cron_jobs": 0,
         "active_api_runs": 0,
     }
-    draining = {**running, "gateway_state": "draining"}
+    draining = {
+        **running,
+        "gateway_state": "draining",
+        "drain_quiesced": True,
+    }
     reads = iter((running, draining))
     monkeypatch.setattr(gateway_status, "get_running_pid", lambda **_kw: 321)
     monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: next(reads))
@@ -822,8 +826,11 @@ def test_when_idle_restart_proceeds_only_after_split_counts_zero(
     restart = []
 
     def record_restart(args):
+        from gateway.drain_control import read_drain_request
+
         assert args.when_idle is False
         assert drain_request_path().exists()
+        assert read_drain_request()["target_pid"] == 321
         restart.append(True)
 
     monkeypatch.setattr(gateway, "_gateway_command_inner", record_restart)
@@ -838,6 +845,52 @@ def test_when_idle_restart_proceeds_only_after_split_counts_zero(
     )
 
     assert restart == [True]
+    assert not drain_request_path().exists()
+
+
+def test_when_idle_restart_does_not_trust_transient_zero_counts(
+    monkeypatch, tmp_path
+):
+    import gateway.status as gateway_status
+    from gateway.drain_control import drain_request_path
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    running = {
+        "pid": 321,
+        "gateway_state": "running",
+        "active_agents": 0,
+        "active_cron_jobs": 0,
+        "active_api_runs": 0,
+        "drain_quiesced": False,
+    }
+    transient_zero = {**running, "gateway_state": "draining"}
+    reads = iter((running, transient_zero))
+    monkeypatch.setattr(gateway_status, "get_running_pid", lambda **_kw: 321)
+    monkeypatch.setattr(gateway_status, "read_runtime_status", lambda: next(reads))
+    monkeypatch.setattr(
+        gateway_status,
+        "get_runtime_status_running_pid",
+        lambda record: record.get("pid"),
+    )
+    monotonic = iter((0.0, 2.0))
+    monkeypatch.setattr(gateway.time, "monotonic", lambda: next(monotonic))
+    restart = []
+    monkeypatch.setattr(
+        gateway, "_gateway_command_inner", lambda _args: restart.append(True)
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        gateway._restart_gateway_when_idle(
+            SimpleNamespace(
+                gateway_command="restart",
+                when_idle=True,
+                timeout=1.0,
+                all=False,
+            )
+        )
+
+    assert exc.value.code == 1
+    assert restart == []
     assert not drain_request_path().exists()
 
 
