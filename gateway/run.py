@@ -3241,6 +3241,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._running_agents: Dict[str, Any] = {}
         self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
         self._active_session_leases: Dict[str, Any] = {}
+        try:
+            from hermes_cli.active_sessions import initialize_active_session_registry
+
+            initialize_active_session_registry()
+        except Exception as exc:
+            # Keep the gateway available, but preserve unavailable/corrupt
+            # evidence so an external recovery supervisor continues to fail
+            # closed rather than mistaking it for an idle registry.
+            logger.warning("Could not initialize active session registry: %s", exc)
         # Per-SESSION_ID turn lease (#64934): serializes the
         # [load history → run → flush] region when two ROUTING KEYS resolve
         # to one session_id (switch_session's many-to-one mapping). The

@@ -1,7 +1,10 @@
 """Tests for the gateway max_concurrent_sessions active-session cap."""
 
 import asyncio
+import json
+import os
 import time
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -82,6 +85,19 @@ def _make_runner(max_concurrent_sessions: int | None = None) -> GatewayRunner:
     runner.session_store = MagicMock()
     runner.delivery_router = MagicMock()
     return runner
+
+
+def test_gateway_initializes_empty_registry_when_cap_is_disabled(tmp_path):
+    config = GatewayConfig(
+        platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***")},
+        max_concurrent_sessions=None,
+        sessions_dir=tmp_path / "sessions",
+    )
+
+    GatewayRunner(config)
+
+    registry = Path(os.environ["HERMES_HOME"]) / "runtime" / "active_sessions.json"
+    assert json.loads(registry.read_text(encoding="utf-8")) == {"entries": []}
 
 
 def _occupy_session(runner: GatewayRunner, chat_id: str = "busy"):

@@ -21,7 +21,9 @@ The guard fails closed unless all of these are true before candidate activation:
 
 - `gateway_state.json` is fresh and identifies the live systemd `MainPID` with matching process start time;
 - `gateway_state=draining`, `drain_quiesced=true`, and all persisted work counters are zero;
-- the cross-process active-session registry has no live leases;
+- the cross-process active-session registry exists, is structurally valid, and
+  has no live leases; every lease must carry a PID plus matching `/proc` start
+  ticks, while stale, reused, foreign, or uninspectable identities fail closed;
 - `state.db` has no non-expired compression lock;
 - every process in the gateway service cgroup has the same PID/start-time identity
   captured before the drain request; a new process, a reused PID, or an
@@ -44,6 +46,10 @@ Rollback requires proof roles for:
 - `dashboard_service` when `dashboard_unit` is set
 
 `systemctl is-active` is therefore never sufficient by itself.
+
+The gateway materializes this registry at startup, and CLI, TUI, and gateway
+turns maintain leases even when `max_concurrent_sessions` is unset or unlimited.
+That setting controls admission only; it does not disable recovery evidence.
 
 ## Artifact contract
 

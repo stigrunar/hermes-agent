@@ -10,6 +10,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from hermes_cli import active_sessions
+
 _original_stdout = sys.stdout
 
 
@@ -38,6 +40,8 @@ def server():
         # next test a clean slate; _methods is NOT cleared because it's
         # populated at module import time and re-registration only happens
         # via reload (which we don't do).
+        for session in list(mod._sessions.values()):
+            mod._release_active_session_slot(session)
         mod._sessions.clear()
         mod._pending.clear()
         mod._answers.clear()
@@ -1041,12 +1045,9 @@ def test_sync_session_key_after_compress_reanchors_active_session_lease(
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
 
-    from hermes_cli.active_sessions import (
-        active_session_registry_snapshot,
-        try_acquire_active_session,
-    )
+    monkeypatch.setattr(active_sessions, "get_hermes_home", lambda: home)
 
-    lease, message = try_acquire_active_session(
+    lease, message = active_sessions.try_acquire_active_session(
         session_id="session-old",
         surface="tui",
         config={"max_concurrent_sessions": 1},
@@ -1072,7 +1073,7 @@ def test_sync_session_key_after_compress_reanchors_active_session_lease(
     with patch.dict(sys.modules, {"tools.approval": fake_approval}):
         server._sync_session_key_after_compress("ui-1", session)
 
-    snapshot = active_session_registry_snapshot()
+    snapshot = active_sessions.active_session_registry_snapshot()
     assert session["session_key"] == "session-new"
     assert lease.session_id == "session-new"
     assert [entry["session_id"] for entry in snapshot] == ["session-new"]

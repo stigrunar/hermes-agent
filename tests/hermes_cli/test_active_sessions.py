@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import subprocess
@@ -5,6 +6,8 @@ import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+
+import pytest
 
 from hermes_cli import active_sessions
 
@@ -74,6 +77,72 @@ def test_active_session_lease_blocks_until_release(tmp_path, monkeypatch):
     assert next_lease is not None
     next_lease.release()
     assert active_sessions.active_session_registry_snapshot() == []
+
+
+def test_disabled_cap_still_tracks_active_work_and_leaves_empty_registry(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="uncapped-session",
+        surface="gateway:telegram",
+        config={},
+    )
+
+    assert message is None
+    assert lease is not None
+    assert lease.enabled is True
+    snapshot = active_sessions.active_session_registry_snapshot()
+    assert [entry["session_id"] for entry in snapshot] == ["uncapped-session"]
+    assert snapshot[0]["process_start_ticks"] == active_sessions._process_start_ticks(os.getpid())
+
+    lease.release()
+
+    state_path = home / "runtime" / "active_sessions.json"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"entries": []}
+
+
+def test_initialize_registry_creates_truthful_empty_proof_but_rejects_corruption(
+    tmp_path, monkeypatch
+):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    active_sessions.initialize_active_session_registry()
+
+    state_path = home / "runtime" / "active_sessions.json"
+    assert json.loads(state_path.read_text(encoding="utf-8")) == {"entries": []}
+
+    state_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(active_sessions.ActiveSessionRegistryError, match="cannot read"):
+        active_sessions.initialize_active_session_registry()
+    assert state_path.read_text(encoding="utf-8") == "not-json"
+
+
+def test_foreign_lease_object_cannot_release_owned_registry_entry(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="owned-session",
+        surface="cli",
+        config={},
+    )
+    assert lease is not None and message is None
+
+    foreign = active_sessions.ActiveSessionLease(
+        lease_id=lease.lease_id,
+        session_id=lease.session_id,
+        surface=lease.surface,
+        pid=lease.pid + 1,
+        process_start_ticks=lease.process_start_ticks,
+    )
+    foreign.release()
+
+    assert [entry["session_id"] for entry in active_sessions.active_session_registry_snapshot()] == [
+        "owned-session"
+    ]
+    lease.release()
 
 
 def test_active_session_registry_prunes_dead_pids(tmp_path, monkeypatch):

@@ -21,6 +21,10 @@ from hermes_constants import get_hermes_home
 logger = logging.getLogger(__name__)
 
 
+class ActiveSessionRegistryError(RuntimeError):
+    """The cross-process active-session registry cannot be trusted."""
+
+
 def coerce_max_concurrent_sessions(value: Any, key: str = "max_concurrent_sessions") -> Optional[int]:
     """Return a positive integer cap, or None when disabled/invalid."""
     if value is None:
@@ -148,13 +152,18 @@ def _read_entries(path: Path) -> list[dict[str, Any]]:
             data = json.load(fh)
     except FileNotFoundError:
         return []
-    except Exception:
-        logger.warning("Ignoring corrupt active session registry at %s", path)
-        return []
+    except Exception as exc:
+        raise ActiveSessionRegistryError(
+            f"cannot read active session registry at {path}: {exc}"
+        ) from exc
     entries = data.get("entries") if isinstance(data, dict) else data
     if not isinstance(entries, list):
-        return []
-    return [entry for entry in entries if isinstance(entry, dict)]
+        raise ActiveSessionRegistryError(f"active session registry is malformed at {path}")
+    if not all(isinstance(entry, dict) for entry in entries):
+        raise ActiveSessionRegistryError(
+            f"active session registry contains malformed entry at {path}"
+        )
+    return entries
 
 
 def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
@@ -173,6 +182,15 @@ def _process_start_time(pid: int) -> Optional[float]:
 
         return float(psutil.Process(pid).create_time())
     except Exception:
+        return None
+
+
+def _process_start_ticks(pid: int) -> Optional[int]:
+    """Return Linux /proc start ticks for stdlib-only external verifiers."""
+    try:
+        tail = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").rsplit(")", 1)[1].split()
+        return int(tail[19])
+    except (OSError, IndexError, ValueError):
         return None
 
 
@@ -224,6 +242,8 @@ class ActiveSessionLease:
     surface: str
     enabled: bool = True
     released: bool = False
+    pid: int = 0
+    process_start_ticks: Optional[int] = None
 
     def release(self) -> None:
         if self.released or not self.enabled:
@@ -240,26 +260,21 @@ def try_acquire_active_session(
 ) -> tuple[Optional[ActiveSessionLease], Optional[str]]:
     """Acquire an active-session slot.
 
-    Returns ``(lease, None)`` on success.  When the cap is disabled, the lease is
-    a no-op object so callers can unconditionally call ``release()``.
+    Returns ``(lease, None)`` on success. The registry always tracks live work;
+    ``max_concurrent_sessions`` controls rejection only.
     """
     max_sessions = resolve_max_concurrent_sessions(config)
     lease_id = uuid.uuid4().hex
-    if max_sessions is None:
-        return ActiveSessionLease(
-            lease_id=lease_id,
-            session_id=session_id,
-            surface=surface,
-            enabled=False,
-        ), None
-
     now = time.time()
+    owner_pid = os.getpid()
+    owner_start_ticks = _process_start_ticks(owner_pid)
     entry = {
         "lease_id": lease_id,
         "session_id": str(session_id),
         "surface": str(surface),
-        "pid": os.getpid(),
-        "process_start_time": _process_start_time(os.getpid()),
+        "pid": owner_pid,
+        "process_start_time": _process_start_time(owner_pid),
+        "process_start_ticks": owner_start_ticks,
         "started_at": now,
         "updated_at": now,
     }
@@ -276,7 +291,7 @@ def try_acquire_active_session(
         if pruned:
             logger.info("Pruned %d stale active session lease(s)", pruned)
         active_count = len(entries)
-        if active_count >= max_sessions:
+        if max_sessions is not None and active_count >= max_sessions:
             _write_entries(state_path, entries)
             logger.info(
                 "Active session limit reached: active=%d max=%d surface=%s",
@@ -292,6 +307,8 @@ def try_acquire_active_session(
         lease_id=lease_id,
         session_id=str(session_id),
         surface=str(surface),
+        pid=owner_pid,
+        process_start_ticks=owner_start_ticks,
     ), None
 
 
@@ -303,7 +320,11 @@ def release_active_session(lease: ActiveSessionLease) -> None:
             kept = [
                 entry
                 for entry in entries
-                if str(entry.get("lease_id") or "") != lease.lease_id
+                if not (
+                    str(entry.get("lease_id") or "") == lease.lease_id
+                    and entry.get("pid") == lease.pid
+                    and entry.get("process_start_ticks") == lease.process_start_ticks
+                )
             ]
             if len(kept) != len(entries):
                 _write_entries(state_path, kept)
@@ -332,7 +353,11 @@ def transfer_active_session(
         entries = _prune_dead(_read_entries(state_path))
         updated = False
         for entry in entries:
-            if str(entry.get("lease_id") or "") != lease.lease_id:
+            if not (
+                str(entry.get("lease_id") or "") == lease.lease_id
+                and entry.get("pid") == lease.pid
+                and entry.get("process_start_ticks") == lease.process_start_ticks
+            ):
                 continue
             entry["session_id"] = new_session_id
             entry["updated_at"] = time.time()
@@ -355,3 +380,11 @@ def active_session_registry_snapshot() -> list[dict[str, Any]]:
         entries = _prune_dead(_read_entries(state_path))
         _write_entries(state_path, entries)
         return entries
+
+
+def initialize_active_session_registry() -> None:
+    """Create/prune the registry without converting corrupt evidence to idle."""
+    state_path = _state_path()
+    with _FileLock(_lock_path()):
+        entries = _prune_dead(_read_entries(state_path))
+        _write_entries(state_path, entries)

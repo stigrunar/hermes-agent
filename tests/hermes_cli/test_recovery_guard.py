@@ -357,6 +357,72 @@ def test_drain_rejects_counter_zero_when_live_session_evidence_is_unavailable(
 
 
 @pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("not-json", "cannot read JSON"),
+        ('{"entries": {}}', "active session registry is malformed"),
+        ('{"entries": [null]}', "contains malformed entry"),
+        ('{"entries": [{"pid": 123}]}', "uninspectable lease identity"),
+    ],
+)
+def test_drain_rejects_corrupt_or_malformed_active_session_evidence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    contents: str,
+    message: str,
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    sessions_path.write_text(contents, encoding="utf-8")
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
+
+    with pytest.raises(GuardError, match=message):
+        supervisor._drain_is_safe()
+
+
+def test_drain_rejects_live_inflight_session_and_stale_or_foreign_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid in {111, 222})
+    monkeypatch.setattr(recovery_guard, "_process_start_time", lambda pid: 22 if pid == 222 else 1)
+
+    entry = {
+        "lease_id": "live-lease",
+        "session_id": "in-flight",
+        "surface": "gateway:telegram",
+        "pid": 222,
+        "process_start_ticks": 22,
+        "started_at": clock.now(),
+        "updated_at": clock.now(),
+    }
+    _write_json(sessions_path, {"entries": [entry]})
+    with pytest.raises(GuardError, match="sessions=1"):
+        supervisor._drain_is_safe()
+
+    entry["process_start_ticks"] = 21
+    _write_json(sessions_path, {"entries": [entry]})
+    with pytest.raises(GuardError, match="process identity"):
+        supervisor._drain_is_safe()
+
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid == 111)
+    _write_json(sessions_path, {"entries": [entry]})
+    with pytest.raises(GuardError, match="stale active session lease"):
+        supervisor._drain_is_safe()
+
+
+@pytest.mark.parametrize(
     "start_time",
     [None, 0, -1, True, "1", 1.5],
     ids=["missing", "zero", "negative", "bool", "string", "float"],
@@ -516,7 +582,20 @@ def test_drain_rejects_active_session_even_when_its_process_identity_is_preexist
     clock = FakeClock()
     plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
     _write_json(state_path, _runtime(111, 1, clock, "draining"))
-    _write_json(sessions_path, {"entries": [{"pid": 444, "session_key": "active"}]})
+    _write_json(
+        sessions_path,
+        {
+            "entries": [
+                {
+                    "lease_id": "active-lease",
+                    "session_id": "active",
+                    "surface": "gateway:telegram",
+                    "pid": 444,
+                    "process_start_ticks": 40,
+                }
+            ]
+        },
+    )
     starts = {111: 1, 444: 40}
     monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid in starts)
     monkeypatch.setattr(recovery_guard, "_process_start_time", starts.get)

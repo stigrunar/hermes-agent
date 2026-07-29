@@ -308,8 +308,15 @@ class RecoverySupervisor:
                 pid = int(entry.get("pid", 0))
             except (TypeError, ValueError):
                 pid = 0
-            if pid > 0 and _pid_alive(pid):
-                active.append(entry)
+            start_time = entry.get("process_start_ticks")
+            if pid <= 0 or isinstance(start_time, bool) or not isinstance(start_time, int):
+                raise GuardError("active session registry contains uninspectable lease identity")
+            if not _pid_alive(pid):
+                raise GuardError("active session registry contains stale active session lease")
+            observed_start = _process_start_time(pid)
+            if observed_start is None or observed_start != start_time:
+                raise GuardError("active session lease process identity is stale or foreign")
+            active.append(entry)
         return active
 
     def _compression_locks(self) -> int:
