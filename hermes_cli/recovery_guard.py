@@ -801,6 +801,7 @@ class RecoverySupervisor:
         return 1
 
     def run(self) -> int:
+        armed = False
         try:
             candidate = self._verify_artifact("candidate")
             rollback = self._verify_artifact("rollback")
@@ -809,7 +810,6 @@ class RecoverySupervisor:
             self.old_start_time = state.get("start_time")
             self.old_service_processes = self._service_processes(self.old_pid)
             self.legacy_incumbent_evidence = self._legacy_incumbent_proof()
-            self._write_owned_drain(self.old_pid)
             self.receipt.event(
                 "armed",
                 supervisor_pid=os.getpid(),
@@ -828,6 +828,8 @@ class RecoverySupervisor:
                     "rollback_seconds": float(self.plan.get("rollback_deadline_seconds", 120.0)),
                 },
             )
+            armed = True
+            self._write_owned_drain(self.old_pid)
             drain_evidence = self._wait_for_drain()
             self.receipt.event("drain_proved", evidence=drain_evidence)
             self._transition_to_candidate()
@@ -841,6 +843,15 @@ class RecoverySupervisor:
                 "success_proofs", float(self.plan.get("readiness_deadline_seconds", 120.0))
             )
         except Exception as exc:
+            if not armed:
+                self.receipt.final(
+                    "prearm_failed",
+                    error=str(exc),
+                    evidence_phase=self.evidence_phase,
+                    legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+                    candidate_identity=self.plan["candidate_identity"],
+                )
+                return 2
             rollback = self.plan.get("rollback")
             if not isinstance(rollback, dict):
                 self.receipt.final(

@@ -254,6 +254,75 @@ def test_success_path_disarms_only_after_identity_health_and_ownership_proofs(
     } in result["proofs"]
 
 
+def test_stale_healthy_incumbent_fails_before_arm_without_invoking_service_artifacts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    clock.value += 11
+    commands: list[list[str]] = []
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        commands.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    supervisor = TestSupervisor(
+        plan_path,
+        ops=GuardOps(now=clock.now, sleep=clock.sleep, run=run),
+    )
+
+    assert supervisor.run() == 2
+    assert commands == []
+    assert not (tmp_path / ".drain_request.json").exists()
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result["outcome"] == "prearm_failed"
+    assert "runtime state is stale" in result["error"]
+    events = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert '"phase": "armed"' not in events
+    assert '"phase": "rollback_started"' not in events
+    assert '"phase": "candidate_command"' not in events
+    assert '"phase": "rollback_command"' not in events
+
+
+def test_drain_timeout_after_durable_arm_runs_verified_rollback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    commands: list[list[str]] = []
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        commands.append(argv)
+        if argv == [str(tmp_path / "rollback.sh")]:
+            _write_json(state_path, _runtime(333, 3, clock))
+            return subprocess.CompletedProcess(argv, 0, "prior runtime restored", "")
+        if argv == ["gateway-service-proof"]:
+            return subprocess.CompletedProcess(argv, 0, "active\n", "")
+        raise AssertionError(f"unexpected command: {argv}")
+
+    supervisor = TestSupervisor(
+        plan_path,
+        ops=GuardOps(
+            now=clock.now,
+            sleep=clock.sleep,
+            run=run,
+            http_json=lambda url, timeout: {"status": "ok", "runtime": "prior"},
+        ),
+    )
+
+    assert supervisor.run() == 1
+    assert [str(tmp_path / "candidate.sh")] not in commands
+    assert [str(tmp_path / "rollback.sh")] in commands
+    assert not (tmp_path / ".drain_request.json").exists()
+    result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
+    assert result["outcome"] == "rolled_back"
+    assert "drain deadline exceeded" in result["trigger"]
+    events = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
+    assert events.index('"phase": "armed"') < events.index('"phase": "rollback_started"')
+
+
 def test_candidate_readiness_timeout_runs_verified_rollback_and_probes_prior_runtime(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

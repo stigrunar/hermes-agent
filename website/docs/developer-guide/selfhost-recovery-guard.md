@@ -15,6 +15,13 @@ The command does not stop or replace the live gateway itself. It:
 
 The transient service then owns the whole disruptive sequence. It requests drain for the exact old gateway PID, rejects stale or counter-only drain state, activates the candidate, and either disarms after all mandatory proofs or restores the prior runtime.
 
+Before writing `armed`, the supervisor validates both sealed artifacts, the fresh
+live incumbent identity, its service cgroup, and the independent legacy-incumbent
+proof. A failure in this pre-arm phase records `prearm_failed` and exits without
+requesting drain or invoking either service artifact. The durable `armed` event is
+written before the drain request; once that disruptive sequence begins, any later
+failure retains the fail-closed verified rollback path.
+
 ## Safety contract
 
 The guard has two explicit evidence phases and fails closed unless the applicable
