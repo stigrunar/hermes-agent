@@ -689,7 +689,7 @@ def test_install_manifest_allows_private_review_ref_without_activation_or_public
         mutation_boundary
     )
     assert manifest["post_closeout_sequence"][0].startswith("Hermes creates")
-    assert manifest["contract_id"] == "ARCHITECT-HARDEN-02-SKRUE-RECUT-R1"
+    assert manifest["contract_id"] == "ARCHITECT-TARGET-BINDING-R1"
     assert "profile_candidates/dollyarchitect/profile.yaml" in manifest["source_files"]
     assert "hermes_cli/kanban_decompose.py" in manifest["source_files"]
     assert "tools/kanban_tools.py" in manifest["source_files"]
