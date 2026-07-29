@@ -250,8 +250,12 @@ class RecoverySupervisor:
         start = state.get("start_time")
         if not isinstance(pid, int) or pid <= 0 or not _pid_alive(pid):
             raise GuardError("gateway runtime PID is not live")
+        if isinstance(start, bool) or not isinstance(start, int) or start <= 0:
+            raise GuardError("gateway runtime state lacks a valid positive start_time")
         observed_start = _process_start_time(pid)
-        if observed_start is not None and start is not None and int(start) != observed_start:
+        if isinstance(observed_start, bool) or not isinstance(observed_start, int) or observed_start <= 0:
+            raise GuardError("gateway runtime PID live start_time is unavailable or invalid")
+        if start != observed_start:
             raise GuardError("gateway runtime PID start_time does not match live process")
         return state
 

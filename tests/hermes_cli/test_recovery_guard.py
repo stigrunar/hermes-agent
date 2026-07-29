@@ -344,6 +344,75 @@ def test_drain_rejects_counter_zero_when_live_session_evidence_is_unavailable(
         supervisor._drain_is_safe()
 
 
+@pytest.mark.parametrize(
+    "start_time",
+    [None, 0, -1, True, "1", 1.5],
+    ids=["missing", "zero", "negative", "bool", "string", "float"],
+)
+def test_runtime_state_rejects_missing_or_invalid_persisted_start_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    start_time: object,
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    state = _runtime(111, 1, clock)
+    if start_time is None:
+        state.pop("start_time")
+    else:
+        state["start_time"] = start_time
+    _write_json(state_path, state)
+
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+    with pytest.raises(GuardError, match="valid positive start_time"):
+        supervisor._runtime_state()
+
+
+@pytest.mark.parametrize(
+    ("live_start_time", "message"),
+    [(None, "unavailable or invalid"), (0, "unavailable or invalid"), (True, "unavailable or invalid"), (2, "does not match")],
+    ids=["unavailable", "zero", "bool", "mismatch"],
+)
+def test_runtime_state_rejects_unavailable_invalid_or_mismatched_live_start_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    live_start_time: object,
+    message: str,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    monkeypatch.setattr(recovery_guard, "_process_start_time", lambda pid: live_start_time)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+    with pytest.raises(GuardError, match=message):
+        supervisor._runtime_state()
+
+
+def test_drain_and_candidate_identity_paths_fail_closed_without_complete_start_time_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+
+    drain_state = _runtime(111, 1, clock, "draining")
+    drain_state.pop("start_time")
+    _write_json(state_path, drain_state)
+    with pytest.raises(GuardError, match="valid positive start_time"):
+        supervisor._drain_is_safe()
+
+    _write_json(state_path, _runtime(222, 2, clock))
+    monkeypatch.setattr(recovery_guard, "_process_start_time", lambda pid: None)
+    with pytest.raises(GuardError, match="live start_time is unavailable"):
+        supervisor._runtime_identity_proof()
+
+
 def test_arm_seals_guard_and_artifacts_before_systemd_user_launch(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
