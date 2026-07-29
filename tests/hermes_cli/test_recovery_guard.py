@@ -562,6 +562,119 @@ def test_candidate_phase_is_reloaded_and_remains_strict_after_reconstruction(
         reconstructed._candidate_session_evidence()
 
 
+def test_candidate_phase_without_transition_receipt_fails_closed_on_reconstruction(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    supervisor.receipt.events_path.unlink()
+
+    with pytest.raises(GuardError, match="requires exactly one durable transition"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
+@pytest.mark.parametrize(
+    ("contents", "message"),
+    [
+        ("not-json\n", "cannot recover durable evidence phase"),
+        ('{"phase": "evidence_phase_transition"}\n', "transition mismatch contract"),
+    ],
+    ids=["malformed-json", "phase-only"],
+)
+def test_candidate_phase_rejects_malformed_transition_receipt(
+    tmp_path: Path,
+    contents: str,
+    message: str,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    supervisor.receipt.events_path.write_text(contents, encoding="utf-8")
+
+    with pytest.raises(GuardError, match=message):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
+def test_candidate_phase_rejects_duplicate_transition_receipts(tmp_path: Path) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    event = supervisor.receipt.events_path.read_text(encoding="utf-8")
+    supervisor.receipt.events_path.write_text(event + event, encoding="utf-8")
+
+    with pytest.raises(GuardError, match="requires exactly one durable transition"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("contract", "wrong-contract"),
+        ("run_id", "wrong-run"),
+        ("legacy_incumbent_identity", {"commit": "a" * 40, "tree": "b" * 40}),
+        ("candidate_identity", {"commit": "e" * 40, "tree": "f" * 40}),
+        ("from_phase", recovery_guard.CANDIDATE_PHASE),
+        ("to_phase", recovery_guard.LEGACY_INCUMBENT_PHASE),
+        ("active_session_registry", False),
+    ],
+    ids=[
+        "contract",
+        "run-id",
+        "legacy-identity",
+        "candidate-identity",
+        "from-phase",
+        "to-phase",
+        "false-registry-marker",
+    ],
+)
+def test_candidate_phase_rejects_transition_contract_mismatch(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    event = json.loads(supervisor.receipt.events_path.read_text(encoding="utf-8"))
+    event[field] = value
+    supervisor.receipt.events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    with pytest.raises(GuardError, match=f"transition mismatch {field}"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
+def test_candidate_phase_rejects_transition_without_registry_marker(tmp_path: Path) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    event = json.loads(supervisor.receipt.events_path.read_text(encoding="utf-8"))
+    event.pop("active_session_registry")
+    supervisor.receipt.events_path.write_text(json.dumps(event) + "\n", encoding="utf-8")
+
+    with pytest.raises(GuardError, match="transition mismatch active_session_registry"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
+def test_transition_receipt_is_rejected_while_durable_phase_is_legacy(tmp_path: Path) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    _write_json(
+        supervisor.phase_path,
+        supervisor._phase_payload(recovery_guard.LEGACY_INCUMBENT_PHASE),
+    )
+
+    with pytest.raises(GuardError, match="transition requires durable candidate phase"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+
 def test_transition_receipt_without_durable_phase_fails_closed_on_reconstruction(
     tmp_path: Path,
 ) -> None:

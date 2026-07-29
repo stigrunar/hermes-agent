@@ -300,18 +300,21 @@ class RecoverySupervisor:
         }
 
     def _load_evidence_phase(self) -> str:
-        transitioned = False
+        transition_events: list[dict[str, Any]] = []
         if self.receipt.events_path.exists():
             try:
-                transitioned = any(
-                    json.loads(line).get("phase") == "evidence_phase_transition"
-                    for line in self.receipt.events_path.read_text(encoding="utf-8").splitlines()
-                    if line.strip()
-                )
-            except (OSError, ValueError, AttributeError) as exc:
+                for line in self.receipt.events_path.read_text(encoding="utf-8").splitlines():
+                    if not line.strip():
+                        continue
+                    event = json.loads(line)
+                    if not isinstance(event, dict):
+                        raise ValueError("event record is not an object")
+                    if event.get("phase") == "evidence_phase_transition":
+                        transition_events.append(event)
+            except (OSError, ValueError) as exc:
                 raise GuardError(f"cannot recover durable evidence phase: {exc}") from exc
         if not self.phase_path.exists():
-            if transitioned:
+            if transition_events:
                 raise GuardError("durable candidate evidence phase is missing after transition")
             return LEGACY_INCUMBENT_PHASE
         payload = _read_json(self.phase_path)
@@ -320,8 +323,33 @@ class RecoverySupervisor:
         phase = payload.get("phase")
         if phase not in {LEGACY_INCUMBENT_PHASE, CANDIDATE_PHASE}:
             raise GuardError(f"unknown durable recovery evidence phase: {phase!r}")
-        if transitioned and phase != CANDIDATE_PHASE:
-            raise GuardError("durable recovery evidence phase regressed after transition")
+        if phase != CANDIDATE_PHASE and transition_events:
+            raise GuardError(
+                "durable recovery evidence phase regressed after transition; "
+                "transition requires durable candidate phase"
+            )
+        if phase == CANDIDATE_PHASE:
+            if len(transition_events) != 1:
+                raise GuardError(
+                    "durable candidate evidence phase requires exactly one durable transition"
+                )
+            expected_transition = {
+                "contract": "HRI-SELFHOST-OUTOFBAND-RECOVERY-GUARD-V1",
+                "run_id": self.run_id,
+                "phase": "evidence_phase_transition",
+                "from_phase": LEGACY_INCUMBENT_PHASE,
+                "to_phase": CANDIDATE_PHASE,
+                "legacy_incumbent_identity": self.plan["legacy_incumbent_identity"],
+                "candidate_identity": self.plan["candidate_identity"],
+                "active_session_registry": "mandatory",
+            }
+            transition = transition_events[0]
+            for field, wanted in expected_transition.items():
+                if transition.get(field) != wanted:
+                    raise GuardError(
+                        f"transition mismatch {field}: expected {wanted!r}, "
+                        f"got {transition.get(field)!r}"
+                    )
         assert isinstance(phase, str)
         return phase
 
