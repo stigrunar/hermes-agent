@@ -211,6 +211,7 @@ Final outcomes:
 
 - `activated` (exit 0): candidate identity, endpoint health, and ownership proofs passed
 - `rolled_back` (exit 1): candidate failed or timed out; prior runtime and service proofs passed
+- `prearm_failed` (exit 2): pre-arm validation failed; no drain was requested and no candidate or rollback artifact command was invoked
 - `rollback_failed` / `rollback_unavailable` (exit 2): local operator intervention is required
 
 Inspect the durable receipt directly; do not infer success from the gateway process being active or from notifier delivery.
