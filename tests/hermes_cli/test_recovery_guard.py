@@ -35,6 +35,15 @@ class TestSupervisor(RecoverySupervisor):
         return [expected_main_pid]
 
 
+class CgroupSupervisor(RecoverySupervisor):
+    __test__ = False
+
+    service_pids: list[int]
+
+    def _service_pids(self, expected_main_pid: int) -> list[int]:
+        return self.service_pids
+
+
 def _write_json(path: Path, body: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(body), encoding="utf-8")
@@ -305,6 +314,7 @@ def test_drain_rejects_state_zero_when_compression_lock_is_live(
     supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
     supervisor.old_pid = 111
     supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
 
     with pytest.raises(GuardError, match="compression_locks=1"):
         supervisor._drain_is_safe()
@@ -322,6 +332,7 @@ def test_drain_rejects_stale_state_even_when_all_counters_are_zero(
     supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
     supervisor.old_pid = 111
     supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
 
     with pytest.raises(GuardError, match="runtime state is stale"):
         supervisor._drain_is_safe()
@@ -339,6 +350,7 @@ def test_drain_rejects_counter_zero_when_live_session_evidence_is_unavailable(
     supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
     supervisor.old_pid = 111
     supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
 
     with pytest.raises(GuardError, match="active session registry is unavailable"):
         supervisor._drain_is_safe()
@@ -400,6 +412,7 @@ def test_drain_and_candidate_identity_paths_fail_closed_without_complete_start_t
     supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
     supervisor.old_pid = 111
     supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
 
     drain_state = _runtime(111, 1, clock, "draining")
     drain_state.pop("start_time")
@@ -411,6 +424,110 @@ def test_drain_and_candidate_identity_paths_fail_closed_without_complete_start_t
     monkeypatch.setattr(recovery_guard, "_process_start_time", lambda pid: None)
     with pytest.raises(GuardError, match="live start_time is unavailable"):
         supervisor._runtime_identity_proof()
+
+
+def test_drain_allows_only_unchanged_persistent_gateway_unit_processes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    starts = {111: 1, 444: 40, 555: 50}
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid in starts)
+    monkeypatch.setattr(recovery_guard, "_process_start_time", starts.get)
+    supervisor = CgroupSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.service_pids = [111, 444, 555]
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1, 444: 40, 555: 50}
+
+    evidence = supervisor._drain_is_safe()
+
+    assert evidence["persistent_cgroup_processes"] == {444: 40, 555: 50}
+
+
+@pytest.mark.parametrize(
+    ("service_pids", "starts", "message"),
+    [
+        ([111, 444, 666], {111: 1, 444: 40, 666: 60}, "unexpected_cgroup_processes"),
+        ([111, 444], {111: 1, 444: 41}, "unexpected_cgroup_processes"),
+        ([111, 444], {111: 1, 444: None}, "start_time is unavailable"),
+    ],
+    ids=["new-descendant", "reused-pid", "unprovable-identity"],
+)
+def test_drain_rejects_unexpected_or_unprovable_gateway_unit_processes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    service_pids: list[int],
+    starts: dict[int, int | None],
+    message: str,
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid in starts)
+    monkeypatch.setattr(recovery_guard, "_process_start_time", starts.get)
+    supervisor = CgroupSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.service_pids = service_pids
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1, 444: 40}
+
+    with pytest.raises(GuardError, match=message):
+        supervisor._drain_is_safe()
+
+
+def test_drain_rejects_main_pid_identity_change_during_cgroup_inspection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    observed_starts = iter([1, 2])
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid == 111)
+    monkeypatch.setattr(recovery_guard, "_process_start_time", lambda pid: next(observed_starts))
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
+
+    with pytest.raises(GuardError, match="MainPID identity"):
+        supervisor._drain_is_safe()
+
+
+def test_drain_rejects_missing_pre_drain_cgroup_identity_snapshot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+
+    with pytest.raises(GuardError, match="not captured before drain"):
+        supervisor._drain_is_safe()
+
+
+def test_drain_rejects_active_session_even_when_its_process_identity_is_preexisting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    _write_json(sessions_path, {"entries": [{"pid": 444, "session_key": "active"}]})
+    starts = {111: 1, 444: 40}
+    monkeypatch.setattr(recovery_guard, "_pid_alive", lambda pid: pid in starts)
+    monkeypatch.setattr(recovery_guard, "_process_start_time", starts.get)
+    supervisor = CgroupSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.service_pids = [111, 444]
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = starts
+
+    with pytest.raises(GuardError, match="sessions=1"):
+        supervisor._drain_is_safe()
 
 
 def test_arm_seals_guard_and_artifacts_before_systemd_user_launch(

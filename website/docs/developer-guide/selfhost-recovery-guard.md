@@ -23,7 +23,11 @@ The guard fails closed unless all of these are true before candidate activation:
 - `gateway_state=draining`, `drain_quiesced=true`, and all persisted work counters are zero;
 - the cross-process active-session registry has no live leases;
 - `state.db` has no non-expired compression lock;
-- the gateway service cgroup contains no live process except its `MainPID`.
+- every process in the gateway service cgroup has the same PID/start-time identity
+  captured before the drain request; a new process, a reused PID, or an
+  uninspectable identity fails closed. Unchanged persistent infrastructure is
+  allowed only after the independent session, compression-lock, and explicit
+  drain-quiescence proofs above are all idle.
 
 A successful candidate must have a new live PID/start-time identity whose command line contains every configured `candidate_runtime_argv_contains` token. The plan must also contain proof roles for:
 

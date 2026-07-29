@@ -217,6 +217,7 @@ class RecoverySupervisor:
         self.drain_path = Path(self.plan["drain_path"])
         self.old_pid: int | None = None
         self.old_start_time: int | None = None
+        self.old_service_processes: dict[int, int] | None = None
 
     def _verify_artifact(self, name: str) -> dict[str, Any]:
         spec = self.plan.get(name)
@@ -366,6 +367,22 @@ class RecoverySupervisor:
                 raise GuardError(f"cannot inspect {procs}: {exc}") from exc
         return sorted(pid for pid in pids if _pid_alive(pid))
 
+    def _service_processes(self, expected_main_pid: int) -> dict[int, int]:
+        """Return exact live identities currently owned by the gateway unit."""
+        identities: dict[int, int] = {}
+        for pid in self._service_pids(expected_main_pid):
+            start_time = _process_start_time(pid)
+            if (
+                isinstance(start_time, bool)
+                or not isinstance(start_time, int)
+                or start_time <= 0
+            ):
+                raise GuardError(f"gateway cgroup PID {pid} start_time is unavailable or invalid")
+            identities[pid] = start_time
+        if identities.get(expected_main_pid) != self.old_start_time:
+            raise GuardError("gateway cgroup MainPID identity does not match runtime state")
+        return identities
+
     def _drain_is_safe(self) -> dict[str, Any]:
         if self.old_pid is None:
             raise GuardError("old gateway identity was not captured")
@@ -383,19 +400,30 @@ class RecoverySupervisor:
         _expect_fields(state, expected)
         sessions = self._active_sessions()
         locks = self._compression_locks()
-        pids = self._service_pids(self.old_pid)
-        descendants = [pid for pid in pids if pid != self.old_pid]
-        if sessions or locks or descendants:
+        if self.old_service_processes is None:
+            raise GuardError("gateway cgroup identities were not captured before drain")
+        processes = self._service_processes(self.old_pid)
+        unexpected = {
+            pid: start_time
+            for pid, start_time in processes.items()
+            if self.old_service_processes.get(pid) != start_time
+        }
+        if sessions or locks or unexpected:
             raise GuardError(
                 f"live drain evidence not idle: sessions={len(sessions)} "
-                f"compression_locks={locks} cgroup_descendants={descendants}"
+                f"compression_locks={locks} unexpected_cgroup_processes={unexpected}"
             )
         return {
             "pid": self.old_pid,
             "start_time": self.old_start_time,
             "active_sessions": 0,
             "compression_locks": 0,
-            "cgroup_pids": pids,
+            "cgroup_processes": processes,
+            "persistent_cgroup_processes": {
+                pid: start_time
+                for pid, start_time in processes.items()
+                if pid != self.old_pid
+            },
         }
 
     def _wait_for_drain(self) -> dict[str, Any]:
@@ -514,12 +542,14 @@ class RecoverySupervisor:
             state = self._runtime_state()
             self.old_pid = int(state["pid"])
             self.old_start_time = state.get("start_time")
+            self.old_service_processes = self._service_processes(self.old_pid)
             self._write_owned_drain(self.old_pid)
             self.receipt.event(
                 "armed",
                 supervisor_pid=os.getpid(),
                 old_gateway_pid=self.old_pid,
                 old_gateway_start_time=self.old_start_time,
+                old_gateway_cgroup_processes=self.old_service_processes,
                 candidate_sha256=candidate["sha256"],
                 rollback_sha256=rollback["sha256"],
             )
