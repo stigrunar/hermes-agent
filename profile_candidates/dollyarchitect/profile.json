@@ -69,6 +69,7 @@
   },
   "active_priority_exclusions": {
     "scope": "profile_local_only",
+    "supported_config_path": "skills.disabled",
     "values": [
       "contract-driven-frontend-implementation",
       "mobile-ui-verification",

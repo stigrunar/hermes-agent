@@ -1,0 +1,5 @@
+description: >-
+  A staged architecture-decision profile that defines reusable boundaries and
+  contracts, then emits a separate DollyCode handoff without implementing,
+  reviewing, releasing, or deploying.
+description_auto: false

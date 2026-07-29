@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+import shutil
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -15,6 +16,8 @@ import pytest
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_decompose as decomp
+from hermes_cli import projects_db
+from agent import profile_runtime_policy as policy
 
 
 @pytest.fixture
@@ -291,6 +294,184 @@ def test_decompose_unknown_assignee_falls_back_to_default(kanban_home):
         child = kb.get_task(conn, outcome.child_ids[0])
     # 'made_up' wasn't in roster, so assignee rewritten to 'fallback'
     assert child.assignee == "fallback"
+
+
+def _structured_task(work_kind: str, *, title: str) -> dict:
+    return {
+        "title": title,
+        "body": f"Execute the explicit {work_kind} contract.",
+        "assignee": "orchestrator",
+        "work_kind": work_kind,
+        "requested_actions": (
+            ["architecture_decision"]
+            if work_kind == "cross_repo_contract"
+            else []
+        ),
+        "architecture_document_path": None,
+        "bounded_file_cluster": ["agent/profile_runtime_policy.py"],
+        "non_goals": ["Release or deploy"],
+        "parents": [],
+    }
+
+
+def _install_architect_profile(home: Path) -> Path:
+    profile_home = home / "profiles" / "dollyarchitect"
+    overlay = profile_home / policy.OVERLAY_RELATIVE_PATH
+    overlay.mkdir(parents=True)
+    source = (
+        Path(__file__).parents[2]
+        / "profile_candidates"
+        / "dollyarchitect"
+    )
+    for name in policy.EXPECTED_OVERLAY_HASHES:
+        shutil.copyfile(source / name, overlay / name)
+    (profile_home / "config.yaml").write_text(
+        """
+model:
+  default: gpt-5.6-sol
+agent:
+  max_turns: 60
+  reasoning_effort: high
+  runtime_policy:
+    id: dollyarchitect.v1
+    enabled: true
+telegram:
+  dm_policy: allowlist
+  allow_from: ["123"]
+  group_policy: disabled
+skills:
+  disabled:
+    - contract-driven-frontend-implementation
+    - external-upstream-pr-recuts
+    - mobile-ui-verification
+    - release-candidate-evidence
+""".lstrip(),
+        encoding="utf-8",
+    )
+    return profile_home
+
+
+def test_structured_work_kinds_materialize_contract_and_named_routes(
+    kanban_home, tmp_path
+):
+    implementation_repo = tmp_path / "implementation-repo"
+    implementation_repo.mkdir()
+    (implementation_repo / ".git").mkdir()
+    with projects_db.connect_closing() as project_conn:
+        project_id = projects_db.create_project(
+            project_conn,
+            name="Target binding",
+            primary_path=str(implementation_repo),
+        )
+    workspace = tmp_path / "source-workspace"
+    workspace.mkdir()
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Route an architecture program",
+            workspace_kind="scratch",
+            workspace_path=str(workspace),
+            project_id=project_id,
+            triage=True,
+        )
+    expected = {
+        "cross_repo_contract": "dollyarchitect",
+        "implementation_code_patch": "dollycode",
+        "benchmark": "dollyqa",
+        "routine_qa_review": "dollyqa",
+        "visual_design": "dollydesign",
+        "pull_request": "dollyops",
+        "release": "dollyops",
+        "deploy": "dollyops",
+    }
+    payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "rationale": "Explicit controller routing",
+            "tasks": [
+                _structured_task(kind, title=f"Route {kind}")
+                for kind in expected
+            ],
+        }
+    )
+    names = ["orchestrator", "dollyarchitect", "dollycode", "dollyqa", "dollydesign", "dollyops"]
+    patches = _patch_list_profiles(names)
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_task(tid, author="router")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok, outcome.reason
+    with kb.connect() as conn:
+        children = [kb.get_task(conn, child_id) for child_id in outcome.child_ids]
+    assert {
+        kind: child.assignee
+        for kind, child in zip(expected, children)
+    } == expected
+    architect = children[0]
+    assert architect is not None
+    assert architect.body.count(policy.DISPATCH_MARKER) == 2
+    contract = policy._parse_exact_json_block(
+        architect.body, policy.DISPATCH_MARKER
+    )
+    assert contract["requested_actions"] == ["architecture_decision"]
+    assert contract["writable_artifact_roots"] == []
+    assert contract["architecture_document_paths"] == []
+    assert contract["project_id"] == project_id
+    assert contract["implementation_repo"] == str(implementation_repo)
+    assert contract["implementation_workspace_policy"] == (
+        "project_primary_repo_worktree"
+    )
+    assert architect.project_id == project_id
+
+    profile_home = _install_architect_profile(kanban_home)
+    spawned_workspace = tmp_path / "architect-workspace"
+    spawned_workspace.mkdir()
+    architect.workspace_path = str(spawned_workspace)
+    architect.current_run_id = 1
+    payload = policy.prepare_dollyarchitect_spawn_env(
+        task=architect,
+        workspace=str(spawned_workspace),
+        profile_name="dollyarchitect",
+        hermes_home=profile_home,
+    )
+    assert jsonlib.loads(payload)["contract"]["contract_id"] == contract["contract_id"]
+
+
+def test_architect_route_rejects_unbound_source_task(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="Unbound architecture program",
+            triage=True,
+        )
+    payload = jsonlib.dumps(
+        {
+            "fanout": True,
+            "rationale": "Must not invent a target",
+            "tasks": [_structured_task("cross_repo_contract", title="Architect")],
+        }
+    )
+    patches = _patch_list_profiles(["orchestrator", "dollyarchitect"])
+    for item in patches:
+        item.start()
+    try:
+        with _patch_aux_client(payload):
+            outcome = decomp.decompose_task(tid, author="router")
+    finally:
+        for item in patches:
+            item.stop()
+
+    assert outcome.ok is False
+    assert "trusted source project binding" in outcome.reason
+    with kb.connect() as conn:
+        source = kb.get_task(conn, tid)
+    assert source is not None
+    assert source.status == "triage"
 
 
 def test_decompose_handles_malformed_llm_json(kanban_home):

@@ -1,7 +1,8 @@
 # DollyArchitect hardening candidate
 
-Status: inactive candidate. The repository now contains a separately reviewed
-generic runtime-policy seam, but this candidate is still inert until DollyOps
+Status: inactive candidate. The repository now contains
+a DollyArchitect-specific policy consumer behind generic runtime hooks, but
+this candidate is still inert until DollyOps
 copies the immutable overlay into one named profile and adds the explicit
 profile-local activation config below. No live profile is changed by this
 candidate.
@@ -11,17 +12,22 @@ scenario grammar, code-versus-data boundaries, shared harness/adapter/UI
 primitives, cross-repository contracts, migration seams, and reuse proven by
 a materially different second scenario. Implementation, evaluation,
 benchmarking, routine QA/review, visual design, PR, release, and deployment
-tags are deterministically rerouted to the named specialist role.
+tags are deterministically classified for the named specialist role. A
+rejection is not automatic rerouting; the Kanban decomposer performs the
+assignment from explicit structured `work_kind` output before spawn.
 
-Scratch is the default workspace. Writes require a resolved
-`HERMES_KANBAN_WORKSPACE` and explicit, existing artifact roots that resolve
-strictly beneath it. Worktree mode is the narrow exception: a valid contract
-must name exactly one architecture-document path, and the guard permits only
-that resolved document while rejecting source suffixes and obvious source
-directories.
+Scratch is the default workspace. `no_edits` and `architecture_decision` are
+handoff-only and expose no write schemas, writable roots, or document paths.
+Only `write_architecture_document` enables guarded `write_file` and `patch`.
+Those writes require a resolved `HERMES_KANBAN_WORKSPACE`, explicit existing
+artifact roots that resolve strictly beneath it, and exactly one named
+architecture-document path. In scratch or worktree mode the guard permits
+only that resolved document while rejecting source suffixes and obvious
+source directories.
 
 The staged capability set is read/search, knowledge/code intelligence,
-Kanban, session search, and guarded assigned-artifact writing. Terminal is
+Kanban, session search, and action-compiled guarded architecture-document
+writing. Terminal is
 disabled because this overlay cannot enforce command, working-directory, and
 resolved-path allowlisting together. Normal cron, delegation, computer use,
 media/image, GitHub write, and deploy/release capability remain disabled.
@@ -45,7 +51,7 @@ literal delimiters (ordinary explanatory text may appear outside the block):
 
 ```text
 <!-- HERMES_ARCHITECT_DISPATCH_V1
-{"contract_id":"...","work_kind":"cross_repo_contract","workspace_kind":"scratch","writable_artifact_roots":["/absolute/workspace/artifacts"],"architecture_document_paths":[],"requested_actions":["architecture_decision"],"implementation_owner":null,"operations_owner":null}
+{"architecture_document_paths":[],"bounded_file_cluster":["agent/profile_runtime_policy.py"],"contract_id":"...","implementation_owner":null,"implementation_repo":"/absolute/project/repository","implementation_workspace_policy":"project_primary_repo_worktree","non_goals":["implementation"],"operations_owner":null,"project_id":"...","repository_identity":"repo:...","requested_actions":["architecture_decision"],"work_kind":"cross_repo_contract","workspace_kind":"scratch","writable_artifact_roots":[]}
 HERMES_ARCHITECT_DISPATCH_V1 -->
 ```
 
@@ -61,15 +67,22 @@ exactly one decision packet:
 
 ```text
 <!-- HERMES_ARCHITECTURE_DECISION_V1
-{"packet_id":"...","decision":"...","rationale":"...","constraints":["..."],"acceptance_criteria":["..."],"dollycode_owner":"DollyCode"}
+{"acceptance_criteria":["..."],"architecture_artifact":"inline:architecture-decision","constraints":["..."],"decision":"...","dollycode_owner":"DollyCode","packet_id":"...","rationale":"...","validation_hypothesis":"..."}
 HERMES_ARCHITECTURE_DECISION_V1 -->
 ```
 
 The runtime replaces that body with canonical
 `HERMES_DOLLYCODE_HANDOFF_V1` JSON containing
-`implementation_actions: []`, binds the child to the architect task, denies a
-second handoff, and denies `kanban_complete` until the first create succeeds.
-`kanban_block` remains available for a real blocker.
+`implementation_actions: []`, binds the child to the trusted source task,
+project, absolute primary repository, and dispatch contract, hashes the
+validated artifact with SHA-256, and creates a non-runnable blocked DollyCode
+card. A `project_primary_repo_worktree` contract persists the project id and
+materializes its deterministic branch from that trusted repository; the
+runtime does not accept a caller-supplied replacement repo or workspace path.
+A stable internal idempotency key makes crash/reclaim retries reuse only an
+exact matching handoff; conflicting create content fails closed. The runtime
+denies a second handoff in one run and denies `kanban_complete` until create
+succeeds. `kanban_block` remains available for a real blocker.
 
 ## Reviewed activation (DollyOps only, later)
 
@@ -79,10 +92,14 @@ Hermes data root for `/srv/hermes`, DollyOps must:
 
 1. Confirm `HERMES_PROFILE=dollyarchitect` will resolve to exactly
    `/srv/hermes/profiles/dollyarchitect`.
-2. Create `/srv/hermes/profiles/dollyarchitect/runtime_policy/dollyarchitect`
+2. Back up `/srv/hermes/profiles/dollyarchitect/profile.yaml` if present,
+   install the reviewed `profile.yaml` candidate at that exact profile-local
+   path, and verify that `hermes_cli.profiles.read_profile_meta` returns the
+   exact reviewed description with `description_auto: false`.
+3. Create `/srv/hermes/profiles/dollyarchitect/runtime_policy/dollyarchitect`
    and copy only the four reviewed files there, preserving their reviewed
    bytes. Do not copy the writable install manifest as an integrity source.
-3. Add this profile-local configuration to
+4. Add this profile-local configuration to
    `/srv/hermes/profiles/dollyarchitect/config.yaml`, preserving any existing
    provider credentials unchanged:
 
@@ -100,9 +117,15 @@ telegram:
   allow_from:
     - "<one-or-more-private-human-user-ids>"
   group_policy: disabled
+skills:
+  disabled:
+    - contract-driven-frontend-implementation
+    - external-upstream-pr-recuts
+    - mobile-ui-verification
+    - release-candidate-evidence
 ```
 
-4. Review the installed bytes against the code-owned SHA-256 pins in
+5. Review the installed bytes against the code-owned SHA-256 pins in
    `agent/profile_runtime_policy.py`. A missing file, extra file, symlink,
    edited manifest, config drift, identity mismatch, or hash mismatch fails
    closed. Then run a profile-load/schema smoke and a non-spawning rejected

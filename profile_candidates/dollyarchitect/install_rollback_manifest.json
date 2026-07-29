@@ -1,12 +1,13 @@
 {
   "manifest_version": 1,
-  "contract_id": "ARCHITECT-HARDEN-01-RUNTIME-WIRING-R1",
+  "contract_id": "ARCHITECT-TARGET-BINDING-R1",
   "status": "inactive_candidate",
   "activation": false,
   "exact_files": [
     "profile_candidates/dollyarchitect/__init__.py",
     "profile_candidates/dollyarchitect/hardening.py",
     "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/profile.yaml",
     "profile_candidates/dollyarchitect/measurement_schema.json",
     "profile_candidates/dollyarchitect/install_rollback_manifest.json",
     "profile_candidates/dollyarchitect/README.md",
@@ -15,13 +16,18 @@
     "model_tools.py",
     "hermes_cli/middleware.py",
     "hermes_cli/kanban_db.py",
+    "hermes_cli/kanban_decompose.py",
+    "tools/kanban_tools.py",
+    "tests/hermes_cli/test_kanban_decompose.py",
     "tests/profile_candidates/test_dollyarchitect_hardening.py",
-    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py"
+    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py",
+    "tests/tools/test_kanban_tools.py"
   ],
   "source_files": [
     "profile_candidates/dollyarchitect/__init__.py",
     "profile_candidates/dollyarchitect/hardening.py",
     "profile_candidates/dollyarchitect/profile.json",
+    "profile_candidates/dollyarchitect/profile.yaml",
     "profile_candidates/dollyarchitect/measurement_schema.json",
     "profile_candidates/dollyarchitect/install_rollback_manifest.json",
     "profile_candidates/dollyarchitect/README.md",
@@ -29,37 +35,45 @@
     "agent/agent_init.py",
     "model_tools.py",
     "hermes_cli/middleware.py",
-    "hermes_cli/kanban_db.py"
+    "hermes_cli/kanban_db.py",
+    "hermes_cli/kanban_decompose.py",
+    "tools/kanban_tools.py"
   ],
   "verification_files": [
     "tests/profile_candidates/test_dollyarchitect_hardening.py",
-    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py"
+    "tests/profile_candidates/test_dollyarchitect_runtime_policy.py",
+    "tests/hermes_cli/test_kanban_decompose.py",
+    "tests/tools/test_kanban_tools.py"
   ],
-  "install_destination_concept": "After closeout approval only, DollyOps copies the four code-hash-pinned immutable overlay files to <resolved DollyArchitect HERMES_HOME>/runtime_policy/dollyarchitect and adds the exact profile-local agent.runtime_policy activation mapping; shared skills remain untouched.",
+  "install_destination_concept": "After closeout approval only, DollyOps copies the four code-hash-pinned immutable overlay files to <resolved DollyArchitect HERMES_HOME>/runtime_policy/dollyarchitect, installs the reviewed profile.yaml profile-locally with backup and metadata-reader readback, and adds the exact profile-local agent.runtime_policy activation plus skills.disabled mappings; shared skills remain untouched.",
   "install_actions": [
     "verify a Hermes-created candidate commit and tree after closeout",
     "review the candidate package and scoped verification receipts",
     "have DollyOps copy the four reviewed immutable files into the fixed profile-local overlay",
+    "back up any existing profile.yaml, install the reviewed profile.yaml profile-locally, and verify exact description readback through hermes_cli.profiles.read_profile_meta",
     "have DollyOps add the exact two-field agent.runtime_policy activation mapping and required model/agent/Telegram invariants",
+    "have DollyOps add all four reviewed profile-local exclusions to skills.disabled without changing shared skills",
     "run profile-load, schema, rejected-dispatch, and accepted no-side-effect smoke checks before scheduling a real card"
   ],
   "rollback_actions": [
     "set agent.runtime_policy.enabled to false or remove the exact mapping before overlay removal",
     "verify the policy no longer loads, then remove only runtime_policy/dollyarchitect",
     "restore the prior profile-local overlay snapshot if one existed",
+    "restore the prior profile.yaml backup and prior profile-local skills.disabled list",
     "rerun profile load and no-live-mutation checks"
   ],
   "candidate_commit_policy": {
     "local_candidate_commit_permitted": true,
     "commit_is_activation": false,
-    "remote_or_public_push_permitted": false
+    "immutable_private_review_ref_permitted": true,
+    "public_or_release_push_permitted": false
   },
   "live_no_mutation_boundary": [
     "a local candidate commit is permitted for provenance and does not install or activate the candidate",
     "no live profile or shared skill changes",
     "no live profile activation, gateway/notifier mutation, or Kanban schema change",
     "no credentials, provider, model, auth, service, product-chain, or telemetry mutation",
-    "no remote or public push, pull request, release, or deploy"
+    "one immutable private-review ref is permitted; no public/main/release push, pull request, release, or deploy"
   ],
   "post_closeout_sequence": [
     "Hermes creates and records the exact candidate commit and tree",

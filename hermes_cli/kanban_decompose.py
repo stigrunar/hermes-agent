@@ -70,6 +70,11 @@ Output a single JSON object with this exact shape:
         "title": "<concrete task title, imperative voice, <= 80 chars>",
         "body":  "<detailed spec for the worker on this child task>",
         "assignee": "<profile name from the roster, or null for default>",
+        "work_kind": "<explicit work-kind enum>",
+        "requested_actions": ["<explicit action>"],
+        "architecture_document_path": null,
+        "bounded_file_cluster": ["<bounded path or component>"],
+        "non_goals": ["<explicitly excluded outcome>"],
         "parents": [<int>, ...]
       },
       ...
@@ -87,6 +92,17 @@ Rules:
   - Pick assignees from the roster by matching the task to the profile's
     DESCRIPTION (not just the name). When nothing matches well, use null
     and the system will route to the default_assignee.
+  - When DollyArchitect is in the roster, every task MUST include the five
+    structured routing fields shown above. The controller, not free-form prose,
+    makes the final owner decision from work_kind. Architecture work uses one
+    of: ontology, scenario_grammar, code_vs_data,
+    shared_harness_adapter_ui_primitive, cross_repo_contract, migration_seam,
+    materially_different_second_scenario_reuse. Other supported kinds are
+    implementation_code_patch, model_evaluation, portfolio_evaluation,
+    benchmark, routine_qa_review, visual_design, pull_request, release, deploy.
+    Architecture requested_actions is exactly one of architecture_decision,
+    no_edits, or write_architecture_document. The first two require
+    architecture_document_path=null.
   - Each child task body is what a fresh worker will read with no other
     context — be specific about goal, approach, and acceptance criteria.
 
@@ -98,7 +114,12 @@ return:
     "rationale": "<one sentence>",
     "title": "<tightened title>",
     "body":  "<concrete spec for a single worker>",
-    "assignee": "<profile name from the roster, or null for default>"
+    "assignee": "<profile name from the roster, or null for default>",
+    "work_kind": "<explicit work-kind enum>",
+    "requested_actions": ["<explicit action>"],
+    "architecture_document_path": null,
+    "bounded_file_cluster": ["<bounded path or component>"],
+    "non_goals": ["<explicitly excluded outcome>"]
   }
 
 In that case the task stays as one work item, just with a tightened spec and
@@ -268,6 +289,43 @@ def _normalize_assignee_choice(
     return chosen
 
 
+def _materialize_profile_route(
+    *,
+    source_task: kb.Task,
+    route_slot: str,
+    entry: dict,
+    body: str,
+    chosen: str,
+    valid_names: set[str],
+) -> tuple[str, str]:
+    """Apply profile-specific policy only when its reviewed profile is present."""
+
+    if "DollyArchitect" not in valid_names and "dollyarchitect" not in valid_names:
+        return chosen, body
+    from agent.profile_runtime_policy import materialize_structured_architect_route
+
+    routing = {
+        "architecture_document_path": entry.get("architecture_document_path"),
+        "bounded_file_cluster": entry.get("bounded_file_cluster"),
+        "non_goals": entry.get("non_goals"),
+        "requested_actions": entry.get("requested_actions"),
+        "work_kind": entry.get("work_kind"),
+    }
+    routed, materialized_body = materialize_structured_architect_route(
+        source_task=source_task,
+        route_slot=route_slot,
+        body=body,
+        routing=routing,
+    )
+    canonical_names = {name.casefold(): name for name in valid_names}
+    resolved = canonical_names.get(routed.casefold())
+    if resolved is None:
+        raise ValueError(
+            f"structured work_kind routes to unavailable profile {routed!r}"
+        )
+    return resolved, materialized_body
+
+
 def decompose_task(
     task_id: str,
     *,
@@ -357,6 +415,19 @@ def decompose_task(
                 default_assignee=default_assignee,
                 valid_names=valid_names,
             )
+            try:
+                assignee_val, body_val = _materialize_profile_route(
+                    source_task=task,
+                    route_slot="single",
+                    entry=parsed,
+                    body=body_val or "",
+                    chosen=assignee_val,
+                    valid_names=valid_names,
+                )
+            except (ValueError, RuntimeError) as exc:
+                return DecomposeOutcome(
+                    task_id, False, f"structured routing rejected: {exc}"
+                )
         if title_val is None and body_val is None:
             return DecomposeOutcome(
                 task_id, False, "decomposer returned fanout=false with no title/body",
@@ -407,6 +478,19 @@ def decompose_task(
             default_assignee=default_assignee,
             valid_names=valid_names,
         )
+        try:
+            chosen, body = _materialize_profile_route(
+                source_task=task,
+                route_slot=f"child:{idx}",
+                entry=entry,
+                body=body.strip(),
+                chosen=chosen,
+                valid_names=valid_names,
+            )
+        except (ValueError, RuntimeError) as exc:
+            return DecomposeOutcome(
+                task_id, False, f"structured routing rejected: {exc}"
+            )
         if (
             isinstance(assignee, str)
             and assignee.strip()
@@ -424,7 +508,7 @@ def decompose_task(
         clean_parents = [p for p in parents if isinstance(p, int) and 0 <= p < len(raw_tasks) and p != idx]
         children.append({
             "title": title.strip()[:200],
-            "body": body.strip(),
+            "body": body,
             "assignee": chosen,
             "parents": clean_parents,
         })

@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from pathlib import Path
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -1324,6 +1325,8 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    strict_idempotency_match = args.get("_strict_idempotency_match") is True
+    trusted_project_binding = args.get("_trusted_project_binding")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
     skills = args.get("skills")
@@ -1346,8 +1349,26 @@ def _handle_create(args: dict, **kw) -> str:
         )
     try:
         board, project_id, session_id = _resolve_gateway_create_routing(args)
+        trusted_project_repo = None
+        if trusted_project_binding is not None:
+            from agent.profile_runtime_policy import (
+                validate_trusted_handoff_project_binding,
+            )
+
+            project_id, trusted_project_repo = validate_trusted_handoff_project_binding(
+                trusted_project_binding
+            )
         kb, conn = _connect(board=board)
         try:
+            if trusted_project_repo is not None:
+                source_task_id = os.environ.get("HERMES_KANBAN_TASK")
+                source_task = (
+                    kb.get_task(conn, source_task_id) if source_task_id else None
+                )
+                if source_task is None or source_task.project_id != project_id:
+                    raise ValueError(
+                        "trusted handoff project binding contradicts the source task"
+                    )
             # Inherit the spawning worker's own task workspace when the
             # caller didn't specify one (see resolution note above).
             if _inherit_workspace:
@@ -1361,6 +1382,106 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            if strict_idempotency_match:
+                if not idempotency_key:
+                    raise ValueError(
+                        "strict idempotency matching requires idempotency_key"
+                    )
+                existing = conn.execute(
+                    "SELECT id FROM tasks WHERE idempotency_key = ? "
+                    "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
+                    (idempotency_key,),
+                ).fetchone()
+                if existing is not None:
+                    existing_task = kb.get_task(conn, existing["id"])
+                    expected_parents = sorted(str(item) for item in parents)
+                    observed_parents = sorted(kb.parent_ids(conn, existing["id"]))
+                    expected_skills = [
+                        str(item).strip() for item in (skills or []) if str(item).strip()
+                    ]
+                    conflicts = []
+                    expected_values = {
+                        "title": str(title).strip(),
+                        "body": body,
+                        "assignee": kb._canonical_assignee(str(assignee)),
+                        "workspace_kind": str(workspace_kind),
+                        "workspace_path": workspace_path,
+                        "project_id": project_id,
+                        "skills": expected_skills,
+                        "goal_mode": bool(goal_mode),
+                    }
+                    observed_values = {
+                        "title": existing_task.title,
+                        "body": existing_task.body,
+                        "assignee": existing_task.assignee,
+                        "workspace_kind": existing_task.workspace_kind,
+                        "workspace_path": existing_task.workspace_path,
+                        "project_id": existing_task.project_id,
+                        "skills": existing_task.skills or [],
+                        "goal_mode": bool(existing_task.goal_mode),
+                    }
+                    for field, expected in expected_values.items():
+                        observed = observed_values[field]
+                        # Dispatcher materialization persists this one derived path;
+                        # it is still the caller's logical scratch/no-path envelope.
+                        materialized_default_scratch_path = (
+                            field == "workspace_path"
+                            and expected is None
+                            and expected_values["workspace_kind"] == "scratch"
+                            and observed_values["workspace_kind"] == "scratch"
+                            and observed is not None
+                            and str(observed)
+                            == str(kb.workspaces_root(board=board) / existing_task.id)
+                        )
+                        materialized_project_worktree_path = (
+                            field == "workspace_path"
+                            and expected is None
+                            and expected_values["workspace_kind"] == "worktree"
+                            and observed_values["workspace_kind"] == "worktree"
+                            and trusted_project_repo is not None
+                            and observed is not None
+                            and str(observed)
+                            == str(
+                                Path(trusted_project_repo)
+                                / ".worktrees"
+                                / existing_task.id
+                            )
+                        )
+                        if (
+                            observed != expected
+                            and not materialized_default_scratch_path
+                            and not materialized_project_worktree_path
+                        ):
+                            conflicts.append(field)
+                    if observed_parents != expected_parents:
+                        conflicts.append("parents")
+                    expected_status = "triage" if triage else "ready"
+                    if initial_status == "blocked":
+                        expected_status = "blocked"
+                    elif expected_parents:
+                        parent_rows = conn.execute(
+                            "SELECT status FROM tasks WHERE id IN ("
+                            + ",".join("?" * len(expected_parents))
+                            + ")",
+                            tuple(expected_parents),
+                        ).fetchall()
+                        if any(row["status"] != "done" for row in parent_rows):
+                            expected_status = "todo"
+                    if existing_task.status != expected_status:
+                        conflicts.append("initial_status")
+                    if conflicts:
+                        raise ValueError(
+                            "idempotency key resolved to conflicting create content: "
+                            + ", ".join(sorted(conflicts))
+                        )
+                    return _ok(
+                        task_id=existing_task.id,
+                        status=existing_task.status,
+                        subscribed=False,
+                        board=kb.get_current_board() if board is None else board,
+                        project_id=existing_task.project_id,
+                        idempotent_reuse=True,
+                    )
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1372,6 +1493,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
+                _trusted_project_repo=trusted_project_repo,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(

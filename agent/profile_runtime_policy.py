@@ -33,10 +33,10 @@ HANDOFF_MARKER = "HERMES_DOLLYCODE_HANDOFF_V1"
 # profile-local overlay.  They deliberately do not come from the install
 # manifest in that writable overlay.
 EXPECTED_OVERLAY_HASHES: Mapping[str, str] = {
-    "__init__.py": "4717c2c25bc35e91a858f09553a0c9be66cfb61b029877a80828028d16661a44",
-    "hardening.py": "024b880b521c7262b55a10f1a688c76ff940a77bff709c87049510cd37ec8e0e",
+    "__init__.py": "3861f2bc40cd2195a6cc4d8b2c0ebe2e2bfd29bbea3553b78baf2e799e6aae8f",
+    "hardening.py": "0fe3eee9aa8a5421c0506c839d70aa7c1f52b08f85caf276670060e6d73743a3",
     "measurement_schema.json": "1e943ba3a82b7dd01766b39c0ad60263b52f5774af08b4d37007680f4da2e6b5",
-    "profile.json": "6b6668646e47324a325244077dd73fdbf490bb5c75bdf741f52c82c2fc3568e8",
+    "profile.json": "2d77e6caa08ff0b9e9a9cdee0f3e7ff72622ed5ef6776ba7a8c65e5bbc9beaa5",
 }
 
 ALLOWED_TOOLS = frozenset(
@@ -54,6 +54,15 @@ ALLOWED_TOOLS = frozenset(
         "kanban_create",
         "kanban_complete",
         "kanban_block",
+    }
+)
+WRITE_TOOLS = frozenset({"write_file", "patch"})
+EXCLUDED_SKILLS = frozenset(
+    {
+        "contract-driven-frontend-implementation",
+        "mobile-ui-verification",
+        "release-candidate-evidence",
+        "external-upstream-pr-recuts",
     }
 )
 
@@ -151,6 +160,21 @@ def _require_config_invariants(config: Mapping[str, Any]) -> None:
         raise ProfileRuntimePolicyError(
             "DollyArchitect persistent/external memory must remain disabled"
         )
+    skills = config.get("skills")
+    if not isinstance(skills, Mapping):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect profile-local skills.disabled config is missing"
+        )
+    disabled = skills.get("disabled")
+    observed_disabled = (
+        {str(item).strip() for item in disabled if str(item).strip()}
+        if isinstance(disabled, list)
+        else set()
+    )
+    if not EXCLUDED_SKILLS.issubset(observed_disabled):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect profile-local skills.disabled exclusions are incomplete"
+        )
     allow_from = telegram.get("allow_from")
     if (
         telegram.get("dm_policy") != "allowlist"
@@ -170,7 +194,7 @@ def _require_config_invariants(config: Mapping[str, Any]) -> None:
         )
 
 
-def _verify_overlay(home: Path) -> tuple[str, ...]:
+def _verify_overlay(home: Path) -> tuple[tuple[str, ...], Mapping[str, bytes]]:
     overlay = home / OVERLAY_RELATIVE_PATH
     if not overlay.is_dir() or overlay.is_symlink():
         raise ProfileRuntimePolicyError(
@@ -185,6 +209,7 @@ def _verify_overlay(home: Path) -> tuple[str, ...]:
             "DollyArchitect immutable overlay file set drifted"
         )
     observed_hashes: list[str] = []
+    verified_sources: dict[str, bytes] = {}
     for name, expected in EXPECTED_OVERLAY_HASHES.items():
         path = overlay / name
         if path.is_symlink():
@@ -192,7 +217,8 @@ def _verify_overlay(home: Path) -> tuple[str, ...]:
                 f"DollyArchitect overlay file must not be a symlink: {name}"
             )
         try:
-            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            source = path.read_bytes()
+            digest = hashlib.sha256(source).hexdigest()
         except OSError as exc:
             raise ProfileRuntimePolicyError(
                 f"DollyArchitect overlay file is unreadable: {name}"
@@ -202,8 +228,9 @@ def _verify_overlay(home: Path) -> tuple[str, ...]:
                 f"DollyArchitect immutable overlay hash mismatch: {name}"
             )
         observed_hashes.append(digest)
+        verified_sources[name] = source
     try:
-        metadata = json.loads((overlay / "profile.json").read_text(encoding="utf-8"))
+        metadata = json.loads(verified_sources["profile.json"].decode("utf-8"))
     except Exception as exc:
         raise ProfileRuntimePolicyError(
             "DollyArchitect overlay metadata is invalid"
@@ -218,10 +245,14 @@ def _verify_overlay(home: Path) -> tuple[str, ...]:
         raise ProfileRuntimePolicyError(
             "DollyArchitect overlay runtime metadata drifted"
         )
-    return tuple(observed_hashes)
+    return tuple(observed_hashes), verified_sources
 
 
-def _load_overlay_hardening(home: Path, signature: tuple[str, ...]) -> Any:
+def _load_overlay_hardening(
+    home: Path,
+    signature: tuple[str, ...],
+    verified_sources: Mapping[str, bytes],
+) -> Any:
     """Import only the already hash-verified installed implementation."""
 
     cache_key = (str(home), signature)
@@ -239,7 +270,7 @@ def _load_overlay_hardening(home: Path, signature: tuple[str, ...]) -> Any:
         module.__package__ = ""
         sys.modules[module_name] = module
         try:
-            source = path.read_bytes()
+            source = verified_sources["hardening.py"]
             exec(compile(source, str(path), "exec"), module.__dict__)
         except Exception as exc:
             sys.modules.pop(module_name, None)
@@ -269,8 +300,10 @@ def load_active_profile_runtime_policy(
         )
     resolved_home = home.resolve(strict=True)
     _require_config_invariants(_read_raw_config(resolved_home))
-    signature = _verify_overlay(resolved_home)
-    hardening = _load_overlay_hardening(resolved_home, signature)
+    signature, verified_sources = _verify_overlay(resolved_home)
+    hardening = _load_overlay_hardening(
+        resolved_home, signature, verified_sources
+    )
     return ActiveProfileRuntimePolicy(
         POLICY_ID, PROFILE_NAME, resolved_home, hardening
     )
@@ -280,10 +313,17 @@ def filter_tool_definitions(definitions: list[dict[str, Any]]) -> list[dict[str,
     policy = load_active_profile_runtime_policy()
     if policy is None:
         return definitions
+    _, runtime = _runtime_contract()
+    actions = {
+        item.value for item in runtime["contract_object"].requested_actions
+    }
+    allowed = ALLOWED_TOOLS
+    if "write_architecture_document" not in actions:
+        allowed = allowed - WRITE_TOOLS
     return [
         definition
         for definition in definitions
-        if definition.get("function", {}).get("name") in ALLOWED_TOOLS
+        if definition.get("function", {}).get("name") in allowed
     ]
 
 
@@ -327,6 +367,160 @@ def _parse_exact_json_block(body: str | None, marker: str) -> Mapping[str, Any]:
     return payload
 
 
+def _resolve_project_primary_repo(project_id: str) -> Path:
+    """Resolve an exact project id to its trusted absolute primary repository."""
+
+    try:
+        from hermes_cli import projects_db
+
+        with projects_db.connect_readonly() as project_conn:
+            project = projects_db.get_project(project_conn, project_id)
+    except Exception as exc:
+        raise ProfileRuntimePolicyError(
+            "architect route project binding could not be resolved read-only"
+        ) from exc
+    if project is None or project.id != project_id or not project.primary_path:
+        raise ProfileRuntimePolicyError(
+            "architect route project must resolve by id with a primary repository"
+        )
+    primary_repo = Path(project.primary_path).expanduser()
+    if not primary_repo.is_absolute() or ".." in primary_repo.parts:
+        raise ProfileRuntimePolicyError(
+            "architect route primary repository must be absolute and traversal-free"
+        )
+    return primary_repo
+
+
+def materialize_structured_architect_route(
+    *,
+    source_task: Any,
+    route_slot: str,
+    body: str,
+    routing: Mapping[str, Any],
+) -> tuple[str, str]:
+    """Resolve explicit work-kind routing and build the architect contract."""
+
+    from profile_candidates.dollyarchitect import hardening
+
+    expected = {
+        "architecture_document_path",
+        "bounded_file_cluster",
+        "non_goals",
+        "requested_actions",
+        "work_kind",
+    }
+    if set(routing) != expected:
+        raise ProfileRuntimePolicyError(
+            "structured routing fields must be exact"
+        )
+    try:
+        decision = hardening.classify_architect_fit(
+            {"work_kind": routing["work_kind"]}
+        )
+    except hardening.ContractValidationError as exc:
+        raise ProfileRuntimePolicyError(
+            f"structured routing rejected: {exc}"
+        ) from exc
+    if not decision.accepted:
+        return decision.route, body
+    if body.count(DISPATCH_MARKER):
+        raise ProfileRuntimePolicyError(
+            "decomposer body must not supply an architect dispatch marker"
+        )
+    actions = routing["requested_actions"]
+    if not isinstance(actions, list):
+        raise ProfileRuntimePolicyError("requested_actions must be a list")
+    bounded_file_cluster = routing["bounded_file_cluster"]
+    non_goals = routing["non_goals"]
+    if not isinstance(bounded_file_cluster, list) or not isinstance(non_goals, list):
+        raise ProfileRuntimePolicyError(
+            "bounded_file_cluster and non_goals must be lists"
+        )
+    workspace_kind = str(getattr(source_task, "workspace_kind", "") or "scratch")
+    workspace_path = str(getattr(source_task, "workspace_path", "") or "")
+    document = routing["architecture_document_path"]
+    writable_roots: list[str] = []
+    document_paths: list[str] = []
+    if actions == ["write_architecture_document"]:
+        if not isinstance(document, str) or not document.strip():
+            raise ProfileRuntimePolicyError(
+                "write_architecture_document requires architecture_document_path"
+            )
+        document_path = Path(document.strip())
+        if not workspace_path or not document_path.is_absolute():
+            raise ProfileRuntimePolicyError(
+                "document-writing routes require an explicit absolute workspace path"
+            )
+        writable_roots = [str(document_path.parent)]
+        document_paths = [str(document_path)]
+    elif document is not None:
+        raise ProfileRuntimePolicyError(
+            "handoff-only routes require architecture_document_path=null"
+        )
+    project_id = str(getattr(source_task, "project_id", "") or "").strip()
+    if not project_id:
+        raise ProfileRuntimePolicyError(
+            "architect routes require a trusted source project binding"
+        )
+    implementation_repo_path = _resolve_project_primary_repo(project_id)
+    implementation_repo = str(implementation_repo_path)
+    repository_identity = f"project:{project_id}:repo:{implementation_repo}"
+    repo_is_materialized = (
+        implementation_repo_path.is_dir()
+        and (implementation_repo_path / ".git").exists()
+    )
+    implementation_workspace_policy = (
+        hardening.ImplementationWorkspacePolicy.PROJECT_WORKTREE
+        if repo_is_materialized
+        else hardening.ImplementationWorkspacePolicy.PREPARATION_ONLY
+    )
+    contract_seed = json.dumps(
+        {
+            "policy_id": POLICY_ID,
+            "route_slot": route_slot,
+            "routing": dict(routing),
+            "source_task_id": source_task.id,
+            "project_id": project_id,
+            "repository_identity": repository_identity,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    contract_id = "architect-" + hashlib.sha256(
+        contract_seed.encode("utf-8")
+    ).hexdigest()[:24]
+    payload = {
+        "architecture_document_paths": document_paths,
+        "bounded_file_cluster": bounded_file_cluster,
+        "contract_id": contract_id,
+        "implementation_owner": None,
+        "implementation_repo": implementation_repo,
+        "implementation_workspace_policy": implementation_workspace_policy.value,
+        "non_goals": non_goals,
+        "operations_owner": None,
+        "project_id": project_id,
+        "repository_identity": repository_identity,
+        "requested_actions": actions,
+        "work_kind": decision.work_kind.value,
+        "workspace_kind": workspace_kind,
+        "writable_artifact_roots": writable_roots,
+    }
+    try:
+        hardening.validate_architecture_contract(
+            hardening.ArchitectureDispatchContract.from_mapping(payload)
+        )
+    except hardening.ContractValidationError as exc:
+        raise ProfileRuntimePolicyError(
+            f"generated architect dispatch contract rejected: {exc}"
+        ) from exc
+    block = (
+        f"<!-- {DISPATCH_MARKER}\n"
+        f"{json.dumps(payload, separators=(',', ':'), sort_keys=True)}\n"
+        f"{DISPATCH_MARKER} -->"
+    )
+    return "DollyArchitect", f"{body.rstrip()}\n\n{block}".strip()
+
+
 def prepare_dollyarchitect_spawn_env(
     *,
     task: Any,
@@ -349,7 +543,8 @@ def prepare_dollyarchitect_spawn_env(
         )
         if not decision.accepted:
             raise ProfileRuntimePolicyError(
-                f"work_kind {decision.work_kind.value} must reroute to {decision.route}"
+                f"work_kind {decision.work_kind.value} is not architect-fit; "
+                f"assign it to {decision.route} before spawn"
             )
         contract = hardening.validate_architecture_contract(
             hardening.ArchitectureDispatchContract.from_mapping(payload)
@@ -362,7 +557,8 @@ def prepare_dollyarchitect_spawn_env(
             decision = None
         if decision is not None and not decision.accepted:
             raise ProfileRuntimePolicyError(
-                f"work_kind {decision.work_kind.value} must reroute to {decision.route}"
+                f"work_kind {decision.work_kind.value} is not architect-fit; "
+                f"assign it to {decision.route} before spawn"
             ) from exc
         raise ProfileRuntimePolicyError(
             f"DollyArchitect dispatch contract rejected: {exc}"
@@ -370,6 +566,30 @@ def prepare_dollyarchitect_spawn_env(
     if contract.workspace_kind.value != task.workspace_kind:
         raise ProfileRuntimePolicyError(
             "DollyArchitect workspace_kind contradicts the Kanban task"
+        )
+    if contract.project_id != str(getattr(task, "project_id", "") or ""):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect project binding contradicts the Kanban task"
+        )
+    current_project_repo = _resolve_project_primary_repo(contract.project_id)
+    if (
+        str(current_project_repo) != contract.implementation_repo
+        or contract.repository_identity
+        != f"project:{contract.project_id}:repo:{current_project_repo}"
+    ):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect repository binding contradicts the current project"
+        )
+    if (
+        contract.implementation_workspace_policy
+        is hardening.ImplementationWorkspacePolicy.PROJECT_WORKTREE
+        and not (
+            current_project_repo.is_dir()
+            and (current_project_repo / ".git").exists()
+        )
+    ):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect project worktree policy requires a materialized repository"
         )
     raw_workspace = Path(workspace)
     if not raw_workspace.is_absolute() or ".." in raw_workspace.parts:
@@ -393,6 +613,17 @@ def prepare_dollyarchitect_spawn_env(
     if getattr(task, "model_override", None) not in (None, "", "gpt-5.6-sol"):
         raise ProfileRuntimePolicyError(
             "DollyArchitect task model override must remain gpt-5.6-sol"
+        )
+    forced_skills = {
+        str(item).strip()
+        for item in (getattr(task, "skills", None) or [])
+        if str(item).strip()
+    }
+    excluded = sorted(forced_skills & EXCLUDED_SKILLS)
+    if excluded:
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect task force-loads excluded skill(s): "
+            + ", ".join(excluded)
         )
     canonical = {
         "contract": {
@@ -462,6 +693,88 @@ def _canonical_handoff_body(emission: Any) -> str:
     )
 
 
+def _architecture_artifact_sha256(
+    policy: ActiveProfileRuntimePolicy,
+    runtime: Mapping[str, Any],
+    packet: Any,
+) -> str:
+    contract = runtime["contract_object"]
+    if packet.architecture_artifact == "inline:architecture-decision":
+        artifact = json.dumps(
+            {
+                "acceptance_criteria": list(packet.acceptance_criteria),
+                "constraints": list(packet.constraints),
+                "decision": packet.decision,
+                "rationale": packet.rationale,
+                "validation_hypothesis": packet.validation_hypothesis,
+            },
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        return hashlib.sha256(artifact).hexdigest()
+    if [
+        action.value for action in contract.requested_actions
+    ] != ["write_architecture_document"]:
+        raise ProfileRuntimePolicyError(
+            "handoff-only architecture must use inline:architecture-decision"
+        )
+    try:
+        resolved = policy.hardening.guard_write_target(
+            target=packet.architecture_artifact,
+            hermes_kanban_workspace=os.environ.get("HERMES_KANBAN_WORKSPACE"),
+            artifact_roots=contract.writable_artifact_roots,
+            workspace_kind=contract.workspace_kind.value,
+            architecture_document_paths=contract.architecture_document_paths,
+        )
+        source = resolved.read_bytes()
+    except (OSError, policy.hardening.PathGuardError) as exc:
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect architecture artifact is missing or unsafe"
+        ) from exc
+    return hashlib.sha256(source).hexdigest()
+
+
+def _handoff_idempotency_key(runtime: Mapping[str, Any]) -> str:
+    canonical = json.dumps(
+        {
+            "dispatch_contract_id": runtime["contract_object"].contract_id,
+            "handoff_slot": "dollycode-primary-handoff",
+            "policy_id": runtime["policy_id"],
+            "source_task_id": runtime["task_id"],
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return "dollyarchitect:" + hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+
+
+def validate_trusted_handoff_project_binding(
+    binding: object,
+) -> tuple[str, str]:
+    """Validate an internal create binding against the signed runtime contract."""
+
+    policy, runtime = _runtime_contract()
+    if policy is None or runtime is None or not isinstance(binding, Mapping):
+        raise ProfileRuntimePolicyError(
+            "trusted handoff project binding requires active DollyArchitect policy"
+        )
+    if set(binding) != {"project_id", "implementation_repo"}:
+        raise ProfileRuntimePolicyError("trusted handoff project binding fields must be exact")
+    contract = runtime["contract_object"]
+    project_id = str(binding["project_id"] or "")
+    implementation_repo = str(binding["implementation_repo"] or "")
+    if (
+        project_id != contract.project_id
+        or implementation_repo != contract.implementation_repo
+    ):
+        raise ProfileRuntimePolicyError(
+            "trusted handoff project binding contradicts the dispatch contract"
+        )
+    return project_id, implementation_repo
+
+
 def guard_tool_call(tool_name: str, args: dict[str, Any]) -> GuardedToolCall:
     """Mandatory last-mile guard used immediately before actual execution."""
 
@@ -475,6 +788,12 @@ def guard_tool_call(tool_name: str, args: dict[str, Any]) -> GuardedToolCall:
     guarded = dict(args)
     contract = runtime["contract_object"]
     if tool_name in {"write_file", "patch"}:
+        if [
+            action.value for action in contract.requested_actions
+        ] != ["write_architecture_document"]:
+            raise ProfileRuntimePolicyError(
+                f"{tool_name} is disabled for this requested_actions capability"
+            )
         if tool_name == "patch" and guarded.get("mode", "replace") != "replace":
             raise ProfileRuntimePolicyError(
                 "DollyArchitect forbids V4A multi-file patch mode"
@@ -525,7 +844,15 @@ def guard_tool_call(tool_name: str, args: dict[str, Any]) -> GuardedToolCall:
             packet = policy.hardening.ArchitectureDecisionPacket.from_mapping(
                 packet_payload
             )
-            emission = policy.hardening.packet_to_dollycode_handoff(packet)
+            artifact_sha256 = _architecture_artifact_sha256(
+                policy, runtime, packet
+            )
+            emission = policy.hardening.packet_to_dollycode_handoff(
+                packet,
+                contract=contract,
+                source_task_id=runtime["task_id"],
+                architecture_artifact_sha256=artifact_sha256,
+            )
         except policy.hardening.ContractValidationError as exc:
             raise ProfileRuntimePolicyError(
                 f"DollyArchitect decision packet rejected: {exc}"
@@ -543,6 +870,21 @@ def guard_tool_call(tool_name: str, args: dict[str, Any]) -> GuardedToolCall:
         guarded["assignee"] = "dollycode"
         guarded["body"] = _canonical_handoff_body(emission)
         guarded["parents"] = [runtime["task_id"]]
+        guarded["idempotency_key"] = _handoff_idempotency_key(runtime)
+        guarded["_strict_idempotency_match"] = True
+        guarded["_trusted_project_binding"] = {
+            "project_id": contract.project_id,
+            "implementation_repo": contract.implementation_repo,
+        }
+        runnable = (
+            contract.implementation_workspace_policy
+            is policy.hardening.ImplementationWorkspacePolicy.PROJECT_WORKTREE
+        )
+        guarded["workspace_kind"] = "worktree" if runnable else "scratch"
+        guarded["workspace_path"] = None
+        guarded["initial_status"] = "running" if runnable else "blocked"
+        guarded["skills"] = []
+        guarded["goal_mode"] = False
         return GuardedToolCall(
             guarded, run_key=run_key, handoff_id=emission.handoffs[0].handoff_id
         )

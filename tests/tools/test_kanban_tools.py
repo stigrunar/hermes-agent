@@ -1096,6 +1096,50 @@ def test_create_no_worker_task_stays_scratch(monkeypatch, worker_env):
         conn.close()
 
 
+@pytest.mark.parametrize(
+    ("initial_workspace", "replay_workspace", "expected_conflicts"),
+    [
+        (
+            {"workspace_kind": "scratch", "workspace_path": None},
+            {"workspace_kind": "scratch", "workspace_path": "/tmp/explicit-replay"},
+            {"workspace_path"},
+        ),
+        (
+            {"workspace_kind": "scratch", "workspace_path": "/tmp/explicit-existing"},
+            {"workspace_kind": "scratch", "workspace_path": None},
+            {"workspace_path"},
+        ),
+        (
+            {"workspace_kind": "dir", "workspace_path": "/tmp/strict-dir"},
+            {"workspace_kind": "scratch", "workspace_path": None},
+            {"workspace_kind", "workspace_path"},
+        ),
+    ],
+)
+def test_create_strict_replay_rejects_explicit_workspace_differences(
+    worker_env, initial_workspace, replay_workspace, expected_conflicts
+):
+    from tools import kanban_tools as kt
+
+    base = {
+        "title": "strict workspace child",
+        "assignee": "peer",
+        "idempotency_key": "strict-workspace-child",
+        "_strict_idempotency_match": True,
+        "initial_status": "blocked",
+    }
+    created = json.loads(kt._handle_create({**base, **initial_workspace}))
+    assert created["ok"] is True, created
+
+    denied = json.loads(kt._handle_create({**base, **replay_workspace}))
+    assert "conflicting create content" in denied["error"]
+    reported_conflicts = {
+        field.strip()
+        for field in denied["error"].rsplit(":", 1)[-1].split(",")
+    }
+    assert reported_conflicts == expected_conflicts
+
+
 def test_create_stamps_session_id_from_env(monkeypatch, worker_env):
     """When the agent loop runs under ACP, the server propagates the
     originating chat session id via HERMES_SESSION_ID. ``kanban_create``

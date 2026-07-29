@@ -23,6 +23,7 @@ from profile_candidates.dollyarchitect import (
     validate_architecture_contract,
     validate_measurement_receipt,
 )
+from hermes_cli.profiles import read_profile_meta
 
 
 @pytest.mark.parametrize(
@@ -59,7 +60,7 @@ def test_explicit_architect_fit_matrix_is_accepted(work_kind: str):
         ("deploy", "DollyOps"),
     ],
 )
-def test_non_architect_work_is_deterministically_rerouted(
+def test_non_architect_work_is_deterministically_classified_for_named_owner(
     work_kind: str, route: str
 ):
     decision = classify_architect_fit({"work_kind": work_kind})
@@ -89,11 +90,19 @@ def _valid_contract_payload(tmp_path: Path) -> dict[str, object]:
         "contract_id": "architecture-1",
         "work_kind": WorkKind.CROSS_REPO_CONTRACT.value,
         "workspace_kind": "scratch",
-        "writable_artifact_roots": [str(artifact_root)],
+        "writable_artifact_roots": [],
         "architecture_document_paths": [],
         "requested_actions": ["architecture_decision"],
         "implementation_owner": None,
         "operations_owner": None,
+        "project_id": "project-1",
+        "repository_identity": "repo-1",
+        "implementation_repo": "/repos/repo-1",
+        "implementation_workspace_policy": (
+            "preparation_only_requires_distinct_workspace"
+        ),
+        "bounded_file_cluster": ["agent/profile_runtime_policy.py"],
+        "non_goals": ["Implementation"],
     }
 
 
@@ -105,7 +114,7 @@ def test_valid_contract_is_accepted_before_dispatch(tmp_path: Path):
     assert validate_architecture_contract(contract) is contract
 
 
-def test_scratch_contract_rejects_worktree_only_document_paths(tmp_path: Path):
+def test_handoff_only_contract_rejects_document_paths(tmp_path: Path):
     payload = _valid_contract_payload(tmp_path)
     payload["architecture_document_paths"] = [
         str(tmp_path / "workspace" / "artifacts" / "architecture.md")
@@ -114,7 +123,7 @@ def test_scratch_contract_rejects_worktree_only_document_paths(tmp_path: Path):
 
     with pytest.raises(
         ContractValidationError,
-        match="scratch mode forbids worktree-only architecture_document_paths",
+        match="handoff-only actions require empty",
     ):
         validate_architecture_contract(contract)
 
@@ -132,46 +141,58 @@ def test_contract_parser_rejects_unknown_fields(tmp_path: Path):
     [
         (
             {"requested_actions": ["no_edits", "commit"]},
-            "no_edits cannot be combined",
+            "exactly one architecture capability",
         ),
         (
             {
                 "requested_actions": ["architecture_decision", "implementation"],
                 "implementation_owner": None,
             },
-            "DollyCode",
+            "exactly one architecture capability",
         ),
         (
             {
                 "requested_actions": ["architecture_decision", "release"],
                 "operations_owner": None,
             },
-            "DollyOps",
+            "exactly one architecture capability",
         ),
         (
             {
                 "requested_actions": ["architecture_decision", "implementation"],
                 "implementation_owner": "DollyCode",
             },
-            "mixed architecture and execution",
+            "exactly one architecture capability",
         ),
         (
             {
                 "requested_actions": ["architecture_decision", "deploy"],
                 "operations_owner": "DollyOps",
             },
-            "mixed architecture and execution",
+            "exactly one architecture capability",
         ),
         (
-            {"writable_artifact_roots": []},
+            {
+                "requested_actions": ["write_architecture_document"],
+                "writable_artifact_roots": [],
+                "architecture_document_paths": ["/workspace/artifacts/architecture.md"],
+            },
             "at least one path",
         ),
         (
-            {"writable_artifact_roots": ["relative/artifacts"]},
+            {
+                "requested_actions": ["write_architecture_document"],
+                "writable_artifact_roots": ["relative/artifacts"],
+                "architecture_document_paths": ["/absolute/architecture.md"],
+            },
             "must be absolute",
         ),
         (
-            {"writable_artifact_roots": ["/absolute/artifacts/*"]},
+            {
+                "requested_actions": ["write_architecture_document"],
+                "writable_artifact_roots": ["/absolute/artifacts/*"],
+                "architecture_document_paths": ["/absolute/artifacts/architecture.md"],
+            },
             "glob syntax",
         ),
     ],
@@ -190,7 +211,9 @@ def test_contradictory_or_ambiguous_contracts_are_rejected_pre_dispatch(
 def test_overlapping_writable_roots_are_ambiguous(tmp_path: Path):
     payload = _valid_contract_payload(tmp_path)
     parent = tmp_path / "workspace" / "artifacts"
+    payload["requested_actions"] = ["write_architecture_document"]
     payload["writable_artifact_roots"] = [str(parent), str(parent / "nested")]
+    payload["architecture_document_paths"] = [str(parent / "architecture.md")]
     contract = ArchitectureDispatchContract.from_mapping(payload)
 
     with pytest.raises(ContractValidationError, match="must not overlap"):
@@ -213,6 +236,7 @@ def test_scratch_guard_accepts_resolved_target_under_assigned_root(tmp_path: Pat
         hermes_kanban_workspace=str(workspace),
         artifact_roots=[str(artifacts)],
         workspace_kind="scratch",
+        architecture_document_paths=[str(target)],
     )
 
     assert resolved == target.resolve()
@@ -230,6 +254,7 @@ def test_guard_fails_closed_without_workspace(
             hermes_kanban_workspace=missing_workspace,
             artifact_roots=[str(artifacts)],
             workspace_kind="scratch",
+            architecture_document_paths=[str(artifacts / "decision.md")],
         )
 
 
@@ -243,6 +268,7 @@ def test_guard_rejects_traversal_even_when_it_would_normalize_inside(tmp_path: P
             hermes_kanban_workspace=str(workspace),
             artifact_roots=[str(artifacts)],
             workspace_kind="scratch",
+            architecture_document_paths=[str(artifacts / "decision.md")],
         )
 
 
@@ -289,6 +315,7 @@ def test_guard_rejects_artifact_root_symlink_escape(tmp_path: Path):
             hermes_kanban_workspace=str(workspace),
             artifact_roots=[str(linked_root)],
             workspace_kind="scratch",
+            architecture_document_paths=[str(linked_root / "decision.md")],
         )
 
 
@@ -301,6 +328,7 @@ def test_guard_rejects_missing_and_ambiguous_artifact_roots(tmp_path: Path):
             hermes_kanban_workspace=str(workspace),
             artifact_roots=[],
             workspace_kind="scratch",
+            architecture_document_paths=[str(artifacts / "decision.md")],
         )
     with pytest.raises(PathGuardError, match="ambiguous after resolution"):
         guard_write_target(
@@ -308,6 +336,7 @@ def test_guard_rejects_missing_and_ambiguous_artifact_roots(tmp_path: Path):
             hermes_kanban_workspace=str(workspace),
             artifact_roots=[str(artifacts), str(artifacts)],
             workspace_kind="scratch",
+            architecture_document_paths=[str(artifacts / "decision.md")],
         )
     with pytest.raises(PathGuardError, match="missing or unresolvable"):
         guard_write_target(
@@ -315,12 +344,17 @@ def test_guard_rejects_missing_and_ambiguous_artifact_roots(tmp_path: Path):
             hermes_kanban_workspace=str(workspace),
             artifact_roots=[str(workspace / "missing")],
             workspace_kind="scratch",
+            architecture_document_paths=[str(artifacts / "decision.md")],
         )
 
 
 def test_worktree_contract_requires_exactly_one_document(tmp_path: Path):
     payload = _valid_contract_payload(tmp_path)
     payload["workspace_kind"] = "worktree"
+    payload["requested_actions"] = ["write_architecture_document"]
+    payload["writable_artifact_roots"] = [
+        str(tmp_path / "workspace" / "artifacts")
+    ]
 
     for documents in ([], ["/a.md", "/b.md"]):
         payload["architecture_document_paths"] = documents
@@ -349,6 +383,10 @@ def test_worktree_contract_rejects_outside_or_source_like_document(
 ):
     payload = _valid_contract_payload(tmp_path)
     payload["workspace_kind"] = "worktree"
+    payload["requested_actions"] = ["write_architecture_document"]
+    payload["writable_artifact_roots"] = [
+        str(tmp_path / "workspace" / "artifacts")
+    ]
     artifact_root = Path(payload["writable_artifact_roots"][0])
     payload["architecture_document_paths"] = [
         document if Path(document).is_absolute() else str(artifact_root / document)
@@ -478,11 +516,11 @@ def test_profile_artifact_matches_executable_policy():
         "continuity": list(PROFILE_POLICY.memory_continuity),
         "reason_code": PROFILE_POLICY.memory_disabled_reason_code,
     }
-    assert profile["active_priority_exclusions"] == {
-        "scope": PROFILE_POLICY.exclusions_scope,
-        "values": list(PROFILE_POLICY.active_priority_exclusions),
-        "mutate_shared_skills": PROFILE_POLICY.shared_skills_mutation,
-    }
+    exclusions = profile["active_priority_exclusions"]
+    assert exclusions["scope"] == PROFILE_POLICY.exclusions_scope
+    assert exclusions["values"] == list(PROFILE_POLICY.active_priority_exclusions)
+    assert exclusions["mutate_shared_skills"] is PROFILE_POLICY.shared_skills_mutation
+    assert exclusions["supported_config_path"] == "skills.disabled"
 
 
 def _decision_packet() -> ArchitectureDecisionPacket:
@@ -494,6 +532,8 @@ def _decision_packet() -> ArchitectureDecisionPacket:
             "constraints": ["Preserve prompt caching.", "No runtime wiring."],
             "acceptance_criteria": ["DollyCode tests both scenarios."],
             "dollycode_owner": "DollyCode",
+            "architecture_artifact": "inline:architecture-decision",
+            "validation_hypothesis": "The adapter passes two scenario tests.",
         }
     )
 
@@ -501,8 +541,24 @@ def _decision_packet() -> ArchitectureDecisionPacket:
 def test_packet_emits_exactly_one_separate_handoff_and_no_implementation():
     packet = _decision_packet()
 
-    emission = packet_to_dollycode_handoff(packet)
-    repeated = packet_to_dollycode_handoff(packet)
+    contract = validate_architecture_contract(
+        ArchitectureDispatchContract.from_mapping(
+            _valid_contract_payload(Path("/tmp"))
+        )
+    )
+    artifact_hash = "a" * 64
+    emission = packet_to_dollycode_handoff(
+        packet,
+        contract=contract,
+        source_task_id="t_source",
+        architecture_artifact_sha256=artifact_hash,
+    )
+    repeated = packet_to_dollycode_handoff(
+        packet,
+        contract=contract,
+        source_task_id="t_source",
+        architecture_artifact_sha256=artifact_hash,
+    )
 
     assert len(emission.handoffs) == 1
     assert emission.implementation_actions == ()
@@ -512,6 +568,25 @@ def test_packet_emits_exactly_one_separate_handoff_and_no_implementation():
     assert handoff.source_packet_id == packet.packet_id
     assert handoff.owner == "DollyCode"
     assert handoff.requested_action == "implement_from_architecture_decision"
+    assert handoff.source_task_id == "t_source"
+    assert handoff.dispatch_contract_id == contract.contract_id
+    assert handoff.architecture_artifact_sha256 == artifact_hash
+
+
+def test_reviewed_profile_description_reads_back_through_real_metadata_reader():
+    candidate = (
+        Path(__file__).parents[2]
+        / "profile_candidates"
+        / "dollyarchitect"
+    )
+    expected = json.loads(
+        (candidate / "profile.json").read_text(encoding="utf-8")
+    )["description"]
+
+    assert read_profile_meta(candidate) == {
+        "description": expected,
+        "description_auto": False,
+    }
 
 
 def _valid_measurement_receipt() -> dict[str, object]:
@@ -584,7 +659,7 @@ def test_measurement_schema_fails_closed(mutation: str):
         validate_measurement_receipt(receipt)
 
 
-def test_install_manifest_allows_local_commit_without_activation_or_external_write():
+def test_install_manifest_allows_private_review_ref_without_activation_or_public_write():
     manifest_path = (
         Path(__file__).parents[2]
         / "profile_candidates"
@@ -602,44 +677,22 @@ def test_install_manifest_allows_local_commit_without_activation_or_external_wri
     assert manifest["candidate_commit_policy"] == {
         "local_candidate_commit_permitted": True,
         "commit_is_activation": False,
-        "remote_or_public_push_permitted": False,
+        "immutable_private_review_ref_permitted": True,
+        "public_or_release_push_permitted": False,
     }
     mutation_boundary = " ".join(manifest["live_no_mutation_boundary"]).casefold()
     assert "local candidate commit is permitted" in mutation_boundary
     assert "does not install or activate" in mutation_boundary
     assert "no live profile or shared skill changes" in mutation_boundary
-    assert "no remote or public push, pull request, release, or deploy" in (
+    assert "one immutable private-review ref is permitted" in mutation_boundary
+    assert "no public/main/release push, pull request, release, or deploy" in (
         mutation_boundary
     )
     assert manifest["post_closeout_sequence"][0].startswith("Hermes creates")
-    assert manifest["exact_files"] == [
-        "profile_candidates/dollyarchitect/__init__.py",
-        "profile_candidates/dollyarchitect/hardening.py",
-        "profile_candidates/dollyarchitect/profile.json",
-        "profile_candidates/dollyarchitect/measurement_schema.json",
-        "profile_candidates/dollyarchitect/install_rollback_manifest.json",
-        "profile_candidates/dollyarchitect/README.md",
-        "agent/profile_runtime_policy.py",
-        "agent/agent_init.py",
-        "model_tools.py",
-        "hermes_cli/middleware.py",
-        "hermes_cli/kanban_db.py",
-        "tests/profile_candidates/test_dollyarchitect_hardening.py",
-        "tests/profile_candidates/test_dollyarchitect_runtime_policy.py",
-    ]
-    assert manifest["source_files"] == [
-        "profile_candidates/dollyarchitect/__init__.py",
-        "profile_candidates/dollyarchitect/hardening.py",
-        "profile_candidates/dollyarchitect/profile.json",
-        "profile_candidates/dollyarchitect/measurement_schema.json",
-        "profile_candidates/dollyarchitect/install_rollback_manifest.json",
-        "profile_candidates/dollyarchitect/README.md",
-        "agent/profile_runtime_policy.py",
-        "agent/agent_init.py",
-        "model_tools.py",
-        "hermes_cli/middleware.py",
-        "hermes_cli/kanban_db.py",
-    ]
+    assert manifest["contract_id"] == "ARCHITECT-HARDEN-02-SKRUE-RECUT-R1"
+    assert "profile_candidates/dollyarchitect/profile.yaml" in manifest["source_files"]
+    assert "hermes_cli/kanban_decompose.py" in manifest["source_files"]
+    assert "tools/kanban_tools.py" in manifest["source_files"]
 
 
 def test_profile_policy_is_immutable_value_data():

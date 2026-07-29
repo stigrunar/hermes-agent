@@ -3156,6 +3156,7 @@ def create_task(
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
+    _trusted_project_repo: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3212,7 +3213,17 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
-    if project_id:
+    if _trusted_project_repo is not None:
+        if not project_id:
+            raise ValueError("trusted project repository requires project_id")
+        trusted_repo_path = Path(str(_trusted_project_repo)).expanduser()
+        if not trusted_repo_path.is_absolute() or ".." in trusted_repo_path.parts:
+            raise ValueError(
+                "trusted project repository must be absolute and traversal-free"
+            )
+        if workspace_kind == "worktree":
+            project_repo = str(trusted_repo_path)
+    elif project_id:
         try:
             from hermes_cli import projects_db as _pdb
 
@@ -3377,7 +3388,10 @@ def create_task(
                 # plus a deterministic branch (project slug + task id). Together
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
-                if project_obj is not None and workspace_kind == "worktree":
+                if (
+                    (project_obj is not None or _trusted_project_repo is not None)
+                    and workspace_kind == "worktree"
+                ):
                     if project_repo and not workspace_path:
                         workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
@@ -3390,6 +3404,8 @@ def create_task(
                             )
                         except Exception:
                             branch_name = None
+                    if not branch_name and project_id:
+                        branch_name = f"{project_id}/{task_id}"
 
                 conn.execute(
                     """
@@ -8160,7 +8176,7 @@ def decompose_triage_task(
     child_ids: list[str] = []
     with write_txn(conn):
         root_row = conn.execute(
-            "SELECT id, status, tenant, workspace_kind, workspace_path "
+            "SELECT id, status, tenant, workspace_kind, workspace_path, project_id "
             "FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
@@ -8175,6 +8191,7 @@ def decompose_triage_task(
         # override with its own 'workspace_kind' / 'workspace_path'.
         root_ws_kind = root_row["workspace_kind"] or "scratch"
         root_ws_path = root_row["workspace_path"]
+        root_project_id = root_row["project_id"]
 
         # Create children. Status is 'todo' regardless of parents — we
         # link them under the root AFTER creation so the dispatcher
@@ -8200,8 +8217,8 @@ def decompose_triage_task(
             conn.execute(
                 "INSERT INTO tasks "
                 "(id, title, body, assignee, status, workspace_kind, "
-                " workspace_path, tenant, created_at, created_by) "
-                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?)",
+                " workspace_path, project_id, tenant, created_at, created_by) "
+                "VALUES (?, ?, ?, ?, 'todo', ?, ?, ?, ?, ?, ?)",
                 (
                     new_id,
                     title,
@@ -8209,6 +8226,7 @@ def decompose_triage_task(
                     assignee,
                     child_ws_kind,
                     child_ws_path,
+                    root_project_id,
                     tenant,
                     now,
                     (author or "decomposer"),

@@ -140,6 +140,11 @@ class RequestedAction(str, Enum):
     DEPLOY = "deploy"
 
 
+class ImplementationWorkspacePolicy(str, Enum):
+    PROJECT_WORKTREE = "project_primary_repo_worktree"
+    PREPARATION_ONLY = "preparation_only_requires_distinct_workspace"
+
+
 _EXECUTION_ACTIONS = frozenset(
     {
         RequestedAction.IMPLEMENTATION,
@@ -176,6 +181,12 @@ class ArchitectureDispatchContract:
     requested_actions: tuple[RequestedAction, ...]
     implementation_owner: str | None
     operations_owner: str | None
+    project_id: str
+    repository_identity: str
+    implementation_repo: str
+    implementation_workspace_policy: ImplementationWorkspacePolicy
+    bounded_file_cluster: tuple[str, ...]
+    non_goals: tuple[str, ...]
 
     @classmethod
     def from_mapping(
@@ -192,6 +203,12 @@ class ArchitectureDispatchContract:
                 "requested_actions",
                 "implementation_owner",
                 "operations_owner",
+                "project_id",
+                "repository_identity",
+                "implementation_repo",
+                "implementation_workspace_policy",
+                "bounded_file_cluster",
+                "non_goals",
             }
         )
         _require_exact_fields(payload, expected, "architecture contract")
@@ -220,6 +237,14 @@ class ArchitectureDispatchContract:
             operations_owner = _strict_string(
                 operations_owner, "operations_owner"
             )
+        try:
+            implementation_workspace_policy = ImplementationWorkspacePolicy(
+                payload["implementation_workspace_policy"]
+            )
+        except (TypeError, ValueError) as exc:
+            raise ContractValidationError(
+                "unknown implementation_workspace_policy"
+            ) from exc
 
         return cls(
             contract_id=_strict_string(payload["contract_id"], "contract_id"),
@@ -235,6 +260,18 @@ class ArchitectureDispatchContract:
             requested_actions=actions,
             implementation_owner=implementation_owner,
             operations_owner=operations_owner,
+            project_id=_strict_string(payload["project_id"], "project_id"),
+            repository_identity=_strict_string(
+                payload["repository_identity"], "repository_identity"
+            ),
+            implementation_repo=_strict_string(
+                payload["implementation_repo"], "implementation_repo"
+            ),
+            implementation_workspace_policy=implementation_workspace_policy,
+            bounded_file_cluster=_strict_string_tuple(
+                payload["bounded_file_cluster"], "bounded_file_cluster"
+            ),
+            non_goals=_strict_string_tuple(payload["non_goals"], "non_goals"),
         )
 
 
@@ -269,72 +306,77 @@ def validate_architecture_contract(
         raise ContractValidationError("requested_actions must be unique")
 
     actions = frozenset(contract.requested_actions)
-    if RequestedAction.NO_EDITS in actions and actions & {
-        RequestedAction.COMMIT,
-        RequestedAction.PUSH,
-    }:
-        raise ContractValidationError("no_edits cannot be combined with commit or push")
-    if (
-        RequestedAction.IMPLEMENTATION in actions
-        and contract.implementation_owner != "DollyCode"
-    ):
+    architecture_actions = actions & {
+        RequestedAction.ARCHITECTURE_DECISION,
+        RequestedAction.WRITE_ARCHITECTURE_DOCUMENT,
+        RequestedAction.NO_EDITS,
+    }
+    if len(actions) != 1 or len(architecture_actions) != 1:
         raise ContractValidationError(
-            "implementation requires separately named DollyCode owner"
+            "requested_actions must select exactly one architecture capability"
         )
-    if actions & {
-        RequestedAction.RELEASE,
-        RequestedAction.DEPLOY,
-        RequestedAction.PULL_REQUEST,
-    } and contract.operations_owner != "DollyOps":
+    if contract.implementation_owner is not None or contract.operations_owner is not None:
         raise ContractValidationError(
-            "release, deploy, or pull_request requires separately named DollyOps owner"
+            "architecture-only contracts must not name execution owners"
+        )
+    if not contract.bounded_file_cluster or not contract.non_goals:
+        raise ContractValidationError(
+            "bounded_file_cluster and non_goals must not be empty"
+        )
+    implementation_repo = Path(contract.implementation_repo)
+    if not implementation_repo.is_absolute() or ".." in implementation_repo.parts:
+        raise ContractValidationError(
+            "implementation_repo must be an absolute traversal-free path"
         )
     if actions & _EXECUTION_ACTIONS:
         raise ContractValidationError(
             "mixed architecture and execution contracts are forbidden"
         )
 
+    writes_document = RequestedAction.WRITE_ARCHITECTURE_DOCUMENT in actions
+    if not writes_document:
+        if contract.writable_artifact_roots or contract.architecture_document_paths:
+            raise ContractValidationError(
+                "handoff-only actions require empty writable roots and document paths"
+            )
+        return contract
+
     _reject_ambiguous_declared_paths(
         contract.writable_artifact_roots, "writable_artifact_roots"
     )
-    if contract.workspace_kind is WorkspaceKind.WORKTREE:
-        if len(contract.architecture_document_paths) != 1:
-            raise ContractValidationError(
-                "worktree mode requires exactly one architecture document path"
-            )
-        _reject_ambiguous_declared_paths(
-            contract.architecture_document_paths,
-            "architecture_document_paths",
-        )
-        document = Path(contract.architecture_document_paths[0])
-        containing_roots = tuple(
-            Path(root)
-            for root in contract.writable_artifact_roots
-            if _is_relative_to(document, Path(root))
-        )
-        if len(containing_roots) != 1:
-            raise ContractValidationError(
-                "worktree architecture document must be beneath one artifact root"
-            )
-        relative_document = document.relative_to(containing_roots[0])
-        if document.suffix.casefold() in _SOURCE_SUFFIXES:
-            raise ContractValidationError(
-                "worktree architecture document must not have a source suffix"
-            )
-        if any(
-            part.casefold() in _SOURCE_DIRECTORY_NAMES
-            for part in relative_document.parts[:-1]
-        ):
-            raise ContractValidationError(
-                "worktree architecture document must not be in a source directory"
-            )
-        if document.suffix.casefold() not in _ARCHITECTURE_DOCUMENT_SUFFIXES:
-            raise ContractValidationError(
-                "worktree architecture document must use a document suffix"
-            )
-    elif contract.architecture_document_paths:
+    if len(contract.architecture_document_paths) != 1:
         raise ContractValidationError(
-            "scratch mode forbids worktree-only architecture_document_paths"
+            "write_architecture_document requires exactly one architecture document path"
+        )
+    _reject_ambiguous_declared_paths(
+        contract.architecture_document_paths,
+        "architecture_document_paths",
+    )
+    document = Path(contract.architecture_document_paths[0])
+    containing_roots = tuple(
+        Path(root)
+        for root in contract.writable_artifact_roots
+        if _is_relative_to(document, Path(root))
+    )
+    if len(containing_roots) != 1:
+        raise ContractValidationError(
+            "architecture document must be beneath one artifact root"
+        )
+    relative_document = document.relative_to(containing_roots[0])
+    if document.suffix.casefold() in _SOURCE_SUFFIXES:
+        raise ContractValidationError(
+            "architecture document must not have a source suffix"
+        )
+    if any(
+        part.casefold() in _SOURCE_DIRECTORY_NAMES
+        for part in relative_document.parts[:-1]
+    ):
+        raise ContractValidationError(
+            "architecture document must not be in a source directory"
+        )
+    if document.suffix.casefold() not in _ARCHITECTURE_DOCUMENT_SUFFIXES:
+        raise ContractValidationError(
+            "architecture document must use a document suffix"
         )
     return contract
 
@@ -480,11 +522,11 @@ def guard_write_target(
             "write target must resolve beneath exactly one assigned artifact root"
         )
 
-    if kind is WorkspaceKind.WORKTREE:
-        if len(architecture_document_paths) != 1:
-            raise PathGuardError(
-                "worktree mode requires exactly one architecture document path"
-            )
+    if len(architecture_document_paths) != 1:
+        raise PathGuardError(
+            "guarded writes require exactly one architecture document path"
+        )
+    if kind in {WorkspaceKind.SCRATCH, WorkspaceKind.WORKTREE}:
         raw_document = Path(architecture_document_paths[0])
         if not raw_document.is_absolute() or ".." in raw_document.parts:
             raise PathGuardError(
@@ -496,13 +538,9 @@ def guard_write_target(
             raise PathGuardError("architecture document path is unresolvable") from exc
         if resolved_target != resolved_document:
             raise PathGuardError(
-                "worktree writes are limited to the named architecture document"
+                "writes are limited to the named architecture document"
             )
         _reject_source_target(resolved_target, workspace)
-    elif architecture_document_paths:
-        raise PathGuardError(
-            "scratch mode must not declare worktree architecture document paths"
-        )
     return resolved_target
 
 
@@ -514,6 +552,8 @@ class ArchitectureDecisionPacket:
     constraints: tuple[str, ...]
     acceptance_criteria: tuple[str, ...]
     dollycode_owner: str
+    architecture_artifact: str
+    validation_hypothesis: str
 
     @classmethod
     def from_mapping(
@@ -528,6 +568,8 @@ class ArchitectureDecisionPacket:
                 "constraints",
                 "acceptance_criteria",
                 "dollycode_owner",
+                "architecture_artifact",
+                "validation_hypothesis",
             }
         )
         _require_exact_fields(payload, expected, "architecture decision packet")
@@ -549,6 +591,12 @@ class ArchitectureDecisionPacket:
             constraints=constraints,
             acceptance_criteria=criteria,
             dollycode_owner=owner,
+            architecture_artifact=_strict_string(
+                payload["architecture_artifact"], "architecture_artifact"
+            ),
+            validation_hypothesis=_strict_string(
+                payload["validation_hypothesis"], "validation_hypothesis"
+            ),
         )
 
 
@@ -556,11 +604,23 @@ class ArchitectureDecisionPacket:
 class DollyCodeHandoffContract:
     handoff_id: str
     source_packet_id: str
+    source_task_id: str
+    dispatch_contract_id: str
+    work_kind: str
+    project_id: str
+    repository_identity: str
+    architecture_artifact: str
+    architecture_artifact_sha256: str
+    implementation_repo: str
+    implementation_workspace_policy: str
+    bounded_file_cluster: tuple[str, ...]
+    non_goals: tuple[str, ...]
     owner: str
     requested_action: str
-    architecture_decision: str
+    decision: str
     constraints: tuple[str, ...]
     acceptance_criteria: tuple[str, ...]
+    validation_hypothesis: str
 
 
 @dataclass(frozen=True)
@@ -571,15 +631,18 @@ class HandoffEmission:
 
 def packet_to_dollycode_handoff(
     packet: ArchitectureDecisionPacket,
+    *,
+    contract: ArchitectureDispatchContract,
+    source_task_id: str,
+    architecture_artifact_sha256: str,
 ) -> HandoffEmission:
-    """Transform one accepted packet into one handoff and execute nothing."""
+    """Bind one accepted packet to trusted dispatch identity and execute nothing."""
 
     canonical = json.dumps(
         {
-            "acceptance_criteria": packet.acceptance_criteria,
-            "constraints": packet.constraints,
-            "decision": packet.decision,
-            "packet_id": packet.packet_id,
+            "contract_id": contract.contract_id,
+            "policy_slot": "dollycode-primary-handoff",
+            "source_task_id": source_task_id,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -588,11 +651,23 @@ def packet_to_dollycode_handoff(
     handoff = DollyCodeHandoffContract(
         handoff_id=f"dollycode-{digest}",
         source_packet_id=packet.packet_id,
+        source_task_id=source_task_id,
+        dispatch_contract_id=contract.contract_id,
+        work_kind=contract.work_kind.value,
+        project_id=contract.project_id,
+        repository_identity=contract.repository_identity,
+        architecture_artifact=packet.architecture_artifact,
+        architecture_artifact_sha256=architecture_artifact_sha256,
+        implementation_repo=contract.implementation_repo,
+        implementation_workspace_policy=contract.implementation_workspace_policy.value,
+        bounded_file_cluster=contract.bounded_file_cluster,
+        non_goals=contract.non_goals,
         owner=packet.dollycode_owner,
         requested_action="implement_from_architecture_decision",
-        architecture_decision=packet.decision,
+        decision=packet.decision,
         constraints=packet.constraints,
         acceptance_criteria=packet.acceptance_criteria,
+        validation_hypothesis=packet.validation_hypothesis,
     )
     return HandoffEmission(handoffs=(handoff,), implementation_actions=())
 
