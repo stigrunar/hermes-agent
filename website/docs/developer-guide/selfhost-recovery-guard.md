@@ -17,19 +17,39 @@ The transient service then owns the whole disruptive sequence. It requests drain
 
 ## Safety contract
 
-The guard fails closed unless all of these are true before candidate activation:
+The guard has two explicit evidence phases and fails closed unless the applicable
+phase contract is satisfied.
+
+During the legacy-incumbent pre-mutation phase, a missing active-session registry
+is tolerated only for the built-in audited baseline commit
+`150ab8ca4dfecae838119cbba9488c27550dd5f5` and tree
+`2b728fa1c71fda2ef4c885284ceda0db25f760ac`. The sealed rollback artifact must
+independently inspect the observed live PID/start-time pair and return that exact
+source identity together with the same pair. A static source-identity response is
+not sufficient. All other evidence remains mandatory:
 
 - `gateway_state.json` is fresh and identifies the live systemd `MainPID` with matching process start time;
 - `gateway_state=draining`, `drain_quiesced=true`, and all persisted work counters are zero;
-- the cross-process active-session registry exists, is structurally valid, and
-  has no live leases; every lease must carry a PID plus matching `/proc` start
-  ticks, while stale, reused, foreign, or uninspectable identities fail closed;
+- the atomic split work counters (`active_agents`, `active_cron_jobs`, and
+  `active_api_runs`) are valid, sum exactly to `active_work`, and are all zero;
 - `state.db` has no non-expired compression lock;
 - every process in the gateway service cgroup has the same PID/start-time identity
   captured before the drain request; a new process, a reused PID, or an
   uninspectable identity fails closed. Unchanged persistent infrastructure is
   allowed only after the independent session, compression-lock, and explicit
-  drain-quiescence proofs above are all idle.
+  drain-quiescence proofs above are all idle. The runtime identity and zero-work
+  state are read again after the independent proofs so PID/MainPID drift or work
+  reopening fails closed.
+
+Immediately before the candidate artifact is invoked, the supervisor durably
+persists and receipts a monotonic phase transition in the sealed run directory.
+A reconstructed supervisor reloads that state; a transition receipt whose state
+file is absent fails closed. From that point through final disarm, the
+cross-process active-session registry is mandatory, structurally valid, and
+empty. Missing or malformed evidence, live leases, and stale, reused, foreign,
+or uninspectable lease identities fail closed. The registry is checked before
+and after candidate proofs and once more immediately before the drain marker is
+removed.
 
 A successful candidate must have a new live PID/start-time identity whose command line contains every configured `candidate_runtime_argv_contains` token. The plan must also contain proof roles for:
 
@@ -55,7 +75,7 @@ That setting controls admission only; it does not disable recovery evidence.
 
 Candidate and rollback artifacts are single, self-contained executables. Their source path and SHA-256 are declared in the plan; the guard copies and re-hashes them before activation. The rollback artifact must restore and restart the prior gateway, plus the dashboard when the plan declares one. It must be safe to invoke after a partial candidate activation.
 
-An artifact's `argv` can use `{artifact}` for its sealed per-run copy. Command proofs can use `{candidate_artifact}` or `{rollback_artifact}` so ownership/service probes are executed by a hash-pinned artifact rather than a mutable helper elsewhere on disk.
+An artifact's `argv` can use `{artifact}` for its sealed per-run copy. Command proofs can use `{candidate_artifact}` or `{rollback_artifact}` so ownership/service probes are executed by a hash-pinned artifact rather than a mutable helper elsewhere on disk. The legacy-incumbent proof must also contain exactly one `{runtime_pid}` and `{runtime_start_time}` argument. The audited rollback-artifact command must use those values to inspect the current process provenance and print four exact lines: `commit`, `tree`, `pid`, and `start_time`.
 
 Example structure (replace every path, hash, token, and expected value with the exact frozen candidate):
 
@@ -75,6 +95,25 @@ Example structure (replace every path, hash, token, and expected value with the 
   "rollback_deadline_seconds": 120,
   "poll_seconds": 1,
   "candidate_runtime_argv_contains": ["hermes_cli.main", "gateway", "run"],
+  "legacy_incumbent_identity": {
+    "commit": "150ab8ca4dfecae838119cbba9488c27550dd5f5",
+    "tree": "2b728fa1c71fda2ef4c885284ceda0db25f760ac"
+  },
+  "candidate_identity": {
+    "commit": "<exact-candidate-commit>",
+    "tree": "<exact-candidate-tree>"
+  },
+  "legacy_incumbent_proof": {
+    "type": "command_text",
+    "role": "legacy_incumbent",
+    "argv": [
+      "{rollback_artifact}",
+      "prove-legacy-incumbent",
+      "{runtime_pid}",
+      "{runtime_start_time}"
+    ],
+    "expected_stdout": "commit=150ab8ca4dfecae838119cbba9488c27550dd5f5\ntree=2b728fa1c71fda2ef4c885284ceda0db25f760ac"
+  },
   "candidate": {
     "artifact": "/absolute/path/activate-candidate",
     "sha256": "<64 lowercase hex characters>",
@@ -98,7 +137,11 @@ Example structure (replace every path, hash, token, and expected value with the 
       "type": "json_file",
       "role": "candidate_runtime",
       "path": "/home/user/.hermes/recovery-identity.json",
-      "expected": {"release_id": "<exact-candidate-release-id>"},
+      "expected": {
+        "release_id": "<exact-candidate-release-id>",
+        "source_commit": "<exact-candidate-commit>",
+        "source_tree": "<exact-candidate-tree>"
+      },
       "freshness_field": "updated_at",
       "max_age_seconds": 15
     },
@@ -151,7 +194,10 @@ Example structure (replace every path, hash, token, and expected value with the 
 The run directory is durable and independent of Telegram, the gateway agent loop, and Kanban notifier delivery:
 
 - `plan.json` — sealed plan with per-run artifact paths and owner token
-- `events.jsonl` — append-only phase evidence (`armed`, `drain_proved`, command results, rollback start, final)
+- `events.jsonl` — append-only phase evidence (`armed`, `drain_proved`,
+  `evidence_phase_transition`, command results, `candidate_disarm_proved`,
+  rollback start, final). The armed event includes both exact source identities,
+  the sealed legacy proof, and all drain/readiness/rollback deadlines.
 - `result.json` — atomic final receipt
 
 Final outcomes:

@@ -30,6 +30,11 @@ from typing import Any, Callable
 
 PLAN_VERSION = 1
 DEFAULT_HEALTH_URL = "http://127.0.0.1:8642/health"
+LEGACY_INCUMBENT_PHASE = "legacy_incumbent_pre_mutation"
+CANDIDATE_PHASE = "candidate_post_start"
+LEGACY_INCUMBENT_COMMIT = "150ab8ca4dfecae838119cbba9488c27550dd5f5"
+LEGACY_INCUMBENT_TREE = "2b728fa1c71fda2ef4c885284ceda0db25f760ac"
+EVIDENCE_PHASE_FILE = "evidence_phase.json"
 
 
 class GuardError(RuntimeError):
@@ -97,6 +102,68 @@ def _expect_fields(body: dict[str, Any], expected: dict[str, Any]) -> None:
         actual = _nested_get(body, dotted)
         if actual != wanted:
             raise GuardError(f"proof mismatch {dotted}: expected {wanted!r}, got {actual!r}")
+
+
+def _validate_source_identity(value: Any, name: str) -> dict[str, str]:
+    if not isinstance(value, dict):
+        raise GuardError(f"{name} must be an exact commit/tree object")
+    commit = value.get("commit")
+    tree = value.get("tree")
+    for field, item in (("commit", commit), ("tree", tree)):
+        if (
+            not isinstance(item, str)
+            or len(item) != 40
+            or any(char not in "0123456789abcdef" for char in item)
+        ):
+            raise GuardError(f"{name}.{field} must be a lowercase 40-character git object id")
+    assert isinstance(commit, str) and isinstance(tree, str)
+    return {"commit": commit, "tree": tree}
+
+
+def _identity_stdout(identity: dict[str, str]) -> str:
+    return f"commit={identity['commit']}\ntree={identity['tree']}"
+
+
+def _validate_two_phase_contract(plan: dict[str, Any], *, source: bool = False) -> None:
+    legacy = _validate_source_identity(
+        plan.get("legacy_incumbent_identity"), "legacy_incumbent_identity"
+    )
+    if legacy != {"commit": LEGACY_INCUMBENT_COMMIT, "tree": LEGACY_INCUMBENT_TREE}:
+        raise GuardError("legacy incumbent identity is not the one audited pinned baseline")
+    candidate = _validate_source_identity(plan.get("candidate_identity"), "candidate_identity")
+    proof = plan.get("legacy_incumbent_proof")
+    if not isinstance(proof, dict):
+        raise GuardError("legacy_incumbent_proof must be an exact command proof")
+    if proof.get("type") != "command_text" or proof.get("role") != "legacy_incumbent":
+        raise GuardError("legacy_incumbent_proof must use command_text role legacy_incumbent")
+    if proof.get("expected_stdout") != _identity_stdout(legacy):
+        raise GuardError("legacy_incumbent_proof is not bound to the pinned baseline identity")
+    argv = proof.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(item, str) for item in argv):
+        raise GuardError("legacy_incumbent_proof requires exact argv")
+    expected_artifact = (
+        "{rollback_artifact}" if source else str(plan.get("rollback", {}).get("artifact", ""))
+    )
+    if argv[0] != expected_artifact:
+        raise GuardError("legacy_incumbent_proof must execute the sealed rollback artifact")
+    if argv.count("{runtime_pid}") != 1 or argv.count("{runtime_start_time}") != 1:
+        raise GuardError(
+            "legacy_incumbent_proof must inspect the observed runtime PID and start time"
+        )
+    candidate_proofs = [
+        item
+        for item in plan.get("success_proofs", [])
+        if isinstance(item, dict) and item.get("role") == "candidate_runtime"
+    ]
+    if len(candidate_proofs) != 1:
+        raise GuardError("success_proofs must contain exactly one candidate_runtime proof")
+    expected = candidate_proofs[0].get("expected")
+    if (
+        not isinstance(expected, dict)
+        or expected.get("source_commit") != candidate["commit"]
+        or expected.get("source_tree") != candidate["tree"]
+    ):
+        raise GuardError("candidate_runtime proof is not bound to candidate commit/tree")
 
 
 def _pid_alive(pid: int) -> bool:
@@ -218,6 +285,45 @@ class RecoverySupervisor:
         self.old_pid: int | None = None
         self.old_start_time: int | None = None
         self.old_service_processes: dict[int, int] | None = None
+        self.phase_path = self.run_dir / EVIDENCE_PHASE_FILE
+        self.evidence_phase = self._load_evidence_phase()
+        self.legacy_incumbent_evidence: dict[str, Any] | None = None
+        _validate_two_phase_contract(self.plan)
+
+    def _phase_payload(self, phase: str) -> dict[str, Any]:
+        return {
+            "contract": "HRI-SELFHOST-OUTOFBAND-RECOVERY-GUARD-V1",
+            "run_id": self.run_id,
+            "phase": phase,
+            "legacy_incumbent_identity": self.plan["legacy_incumbent_identity"],
+            "candidate_identity": self.plan["candidate_identity"],
+        }
+
+    def _load_evidence_phase(self) -> str:
+        transitioned = False
+        if self.receipt.events_path.exists():
+            try:
+                transitioned = any(
+                    json.loads(line).get("phase") == "evidence_phase_transition"
+                    for line in self.receipt.events_path.read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                )
+            except (OSError, ValueError, AttributeError) as exc:
+                raise GuardError(f"cannot recover durable evidence phase: {exc}") from exc
+        if not self.phase_path.exists():
+            if transitioned:
+                raise GuardError("durable candidate evidence phase is missing after transition")
+            return LEGACY_INCUMBENT_PHASE
+        payload = _read_json(self.phase_path)
+        expected = self._phase_payload(str(payload.get("phase") or ""))
+        _expect_fields(payload, expected)
+        phase = payload.get("phase")
+        if phase not in {LEGACY_INCUMBENT_PHASE, CANDIDATE_PHASE}:
+            raise GuardError(f"unknown durable recovery evidence phase: {phase!r}")
+        if transitioned and phase != CANDIDATE_PHASE:
+            raise GuardError("durable recovery evidence phase regressed after transition")
+        assert isinstance(phase, str)
+        return phase
 
     def _verify_artifact(self, name: str) -> dict[str, Any]:
         spec = self.plan.get(name)
@@ -295,6 +401,11 @@ class RecoverySupervisor:
             raise GuardError("active_sessions_path is required for drain proof")
         path = Path(path_value)
         if not path.exists():
+            if (
+                self.evidence_phase == LEGACY_INCUMBENT_PHASE
+                and self.legacy_incumbent_evidence is not None
+            ):
+                return []
             raise GuardError("active session registry is unavailable")
         body = _read_json(path)
         entries = body.get("entries", [])
@@ -318,6 +429,83 @@ class RecoverySupervisor:
                 raise GuardError("active session lease process identity is stale or foreign")
             active.append(entry)
         return active
+
+    def _legacy_incumbent_proof(self) -> dict[str, Any]:
+        """Prove the one legacy runtime allowed to lack the new lease registry."""
+        if self.evidence_phase != LEGACY_INCUMBENT_PHASE:
+            raise GuardError("legacy incumbent proof requested outside legacy phase")
+        before = self._runtime_state()
+        proof = self.plan["legacy_incumbent_proof"]
+        expected_identity = self.plan["legacy_incumbent_identity"]
+        argv = [
+            item.replace("{runtime_pid}", str(before["pid"])).replace(
+                "{runtime_start_time}", str(before["start_time"])
+            )
+            for item in proof["argv"]
+        ]
+        result = self.ops.run(argv, float(proof.get("timeout_seconds", 5.0)))
+        if result.returncode != 0:
+            raise GuardError(f"legacy incumbent proof command failed: {result.stderr.strip()}")
+        expected_stdout = (
+            f"{_identity_stdout(expected_identity)}\n"
+            f"pid={before['pid']}\nstart_time={before['start_time']}"
+        )
+        if result.stdout.strip() != expected_stdout:
+            raise GuardError(
+                "legacy incumbent proof is not bound to the observed live runtime identity"
+            )
+        after = self._runtime_state()
+        before_identity = (before.get("pid"), before.get("start_time"))
+        after_identity = (after.get("pid"), after.get("start_time"))
+        if before_identity != after_identity:
+            raise GuardError("gateway identity changed during legacy incumbent proof")
+        return {
+            "source": self.plan["legacy_incumbent_identity"],
+            "runtime": {"pid": before_identity[0], "start_time": before_identity[1]},
+            "proof": {"type": "command_text", "role": "legacy_incumbent", "argv": argv},
+        }
+
+    def _split_work_evidence(self, state: dict[str, Any]) -> dict[str, int]:
+        fields = ("active_agents", "active_cron_jobs", "active_api_runs")
+        values: dict[str, int] = {}
+        for field in fields:
+            value = state.get(field)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise GuardError(f"gateway runtime state has invalid {field}")
+            values[field] = value
+        active_work = state.get("active_work")
+        if (
+            isinstance(active_work, bool)
+            or not isinstance(active_work, int)
+            or active_work < 0
+            or active_work != sum(values.values())
+        ):
+            raise GuardError("gateway runtime split work counters are inconsistent")
+        if active_work:
+            raise GuardError(f"gateway runtime still has active work: {values}")
+        return {**values, "active_work": active_work}
+
+    def _candidate_session_evidence(self) -> dict[str, Any]:
+        if self.evidence_phase != CANDIDATE_PHASE:
+            raise GuardError("strict active-session proof requested outside candidate phase")
+        sessions = self._active_sessions()
+        if sessions:
+            raise GuardError(f"candidate active session registry has live leases: sessions={len(sessions)}")
+        return {"phase": self.evidence_phase, "active_sessions": 0, "registry_required": True}
+
+    def _transition_to_candidate(self) -> None:
+        if self.evidence_phase != LEGACY_INCUMBENT_PHASE:
+            raise GuardError("recovery evidence phase transition is not monotonic")
+        _atomic_json(self.phase_path, self._phase_payload(CANDIDATE_PHASE))
+        self.evidence_phase = CANDIDATE_PHASE
+        self.receipt.event(
+            "evidence_phase_transition",
+            from_phase=LEGACY_INCUMBENT_PHASE,
+            to_phase=CANDIDATE_PHASE,
+            legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+            candidate_identity=self.plan["candidate_identity"],
+            active_session_registry="mandatory",
+        )
 
     def _compression_locks(self) -> int:
         path_value = self.plan.get("state_db_path")
@@ -405,7 +593,12 @@ class RecoverySupervisor:
             "active_work": 0,
         }
         _expect_fields(state, expected)
+        work_evidence = self._split_work_evidence(state)
+        if self.legacy_incumbent_evidence is None:
+            self.legacy_incumbent_evidence = self._legacy_incumbent_proof()
         sessions = self._active_sessions()
+        registry_path = Path(str(self.plan["active_sessions_path"]))
+        registry_mode = "strict" if registry_path.exists() else "legacy_absent"
         locks = self._compression_locks()
         if self.old_service_processes is None:
             raise GuardError("gateway cgroup identities were not captured before drain")
@@ -420,12 +613,32 @@ class RecoverySupervisor:
                 f"live drain evidence not idle: sessions={len(sessions)} "
                 f"compression_locks={locks} unexpected_cgroup_processes={unexpected}"
             )
+        final_state = self._runtime_state()
+        if (
+            final_state.get("pid") != self.old_pid
+            or final_state.get("start_time") != self.old_start_time
+        ):
+            raise GuardError("gateway identity changed while collecting drain evidence")
+        _expect_fields(final_state, expected)
+        self._split_work_evidence(final_state)
+        final_sessions = self._active_sessions()
+        final_locks = self._compression_locks()
+        final_processes = self._service_processes(self.old_pid)
+        if final_sessions or final_locks or final_processes != self.old_service_processes:
+            raise GuardError(
+                "live drain evidence changed while collecting proof: "
+                f"sessions={len(final_sessions)} compression_locks={final_locks} "
+                f"cgroup_processes={final_processes}"
+            )
         return {
             "pid": self.old_pid,
             "start_time": self.old_start_time,
             "active_sessions": 0,
+            "active_session_registry": registry_mode,
             "compression_locks": 0,
-            "cgroup_processes": processes,
+            "split_work": work_evidence,
+            "legacy_incumbent": self.legacy_incumbent_evidence,
+            "cgroup_processes": final_processes,
             "persistent_cgroup_processes": {
                 pid: start_time
                 for pid, start_time in processes.items()
@@ -503,11 +716,14 @@ class RecoverySupervisor:
             try:
                 evidence: list[dict[str, Any]] = []
                 if key == "success_proofs":
+                    evidence.append({"active_sessions": self._candidate_session_evidence()})
                     evidence.append({"runtime_identity": self._runtime_identity_proof()})
                 for proof in proofs:
                     if not isinstance(proof, dict):
                         raise GuardError(f"malformed {key} entry")
                     evidence.append(self._check_proof(proof))
+                if key == "success_proofs":
+                    self._candidate_session_evidence()
                 return evidence
             except GuardError as exc:
                 last_error = str(exc)
@@ -537,9 +753,23 @@ class RecoverySupervisor:
                 "rollback_proofs", float(self.plan.get("rollback_deadline_seconds", 120.0))
             )
         except Exception as exc:
-            self.receipt.final("rollback_failed", trigger=trigger, error=str(exc))
+            self.receipt.final(
+                "rollback_failed",
+                trigger=trigger,
+                error=str(exc),
+                evidence_phase=self.evidence_phase,
+                legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+                candidate_identity=self.plan["candidate_identity"],
+            )
             return 2
-        self.receipt.final("rolled_back", trigger=trigger, proofs=evidence)
+        self.receipt.final(
+            "rolled_back",
+            trigger=trigger,
+            evidence_phase=self.evidence_phase,
+            legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+            candidate_identity=self.plan["candidate_identity"],
+            proofs=evidence,
+        )
         return 1
 
     def run(self) -> int:
@@ -550,6 +780,7 @@ class RecoverySupervisor:
             self.old_pid = int(state["pid"])
             self.old_start_time = state.get("start_time")
             self.old_service_processes = self._service_processes(self.old_pid)
+            self.legacy_incumbent_evidence = self._legacy_incumbent_proof()
             self._write_owned_drain(self.old_pid)
             self.receipt.event(
                 "armed",
@@ -559,9 +790,19 @@ class RecoverySupervisor:
                 old_gateway_cgroup_processes=self.old_service_processes,
                 candidate_sha256=candidate["sha256"],
                 rollback_sha256=rollback["sha256"],
+                evidence_phase=self.evidence_phase,
+                legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+                candidate_identity=self.plan["candidate_identity"],
+                legacy_incumbent_evidence=self.legacy_incumbent_evidence,
+                deadlines={
+                    "drain_seconds": float(self.plan.get("drain_timeout_seconds", 180.0)),
+                    "readiness_seconds": float(self.plan.get("readiness_deadline_seconds", 120.0)),
+                    "rollback_seconds": float(self.plan.get("rollback_deadline_seconds", 120.0)),
+                },
             )
             drain_evidence = self._wait_for_drain()
             self.receipt.event("drain_proved", evidence=drain_evidence)
+            self._transition_to_candidate()
             result = self._execute_artifact("candidate", candidate)
             if result.returncode != 0:
                 raise GuardError(f"candidate activation exited {result.returncode}")
@@ -574,11 +815,25 @@ class RecoverySupervisor:
         except Exception as exc:
             rollback = self.plan.get("rollback")
             if not isinstance(rollback, dict):
-                self.receipt.final("rollback_unavailable", error=str(exc))
+                self.receipt.final(
+                    "rollback_unavailable",
+                    error=str(exc),
+                    evidence_phase=self.evidence_phase,
+                    legacy_incumbent_identity=self.plan["legacy_incumbent_identity"],
+                    candidate_identity=self.plan["candidate_identity"],
+                )
                 return 2
             return self._rollback(rollback, str(exc))
+        disarm_session_evidence = self._candidate_session_evidence()
+        self.receipt.event("candidate_disarm_proved", evidence=disarm_session_evidence)
         self._clear_owned_drain()
-        self.receipt.final("activated", proofs=evidence)
+        self.receipt.final(
+            "activated",
+            evidence_phase=self.evidence_phase,
+            candidate_identity=self.plan["candidate_identity"],
+            active_sessions=disarm_session_evidence,
+            proofs=evidence,
+        )
         return 0
 
 
@@ -596,6 +851,9 @@ def _validate_source_plan(plan: dict[str, Any]) -> None:
         "success_proofs",
         "rollback_proofs",
         "candidate_runtime_argv_contains",
+        "legacy_incumbent_identity",
+        "candidate_identity",
+        "legacy_incumbent_proof",
     }
     missing = sorted(required - plan.keys())
     if missing:
@@ -606,6 +864,7 @@ def _validate_source_plan(plan: dict[str, Any]) -> None:
     if not run_id or any(char not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_" for char in run_id):
         raise GuardError("run_id must contain only letters, digits, '-' or '_'")
     _validate_proof_contract(plan)
+    _validate_two_phase_contract(plan, source=True)
 
 
 def _validate_proof_contract(plan: dict[str, Any]) -> None:
@@ -727,6 +986,11 @@ def arm(plan_path: Path, *, launch: Callable[[list[str]], subprocess.CompletedPr
     snapshot["owner_token"] = uuid.uuid4().hex
     snapshot["candidate"] = _copy_artifact(source["candidate"], run_dir, "candidate")
     snapshot["rollback"] = _copy_artifact(source["rollback"], run_dir, "rollback")
+    snapshot["legacy_incumbent_proof"] = _seal_proofs(
+        source["legacy_incumbent_proof"],
+        candidate_artifact=snapshot["candidate"]["artifact"],
+        rollback_artifact=snapshot["rollback"]["artifact"],
+    )
     for proof_key in ("success_proofs", "rollback_proofs"):
         snapshot[proof_key] = _seal_proofs(
             source[proof_key],
@@ -740,6 +1004,16 @@ def arm(plan_path: Path, *, launch: Callable[[list[str]], subprocess.CompletedPr
     snapshot_path = run_dir / "plan.json"
     _atomic_json(snapshot_path, snapshot)
     os.chmod(snapshot_path, 0o400)
+    _atomic_json(
+        run_dir / EVIDENCE_PHASE_FILE,
+        {
+            "contract": "HRI-SELFHOST-OUTOFBAND-RECOVERY-GUARD-V1",
+            "run_id": snapshot["run_id"],
+            "phase": LEGACY_INCUMBENT_PHASE,
+            "legacy_incumbent_identity": snapshot["legacy_incumbent_identity"],
+            "candidate_identity": snapshot["candidate_identity"],
+        },
+    )
 
     unit = f"hermes-recovery-{source['run_id']}.service"
     argv = [

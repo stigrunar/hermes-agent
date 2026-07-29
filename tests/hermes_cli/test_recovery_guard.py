@@ -34,6 +34,13 @@ class TestSupervisor(RecoverySupervisor):
     def _service_pids(self, expected_main_pid: int) -> list[int]:
         return [expected_main_pid]
 
+    def _legacy_incumbent_proof(self) -> dict:
+        return {
+            "source": self.plan["legacy_incumbent_identity"],
+            "runtime": {"pid": self.old_pid, "start_time": self.old_start_time},
+            "proof": {"type": "command_text", "role": "legacy_incumbent"},
+        }
+
 
 class CgroupSupervisor(RecoverySupervisor):
     __test__ = False
@@ -43,6 +50,13 @@ class CgroupSupervisor(RecoverySupervisor):
     def _service_pids(self, expected_main_pid: int) -> list[int]:
         return self.service_pids
 
+    def _legacy_incumbent_proof(self) -> dict:
+        return {
+            "source": self.plan["legacy_incumbent_identity"],
+            "runtime": {"pid": self.old_pid, "start_time": self.old_start_time},
+            "proof": {"type": "command_text", "role": "legacy_incumbent"},
+        }
+
 
 def _write_json(path: Path, body: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -50,7 +64,7 @@ def _write_json(path: Path, body: dict) -> None:
 
 
 def _runtime(pid: int, start: int, clock: FakeClock, state: str = "running") -> dict:
-    return {
+    runtime = {
         "pid": pid,
         "start_time": start,
         "argv": ["hermes", "gateway", "run"],
@@ -62,6 +76,9 @@ def _runtime(pid: int, start: int, clock: FakeClock, state: str = "running") -> 
         "active_work": 0,
         "updated_at": datetime.fromtimestamp(clock.now(), timezone.utc).isoformat(),
     }
+    if pid == 222:
+        runtime.update({"source_commit": "c" * 40, "source_tree": "d" * 40})
+    return runtime
 
 
 def _artifact(path: Path, text: str) -> dict:
@@ -86,6 +103,12 @@ def _make_plan(tmp_path: Path, clock: FakeClock) -> tuple[Path, Path, Path, dict
             "CREATE TABLE compression_locks (session_id TEXT, holder TEXT, acquired_at REAL, expires_at REAL)"
         )
 
+    candidate = _artifact(tmp_path / "candidate.sh", "candidate")
+    rollback = _artifact(tmp_path / "rollback.sh", "rollback")
+    legacy_identity = {
+        "commit": recovery_guard.LEGACY_INCUMBENT_COMMIT,
+        "tree": recovery_guard.LEGACY_INCUMBENT_TREE,
+    }
     plan = {
         "version": 1,
         "run_id": "test-guard",
@@ -101,8 +124,23 @@ def _make_plan(tmp_path: Path, clock: FakeClock) -> tuple[Path, Path, Path, dict
         "readiness_deadline_seconds": 3,
         "rollback_deadline_seconds": 3,
         "candidate_runtime_argv_contains": ["candidate-runtime"],
-        "candidate": _artifact(tmp_path / "candidate.sh", "candidate"),
-        "rollback": _artifact(tmp_path / "rollback.sh", "rollback"),
+        "legacy_incumbent_identity": legacy_identity,
+        "candidate_identity": {"commit": "c" * 40, "tree": "d" * 40},
+        "legacy_incumbent_proof": {
+            "type": "command_text",
+            "role": "legacy_incumbent",
+            "argv": [
+                rollback["artifact"],
+                "prove-legacy-incumbent",
+                "{runtime_pid}",
+                "{runtime_start_time}",
+            ],
+            "expected_stdout": (
+                f"commit={legacy_identity['commit']}\ntree={legacy_identity['tree']}"
+            ),
+        },
+        "candidate": candidate,
+        "rollback": rollback,
         "success_proofs": [
             {
                 "type": "http_json",
@@ -114,7 +152,12 @@ def _make_plan(tmp_path: Path, clock: FakeClock) -> tuple[Path, Path, Path, dict
                 "type": "json_file",
                 "role": "candidate_runtime",
                 "path": str(state_path),
-                "expected": {"gateway_state": "running", "start_time": 2},
+                "expected": {
+                    "gateway_state": "running",
+                    "start_time": 2,
+                    "source_commit": "c" * 40,
+                    "source_tree": "d" * 40,
+                },
             },
             {
                 "type": "command_text",
@@ -195,6 +238,15 @@ def test_success_path_disarms_only_after_identity_health_and_ownership_proofs(
     assert not (tmp_path / ".drain_request.json").exists()
     events = (tmp_path / "events.jsonl").read_text(encoding="utf-8")
     assert events.index('"phase": "armed"') < events.index('"phase": "drain_proved"')
+    assert events.index('"phase": "drain_proved"') < events.index(
+        '"phase": "evidence_phase_transition"'
+    )
+    assert events.index('"phase": "evidence_phase_transition"') < events.index(
+        '"phase": "candidate_command"'
+    )
+    assert '"phase": "candidate_disarm_proved"' in events
+    assert result["evidence_phase"] == recovery_guard.CANDIDATE_PHASE
+    assert result["candidate_identity"] == {"commit": "c" * 40, "tree": "d" * 40}
     assert {
         "type": "command_text",
         "role": "notifier_owner",
@@ -243,6 +295,10 @@ def test_candidate_readiness_timeout_runs_verified_rollback_and_probes_prior_run
     assert supervisor.run() == 1
     result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
     assert result["outcome"] == "rolled_back"
+    assert result["evidence_phase"] == recovery_guard.CANDIDATE_PHASE
+    assert result["legacy_incumbent_identity"]["commit"] == (
+        recovery_guard.LEGACY_INCUMBENT_COMMIT
+    )
     assert "success_proofs deadline exceeded" in result["trigger"]
     assert not (tmp_path / ".drain_request.json").exists()
     assert '"phase": "rollback_started"' in (tmp_path / "events.jsonl").read_text(encoding="utf-8")
@@ -294,6 +350,7 @@ def test_failed_candidate_uses_rollback_and_escalates_if_restore_fails(
     assert supervisor.run() == expected_status
     result = json.loads((tmp_path / "result.json").read_text(encoding="utf-8"))
     assert result["outcome"] == expected_outcome
+    assert result["candidate_identity"] == {"commit": "c" * 40, "tree": "d" * 40}
     assert "candidate activation exited 17" in result["trigger"]
     assert not (tmp_path / ".drain_request.json").exists()
 
@@ -351,9 +408,178 @@ def test_drain_rejects_counter_zero_when_live_session_evidence_is_unavailable(
     supervisor.old_pid = 111
     supervisor.old_start_time = 1
     supervisor.old_service_processes = {111: 1}
+    supervisor.evidence_phase = recovery_guard.CANDIDATE_PHASE
 
     with pytest.raises(GuardError, match="active session registry is unavailable"):
         supervisor._drain_is_safe()
+
+
+def test_exact_quiet_legacy_incumbent_can_prove_drain_without_registry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    _write_json(state_path, _runtime(111, 1, clock, "draining"))
+    sessions_path.unlink()
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
+
+    evidence = supervisor._drain_is_safe()
+
+    assert evidence["active_session_registry"] == "legacy_absent"
+    assert evidence["legacy_incumbent"]["source"] == {
+        "commit": recovery_guard.LEGACY_INCUMBENT_COMMIT,
+        "tree": recovery_guard.LEGACY_INCUMBENT_TREE,
+    }
+    assert evidence["split_work"] == {
+        "active_agents": 0,
+        "active_cron_jobs": 0,
+        "active_api_runs": 0,
+        "active_work": 0,
+    }
+
+
+def test_legacy_proof_binds_pinned_source_to_observed_pid_and_start_time(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    observed_argv: list[str] = []
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        observed_argv[:] = argv
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                f"commit={recovery_guard.LEGACY_INCUMBENT_COMMIT}\n"
+                f"tree={recovery_guard.LEGACY_INCUMBENT_TREE}\n"
+                "pid=111\nstart_time=1\n"
+            ),
+            stderr="",
+        )
+
+    supervisor = RecoverySupervisor(
+        plan_path,
+        ops=GuardOps(now=clock.now, sleep=clock.sleep, run=run),
+    )
+    evidence = supervisor._legacy_incumbent_proof()
+
+    assert observed_argv[-2:] == ["111", "1"]
+    assert evidence["runtime"] == {"pid": 111, "start_time": 1}
+
+
+def test_legacy_proof_rejects_source_identity_mismatch_for_observed_runtime(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+
+    def run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(
+            argv,
+            0,
+            stdout=(
+                f"commit={'a' * 40}\n"
+                f"tree={recovery_guard.LEGACY_INCUMBENT_TREE}\n"
+                "pid=111\nstart_time=1\n"
+            ),
+            stderr="",
+        )
+
+    supervisor = RecoverySupervisor(
+        plan_path,
+        ops=GuardOps(now=clock.now, sleep=clock.sleep, run=run),
+    )
+
+    with pytest.raises(GuardError, match="not bound to the observed live runtime identity"):
+        supervisor._legacy_incumbent_proof()
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["active_agents", "active_cron_jobs", "active_api_runs"],
+    ids=["model-or-tool-turn", "cron-work", "api-work"],
+)
+def test_legacy_drain_rejects_each_split_counter_work_class(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    field: str,
+) -> None:
+    clock = FakeClock()
+    plan_path, state_path, sessions_path, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    state = _runtime(111, 1, clock, "draining")
+    state[field] = 1
+    state["active_work"] = 1
+    _write_json(state_path, state)
+    sessions_path.unlink()
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor.old_pid = 111
+    supervisor.old_start_time = 1
+    supervisor.old_service_processes = {111: 1}
+
+    with pytest.raises(GuardError, match="proof mismatch|active work"):
+        supervisor._drain_is_safe()
+
+
+def test_candidate_phase_requires_registry_and_rejects_corruption(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, _, sessions_path, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+
+    sessions_path.unlink()
+    with pytest.raises(GuardError, match="registry is unavailable"):
+        supervisor._candidate_session_evidence()
+
+    sessions_path.write_text("not-json", encoding="utf-8")
+    with pytest.raises(GuardError, match="cannot read JSON"):
+        supervisor._candidate_session_evidence()
+
+
+def test_candidate_phase_is_reloaded_and_remains_strict_after_reconstruction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = FakeClock()
+    plan_path, _, sessions_path, _ = _make_plan(tmp_path, clock)
+    _patch_processes(monkeypatch)
+    first = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    first._transition_to_candidate()
+
+    reconstructed = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    assert reconstructed.evidence_phase == recovery_guard.CANDIDATE_PHASE
+    sessions_path.unlink()
+    with pytest.raises(GuardError, match="registry is unavailable"):
+        reconstructed._candidate_session_evidence()
+
+
+def test_transition_receipt_without_durable_phase_fails_closed_on_reconstruction(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, _ = _make_plan(tmp_path, clock)
+    supervisor = TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+    supervisor._transition_to_candidate()
+    supervisor.phase_path.unlink()
+
+    with pytest.raises(GuardError, match="phase is missing after transition"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
+
+    _write_json(
+        supervisor.phase_path,
+        supervisor._phase_payload(recovery_guard.LEGACY_INCUMBENT_PHASE),
+    )
+    with pytest.raises(GuardError, match="phase regressed after transition"):
+        TestSupervisor(plan_path, ops=GuardOps(now=clock.now, sleep=clock.sleep))
 
 
 @pytest.mark.parametrize(
@@ -615,6 +841,7 @@ def test_arm_seals_guard_and_artifacts_before_systemd_user_launch(
     clock = FakeClock()
     plan_path, _, _, plan = _make_plan(tmp_path, clock)
     plan.pop("owner_token")
+    plan["legacy_incumbent_proof"]["argv"][0] = "{rollback_artifact}"
     plan["success_proofs"][2]["argv"] = ["{candidate_artifact}", "prove-notifier"]
     plan["rollback_proofs"][2]["argv"] = ["{rollback_artifact}", "prove-service"]
     _write_json(plan_path, plan)
@@ -638,6 +865,11 @@ def test_arm_seals_guard_and_artifacts_before_systemd_user_launch(
     assert Path(sealed["rollback"]["artifact"]).parent == run_dir
     assert sealed["success_proofs"][2]["argv"][0] == sealed["candidate"]["artifact"]
     assert sealed["rollback_proofs"][2]["argv"][0] == sealed["rollback"]["artifact"]
+    assert sealed["legacy_incumbent_proof"]["argv"][0] == sealed["rollback"]["artifact"]
+    phase = json.loads(
+        (run_dir / recovery_guard.EVIDENCE_PHASE_FILE).read_text(encoding="utf-8")
+    )
+    assert phase["phase"] == recovery_guard.LEGACY_INCUMBENT_PHASE
     assert hashlib.sha256(Path(sealed["rollback"]["artifact"]).read_bytes()).hexdigest() == sealed["rollback"]["sha256"]
     assert (run_dir / "recovery_guard.py").is_file()
 
@@ -651,4 +883,33 @@ def test_plan_cannot_disarm_without_explicit_ownership_proof_roles(tmp_path: Pat
     _write_json(plan_path, plan)
 
     with pytest.raises(GuardError, match="dispatcher_owner"):
+        RecoverySupervisor(plan_path)
+
+
+def test_plan_rejects_unpinned_legacy_identity_or_unsealed_identity_proof(
+    tmp_path: Path,
+) -> None:
+    clock = FakeClock()
+    plan_path, _, _, plan = _make_plan(tmp_path, clock)
+    plan["legacy_incumbent_identity"]["commit"] = "a" * 40
+    _write_json(plan_path, plan)
+    with pytest.raises(GuardError, match="audited pinned baseline"):
+        RecoverySupervisor(plan_path)
+
+    plan["legacy_incumbent_identity"]["commit"] = recovery_guard.LEGACY_INCUMBENT_COMMIT
+    plan["legacy_incumbent_proof"]["argv"][0] = "/tmp/mutable-helper"
+    _write_json(plan_path, plan)
+    with pytest.raises(GuardError, match="sealed rollback artifact"):
+        RecoverySupervisor(plan_path)
+
+    plan["legacy_incumbent_proof"]["argv"][0] = plan["rollback"]["artifact"]
+    plan["legacy_incumbent_proof"]["argv"].remove("{runtime_start_time}")
+    _write_json(plan_path, plan)
+    with pytest.raises(GuardError, match="observed runtime PID and start time"):
+        RecoverySupervisor(plan_path)
+
+    plan["legacy_incumbent_proof"]["argv"].append("{runtime_start_time}")
+    plan["success_proofs"][1]["expected"]["source_tree"] = "e" * 40
+    _write_json(plan_path, plan)
+    with pytest.raises(GuardError, match="not bound to candidate commit/tree"):
         RecoverySupervisor(plan_path)
