@@ -3100,10 +3100,23 @@ async def get_status(profile: Optional[str] = None):
         # keys off gateway_running (a live PID/health probe), NEVER
         # gateway_updated_at — a healthy idle gateway never advances that.
         active_agents = parse_active_agents((runtime or {}).get("active_agents", 0))
+        active_cron_jobs = parse_active_agents(
+            (runtime or {}).get("active_cron_jobs", 0)
+        )
+        active_api_runs = parse_active_agents(
+            (runtime or {}).get("active_api_runs", 0)
+        )
+        gateway_drain_quiesced = bool(
+            gateway_running
+            and gateway_state == "draining"
+            and (runtime or {}).get("drain_quiesced") is True
+        )
         gateway_busy = derive_gateway_busy(
             gateway_running=gateway_running,
             gateway_state=gateway_state,
             active_agents=active_agents,
+            active_cron_jobs=active_cron_jobs,
+            active_api_runs=active_api_runs,
         )
         gateway_drainable = derive_gateway_drainable(
             gateway_running=gateway_running,
@@ -3184,6 +3197,10 @@ async def get_status(profile: Optional[str] = None):
             "gateway_exit_reason": gateway_exit_reason,
             "gateway_updated_at": gateway_updated_at,
             "active_agents": active_agents,
+            "active_cron_jobs": active_cron_jobs,
+            "active_api_runs": active_api_runs,
+            "active_work": active_agents + active_cron_jobs + active_api_runs,
+            "gateway_drain_quiesced": gateway_drain_quiesced,
             "gateway_busy": gateway_busy,
             "gateway_drainable": gateway_drainable,
             "restart_drain_timeout": restart_drain_timeout,

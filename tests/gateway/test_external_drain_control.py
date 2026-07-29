@@ -12,15 +12,19 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+import os
+import socket
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
+from aiohttp import ClientSession
 import pytest
 
 import gateway.drain_control as dc
 from gateway.run import GatewayRunner
-from gateway.config import Platform
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
+from gateway.status import read_runtime_status
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
 
 
@@ -71,6 +75,87 @@ class TestMarkerContract:
 
         data = json.loads(dc.drain_request_path().read_text())
         assert data["action"] == "drain"
+
+    def test_owned_create_refuses_existing_marker(self, home):
+        dc.write_drain_request(principal="nas")
+
+        assert dc.create_owned_drain_request("cli-token") is None
+        assert dc.read_drain_request()["principal"] == "nas"
+
+    def test_owned_clear_only_removes_matching_marker(self, home):
+        payload = dc.create_owned_drain_request("cli-token")
+        assert payload is not None
+
+        assert dc.clear_owned_drain_request("other-token") is False
+        assert dc.drain_requested() is True
+        assert dc.clear_owned_drain_request("cli-token") is True
+        assert dc.drain_requested() is False
+
+    def test_owned_restart_marker_applies_only_to_target_gateway(
+        self, home, monkeypatch
+    ):
+        monkeypatch.setattr(dc.os, "getpid", lambda: 111)
+        payload = dc.create_owned_drain_request(
+            "cli-token", target_pid=111
+        )
+
+        assert payload is not None
+        assert payload["target_pid"] == 111
+        assert dc.drain_requested() is True
+
+        # A replacement process in the same VM/container epoch must not
+        # inherit the old process's owned restart drain.
+        monkeypatch.setattr(dc.os, "getpid", lambda: 222)
+        assert dc.drain_requested() is False
+
+    def test_malformed_target_pid_fails_safe_toward_drain(self, home):
+        dc.drain_request_path().write_text(
+            '{"action":"drain","target_pid":"not-a-pid"}',
+            encoding="utf-8",
+        )
+
+        assert dc.drain_requested() is True
+
+    @pytest.mark.asyncio
+    async def test_replacement_gateway_ignores_old_restart_drain_and_binds_health(
+        self, home, monkeypatch
+    ):
+        """Exercise the no-live replacement startup path through a real listener."""
+        with socket.socket() as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+
+        old_pid = os.getpid() + 100_000
+        payload = dc.create_owned_drain_request(
+            "cli-token", target_pid=old_pid
+        )
+        assert payload is not None
+
+        config = GatewayConfig(
+            platforms={
+                Platform.API_SERVER: PlatformConfig(
+                    enabled=True,
+                    extra={"host": "127.0.0.1", "port": port},
+                )
+            },
+            sessions_dir=home / "sessions",
+        )
+        runner = GatewayRunner(config)
+        monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
+        monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
+
+        try:
+            assert await runner.start() is True
+            async with ClientSession() as client:
+                response = await client.get(f"http://127.0.0.1:{port}/health")
+                assert response.status == 200
+            await asyncio.sleep(0)
+            assert runner._external_drain_active is False
+            runtime = read_runtime_status()
+            assert runtime is not None
+            assert runtime["drain_quiesced"] is False
+        finally:
+            await runner.stop()
 
 
 class TestSuppressNotification:
@@ -228,6 +313,7 @@ class TestInstantiationEpoch:
 def _drain_runner():
     runner, adapter = make_restart_runner()
     runner._external_drain_active = False
+    runner._external_drain_quiesced = False
     # Bind the real methods under test.
     runner._enter_external_drain = GatewayRunner._enter_external_drain.__get__(
         runner, GatewayRunner
@@ -249,11 +335,32 @@ class TestDrainStateMachine:
 
         assert runner._active_work_count() == 4
 
+    def test_persist_writes_split_work_counts_together(self, monkeypatch):
+        runner, _ = _drain_runner()
+        runner._persist_active_agents = GatewayRunner._persist_active_agents.__get__(
+            runner, GatewayRunner
+        )
+        runner._running_agents = {"session": MagicMock()}
+        monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 2)
+        monkeypatch.setattr(runner, "_active_api_run_count", lambda: 3)
+        write = MagicMock()
+        monkeypatch.setattr("gateway.status.write_runtime_status", write)
+
+        runner._persist_active_agents()
+
+        write.assert_called_once_with(
+            active_agents=1,
+            active_cron_jobs=2,
+            active_api_runs=3,
+        )
+
     def test_enter_sets_flag_and_flips_state(self):
         runner, _ = _drain_runner()
         runner._enter_external_drain()
         assert runner._external_drain_active is True
-        runner._update_runtime_status.assert_called_with("draining")
+        runner._update_runtime_status.assert_called_with(
+            "draining", drain_quiesced=False
+        )
 
     def test_enter_idempotent(self):
         runner, _ = _drain_runner()
@@ -268,7 +375,10 @@ class TestDrainStateMachine:
         runner._update_runtime_status.reset_mock()
         runner._exit_external_drain()
         assert runner._external_drain_active is False
-        runner._update_runtime_status.assert_called_with("running")
+        assert runner._external_drain_quiesced is False
+        runner._update_runtime_status.assert_called_with(
+            "running", drain_quiesced=False
+        )
 
     def test_exit_idempotent_when_not_draining(self):
         runner, _ = _drain_runner()
@@ -300,6 +410,28 @@ class TestDrainStateMachine:
 
 
 class TestDrainWatcher:
+    @pytest.mark.asyncio
+    async def test_watcher_publishes_quiesced_only_after_zero_work(
+        self, home, monkeypatch
+    ):
+        runner, _ = _drain_runner()
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        work = iter((1, 0, 0))
+        monkeypatch.setattr(runner, "_active_work_count", lambda: next(work, 0))
+        dc.write_drain_request()
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await asyncio.sleep(0.04)
+        runner._running = False
+        await task
+
+        assert runner._external_drain_quiesced is True
+        runner._update_runtime_status.assert_any_call(
+            "draining", drain_quiesced=True
+        )
+
     @pytest.mark.asyncio
     async def test_watcher_persists_aggregate_work_during_external_drain(self, home, monkeypatch):
         runner, _ = _drain_runner()
@@ -372,3 +504,39 @@ class TestNewTurnGate:
         runner._enter_external_drain()
         assert runner._running_agents.get("k") is sentinel
         sentinel.interrupt.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_internal_turn_allowed_while_drain_is_converging(self):
+        runner, _ = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_quiesced = False
+        runner._handle_message_with_agent = AsyncMock(return_value="done")
+        event = MessageEvent(
+            text="completion",
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id="internal-1",
+            internal=True,
+        )
+
+        result = await runner._handle_message(event)
+
+        assert result == "done"
+
+    @pytest.mark.asyncio
+    async def test_internal_turn_cannot_reopen_quiesced_drain(self):
+        runner, _ = _drain_runner()
+        runner._external_drain_active = True
+        runner._external_drain_quiesced = True
+        event = MessageEvent(
+            text="completion",
+            message_type=MessageType.TEXT,
+            source=make_restart_source(),
+            message_id="internal-2",
+            internal=True,
+        )
+
+        result = await runner._handle_message(event)
+
+        assert result is None
+        assert runner._running_agents == {}

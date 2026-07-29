@@ -7559,22 +7559,45 @@ class TestGatewayBusyReadout:
         assert data["gateway_busy"] is False
         assert data["gateway_drainable"] is True
 
-    def test_draining_state_is_neither_busy_nor_drainable(self, monkeypatch):
-        """While draining, the gateway is not a fresh begin-drain target, and
-        busy is False even with a stale active_agents>0 in the file — the state
-        gate dominates."""
+    def test_draining_state_reports_split_work_busy_but_not_drainable(self, monkeypatch):
+        """A drain is not a fresh begin-drain target, but remains busy until
+        every gateway-owned workload reaches zero."""
         import hermes_cli.web_server as ws
 
         monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
         monkeypatch.setattr(ws, "read_runtime_status", lambda: {
             "gateway_state": "draining",
             "platforms": {},
-            "active_agents": 3,
+            "active_agents": 0,
+            "active_cron_jobs": 3,
+            "active_api_runs": 1,
         })
 
         data = self.client.get("/api/status").json()
-        assert data["gateway_busy"] is False
+        assert data["active_agents"] == 0
+        assert data["active_cron_jobs"] == 3
+        assert data["active_api_runs"] == 1
+        assert data["active_work"] == 4
+        assert data["gateway_drain_quiesced"] is False
+        assert data["gateway_busy"] is True
         assert data["gateway_drainable"] is False
+
+    def test_quiesced_drain_requires_live_draining_handshake(self, monkeypatch):
+        import hermes_cli.web_server as ws
+
+        monkeypatch.setattr(ws, "get_running_pid_cached", lambda: 1234)
+        monkeypatch.setattr(ws, "read_runtime_status", lambda: {
+            "gateway_state": "draining",
+            "platforms": {},
+            "active_agents": 0,
+            "active_cron_jobs": 0,
+            "active_api_runs": 0,
+            "drain_quiesced": True,
+        })
+
+        data = self.client.get("/api/status").json()
+        assert data["active_work"] == 0
+        assert data["gateway_drain_quiesced"] is True
 
     def test_down_gateway_degrades_to_safe_falsy(self, monkeypatch):
         """Gateway down (no PID, no remote probe): busy/drainable False,

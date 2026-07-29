@@ -19,7 +19,7 @@ def _make_runner(*, connected=True, multiplex=False):
         {"writer": {Platform.DISCORD: MagicMock()}} if connected and multiplex else {}
     )
     runner._kanban_sub_fail_counts = {}
-    runner._kanban_notifier_lock_handle = None
+    runner._active_profile_name = lambda: "default"
     return runner
 
 
@@ -62,9 +62,11 @@ def test_notify_default_true_is_backward_compatible():
 def test_non_owner_does_not_enumerate_or_open_boards(lock_state):
     runner = _make_runner()
     sleep_calls = []
+    real_sleep = asyncio.sleep
 
     async def stop_after_retry(delay):
         sleep_calls.append(delay)
+        await real_sleep(0)
         if delay != 5:
             runner._running = False
 
@@ -86,22 +88,24 @@ def test_non_owner_does_not_enumerate_or_open_boards(lock_state):
     acquire.assert_called_once()
     list_boards.assert_not_called()
     connect.assert_not_called()
-    assert sleep_calls == [5, 0.1]
+    assert sleep_calls == [5, 0.1, 0.1]
 
 
 def test_disconnected_process_does_not_acquire_but_multiplex_adapter_does():
     runner = _make_runner(connected=False)
     acquire = MagicMock(return_value=(MagicMock(), "held"))
     sleep_calls = []
+    real_sleep = asyncio.sleep
 
     async def connect_multiplex_after_wait(delay):
         sleep_calls.append(delay)
+        await real_sleep(0)
         if delay == 0.1:
             runner._profile_adapters = {
                 "writer": {Platform.DISCORD: MagicMock()}
             }
 
-    async def owner_once(*, interval):
+    async def owner_once(*, interval, notifier_profile):
         runner._running = False
 
     with (
@@ -117,7 +121,7 @@ def test_disconnected_process_does_not_acquire_but_multiplex_adapter_does():
     ):
         asyncio.run(runner._kanban_notifier_watcher(interval=0.1))
 
-    assert sleep_calls == [5, 0.1]
+    assert sleep_calls == [5, 0.1, 0.1]
     acquire.assert_called_once()
 
 
@@ -127,7 +131,11 @@ def test_owner_loop_with_no_adapters_returns_before_board_poll():
         patch("hermes_cli.kanban_db.list_boards") as list_boards,
         patch("hermes_cli.kanban_db.connect") as connect,
     ):
-        asyncio.run(runner._kanban_notifier_owner_loop(interval=0.1))
+        asyncio.run(
+            runner._kanban_notifier_owner_loop(
+                interval=0.1, notifier_profile="default",
+            )
+        )
 
     list_boards.assert_not_called()
     connect.assert_not_called()
@@ -136,12 +144,22 @@ def test_owner_loop_with_no_adapters_returns_before_board_poll():
 def test_owner_releases_lease_on_cancellation():
     runner = _make_runner()
     lock_handle = MagicMock()
+    real_sleep = asyncio.sleep
+    owner_started = asyncio.Event()
 
     async def no_delay(_delay):
-        return None
+        await real_sleep(0)
 
-    async def cancel_owner(*, interval):
-        raise asyncio.CancelledError
+    async def waiting_owner(*, interval, notifier_profile):
+        owner_started.set()
+        await asyncio.Event().wait()
+
+    async def scenario():
+        watcher = asyncio.create_task(runner._kanban_notifier_watcher(interval=0.1))
+        await owner_started.wait()
+        watcher.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await watcher
 
     with (
         patch("hermes_cli.config.load_config", return_value=_config()),
@@ -154,14 +172,13 @@ def test_owner_releases_lease_on_cancellation():
         ) as release,
         patch("gateway.kanban_watchers.asyncio.sleep", side_effect=no_delay),
         patch.object(
-            runner, "_kanban_notifier_owner_loop", side_effect=cancel_owner,
+            runner, "_kanban_notifier_owner_loop", side_effect=waiting_owner,
         ),
     ):
-        with pytest.raises(asyncio.CancelledError):
-            asyncio.run(runner._kanban_notifier_watcher(interval=0.1))
+        asyncio.run(scenario())
 
     release.assert_called_once_with(lock_handle)
-    assert runner._kanban_notifier_lock_handle is None
+
 
 
 def test_owner_loss_releases_and_waiter_can_take_over_then_reconnect():
@@ -176,8 +193,9 @@ def test_owner_loss_releases_and_waiter_can_take_over_then_reconnect():
         ]
     )
     owner_calls = 0
+    real_sleep = asyncio.sleep
 
-    async def owner_lifecycle(*, interval):
+    async def owner_lifecycle(*, interval, notifier_profile):
         nonlocal owner_calls
         owner_calls += 1
         if owner_calls == 1:
@@ -186,6 +204,7 @@ def test_owner_loss_releases_and_waiter_can_take_over_then_reconnect():
         runner._running = False
 
     async def reconnect_or_retry(_delay):
+        await real_sleep(0)
         if not runner.adapters:
             runner.adapters[Platform.TELEGRAM] = MagicMock()
 
@@ -214,6 +233,28 @@ def test_owner_loss_releases_and_waiter_can_take_over_then_reconnect():
         ((second_lock,),),
     ]
     assert owner_calls == 2
+
+
+def test_profile_notifier_leases_are_isolated(tmp_path):
+    from gateway.kanban_watchers import _profile_notifier_lock_path
+
+    default_lock = _profile_notifier_lock_path(tmp_path, "default")
+    design_lock = _profile_notifier_lock_path(tmp_path, "dollydesign")
+
+    assert default_lock != design_lock
+    assert default_lock.parent == design_lock.parent == tmp_path / "kanban"
+
+
+def test_connected_profiles_include_primary_and_multiplex_adapters():
+    from gateway.kanban_watchers import _connected_kanban_profiles
+
+    runner = _make_runner()
+    runner._profile_adapters = {
+        "writer": {Platform.DISCORD: MagicMock()},
+        "offline": {},
+    }
+
+    assert _connected_kanban_profiles(runner) == {"default", "writer"}
 
 
 def test_dispatcher_watcher_remains_disabled_by_config(monkeypatch):

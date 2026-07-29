@@ -1873,6 +1873,38 @@ class TestActiveAgentsTurnBoundaryWrite:
         # _persist_active_agents helper safe to call on every turn.
         assert rec["gateway_state"] == "running"
 
+    def test_split_work_counts_are_clamped_and_totalled(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="running",
+            active_agents=0,
+            active_cron_jobs=2,
+            active_api_runs=3,
+        )
+
+        rec = status.read_runtime_status()
+        assert rec["active_agents"] == 0
+        assert rec["active_cron_jobs"] == 2
+        assert rec["active_api_runs"] == 3
+        assert rec["active_work"] == 5
+
+    def test_drain_quiesced_is_explicit_and_preserved(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+        status.write_runtime_status(
+            gateway_state="draining",
+            active_agents=0,
+            active_cron_jobs=0,
+            active_api_runs=0,
+            drain_quiesced=True,
+        )
+        status.write_runtime_status(active_agents=0)
+
+        rec = status.read_runtime_status()
+        assert rec["gateway_state"] == "draining"
+        assert rec["drain_quiesced"] is True
+
     def test_active_agents_only_write_preserves_draining_state(self, tmp_path, monkeypatch):
         """Same invariant while draining — a turn finishing mid-drain (count
         falling) must not flip the state back to running."""
@@ -1907,8 +1939,17 @@ class TestGatewayBusyDerivation:
             gateway_running=False, gateway_state="running", active_agents=9
         ) is False
 
-    def test_busy_false_for_non_running_states(self):
-        for state in ("draining", "stopping", "stopped", "startup_failed", None):
+    def test_busy_during_drain_when_non_agent_work_remains(self):
+        assert status.derive_gateway_busy(
+            gateway_running=True,
+            gateway_state="draining",
+            active_agents=0,
+            active_cron_jobs=1,
+            active_api_runs=0,
+        ) is True
+
+    def test_busy_false_for_inactive_lifecycle_states(self):
+        for state in ("stopping", "stopped", "startup_failed", None):
             assert status.derive_gateway_busy(
                 gateway_running=True, gateway_state=state, active_agents=5
             ) is False, state

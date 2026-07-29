@@ -141,6 +141,17 @@ def build_gateway_parser(
         action="store_true",
         help="Kill ALL gateway processes across all profiles before restarting",
     )
+    gateway_restart.add_argument(
+        "--when-idle",
+        action="store_true",
+        help="Drain new gateway work and restart only after all active work finishes",
+    )
+    gateway_restart.add_argument(
+        "--timeout",
+        type=float,
+        metavar="SECONDS",
+        help="Maximum wait for --when-idle (default: configured restart drain timeout)",
+    )
     _add_compat_platform_flag(gateway_restart)
 
     # gateway status
@@ -222,6 +233,20 @@ def build_gateway_parser(
 
     # gateway setup
     gateway_subparsers.add_parser("setup", help="Configure messaging platforms")
+
+    # gateway recovery-guard — pre-arm an out-of-process activation/rollback
+    # transaction. The transient systemd-user service owns the disruptive
+    # commands; this CLI only seals the plan/artifacts and waits for the durable
+    # "armed" receipt.
+    gateway_recovery_guard = gateway_subparsers.add_parser(
+        "recovery-guard",
+        help="Arm a gateway-independent activation and rollback supervisor",
+    )
+    gateway_recovery_guard.add_argument(
+        "--plan",
+        required=True,
+        help="Path to a recovery guard JSON plan",
+    )
 
     # gateway migrate-legacy
     gateway_migrate_legacy = gateway_subparsers.add_parser(
