@@ -18,9 +18,11 @@ The transient service then owns the whole disruptive sequence. It requests drain
 Before writing `armed`, the supervisor validates both sealed artifacts, the fresh
 live incumbent identity, its service cgroup, and the independent legacy-incumbent
 proof. A failure in this pre-arm phase records `prearm_failed` and exits without
-requesting drain or invoking either service artifact. The durable `armed` event is
-written before the drain request; once that disruptive sequence begins, any later
-failure retains the fail-closed verified rollback path.
+requesting drain, invoking candidate activation, or running rollback recovery. The
+mandatory legacy-incumbent proof may execute the sealed rollback artifact in proof
+mode before arming. The durable `armed` event is written before the drain request;
+once that disruptive sequence begins, any later failure retains the fail-closed
+verified rollback path.
 
 ## Safety contract
 
@@ -211,7 +213,7 @@ Final outcomes:
 
 - `activated` (exit 0): candidate identity, endpoint health, and ownership proofs passed
 - `rolled_back` (exit 1): candidate failed or timed out; prior runtime and service proofs passed
-- `prearm_failed` (exit 2): pre-arm validation failed; no drain was requested and no candidate or rollback artifact command was invoked
+- `prearm_failed` (exit 2): pre-arm validation failed; no drain was requested, candidate activation was not invoked, and rollback recovery did not run. Validation may already have executed the sealed rollback artifact solely for the mandatory legacy-incumbent proof
 - `rollback_failed` / `rollback_unavailable` (exit 2): local operator intervention is required
 
 Inspect the durable receipt directly; do not infer success from the gateway process being active or from notifier delivery.
