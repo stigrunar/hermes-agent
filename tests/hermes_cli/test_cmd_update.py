@@ -593,16 +593,18 @@ class TestCmdUpdateCheckBranchFlag:
     def test_check_stig_target_fetches_and_compares_only_stig_release(
         self, mock_run, _mock_method, monkeypatch
     ):
+        """The real cmd_update/check seam accepts and preserves an UpdateTarget."""
         from hermes_cli import main as hm
         from hermes_cli.update_channel import UpdateTarget
 
+        target = UpdateTarget("stig", "release/stig-tested")
         mock_run.side_effect = self._check_side_effect(
             target_branch="release/stig-tested", commit_count="0"
         )
         monkeypatch.setattr(
             hm,
             "_resolve_update_target",
-            lambda _args: UpdateTarget("stig", "release/stig-tested"),
+            lambda _args: target,
         )
 
         cmd_update(SimpleNamespace(check=True, branch=None))

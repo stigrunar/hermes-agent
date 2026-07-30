@@ -1917,7 +1917,9 @@ def _run_logged_subprocess(cmd, *, cwd=None, env=None):
     _log_only_write(result.stdout or "")
     return result
 
-def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
+def _cmd_update_check(
+    branch: str = "main", *, branch_explicit: bool = False, target=None
+):
     """Implement ``hermes update --check``: fetch and report without installing.
 
     ``branch`` selects which branch the check compares against. Default is
@@ -1929,6 +1931,12 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     one-line notice instead of silently dropping the flag.
     """
     from hermes_cli.config import detect_install_method, recommended_update_command_for_method
+    from hermes_cli.update_channel import UpdateTarget
+
+    if target is None:
+        target = UpdateTarget(remote="origin", branch=branch)
+    branch = target.branch
+    remote = target.remote
     method = detect_install_method(_m().PROJECT_ROOT)
     if method == "docker":
         # Docker can't ``git fetch`` from within the container.  Surface the
@@ -1974,7 +1982,7 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
     )
     depth_args = ["--depth", "1"] if is_shallow else []
 
-    if branch == "main":
+    if remote == "origin" and branch == "main":
         # Probe locally (~6 ms) whether an 'upstream' remote exists at all
         # before spending a network fetch on it. Non-fork installs have no
         # 'upstream' remote, and the old flow burned a failed network attempt
@@ -2012,16 +2020,18 @@ def _cmd_update_check(branch: str = "main", *, branch_explicit: bool = False):
             upstream_exists = False
             compare_branch = f"origin/{branch}"
     else:
-        # Non-default branch: compare against origin/<branch> directly.
-        print("→ Fetching from origin...")
+        # A selected non-default target, including Stig's tested release, is
+        # fetched directly. Never probe upstream for an explicitly selected
+        # remote.
+        print(f"→ Fetching from {remote}...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch"] + depth_args + ["origin", branch],
+            git_cmd + ["fetch"] + depth_args + [remote, branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
         )
         upstream_exists = False
-        compare_branch = f"origin/{branch}"
+        compare_branch = f"{remote}/{branch}"
 
     if fetch_result.returncode != 0:
         stderr = fetch_result.stderr.strip()
