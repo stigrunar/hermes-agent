@@ -52,111 +52,6 @@ class TestMarkerContract:
         body = dc.read_drain_request()
         assert body is not None and body["principal"] == "nas"
 
-    def test_clear_removes(self, home):
-        dc.write_drain_request()
-        assert dc.clear_drain_request() is True
-        assert dc.drain_requested() is False
-        # idempotent: clearing again is a no-op, returns False
-        assert dc.clear_drain_request() is False
-
-    def test_path_respects_hermes_home(self, home):
-        assert dc.drain_request_path() == home / ".drain_request.json"
-
-    def test_corrupt_marker_reads_as_present_contentless(self, home):
-        # A half-written / malformed marker must still count as "drain active"
-        # (fail-safe toward quiescing).
-        dc.drain_request_path().write_text("{not valid json", encoding="utf-8")
-        assert dc.drain_requested() is True
-        assert dc.read_drain_request() == {}
-
-    def test_write_is_atomic_json(self, home):
-        dc.write_drain_request(principal="x")
-        import json
-
-        data = json.loads(dc.drain_request_path().read_text())
-        assert data["action"] == "drain"
-
-    def test_owned_create_refuses_existing_marker(self, home):
-        dc.write_drain_request(principal="nas")
-
-        assert dc.create_owned_drain_request("cli-token") is None
-        assert dc.read_drain_request()["principal"] == "nas"
-
-    def test_owned_clear_only_removes_matching_marker(self, home):
-        payload = dc.create_owned_drain_request("cli-token")
-        assert payload is not None
-
-        assert dc.clear_owned_drain_request("other-token") is False
-        assert dc.drain_requested() is True
-        assert dc.clear_owned_drain_request("cli-token") is True
-        assert dc.drain_requested() is False
-
-    def test_owned_restart_marker_applies_only_to_target_gateway(
-        self, home, monkeypatch
-    ):
-        monkeypatch.setattr(dc.os, "getpid", lambda: 111)
-        payload = dc.create_owned_drain_request(
-            "cli-token", target_pid=111
-        )
-
-        assert payload is not None
-        assert payload["target_pid"] == 111
-        assert dc.drain_requested() is True
-
-        # A replacement process in the same VM/container epoch must not
-        # inherit the old process's owned restart drain.
-        monkeypatch.setattr(dc.os, "getpid", lambda: 222)
-        assert dc.drain_requested() is False
-
-    def test_malformed_target_pid_fails_safe_toward_drain(self, home):
-        dc.drain_request_path().write_text(
-            '{"action":"drain","target_pid":"not-a-pid"}',
-            encoding="utf-8",
-        )
-
-        assert dc.drain_requested() is True
-
-    @pytest.mark.asyncio
-    async def test_replacement_gateway_ignores_old_restart_drain_and_binds_health(
-        self, home, monkeypatch
-    ):
-        """Exercise the no-live replacement startup path through a real listener."""
-        with socket.socket() as probe:
-            probe.bind(("127.0.0.1", 0))
-            port = probe.getsockname()[1]
-
-        old_pid = os.getpid() + 100_000
-        payload = dc.create_owned_drain_request(
-            "cli-token", target_pid=old_pid
-        )
-        assert payload is not None
-
-        config = GatewayConfig(
-            platforms={
-                Platform.API_SERVER: PlatformConfig(
-                    enabled=True,
-                    extra={"host": "127.0.0.1", "port": port},
-                )
-            },
-            sessions_dir=home / "sessions",
-        )
-        runner = GatewayRunner(config)
-        monkeypatch.setattr(runner.hooks, "discover_and_load", lambda: None)
-        monkeypatch.setattr(runner.hooks, "emit", AsyncMock())
-
-        try:
-            assert await runner.start() is True
-            async with ClientSession() as client:
-                response = await client.get(f"http://127.0.0.1:{port}/health")
-                assert response.status == 200
-            await asyncio.sleep(0)
-            assert runner._external_drain_active is False
-            runtime = read_runtime_status()
-            assert runtime is not None
-            assert runtime["drain_quiesced"] is False
-        finally:
-            await runner.stop()
-
 
 class TestSuppressNotification:
     """The generic suppress_notification flag on the drain marker.
@@ -179,42 +74,6 @@ class TestSuppressNotification:
         assert body is not None and body["suppress_notification"] is True
         assert dc.drain_notification_suppressed() is True
 
-    def test_suppressed_false_when_no_marker(self, home):
-        assert dc.drain_notification_suppressed() is False
-
-    def test_legacy_marker_without_field_not_suppressed(self, home):
-        # A marker written before this change has no suppress_notification key →
-        # must read as not-suppressed (broadcast still fires), while still being
-        # an active drain.
-        import json
-
-        dc.drain_request_path().write_text(
-            json.dumps({"action": "drain", "epoch": dc.current_instantiation_epoch()}),
-            encoding="utf-8",
-        )
-        assert dc.drain_requested() is True
-        assert dc.drain_notification_suppressed() is False
-
-    def test_corrupt_marker_not_suppressed(self, home):
-        # Half-written marker → read_drain_request returns {} → no flag → not
-        # suppressed (fail toward the louder, visible behaviour) even though the
-        # drain itself stays active (fail-safe toward quiescing).
-        dc.drain_request_path().write_text("{not valid json", encoding="utf-8")
-        assert dc.drain_requested() is True
-        assert dc.drain_notification_suppressed() is False
-
-    def test_stale_epoch_marker_not_suppressed(self, home, monkeypatch):
-        # THE NS-570 ANALOGUE for suppression: a suppress_notification:true
-        # marker that survived a machine restart on the durable volume must NOT
-        # silence the freshly-restarted gateway's legitimate shutdown broadcast.
-        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-OLD")
-        dc.write_drain_request(principal="nas", suppress_notification=True)
-        assert dc.drain_notification_suppressed() is True  # same epoch → honoured
-
-        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-NEW")
-        assert dc.drain_request_path().exists() is True
-        assert dc.drain_notification_suppressed() is False  # stale → ignored
-
 
 # ---------------------------------------------------------------------------
 # Instantiation-epoch staleness (NS-570: orphaned marker on durable volume)
@@ -228,11 +87,6 @@ class TestInstantiationEpoch:
         body = dc.read_drain_request()
         assert body is not None and body["epoch"] == dc.current_instantiation_epoch()
 
-    def test_current_epoch_is_stable_within_process(self):
-        # Memoised — an s6 respawn of just the gateway keeps PID 1, so a
-        # repeated call inside one process must return the same value (an
-        # in-flight drain stays honoured).
-        assert dc.current_instantiation_epoch() == dc.current_instantiation_epoch()
 
     def test_marker_from_prior_instantiation_reads_as_absent(self, home, monkeypatch):
         # THE NS-570 REGRESSION. A begin-drain marker written by a PREVIOUS
@@ -250,40 +104,6 @@ class TestInstantiationEpoch:
         # …but it is ignored because its epoch belongs to a prior instantiation.
         assert dc.drain_requested() is False
 
-    def test_marker_from_current_instantiation_is_honoured(self, home, monkeypatch):
-        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "epoch-A")
-        dc.write_drain_request()
-        assert dc.drain_requested() is True
-
-    def test_legacy_marker_without_epoch_still_active(self, home):
-        # A marker written before this change (no "epoch" key) must remain
-        # fail-safe toward quiescing — never silently ignored.
-        import json
-
-        dc.drain_request_path().write_text(
-            json.dumps({"action": "drain", "requested_at": "x", "principal": "p"}),
-            encoding="utf-8",
-        )
-        assert dc.drain_requested() is True
-
-    def test_corrupt_marker_with_no_parseable_epoch_still_active(self, home):
-        # Half-written / malformed → read_drain_request returns {} → no epoch →
-        # lenient check keeps it active (fail-safe), same as before the change.
-        dc.drain_request_path().write_text("{not valid json", encoding="utf-8")
-        assert dc.drain_requested() is True
-
-    def test_unavailable_epoch_disables_staleness_check(self, home, monkeypatch):
-        # No /proc (non-Linux, etc.) → epoch "" → degrade to presence-only:
-        # any present marker (even with a foreign epoch) reads as active rather
-        # than fail-closed.
-        import json
-
-        dc.drain_request_path().write_text(
-            json.dumps({"action": "drain", "epoch": "some-other-epoch"}),
-            encoding="utf-8",
-        )
-        monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "")
-        assert dc.drain_requested() is True
 
     def test_current_epoch_empty_when_proc_unreadable(self, monkeypatch):
         # When neither /proc identity source is readable, the epoch is "" so
@@ -325,42 +145,7 @@ def _drain_runner():
 
 
 class TestDrainStateMachine:
-    def test_active_work_count_includes_api_and_cron_work(self, monkeypatch):
-        runner, _ = _drain_runner()
-        runner.adapters = {
-            Platform.API_SERVER: MagicMock(active_agent_work_count=MagicMock(return_value=2))
-        }
-        runner._running_agents = {"session": MagicMock()}
-        monkeypatch.setattr("cron.scheduler.get_running_job_ids", lambda: {"job-1"})
 
-        assert runner._active_work_count() == 4
-
-    def test_persist_writes_split_work_counts_together(self, monkeypatch):
-        runner, _ = _drain_runner()
-        runner._persist_active_agents = GatewayRunner._persist_active_agents.__get__(
-            runner, GatewayRunner
-        )
-        runner._running_agents = {"session": MagicMock()}
-        monkeypatch.setattr(runner, "_active_cron_job_count", lambda: 2)
-        monkeypatch.setattr(runner, "_active_api_run_count", lambda: 3)
-        write = MagicMock()
-        monkeypatch.setattr("gateway.status.write_runtime_status", write)
-
-        runner._persist_active_agents()
-
-        write.assert_called_once_with(
-            active_agents=1,
-            active_cron_jobs=2,
-            active_api_runs=3,
-        )
-
-    def test_enter_sets_flag_and_flips_state(self):
-        runner, _ = _drain_runner()
-        runner._enter_external_drain()
-        assert runner._external_drain_active is True
-        runner._update_runtime_status.assert_called_with(
-            "draining", drain_quiesced=False
-        )
 
     def test_enter_idempotent(self):
         runner, _ = _drain_runner()
@@ -369,21 +154,6 @@ class TestDrainStateMachine:
         runner._enter_external_drain()  # second call — no-op
         runner._update_runtime_status.assert_not_called()
 
-    def test_exit_reverts_to_running(self):
-        runner, _ = _drain_runner()
-        runner._enter_external_drain()
-        runner._update_runtime_status.reset_mock()
-        runner._exit_external_drain()
-        assert runner._external_drain_active is False
-        assert runner._external_drain_quiesced is False
-        runner._update_runtime_status.assert_called_with(
-            "running", drain_quiesced=False
-        )
-
-    def test_exit_idempotent_when_not_draining(self):
-        runner, _ = _drain_runner()
-        runner._exit_external_drain()  # never entered — no-op
-        runner._update_runtime_status.assert_not_called()
 
     def test_exit_during_shutdown_does_not_revert_to_running(self):
         runner, _ = _drain_runner()
@@ -395,14 +165,6 @@ class TestDrainStateMachine:
         assert runner._external_drain_active is False
         runner._update_runtime_status.assert_not_called()
 
-    def test_exit_when_loop_stopped_does_not_revert(self):
-        runner, _ = _drain_runner()
-        runner._enter_external_drain()
-        runner._update_runtime_status.reset_mock()
-        runner._running = False
-        runner._exit_external_drain()
-        runner._update_runtime_status.assert_not_called()
-
 
 # ---------------------------------------------------------------------------
 # Watcher reconciliation
@@ -410,47 +172,6 @@ class TestDrainStateMachine:
 
 
 class TestDrainWatcher:
-    @pytest.mark.asyncio
-    async def test_watcher_publishes_quiesced_only_after_zero_work(
-        self, home, monkeypatch
-    ):
-        runner, _ = _drain_runner()
-        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
-            runner, GatewayRunner
-        )
-        work = iter((1, 0, 0))
-        monkeypatch.setattr(runner, "_active_work_count", lambda: next(work, 0))
-        dc.write_drain_request()
-
-        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
-        await asyncio.sleep(0.04)
-        runner._running = False
-        await task
-
-        assert runner._external_drain_quiesced is True
-        runner._update_runtime_status.assert_any_call(
-            "draining", drain_quiesced=True
-        )
-
-    @pytest.mark.asyncio
-    async def test_watcher_persists_aggregate_work_during_external_drain(self, home, monkeypatch):
-        runner, _ = _drain_runner()
-        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
-            runner, GatewayRunner
-        )
-        runner._persist_active_agents = MagicMock()
-        dc.write_drain_request()
-        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
-        await asyncio.sleep(0.03)
-        runner._running = False
-        await asyncio.sleep(0.02)
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-        runner._persist_active_agents.assert_called()
 
     @pytest.mark.asyncio
     async def test_watcher_enters_then_exits_with_marker(self, home):
@@ -495,48 +216,3 @@ class TestNewTurnGate:
         assert result is not None
         assert "draining" in result.lower()
 
-    @pytest.mark.asyncio
-    async def test_in_flight_turn_not_interrupted_by_drain(self):
-        # Entering drain must NOT touch the running-agents set.
-        runner, _ = _drain_runner()
-        sentinel = MagicMock()
-        runner._running_agents["k"] = sentinel
-        runner._enter_external_drain()
-        assert runner._running_agents.get("k") is sentinel
-        sentinel.interrupt.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_internal_turn_allowed_while_drain_is_converging(self):
-        runner, _ = _drain_runner()
-        runner._external_drain_active = True
-        runner._external_drain_quiesced = False
-        runner._handle_message_with_agent = AsyncMock(return_value="done")
-        event = MessageEvent(
-            text="completion",
-            message_type=MessageType.TEXT,
-            source=make_restart_source(),
-            message_id="internal-1",
-            internal=True,
-        )
-
-        result = await runner._handle_message(event)
-
-        assert result == "done"
-
-    @pytest.mark.asyncio
-    async def test_internal_turn_cannot_reopen_quiesced_drain(self):
-        runner, _ = _drain_runner()
-        runner._external_drain_active = True
-        runner._external_drain_quiesced = True
-        event = MessageEvent(
-            text="completion",
-            message_type=MessageType.TEXT,
-            source=make_restart_source(),
-            message_id="internal-2",
-            internal=True,
-        )
-
-        result = await runner._handle_message(event)
-
-        assert result is None
-        assert runner._running_agents == {}

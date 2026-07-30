@@ -178,6 +178,29 @@ _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024
 
 
+def _assert_not_delegated_child_mutation() -> None:
+    """Reject Kanban state mutations from ``delegate_task`` child contexts.
+
+    The structured kanban tools and CLI dispatch layer both have fast-fail
+    guards for better UX, but neither is a trust boundary: a delegated child can
+    still shell out to the CLI or import this module directly. The actual
+    invariant belongs at the DB/filesystem mutation layer so every public
+    mutator that uses ``write_txn`` (tasks, runs, comments, attachments,
+    dispatcher claims, repair events, subscriptions, GC, etc.) and every board
+    metadata mutator fails closed before touching durable state.
+    """
+    try:
+        from agent.delegation_context import is_delegated_child_process_context
+
+        delegated = is_delegated_child_process_context()
+    except Exception:
+        delegated = bool(os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT"))
+    if delegated:
+        raise PermissionError(
+            "delegate_task child contexts cannot mutate Kanban tasks or boards"
+        )
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Fire a kanban lifecycle plugin hook, fully best-effort.
 
@@ -192,7 +215,7 @@ def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None
     it through.
     """
     try:
-        from hermes_cli.plugins import invoke_hook
+        from hermes_cli.lifecycle import invoke_hook
         from hermes_cli.profiles import get_active_profile_name
         try:
             profile_name = get_active_profile_name()
@@ -512,6 +535,7 @@ def set_current_board(slug: str) -> Path:
     so that ``hermes kanban boards switch <typo>`` returns an error
     instead of silently pointing at nothing.
     """
+    _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -523,6 +547,7 @@ def set_current_board(slug: str) -> Path:
 
 def clear_current_board() -> None:
     """Remove ``<root>/kanban/current`` so the active board reverts to ``default``."""
+    _assert_not_delegated_child_mutation()
     try:
         current_board_path().unlink()
     except FileNotFoundError:
@@ -725,6 +750,7 @@ def write_board_metadata(
     Preserves any existing fields not mentioned in the call. Sets
     ``created_at`` on first write. Returns the resulting metadata dict.
     """
+    _assert_not_delegated_child_mutation()
     slug = _normalize_board_slug(board) or DEFAULT_BOARD
     meta = read_board_metadata(slug)
     # Preserve existing DB-derived fields — they get re-computed each
@@ -840,6 +866,7 @@ def remove_board(slug: str, *, archive: bool = True) -> dict:
     Returns a summary dict describing what happened (``{"slug", "action",
     "new_path"}``).
     """
+    _assert_not_delegated_child_mutation()
     normed = _normalize_board_slug(slug)
     if not normed:
         raise ValueError("board slug is required")
@@ -925,6 +952,13 @@ class Task:
     # the defaults; empty list = explicitly no extra skills.
     skills: Optional[list] = None
     model_override: Optional[str] = None
+    # Provider that ``model_override`` belongs to. When set, the dispatcher
+    # passes ``--provider <name>`` alongside ``-m <model>`` so the worker
+    # resolves the model against the right backend instead of the profile's
+    # configured provider. NULL = worker profile's provider resolves the
+    # model (pre-existing behaviour). Solves the "model from provider A,
+    # profile configured for provider B" mismatch class.
+    provider_override: Optional[str] = None
     # Per-task override for the consecutive-failure circuit breaker.
     # The value is the failure count at which the breaker trips — e.g.
     # ``max_retries=1`` blocks on the first failure (zero retries),
@@ -1023,6 +1057,11 @@ class Task:
             ),
             skills=skills_value,
             model_override=row["model_override"] if "model_override" in keys and row["model_override"] else None,
+            provider_override=(
+                row["provider_override"]
+                if "provider_override" in keys and row["provider_override"]
+                else None
+            ),
             max_retries=(
                 row["max_retries"] if "max_retries" in keys else None
             ),
@@ -1253,6 +1292,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- to the worker, overriding the profile's default model. NULL = use
     -- the profile default.
     model_override       TEXT,
+    -- Provider the model override belongs to. When set (alongside
+    -- model_override), the dispatcher passes --provider <name> so the
+    -- worker resolves the model against the right backend instead of the
+    -- profile's configured provider. NULL = profile provider.
+    provider_override    TEXT,
     -- Per-task override for the consecutive-failure circuit breaker.
     -- The value is the failure count at which the breaker trips — e.g.
     -- ``max_retries=1`` blocks on the first failure. NULL (the common
@@ -1405,7 +1449,6 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
-    session_key   TEXT,
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
@@ -1474,10 +1517,20 @@ def _resolve_busy_timeout_ms() -> int:
 
 
 def _sqlite_connect(path: Path) -> sqlite3.Connection:
-    """Open a Kanban SQLite connection with consistent lock waiting."""
+    """Open a Kanban SQLite connection with consistent lock waiting.
+
+    Uses ``connect_tracked`` so the live-connection registry knows this file
+    is open: while it is, byte-level probes of the same file are refused,
+    because an ``open()``/``close()`` would cancel this process's POSIX
+    advisory locks on the database (see ``hermes_cli.sqlite_safe_read``).
+    The registration is released automatically when the connection closes.
+    """
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     busy_timeout_ms = _resolve_busy_timeout_ms()
-    conn = sqlite3.connect(
-        str(path),
+    conn = connect_tracked(
+        path,
+        connect_fn=sqlite3.connect,
         isolation_level=None,
         timeout=busy_timeout_ms / 1000.0,
     )
@@ -1739,10 +1792,14 @@ def _validate_sqlite_header(path: Path) -> None:
         return
     if stat.st_size == 0:
         return
-    try:
-        with path.open("rb") as handle:
-            head = handle.read(64)
-    except OSError:
+    # Byte-level probe, so it must run BEFORE any connection to this path
+    # exists (connect() calls it under the init lock, ahead of _sqlite_connect).
+    # read_header_bytes_preopen refuses once a connection is live, because the
+    # close() would cancel this process's POSIX locks on the file.
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(path, length=64)
+    if head is None:
         return
     if head.startswith(_SQLITE_HEADER):
         return
@@ -1847,6 +1904,25 @@ def _backup_corrupt_db(path: Path) -> Optional[Path]:
     resolved = path.resolve()
     parent = resolved.parent
     base_name = resolved.name  # basename only
+    # This reads the whole DB file to fingerprint it. That is a close()-on-a-
+    # database-file hazard (it cancels this process's POSIX advisory locks --
+    # see hermes_cli.sqlite_safe_read), so it must only run once the board has
+    # been taken out of service. Every caller reaches here on the corrupt/
+    # quarantine path after closing its probe connection, but another
+    # SessionDB/kanban connection elsewhere in the process would still be at
+    # risk -- so REFUSE rather than warn-and-proceed. Losing a forensic copy
+    # is strictly better than corrupting the live database we are trying to
+    # rescue.
+    from hermes_cli.sqlite_safe_read import has_live_connection
+
+    if has_live_connection(resolved):
+        _log.error(
+            "refusing to quarantine %s: a connection to it is still open in "
+            "this process, and fingerprinting the file would cancel that "
+            "connection's POSIX locks. Close all connections first.",
+            resolved,
+        )
+        return None
     digest = hashlib.sha256()
     try:
         with resolved.open("rb") as handle:
@@ -2226,6 +2302,12 @@ def connect(
         return conn
 
     with _cross_process_init_lock(path):
+        # Read-only file/sidecar preflight (port of kilocode#12508) —
+        # repair-or-refuse before the header/integrity probes so a stray
+        # read-only kanban.db fails with an actionable message instead of
+        # "attempt to write a readonly database" mid-init.
+        from hermes_state import preflight_db_writability
+        preflight_db_writability(path, db_label=f"kanban.db ({path.name})")
         # Cheap byte-level check first — catches the #29507 TLS-overwrite shape
         # and other invalid-header cases without opening a sqlite connection.
         _validate_sqlite_header(path)
@@ -2243,7 +2325,7 @@ def connect(
                 # critical section as schema initialization so concurrent gateway
                 # startup threads do not race before _INITIALIZED_PATHS is populated.
                 # WAL doesn't work on network filesystems (NFS/SMB/FUSE). Shared helper
-                # falls back to DELETE with one WARNING so kanban stays usable there.
+                # falls back to DELETE with one ERROR log so kanban stays usable there.
                 # See hermes_state._WAL_INCOMPAT_MARKERS for detection logic.
                 from hermes_state import apply_wal_with_fallback
                 apply_wal_with_fallback(conn, db_label=f"kanban.db ({path.name})")
@@ -2564,6 +2646,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if "model_override" not in cols:
         conn.execute("ALTER TABLE tasks ADD COLUMN model_override TEXT")
 
+    if "provider_override" not in cols:
+        # Provider the model_override belongs to. NULL = worker profile's
+        # provider resolves the model (the behaviour existing rows had).
+        _add_column_if_missing(
+            conn, "tasks", "provider_override", "provider_override TEXT"
+        )
+
     if "goal_mode" not in cols:
         # Ralph-style goal loop toggle for the dispatched worker. 0 (the
         # default) = classic single-shot worker, preserving the behaviour
@@ -2655,20 +2744,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "chat_type", "chat_type TEXT"
             )
-        if "session_key" not in notify_cols:
-            _add_column_if_missing(
-                conn, "kanban_notify_subs", "session_key", "session_key TEXT"
-            )
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
-                conn,
-                "kanban_notify_subs",
-                "delivery_metadata",
-                "delivery_metadata TEXT",
-            )
-        if "baseline_event_id" not in notify_cols:
-            _add_column_if_missing(
-                conn, "kanban_notify_subs", "baseline_event_id", "baseline_event_id INTEGER"
+                conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -2848,9 +2926,8 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, session_key TEXT, delivery_metadata TEXT,"
-        " created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0, baseline_event_id INTEGER,"
+        " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -2982,42 +3059,40 @@ def _baseline_legacy_notify_subs(conn: sqlite3.Connection) -> None:
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
-    """Read the SQLite header page_count and compare against actual file size.
+    """Compare SQLite's own page accounting against the file size on disk.
 
     Raises sqlite3.DatabaseError if the file is shorter than the header claims
     (torn-extend corruption).
+
+    Both sides are read WITHOUT opening the database file. The header side
+    comes from ``PRAGMA page_count`` over the existing connection; the on-disk
+    side from ``stat()``. An earlier version read the header field with a bare
+    ``open(path,"rb")`` -- but ``close()`` cancels every POSIX advisory lock
+    this process holds on the file, so that probe silently dropped the locks
+    of concurrent writers (and of a running VACUUM) and let other processes
+    write into a database a writer still believed it owned. That is the
+    documented corruption route in sqlite.org/howtocorrupt.html section 2.2.
     """
+    from hermes_cli.sqlite_safe_read import file_length_matches_header
+
+    # In WAL mode a just-committed page can still live in the -wal file, so
+    # the main file legitimately lags its page count. Only enforce the
+    # invariant under a rollback journal, where every committed page must
+    # already be in the main file.
     try:
-        row = conn.execute("PRAGMA database_list").fetchone()
-        if row is None:
-            return
-        path_str = row[2]  # column 2 is the file path; empty for in-memory DBs
-        if not path_str:
-            return  # in-memory or unnamed DB; skip
-        path = path_str
-        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
-        file_size = os.path.getsize(path)
-        with open(path, "rb") as f:
-            f.seek(28)
-            header_bytes = f.read(4)
-        if len(header_bytes) < 4:
-            return  # can't read header; skip
-        header_page_count = int.from_bytes(header_bytes, "big")
-        if header_page_count == 0:
-            return  # new/empty DB; skip
-        actual_pages = file_size // page_size
-        if actual_pages < header_page_count:
-            raise sqlite3.DatabaseError(
-                f"torn-extend detected: page count mismatch on {path}: "
-                f"header claims {header_page_count} pages, "
-                f"file has {actual_pages} pages "
-                f"(missing {header_page_count - actual_pages} pages, "
-                f"file_size={file_size}, page_size={page_size})"
-            )
-    except sqlite3.DatabaseError:
-        raise
-    except Exception:
-        pass  # I/O errors during check are non-fatal; let normal ops continue
+        row = conn.execute("PRAGMA journal_mode").fetchone()
+        journal_mode = str(row[0]).lower() if row and row[0] is not None else ""
+    except sqlite3.Error:
+        return
+    if journal_mode == "wal":
+        return
+
+    ok = file_length_matches_header(conn)
+    if ok is False:
+        raise sqlite3.DatabaseError(
+            "torn-extend detected: the database file is shorter than its "
+            "header page count claims"
+        )
 
 
 # SQLite's own busy_timeout uses a near-deterministic backoff, so concurrent
@@ -3064,6 +3139,7 @@ def write_txn(conn: sqlite3.Connection):
     a SQLite auto-rollback (which leaves no active transaction) does not
     shadow the original exception with a spurious rollback error.
     """
+    _assert_not_delegated_child_mutation()
     _execute_boundary_with_retry(conn, "BEGIN IMMEDIATE")
     try:
         yield conn
@@ -3150,13 +3226,15 @@ def create_task(
     max_runtime_seconds: Optional[int] = None,
     skills: Optional[Iterable[str]] = None,
     max_retries: Optional[int] = None,
+    model_override: Optional[str] = None,
+    provider_override: Optional[str] = None,
     goal_mode: bool = False,
     goal_max_turns: Optional[int] = None,
     initial_status: str = "running",
     session_id: Optional[str] = None,
     board: Optional[str] = None,
     project_id: Optional[str] = None,
-    _trusted_project_repo: Optional[str] = None,
+    project_source_task_id: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3180,7 +3258,22 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``model_override`` / ``provider_override`` pin the worker to a specific
+    model (and optionally its provider) without touching the profile's
+    config — passed to the worker as ``-m <model> [--provider <name>]``.
+    ``provider_override`` requires ``model_override``.
+
+    ``project_source_task_id`` is an internal cross-profile fallback for a
+    worker-created child. When the active profile cannot resolve ``project_id``
+    in its own projects.db, a matching canonical project-linked task in this
+    board can supply the repo and branch convention. Its literal worktree is
+    never reused; the new task still gets its own task-id-keyed path.
     """
+    model_override = (model_override or "").strip() or None
+    provider_override = (provider_override or "").strip() or None
+    if provider_override and not model_override:
+        raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
     if not title or not title.strip():
         raise ValueError("title is required")
@@ -3213,24 +3306,62 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
-    if _trusted_project_repo is not None:
-        if not project_id:
-            raise ValueError("trusted project repository requires project_id")
-        trusted_repo_path = Path(str(_trusted_project_repo)).expanduser()
-        if not trusted_repo_path.is_absolute() or ".." in trusted_repo_path.parts:
-            raise ValueError(
-                "trusted project repository must be absolute and traversal-free"
-            )
-        if workspace_kind == "worktree":
-            project_repo = str(trusted_repo_path)
-    elif project_id:
-        try:
-            from hermes_cli import projects_db as _pdb
+    if project_id:
+        from hermes_cli import projects_db as _pdb
 
+        try:
             with _pdb.connect_closing() as _pconn:
                 project_obj = _pdb.get_project(_pconn, project_id)
         except Exception:
             project_obj = None
+        if project_obj is None and project_source_task_id:
+            # Worker profiles have their own projects.db, while the Kanban DB is
+            # intentionally shared. Recover routing only from a canonical
+            # project-linked source task in this same board. This carries the
+            # repo + project branch convention forward without copying or
+            # opening the creator profile's project store, and without reusing
+            # the source task's literal worktree path.
+            source_task = get_task(conn, str(project_source_task_id))
+            if (
+                source_task is not None
+                and source_task.project_id == project_id
+                and source_task.workspace_kind == "worktree"
+                and source_task.workspace_path
+            ):
+                source_path = Path(source_task.workspace_path)
+                if (
+                    source_path.is_absolute()
+                    and source_path.name == source_task.id
+                    and source_path.parent.name == ".worktrees"
+                ):
+                    project_slug = None
+                    if source_task.branch_name:
+                        prefix, separator, leaf = source_task.branch_name.partition("/")
+                        if separator and (
+                            leaf == source_task.id
+                            or leaf.startswith(f"{source_task.id}-")
+                        ):
+                            try:
+                                project_slug = _pdb.normalize_slug(prefix)
+                            except ValueError:
+                                project_slug = None
+                    if project_slug is None:
+                        try:
+                            project_slug = _pdb.normalize_slug(project_id)
+                        except ValueError:
+                            project_slug = None
+                    if project_slug:
+                        project_repo = str(source_path.parent.parent)
+                        project_obj = _pdb.Project(
+                            id=project_id,
+                            slug=project_slug,
+                            name=project_slug,
+                            created_at=0,
+                            primary_path=project_repo,
+                        )
+                        if workspace_kind == "scratch":
+                            workspace_kind = "worktree"
+
         if project_obj is None:
             # A project id/slug that doesn't resolve must not crash task
             # creation or persist a dangling reference — drop the link and
@@ -3428,8 +3559,9 @@ def create_task(
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
                         max_runtime_seconds,
-                        skills, max_retries, goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        skills, max_retries, model_override, provider_override,
+                        goal_mode, goal_max_turns, session_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3449,6 +3581,8 @@ def create_task(
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
                         json.dumps(skills_list) if skills_list is not None else None,
                         int(max_retries) if max_retries is not None else None,
+                        model_override,
+                        provider_override,
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
@@ -3468,9 +3602,14 @@ def create_task(
                         "status": task_status,
                         "parents": list(parents),
                         "tenant": tenant,
+                        "workspace_kind": workspace_kind,
+                        "workspace_path": workspace_path,
                         "branch_name": branch_name,
+                        "project_id": project_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
+                        "model_override": model_override,
+                        "provider_override": provider_override,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -3503,14 +3642,14 @@ def _inherit_notify_subs(
     *,
     created_at: Optional[int] = None,
 ) -> None:
-    """Copy complete notifier route provenance from parents to a child.
+    """Copy gateway notification subscriptions from parent tasks to a child.
 
-    The inherited subscription starts at the child's current event cursor so
-    linking an existing child never replays its pre-link event history.
-    Ambiguous parent rows are copied without guessing: the notifier's
-    fail-closed profile check still prevents them from being claimed or sent.
+    The inherited subscription starts caught up to the child's current event
+    cursor. This makes manual `link_tasks(parent, existing_child)` safe: the
+    parent chat receives future child terminal events without replaying the
+    child's pre-link history.
     """
-    parent_ids = tuple(dict.fromkeys(parent for parent in parents if parent))
+    parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
         return
     row = conn.execute(
@@ -3522,18 +3661,15 @@ def _inherit_notify_subs(
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, chat_type, thread_id, user_id,
-             notifier_profile, session_key, delivery_metadata, created_at,
-             last_event_id, baseline_event_id)
-        SELECT ?, platform, chat_id, chat_type, thread_id, user_id,
-               notifier_profile, session_key, delivery_metadata, ?, ?, ?
+            (task_id, platform, chat_id, thread_id, user_id,
+             notifier_profile, created_at, last_event_id)
+        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
         (
             child_id,
             int(created_at if created_at is not None else time.time()),
-            cursor,
             cursor,
             *parent_ids,
         ),
@@ -3641,6 +3777,51 @@ def assign_task(conn: sqlite3.Connection, task_id: str, profile: Optional[str]) 
         else:
             conn.execute("UPDATE tasks SET assignee = ? WHERE id = ?", (profile, task_id))
         _append_event(conn, task_id, "assigned", {"assignee": profile})
+        return True
+
+
+def set_model_override(
+    conn: sqlite3.Connection,
+    task_id: str,
+    model: Optional[str],
+    provider: Optional[str] = None,
+) -> bool:
+    """Set (or clear) the per-task model/provider override.
+
+    ``model=None`` (or empty) clears BOTH overrides — the worker falls back
+    to its profile's configured model. ``provider`` without ``model`` is
+    rejected: a bare provider switch has no defined meaning for the worker
+    spawn (``--provider`` alone would re-resolve the profile's model name
+    against a different backend, which is exactly the mismatch class this
+    feature exists to kill).
+
+    Allowed on any non-archived task, including ``running`` ones — the
+    override only takes effect on the NEXT dispatch, so setting it on a
+    running task that's about to be reclaimed/retried is the primary
+    rate-limit-recovery flow. Returns True on success.
+    """
+    model = (model or "").strip() or None
+    provider = (provider or "").strip() or None
+    if provider and not model:
+        raise ValueError("provider_override requires a model_override")
+    if not model:
+        provider = None
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        ).fetchone()
+        if not row:
+            return False
+        if row["status"] == "archived":
+            raise RuntimeError(f"cannot set model override on archived task {task_id}")
+        conn.execute(
+            "UPDATE tasks SET model_override = ?, provider_override = ? WHERE id = ?",
+            (model, provider, task_id),
+        )
+        _append_event(
+            conn, task_id, "model_override_set",
+            {"model": model, "provider": provider},
+        )
         return True
 
 
@@ -7208,7 +7389,7 @@ def _cleanup_worker_tmux(conn: sqlite3.Connection, task_id: str) -> None:
         # Check if session exists and pane is dead before killing
         out = subprocess.run(
             ["tmux", "list-panes", "-t", session, "-F", "#{pane_dead}"],
-            capture_output=True, text=True, timeout=5,
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=5,
         )
         if out.stdout.strip() == "1":
             subprocess.run(
@@ -7416,68 +7597,6 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
-    # Validate the policy-bearing portions before accepting phase one. The
-    # worker will exit after this call, so discovering an invalid review or
-    # dependency handoff only after reaping would strand a workerless running
-    # task with an unfulfillable terminal request.
-    if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
-        raise ValueError(
-            "explicit review successor gate remains protected until the review "
-            "handoff is approved"
-        )
-    _request_review_required = bool(
-        reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
-    )
-    if not _after_reap and _request_review_required:
-        handoff = _review_handoff_row(conn, source_task_id=task_id)
-        if handoff is None:
-            raise ValueError(
-                "review-required handoff cannot activate: no explicit review "
-                "relationship (no registered review_handoff). Register exactly "
-                "one with kanban_link relationship='review_gate' before blocking; "
-                "no task state was changed"
-            )
-        # An active handoff has already detached the review gate. Terminal
-        # delivery retries must remain idempotent even though the review card
-        # is intentionally in ``review`` rather than a releasable parking
-        # status. New handoffs still require a releasable review card before
-        # phase one can strand the workerless task.
-        if handoff["state"] != "active":
-            review = conn.execute(
-                "SELECT status FROM tasks WHERE id=?", (handoff["review_task_id"],)
-            ).fetchone()
-            if review is None or review["status"] not in ("todo", "ready", "blocked", "done"):
-                raise ValueError("registered review gate is not releasable")
-    accepted_dependency_payload = None
-    if kind == "dependency" and not _after_reap:
-        accepted_dependency_payload = _dependency_wait_payload(
-            conn, task_id, reason, dependency_task_id,
-        )
-        if not any(
-            (dependency := get_task(conn, dep_id)) is not None
-            and dependency.status not in TERMINAL_STATUSES
-            for dep_id in accepted_dependency_payload["dependency_ids"]
-        ):
-            raise ValueError("dependency_wait_requires_unfinished_parent")
-    terminal_payload = {
-            "reason": reason,
-            "kind": kind,
-            "dependency_task_id": dependency_task_id,
-    }
-    if accepted_dependency_payload is not None:
-        terminal_payload["dependency_wait_payload"] = accepted_dependency_payload
-    if not _after_reap and _request_terminal_transition(
-        conn,
-        task_id,
-        action="block",
-        payload=terminal_payload,
-        expected_run_id=expected_run_id,
-    ):
-        return True
-    review_required = bool(
-        reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
-    )
-    routed_to = "blocked"
     recurrences = 0
     with write_txn(conn):
         if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
@@ -7630,7 +7749,6 @@ def block_task(
                 conn, task_id, "dependency_wait",
                 dependency_payload, run_id=run_id,
             )
-            routed_to = "todo"
             _blocked_task = get_task(conn, task_id)
             _fire_kanban_lifecycle_hook(
                 "kanban_task_blocked",
@@ -7690,7 +7808,6 @@ def block_task(
                 },
                 run_id=run_id,
             )
-            routed_to = "triage"
         else:
             if expected_run_id is None:
                 cur = conn.execute(
@@ -8371,6 +8488,15 @@ def decompose_triage_task(
             child_ws_kind = child.get("workspace_kind") or root_ws_kind
             if child.get("workspace_path"):
                 child_ws_path = child.get("workspace_path")
+            elif child_ws_kind == "worktree":
+                # Never share one worktree checkout between siblings: the
+                # root's literal path would put every child in the same
+                # directory on the first-dispatched sibling's branch, with
+                # no lock — siblings can be promoted and dispatched
+                # concurrently. Leave the path unset so dispatch
+                # materializes a fresh <repo>/.worktrees/<child-id> per
+                # child from the board anchor.
+                child_ws_path = None
             elif child_ws_kind == root_ws_kind:
                 child_ws_path = root_ws_path
             else:
@@ -8591,7 +8717,7 @@ def _git_toplevel(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -8613,7 +8739,7 @@ def _git_branch_exists(repo_root: Path, branch_name: str) -> bool:
         result = subprocess.run(
             ["git", "-C", str(repo_root), "show-ref", "--verify", f"refs/heads/{branch_name}"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -8627,7 +8753,7 @@ def _git_common_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-common-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -8646,7 +8772,7 @@ def _git_dir(path: Path) -> Optional[Path]:
         result = subprocess.run(
             ["git", "-C", str(path), "rev-parse", "--path-format=absolute", "--git-dir"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -8665,7 +8791,7 @@ def _git_current_branch(path: Path) -> Optional[str]:
         result = subprocess.run(
             ["git", "-C", str(path), "branch", "--show-current"],
             capture_output=True,
-            text=True,
+            text=True, encoding='utf-8', errors='replace',
             timeout=30,
             check=False,
         )
@@ -8722,7 +8848,7 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
     result = subprocess.run(
         cmd,
         capture_output=True,
-        text=True,
+        text=True, encoding='utf-8', errors='replace',
         timeout=60,
         check=False,
     )
@@ -8791,6 +8917,24 @@ def _resolve_worktree_workspace(
 
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
+        if actual_branch == branch_name:
+            return requested_resolved, actual_branch
+        # The requested path is an existing checkout of a DIFFERENT
+        # task's branch. Decompose children inherit the root's
+        # workspace_path verbatim, so siblings all point here; reusing
+        # the checkout as-is would run this task on the other task's
+        # branch — silent cross-task provenance corruption, and unsafe
+        # when siblings run concurrently. Fall back to a fresh worktree
+        # of our own under the same repo.
+        fallback_root = _repo_root_for_worktree_target(requested.parent)
+        if fallback_root is not None:
+            fallback = fallback_root / ".worktrees" / task.id
+            if fallback.resolve(strict=False) != requested_resolved:
+                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                return fallback.resolve(strict=False), branch_name
+        # No repo to anchor a fallback on (or the occupied path IS this
+        # task's own canonical worktree): keep the legacy reuse rather
+        # than failing dispatch.
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)
@@ -9214,7 +9358,7 @@ def _pid_alive(pid: Optional[int]) -> bool:
                 ["ps", "-o", "stat=", "-p", str(int(pid))],
                 stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL,
-                text=True,
+                text=True, encoding='utf-8', errors='replace',
                 timeout=1,
                 check=False,
             )
@@ -11622,7 +11766,6 @@ def detect_stale_running(
 
 
     now = int(time.time())
-    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     reclaimed: list[str] = []
 
     rows = conn.execute(
@@ -12117,7 +12260,6 @@ def _record_task_failure(
             ):
                 return False
         failures = int(row["consecutive_failures"]) + 1
-        cur_status = row["status"]
 
         # Per-task override wins over both caller-supplied and default
         # thresholds. None (the common case) falls through.
@@ -13526,6 +13668,12 @@ def _default_spawn(
 
     prompt = f"work kanban task {task.id}"
     env = dict(os.environ)
+    # The dispatcher is detached from every conversation. Its worker must never
+    # inherit routing mirrored by a previous gateway turn, even before the first
+    # session binds ContextVars in this process.
+    from gateway.session_context import _VAR_MAP
+    for key in _VAR_MAP:
+        env.pop(key, None)
 
     # Inject HERMES_HOME so the worker reads the profile-scoped config.yaml
     # (fallback_providers, toolsets, agent settings, etc.) instead of the root
@@ -13663,6 +13811,12 @@ def _default_spawn(
                 cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
+        # Pin the provider too when the override names one, so the worker
+        # resolves the model against the intended backend instead of the
+        # profile's configured provider (mixing model X with provider Y is
+        # the classic mis-set that stalls a board).
+        if task.provider_override:
+            cmd.extend(["--provider", task.provider_override])
     worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
     if worker_toolsets:
         cmd.extend(["--toolsets", ",".join(worker_toolsets)])
@@ -14278,14 +14432,15 @@ def task_age(task: Task) -> dict:
 def _encode_notify_delivery_metadata(
     metadata: Optional[Mapping[str, Any]],
 ) -> Optional[str]:
-    """Serialize privacy-safe scalar adapter metadata for durable delivery."""
+    """Serialize platform send metadata stored on notification subscriptions."""
     if not isinstance(metadata, Mapping):
         return None
-    clean = {
-        str(key): value
-        for key, value in metadata.items()
-        if value is not None and isinstance(value, (str, int, float, bool))
-    }
+    clean: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            clean[str(key)] = value
     if not clean:
         return None
     return json.dumps(clean, sort_keys=True, separators=(",", ":"))
@@ -14297,15 +14452,15 @@ def _decode_notify_delivery_metadata(raw: Any) -> dict[str, Any]:
     if not raw:
         return {}
     try:
-        value = json.loads(str(raw))
-    except (TypeError, ValueError):
+        data = json.loads(str(raw))
+    except Exception:
         return {}
-    if not isinstance(value, dict):
+    if not isinstance(data, dict):
         return {}
     return {
-        str(key): item
-        for key, item in value.items()
-        if isinstance(item, (str, int, float, bool))
+        str(key): value
+        for key, value in data.items()
+        if isinstance(value, (str, int, float, bool))
     }
 
 
@@ -14319,14 +14474,19 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
-    session_key: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Register from-now terminal-state notifications for ``task_id``.
+    """Register a gateway source that wants terminal-state notifications
+    for ``task_id``. Idempotent on (task, platform, chat, thread).
 
-    The initial cursor and durable baseline marker atomically snapshot the
-    task's current event maximum. Idempotent re-subscribe preserves an
-    existing row's cursor on (task, platform, chat, thread).
+    New subscriptions start "caught up": ``last_event_id`` snaps to the
+    task's current ``MAX(task_events.id)`` at creation instead of the
+    schema default 0. A cursor of 0 on an already-active task made the
+    gateway notifier replay every historical terminal event on its next
+    tick — and with many stale subs, a single boot-time burst of 100+
+    messages (issue #29905). Subscribers only want events that occur
+    AFTER they subscribe; the gateway/tool auto-subscribe paths run at
+    task creation, where the snapshot is 0 anyway.
     """
     now = int(time.time())
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
@@ -14335,19 +14495,25 @@ def add_notify_sub(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
-                 notifier_profile, session_key, delivery_metadata, created_at,
-                 last_event_id, baseline_event_id)
-            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                   COALESCE(MAX(id), 0), COALESCE(MAX(id), 0)
-              FROM task_events
-             WHERE task_id = ?
+                 notifier_profile, delivery_metadata, created_at, last_event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
+                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
             """,
             (
-                task_id, platform, chat_id, chat_type, thread_id or "", user_id,
-                notifier_profile, session_key, metadata_json, now, task_id,
+                task_id,
+                platform,
+                chat_id,
+                chat_type,
+                thread_id or "",
+                user_id,
+                notifier_profile,
+                metadata_json,
+                now,
+                task_id,
             ),
         )
         if chat_type:
+            # Self-heal rows created before chat_type was persisted.
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
@@ -14369,17 +14535,10 @@ def add_notify_sub(
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
             )
-        if session_key:
-            conn.execute(
-                """
-                UPDATE kanban_notify_subs
-                   SET session_key = ?
-                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
-                   AND (session_key IS NULL OR session_key = '')
-                """,
-                (session_key, task_id, platform, chat_id, thread_id or ""),
-            )
         if metadata_json:
+            # A duplicate subscribe from the same chat/thread should refresh
+            # the routing anchor. Telegram DM-topic notifications need the
+            # latest reply anchor to stay inside the visible topic lane.
             conn.execute(
                 """
                 UPDATE kanban_notify_subs
@@ -14402,11 +14561,50 @@ def list_notify_subs(
     out: list[dict] = []
     for row in rows:
         item = dict(row)
-        item["delivery_metadata"] = _decode_notify_delivery_metadata(
-            item.get("delivery_metadata")
-        )
+        if "delivery_metadata" in item:
+            item["delivery_metadata"] = _decode_notify_delivery_metadata(
+                item.get("delivery_metadata")
+            )
         out.append(item)
     return out
+
+
+def count_notify_subs(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+) -> int:
+    """Count ``kanban_notify_subs`` rows via a read-only connection.
+
+    Cheap probe for the gateway notifier's zero-subscription early exit:
+    unlike :func:`connect`, this never creates the DB file, never runs
+    schema init/migration, and never opens the database writable (no
+    write locks, no checkpoints — though a read-only open of a WAL
+    database may still create the ``-shm``/``-wal`` sidecars, it cannot
+    write table content). Rows in a not-yet-checkpointed WAL are
+    visible, so a freshly added subscription is never missed. A missing
+    DB, or a legacy DB that predates the subscriptions table, counts as
+    zero. Path resolution matches :func:`connect` (explicit ``db_path``,
+    else ``board`` via :func:`kanban_db_path`). Raises
+    :class:`sqlite3.Error` when the DB exists but cannot be read
+    (locked, corrupt); callers choose their own fallback.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    if not path.exists():
+        return 0
+    conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        try:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_subs"
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return 0
+            raise
+        return int(row[0]) if row else 0
+    finally:
+        conn.close()
 
 
 def remove_notify_sub(

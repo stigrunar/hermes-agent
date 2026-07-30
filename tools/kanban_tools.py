@@ -63,6 +63,33 @@ def _profile_has_kanban_toolset() -> bool:
         return False
 
 
+def _is_delegated_child_context() -> bool:
+    try:
+        from agent.delegation_context import is_delegated_child_context
+
+        return is_delegated_child_context()
+    except Exception:
+        return False
+
+
+def _reject_delegated_child_mutation(tool_name: str) -> Optional[str]:
+    """Deny Kanban mutations from delegate_task children.
+
+    A delegate_task child runs in the same process as its parent, so stale or
+    inherited HERMES_KANBAN_* env vars are not proof of dispatcher ownership.
+    The child may summarize findings to its parent, but it must not complete,
+    block, heartbeat, comment, create, link, or unblock board tasks directly.
+    """
+    if not _is_delegated_child_context():
+        return None
+    return tool_error(
+        f"{tool_name} refused: delegate_task child agents are not Kanban "
+        "run owners. Return findings to the parent agent; the dispatcher "
+        "worker or an explicitly configured Kanban orchestrator must perform "
+        "board mutations."
+    )
+
+
 def _check_kanban_mode() -> bool:
     """Task-lifecycle tools are available when:
 
@@ -75,6 +102,8 @@ def _check_kanban_mode() -> bool:
     embedded by default) and orchestrator profiles with the kanban
     toolset enabled see the Kanban lifecycle tool surface.
     """
+    if _is_delegated_child_context():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return True
     return _profile_has_kanban_toolset()
@@ -89,6 +118,8 @@ def _check_kanban_orchestrator_mode() -> bool:
     board state. Profiles that explicitly opt into the kanban toolset
     and are NOT scoped to a single task are the orchestrator surface.
     """
+    if _is_delegated_child_context():
+        return False
     if os.environ.get("HERMES_KANBAN_TASK"):
         return False
     return _profile_has_kanban_toolset()
@@ -102,6 +133,8 @@ def _default_task_id(arg: Optional[str]) -> Optional[str]:
     """Resolve ``task_id`` arg or fall back to the env var the dispatcher set."""
     if arg:
         return arg
+    if _is_delegated_child_context():
+        return None
     env_tid = os.environ.get("HERMES_KANBAN_TASK")
     return env_tid or None
 
@@ -561,6 +594,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "completed_at": task.completed_at,
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
+        "provider_override": task.provider_override,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -606,6 +640,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "result": t.result,
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
+                    "provider_override": t.provider_override,
                 }
 
             def _run_dict(r):
@@ -711,6 +746,9 @@ def _handle_list(args: dict, **kw) -> str:
 
 def _handle_complete(args: dict, **kw) -> str:
     """Mark the current task done with a structured handoff."""
+    delegated_err = _reject_delegated_child_mutation("kanban_complete")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -902,6 +940,9 @@ def _handle_complete(args: dict, **kw) -> str:
 
 def _handle_block(args: dict, **kw) -> str:
     """Transition the task to blocked with a reason a human will read."""
+    delegated_err = _reject_delegated_child_mutation("kanban_block")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -988,6 +1029,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
     by ``release_stale_claims`` — which is exactly the trap that
     ``heartbeat_claim``'s docstring warns against.
     """
+    delegated_err = _reject_delegated_child_mutation("kanban_heartbeat")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1031,6 +1075,9 @@ def _handle_heartbeat(args: dict, **kw) -> str:
 
 def _handle_comment(args: dict, **kw) -> str:
     """Append a comment to a task's thread."""
+    delegated_err = _reject_delegated_child_mutation("kanban_comment")
+    if delegated_err:
+        return delegated_err
     tid = args.get("task_id")
     if not tid:
         return tool_error(
@@ -1076,6 +1123,9 @@ def _handle_attach(args: dict, **kw) -> str:
     """
     from hermes_cli import kanban_db as kb
 
+    delegated_err = _reject_delegated_child_mutation("kanban_attach")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1195,6 +1245,9 @@ def _handle_attach_url(args: dict, **kw) -> str:
     """
     from hermes_cli import kanban_db as kb
 
+    delegated_err = _reject_delegated_child_mutation("kanban_attach_url")
+    if delegated_err:
+        return delegated_err
     tid = _default_task_id(args.get("task_id"))
     if not tid:
         return tool_error(
@@ -1291,6 +1344,9 @@ def _handle_create(args: dict, **kw) -> str:
     ``parents`` can be a list of task ids; dependency-gated promotion
     works as usual.
     """
+    delegated_err = _reject_delegated_child_mutation("kanban_create")
+    if delegated_err:
+        return delegated_err
     title = args.get("title")
     if not title or not str(title).strip():
         return tool_error("title is required")
@@ -1306,19 +1362,31 @@ def _handle_create(args: dict, **kw) -> str:
     # Stamp the originating session id when the agent loop runs under
     # ACP (which sets HERMES_SESSION_ID before invoking tools). NULL on
     # CLI / dashboard paths and on legacy hosts that don't set the env.
-    session_id = args.get("session_id") or os.environ.get("HERMES_SESSION_ID")
+    # Prefer the request-scoped api_server origin binding: HERMES_SESSION_ID
+    # is clobbered with a subagent's internal id whenever a child agent is
+    # constructed in-process (agent_init calls set_current_session_id), which
+    # would stamp — and later wake — the wrong session.
+    from tools.async_delegation import _current_origin_session_id
+
+    session_id = (
+        args.get("session_id")
+        or _current_origin_session_id()
+        or os.environ.get("HERMES_SESSION_ID")
+    )
     priority = args.get("priority")
-    # Resolve workspace. If the caller passed one explicitly, honor it.
-    # Otherwise, a dispatcher-spawned worker (HERMES_KANBAN_TASK set)
-    # inherits its own running task's workspace, so a worker editing a
-    # dir:/worktree project that spawns a follow-up child keeps the child
-    # in that project instead of a throwaway scratch dir. Orchestrators
-    # (kanban toolset, no HERMES_KANBAN_TASK) and CLI/dashboard callers
-    # fall back to scratch as before. Explicit None path stays None.
+    # Resolve workspace. Workspace sharing is always explicit: omitted fields
+    # mean a fresh scratch workspace, even when a dispatcher-spawned worker
+    # creates the task. Reusing a parent's literal path would let a child
+    # mutate review evidence or race the parent's checkout (#67567).
+    #
+    # Project identity is the one safe context to inherit implicitly. The DB
+    # resolves a project-linked scratch request into a fresh per-task worktree,
+    # preserving the repository/branch convention without sharing a checkout.
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
-    _inherit_workspace = workspace_kind is None and workspace_path is None
+    project_source_task_id = None
+    _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
         workspace_kind = "scratch"
     triage, bool_error = _parse_bool_arg(args, "triage")
@@ -1344,6 +1412,10 @@ def _handle_create(args: dict, **kw) -> str:
     if goal_bool_error:
         return tool_error(goal_bool_error)
     goal_max_turns = args.get("goal_max_turns")
+    model_override = args.get("model")
+    provider_override = args.get("provider")
+    if provider_override and not model_override:
+        return tool_error("'provider' requires 'model' to be set as well")
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1363,168 +1435,16 @@ def _handle_create(args: dict, **kw) -> str:
             )
         kb, conn = _connect(board=board)
         try:
-            if trusted_project_repo is not None:
-                source_task_id = os.environ.get("HERMES_KANBAN_TASK")
-                source_task = (
-                    kb.get_task(conn, source_task_id) if source_task_id else None
-                )
-                if source_task is None or source_task.project_id != project_id:
-                    raise ValueError(
-                        "trusted handoff project binding contradicts the source task"
-                    )
-            # Inherit the spawning worker's own task workspace when the
-            # caller didn't specify one (see resolution note above).
-            if _inherit_workspace:
+            # A project link is safe to inherit because ``create_task`` turns
+            # it into a fresh per-task worktree. Never inherit the parent's
+            # literal workspace kind/path; directory sharing must be explicit.
+            if _inherit_project and project_id is None:
                 _self_tid = os.environ.get("HERMES_KANBAN_TASK")
                 if _self_tid:
                     _self_task = kb.get_task(conn, _self_tid)
-                    if _self_task is not None and _self_task.workspace_kind:
-                        workspace_kind = _self_task.workspace_kind
-                        workspace_path = _self_task.workspace_path
-                        # Keep follow-up children inside the same project so the
-                        # whole subtree shares one repo + branch convention.
-                        if project_id is None and _self_task.project_id:
-                            project_id = _self_task.project_id
-            if review_source_task_id:
-                if not idempotency_key:
-                    raise ValueError("review preparation requires idempotency_key")
-                if parents and list(parents) != [review_source_task_id]:
-                    raise ValueError(
-                        "review preparation owns its single source parent; "
-                        "do not pass other parents"
-                    )
-                if triage or goal_mode:
-                    raise ValueError(
-                        "review preparation cannot use triage or goal_mode"
-                    )
-                prepared = kb.prepare_review_gate(
-                    conn,
-                    str(review_source_task_id),
-                    title=str(title).strip(),
-                    body=body,
-                    assignee=str(assignee),
-                    idempotency_key=str(idempotency_key),
-                    next_task_id=(
-                        str(review_next_task_id) if review_next_task_id else None
-                    ),
-                    created_by=os.environ.get("HERMES_PROFILE") or "worker",
-                    workspace_kind=str(workspace_kind),
-                    workspace_path=workspace_path,
-                    project_id=project_id,
-                    tenant=tenant,
-                    priority=int(priority) if priority is not None else 0,
-                    max_runtime_seconds=(
-                        int(max_runtime_seconds)
-                        if max_runtime_seconds is not None else None
-                    ),
-                    skills=skills,
-                    source_execution_envelope=source_execution_envelope,
-                    board=board,
-                )
-                return _ok(
-                    **prepared,
-                    board=kb.get_current_board() if board is None else board,
-                )
-            if strict_idempotency_match:
-                if not idempotency_key:
-                    raise ValueError(
-                        "strict idempotency matching requires idempotency_key"
-                    )
-                existing = conn.execute(
-                    "SELECT id FROM tasks WHERE idempotency_key = ? "
-                    "AND status != 'archived' ORDER BY created_at DESC LIMIT 1",
-                    (idempotency_key,),
-                ).fetchone()
-                if existing is not None:
-                    existing_task = kb.get_task(conn, existing["id"])
-                    expected_parents = sorted(str(item) for item in parents)
-                    observed_parents = sorted(kb.parent_ids(conn, existing["id"]))
-                    expected_skills = [
-                        str(item).strip() for item in (skills or []) if str(item).strip()
-                    ]
-                    conflicts = []
-                    expected_values = {
-                        "title": str(title).strip(),
-                        "body": body,
-                        "assignee": kb._canonical_assignee(str(assignee)),
-                        "workspace_kind": str(workspace_kind),
-                        "workspace_path": workspace_path,
-                        "project_id": project_id,
-                        "skills": expected_skills,
-                        "goal_mode": bool(goal_mode),
-                    }
-                    observed_values = {
-                        "title": existing_task.title,
-                        "body": existing_task.body,
-                        "assignee": existing_task.assignee,
-                        "workspace_kind": existing_task.workspace_kind,
-                        "workspace_path": existing_task.workspace_path,
-                        "project_id": existing_task.project_id,
-                        "skills": existing_task.skills or [],
-                        "goal_mode": bool(existing_task.goal_mode),
-                    }
-                    for field, expected in expected_values.items():
-                        observed = observed_values[field]
-                        # Dispatcher materialization persists this one derived path;
-                        # it is still the caller's logical scratch/no-path envelope.
-                        materialized_default_scratch_path = (
-                            field == "workspace_path"
-                            and expected is None
-                            and expected_values["workspace_kind"] == "scratch"
-                            and observed_values["workspace_kind"] == "scratch"
-                            and observed is not None
-                            and str(observed)
-                            == str(kb.workspaces_root(board=board) / existing_task.id)
-                        )
-                        materialized_project_worktree_path = (
-                            field == "workspace_path"
-                            and expected is None
-                            and expected_values["workspace_kind"] == "worktree"
-                            and observed_values["workspace_kind"] == "worktree"
-                            and trusted_project_repo is not None
-                            and observed is not None
-                            and str(observed)
-                            == str(
-                                Path(trusted_project_repo)
-                                / ".worktrees"
-                                / existing_task.id
-                            )
-                        )
-                        if (
-                            observed != expected
-                            and not materialized_default_scratch_path
-                            and not materialized_project_worktree_path
-                        ):
-                            conflicts.append(field)
-                    if observed_parents != expected_parents:
-                        conflicts.append("parents")
-                    expected_status = "triage" if triage else "ready"
-                    if initial_status == "blocked":
-                        expected_status = "blocked"
-                    elif expected_parents:
-                        parent_rows = conn.execute(
-                            "SELECT status FROM tasks WHERE id IN ("
-                            + ",".join("?" * len(expected_parents))
-                            + ")",
-                            tuple(expected_parents),
-                        ).fetchall()
-                        if any(row["status"] != "done" for row in parent_rows):
-                            expected_status = "todo"
-                    if existing_task.status != expected_status:
-                        conflicts.append("initial_status")
-                    if conflicts:
-                        raise ValueError(
-                            "idempotency key resolved to conflicting create content: "
-                            + ", ".join(sorted(conflicts))
-                        )
-                    return _ok(
-                        task_id=existing_task.id,
-                        status=existing_task.status,
-                        subscribed=False,
-                        board=kb.get_current_board() if board is None else board,
-                        project_id=existing_task.project_id,
-                        idempotent_reuse=True,
-                    )
+                    if _self_task is not None and _self_task.project_id:
+                        project_id = _self_task.project_id
+                        project_source_task_id = _self_task.id
             new_tid = kb.create_task(
                 conn,
                 title=str(title).strip(),
@@ -1536,7 +1456,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
-                _trusted_project_repo=trusted_project_repo,
+                project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
                 max_runtime_seconds=(
@@ -1544,6 +1464,8 @@ def _handle_create(args: dict, **kw) -> str:
                     if max_runtime_seconds is not None else None
                 ),
                 skills=skills,
+                model_override=model_override,
+                provider_override=provider_override,
                 goal_mode=goal_mode,
                 goal_max_turns=(
                     int(goal_max_turns) if goal_max_turns is not None else None
@@ -1557,6 +1479,9 @@ def _handle_create(args: dict, **kw) -> str:
             return _ok(
                 task_id=new_tid,
                 status=new_task.status if new_task else None,
+                workspace_kind=new_task.workspace_kind if new_task else None,
+                workspace_path=new_task.workspace_path if new_task else None,
+                project_id=new_task.project_id if new_task else None,
                 subscribed=subscribed,
                 board=kb.get_current_board() if board is None else board,
                 project_id=new_task.project_id if new_task else project_id,
@@ -1586,10 +1511,10 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
     Subscription paths:
 
-    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``
-      and ``HERMES_SESSION_CHAT_ID`` are set in ContextVars by the
-      messaging gateway before agent dispatch. The notification poller
-      already keys off these, so we just register a row.
+    - **Gateway** (telegram/discord/slack/etc): ``HERMES_SESSION_PLATFORM``,
+      ``HERMES_SESSION_CHAT_ID``, and ``HERMES_SESSION_CHAT_TYPE`` are set in
+      ContextVars by the messaging gateway before agent dispatch. The
+      notification poller already keys off these, so we just register a row.
 
     - **TUI** (herm desktop / herm TUI): the platform/chat_id ContextVars
       are intentionally cleared (TUI is a single-channel local UI, not
@@ -1648,8 +1573,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         thread_id = get_session_env("HERMES_SESSION_THREAD_ID", "") or None
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
-        session_key = get_session_env("HERMES_SESSION_KEY", "") or None
-        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or None
+        message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
@@ -1660,26 +1584,6 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
                 notifier_profile = get_active_profile_name() or "default"
             except Exception:
                 notifier_profile = "default"
-        notifier_profile = str(notifier_profile or "").strip()
-
-        # Gateway subscriptions must be a complete provenance tuple.  A
-        # partial row can still send text, but cannot safely prove which bot
-        # owns the route or reconstruct the creator session for a wake.  Do
-        # not claim ``subscribed=true`` in that state.  TUI rows deliberately
-        # use their local session key as ``chat_id`` and have no chat type.
-        if platform.lower() != "tui" and (
-            not notifier_profile or not chat_type or not session_key
-        ):
-            logger.warning(
-                "_maybe_auto_subscribe refused incomplete gateway provenance "
-                "(platform=%r profile_set=%r chat_type_set=%r session_key_set=%r)",
-                platform,
-                bool(notifier_profile),
-                bool(chat_type),
-                bool(session_key),
-            )
-            return False
-
         delivery_metadata: dict[str, Any] = {}
         if thread_id:
             delivery_metadata["thread_id"] = thread_id
@@ -1701,9 +1605,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         _kb.add_notify_sub(
             conn, task_id=task_id,
             platform=platform, chat_id=chat_id,
-            chat_type=chat_type, thread_id=thread_id, user_id=user_id,
+            chat_type=chat_type,
+            thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
-            session_key=session_key,
             delivery_metadata=delivery_metadata or None,
         )
         return True
@@ -1717,6 +1621,9 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
 
 def _handle_unblock(args: dict, **kw) -> str:
     """Transition a blocked task to ready, or todo while parents remain open."""
+    delegated_err = _reject_delegated_child_mutation("kanban_unblock")
+    if delegated_err:
+        return delegated_err
     guard = _require_orchestrator_tool("kanban_unblock")
     if guard:
         return guard
@@ -1745,7 +1652,10 @@ def _handle_unblock(args: dict, **kw) -> str:
 
 
 def _handle_link(args: dict, **kw) -> str:
-    """Add a dependency, review gate, or auditable review-gate repair."""
+    """Add a parent→child dependency edge after the fact."""
+    delegated_err = _reject_delegated_child_mutation("kanban_link")
+    if delegated_err:
+        return delegated_err
     parent_id = args.get("parent_id")
     child_id = args.get("child_id")
     if not parent_id or not child_id:
@@ -2360,6 +2270,26 @@ KANBAN_CREATE_SCHEMA = {
                     "continuation turns the worker may take before the task "
                     "is blocked for review. Ignored unless goal_mode is "
                     "true. Defaults to the goal-engine default (20)."
+                ),
+            },
+            "model": {
+                "type": "string",
+                "description": (
+                    "Pin the dispatched worker to this model instead of "
+                    "the assignee profile's configured model. Use the "
+                    "exact model name the target provider expects. Omit "
+                    "to use the profile default."
+                ),
+            },
+            "provider": {
+                "type": "string",
+                "description": (
+                    "Provider the 'model' belongs to (e.g. 'openrouter', "
+                    "'anthropic', 'nous'). Set this whenever the model "
+                    "is not from the assignee profile's configured "
+                    "provider — a model name alone is resolved against "
+                    "the profile's provider and will fail if it belongs "
+                    "to a different one. Requires 'model'."
                 ),
             },
             "board": _board_schema_prop(),
