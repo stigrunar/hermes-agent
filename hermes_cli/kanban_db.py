@@ -3669,12 +3669,12 @@ def _inherit_notify_subs(
     *,
     created_at: Optional[int] = None,
 ) -> None:
-    """Copy gateway notification subscriptions from parent tasks to a child.
+    """Copy complete notifier route provenance from parents to a child.
 
-    The inherited subscription starts caught up to the child's current event
-    cursor. This makes manual `link_tasks(parent, existing_child)` safe: the
-    parent chat receives future child terminal events without replaying the
-    child's pre-link history.
+    The inherited subscription starts at the child's current event cursor so
+    linking an existing child never replays its pre-link event history.
+    Ambiguous parent rows are copied without guessing: the notifier's
+    fail-closed profile check still prevents them from being claimed or sent.
     """
     parent_ids = tuple(dict.fromkeys(p for p in parents if p))
     if not parent_ids:
@@ -3688,15 +3688,18 @@ def _inherit_notify_subs(
     conn.execute(
         f"""
         INSERT OR IGNORE INTO kanban_notify_subs
-            (task_id, platform, chat_id, thread_id, user_id,
-             notifier_profile, created_at, last_event_id)
-        SELECT ?, platform, chat_id, thread_id, user_id, notifier_profile, ?, ?
+            (task_id, platform, chat_id, chat_type, thread_id, user_id,
+             notifier_profile, session_key, delivery_metadata, created_at,
+             last_event_id, baseline_event_id)
+        SELECT ?, platform, chat_id, chat_type, thread_id, user_id,
+               notifier_profile, session_key, delivery_metadata, ?, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
         (
             child_id,
             int(created_at if created_at is not None else time.time()),
+            cursor,
             cursor,
             *parent_ids,
         ),
@@ -14553,6 +14556,7 @@ def add_notify_sub(
     thread_id: Optional[str] = None,
     user_id: Optional[str] = None,
     notifier_profile: Optional[str] = None,
+    session_key: Optional[str] = None,
     delivery_metadata: Optional[Mapping[str, Any]] = None,
 ) -> None:
     """Register a gateway source that wants terminal-state notifications
@@ -14574,9 +14578,12 @@ def add_notify_sub(
             """
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, chat_type, thread_id, user_id,
-                 notifier_profile, delivery_metadata, created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+                 notifier_profile, session_key, delivery_metadata, created_at,
+                 last_event_id, baseline_event_id)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   COALESCE(MAX(id), 0), COALESCE(MAX(id), 0)
+              FROM task_events
+             WHERE task_id = ?
             """,
             (
                 task_id,
@@ -14586,6 +14593,7 @@ def add_notify_sub(
                 thread_id or "",
                 user_id,
                 notifier_profile,
+                session_key,
                 metadata_json,
                 now,
                 task_id,
@@ -14613,6 +14621,16 @@ def add_notify_sub(
                    AND (notifier_profile IS NULL OR notifier_profile = '')
                 """,
                 (notifier_profile, task_id, platform, chat_id, thread_id or ""),
+            )
+        if session_key:
+            conn.execute(
+                """
+                UPDATE kanban_notify_subs
+                   SET session_key = ?
+                 WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?
+                   AND (session_key IS NULL OR session_key = '')
+                """,
+                (session_key, task_id, platform, chat_id, thread_id or ""),
             )
         if metadata_json:
             # A duplicate subscribe from the same chat/thread should refresh

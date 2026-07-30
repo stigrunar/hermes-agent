@@ -39,9 +39,6 @@ class RecordingAdapter:
     async def handle_message(self, event):
         self.handled.append(event)
 
-    async def handle_message(self, event):
-        self.handled.append(event)
-
 
 class DisconnectedAdapters(dict):
     """Expose a platform during collection, then simulate disconnect on get()."""
@@ -124,6 +121,7 @@ def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, m
             task_id=tid,
             platform="telegram",
             chat_id="chat-1",
+            chat_type="dm",
             thread_id="20197",
             delivery_metadata={
                 "chat_type": "dm",
@@ -184,7 +182,7 @@ def test_active_named_profile_subscription_is_delivered(tmp_path, monkeypatch):
     runner = _make_runner(adapter)
     runner._active_profile_name = lambda: "main"
 
-    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner, profile="main"))
 
     assert len(adapter.sent) == 1
     message = adapter.sent[0]["text"]
@@ -610,18 +608,39 @@ class FailingAdapter:
         raise RuntimeError("simulated send failure")
 
 
-class ReportedFailureAdapter:
-    """Adapter that REPORTS failure via SendResult(success=False) instead of
-    raising — the exact contract the Telegram adapter uses for 'Not connected'
-    and degraded-send paths."""
+class UnsuccessfulAdapter:
+    """Adapter whose send() reports failure without raising."""
 
     def __init__(self):
         self.attempts = 0
+        self.handled = []
 
     async def send(self, chat_id, text, metadata=None):
         self.attempts += 1
-        from gateway.platforms.base import SendResult
-        return SendResult(success=False, error="Not connected")
+        return SendResult(
+            success=False,
+            error="send_path_degraded",
+            retryable=True,
+        )
+
+    async def handle_message(self, event):
+        self.handled.append(event)
+
+
+def test_kanban_notifier_rewinds_claim_on_send_exception(tmp_path, monkeypatch):
+    """A raising adapter rewinds the claim so the next tick can retry."""
+    db_path = tmp_path / "send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_completed_subscription()
+
+    adapter = FailingAdapter()
+    runner = _make_runner(adapter)
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.attempts >= 1, "send should have been attempted at least once"
+    assert [ev.kind for ev in _unseen_terminal_events(tid)] == ["completed"]
 
     recovered = RecordingAdapter()
     asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
@@ -1036,14 +1055,24 @@ def test_four_profile_workers_route_only_owned_rows_without_duplicates(
         runners.append(runner)
         adapters[profile] = adapter
 
-    real_sleep = asyncio.sleep
+    stop_barrier = None
+    sleepers = 0
 
     async def finish_after_first_tick(_delay):
-        for runner in runners:
-            runner._running = False
-        await real_sleep(0)
+        nonlocal sleepers
+        sleepers += 1
+        if sleepers == len(runners):
+            for runner in runners:
+                runner._running = False
+            stop_barrier.set()
+        await stop_barrier.wait()
+
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
 
     async def run_all():
+        nonlocal stop_barrier
+        stop_barrier = asyncio.Event()
         await asyncio.gather(*(
             runner._kanban_notifier_owner_loop(
                 interval=1,
@@ -1053,6 +1082,7 @@ def test_four_profile_workers_route_only_owned_rows_without_duplicates(
         ))
 
     monkeypatch.setattr(asyncio, "sleep", finish_after_first_tick)
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
     asyncio.run(run_all())
 
     for profile in profiles:
@@ -1161,11 +1191,16 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     try:
         tid = kb.create_task(conn, title="loops forever", assignee="worker")
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
-        kb._append_event(
-            conn, tid, "block_loop_detected",
-            {"reason": "needs credentials", "kind": "needs_input",
-             "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
-        )
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET status='triage' WHERE id=?",
+                (tid,),
+            )
+            kb._append_event(
+                conn, tid, "block_loop_detected",
+                {"reason": "needs credentials", "kind": "needs_input",
+                 "recurrences": 2, "limit": kb.BLOCK_RECURRENCE_LIMIT},
+            )
     finally:
         conn.close()
 

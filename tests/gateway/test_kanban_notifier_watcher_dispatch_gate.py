@@ -27,10 +27,40 @@ def _config(**kanban):
     return {"kanban": kanban}
 
 
-def test_notifier_watcher_runs_when_dispatch_enabled():
-    """dispatch_in_gateway=true proceeds past the gate to the board fan-out."""
-    runner = _make_runner(with_adapter=True)
-    past_gate = []
+def test_notify_false_disables_before_board_poll():
+    runner = _make_runner()
+    with (
+        patch(
+            "hermes_cli.config.load_config",
+            return_value=_config(notify_in_gateway=False),
+        ),
+        patch("gateway.kanban_watchers._acquire_singleton_lock") as acquire,
+        patch("hermes_cli.kanban_db.list_boards") as list_boards,
+        patch("hermes_cli.kanban_db.connect") as connect,
+    ):
+        asyncio.run(runner._kanban_notifier_watcher())
+
+    acquire.assert_not_called()
+    list_boards.assert_not_called()
+    connect.assert_not_called()
+
+
+def test_notify_default_true_is_backward_compatible():
+    runner = _make_runner()
+
+    async def stop_after_start(_delay):
+        runner._running = False
+
+    with (
+        patch("hermes_cli.config.load_config", return_value=_config()),
+        patch("gateway.kanban_watchers.asyncio.sleep", side_effect=stop_after_start),
+    ):
+        asyncio.run(runner._kanban_notifier_watcher())
+
+
+@pytest.mark.parametrize("lock_state", ["contended", "unavailable"])
+def test_non_owner_does_not_enumerate_or_open_boards(lock_state):
+    runner = _make_runner()
     sleep_calls = []
     real_sleep = asyncio.sleep
 

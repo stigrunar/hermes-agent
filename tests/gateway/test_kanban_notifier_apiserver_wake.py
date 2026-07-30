@@ -10,6 +10,7 @@ Covers the wrong-session-wake / silent-loss fixes:
 """
 
 import asyncio
+from unittest.mock import patch
 
 from gateway.config import Platform
 from gateway.platforms.base import SendResult
@@ -54,14 +55,21 @@ class ApiServerLikeAdapter:
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
-    async def fake_sleep(delay):
-        if delay == 5:
-            return None
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    async def fake_sleep(_delay):
         runner._running = False
         await real_sleep(0)
 
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    with patch(
+        "gateway.kanban_watchers.asyncio.to_thread", side_effect=fake_to_thread,
+    ):
+        await runner._kanban_notifier_owner_loop(
+            interval=1,
+            notifier_profile="default",
+        )
 
 
 def _make_runner(adapters):
@@ -69,6 +77,7 @@ def _make_runner(adapters):
     runner._running = True
     runner.adapters = adapters
     runner._kanban_sub_fail_counts = {}
+    runner._active_profile_name = lambda: "default"
     return runner
 
 
@@ -78,7 +87,14 @@ def _create_completed_subscription(platform, chat_id, session_id=None):
         tid = kb.create_task(
             conn, title="notify once", assignee="worker", session_id=session_id,
         )
-        kb.add_notify_sub(conn, task_id=tid, platform=platform, chat_id=chat_id)
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform=platform,
+            chat_id=chat_id,
+            notifier_profile="default",
+            session_key=session_id,
+        )
         kb.complete_task(conn, tid, summary="done once")
         return tid
     finally:
@@ -134,5 +150,4 @@ def test_apiserver_sub_wakes_real_session_via_self_post(tmp_path, monkeypatch):
     # fallback is attempted for stateless api_server subs) — cursor advances
     # once the wake succeeds.
     assert _unseen_terminal_events(tid, "api_server", "raw-sid-123") == []
-
 

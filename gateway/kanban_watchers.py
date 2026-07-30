@@ -297,6 +297,15 @@ def _resolve_kanban_notification_events(
             if current:
                 return [current[-1]]
 
+    # A block-loop event is the current triage transition: it exists solely to
+    # force a human decision and has no companion blocked/status event.
+    if status == "triage":
+        loop_events = [
+            event for event in claimed if event.kind == "block_loop_detected"
+        ]
+        if loop_events:
+            return [loop_events[-1]]
+
     # Preserve legacy run-less events used by older writers. A later unblocked
     # transition proves the failure is no longer current.
     if latest_run is None and failures:
@@ -604,15 +613,21 @@ class GatewayKanbanWatchersMixin:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
                                 try:
-                                    owner_profile = sub.get("notifier_profile") or None
-                                    if owner_profile and owner_profile != notifier_profile:
-                                        _owner_adapters = getattr(self, "_profile_adapters", {}).get(owner_profile)
-                                        if not _owner_adapters:
-                                            logger.debug(
-                                                "kanban notifier: subscription for %s owned by profile %s; current profile %s has no adapter for it, skipping",
-                                                sub.get("task_id"), owner_profile, notifier_profile,
-                                            )
-                                            continue
+                                    owner_profile = str(
+                                        sub.get("notifier_profile") or ""
+                                    ).strip()
+                                    # Unknown legacy ownership is ambiguous.
+                                    # Refuse it before claiming so no gateway
+                                    # can consume it through whichever bot won
+                                    # a lease.
+                                    if not owner_profile:
+                                        logger.warning(
+                                            "kanban notifier: subscription for %s has no notifier_profile; refusing delivery",
+                                            sub.get("task_id"),
+                                        )
+                                        continue
+                                    if owner_profile != notifier_profile:
+                                        continue
                                     platform = (sub.get("platform") or "").lower()
                                     if platform not in active_platforms:
                                         logger.debug(
@@ -631,15 +646,25 @@ class GatewayKanbanWatchersMixin:
                                     if not events:
                                         continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    latest_run = _kb.latest_run(
+                                        conn, sub["task_id"],
+                                    )
+                                    resolved_events = _resolve_kanban_notification_events(
+                                        task,
+                                        events,
+                                        latest_run,
+                                        terminal_statuses=_kb.TERMINAL_STATUSES,
+                                    )
                                     logger.debug(
-                                        "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
-                                        len(events), sub["task_id"], slug, old_cursor, cursor,
+                                        "kanban notifier: claimed %d event(s), resolved %d current event(s) for %s on board %s cursor %s→%s",
+                                        len(events), len(resolved_events),
+                                        sub["task_id"], slug, old_cursor, cursor,
                                     )
                                     deliveries.append({
                                         "sub": sub,
                                         "old_cursor": old_cursor,
                                         "cursor": cursor,
-                                        "events": events,
+                                        "events": resolved_events,
                                         "task": task,
                                         "board": slug,
                                     })
@@ -918,7 +943,9 @@ class GatewayKanbanWatchersMixin:
                         #   advances after it succeeds — a failure rewinds the
                         #   claim exactly like a failed send() above, so the
                         #   next tick retries.
-                        task_terminal = task and task.status in {"done", "archived"}
+                        task_terminal = (
+                            task and task.status in _kb.TERMINAL_STATUSES
+                        )
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
@@ -927,7 +954,17 @@ class GatewayKanbanWatchersMixin:
                         _session_key = ""
                         _synth = ""
                         if _wake_kinds:
-                            _session_key = getattr(task, "session_id", None) or ""
+                            if _is_push_adapter:
+                                _session_key = str(
+                                    sub.get("session_key") or ""
+                                ).strip()
+                            else:
+                                # api_server sessions use the raw caller-
+                                # supplied session id and cannot be rebuilt
+                                # through SessionSource/build_session_key.
+                                _session_key = (
+                                    getattr(task, "session_id", None) or ""
+                                )
                         if _wake_kinds and _session_key:
                             _title = (task.title if task else sub["task_id"])[:120]
                             _assignee = task.assignee if task else ""
@@ -1015,51 +1052,43 @@ class GatewayKanbanWatchersMixin:
                             try:
                                 from gateway.session import SessionSource
                                 from gateway.wake import deliver_wake
-                                # Rebuild the creator's real session scope from
-                                # the chat_type persisted on the subscription
-                                # row (#56580). build_session_key() keys DMs
-                                # (":dm:<chat_id>") on a wholly different shape
-                                # from group/thread, so the old hardcoded
-                                # "group" mis-routed DM/thread creators into a
-                                # fresh session. Legacy rows written before the
-                                # column existed may still carry chat_type in
-                                # delivery_metadata (#60600 rows) — fall back
-                                # to that, then to "group" (the historical
-                                # default that suits the dashboard/group flows).
-                                # handle_message() get_or_create_session's the
-                                # target, so a mismatch only ever degrades to a
-                                # fresh session, never an exception.
                                 _chat_type = str(sub.get("chat_type") or "").strip()
-                                if not _chat_type:
-                                    _delivery_meta = sub.get("delivery_metadata")
-                                    if isinstance(_delivery_meta, dict):
-                                        _chat_type = str(
-                                            _delivery_meta.get("chat_type") or ""
-                                        ).strip()
-                                _chat_type = _chat_type or "group"
-                                _source = SessionSource(
-                                    platform=plat,
-                                    chat_id=sub["chat_id"],
-                                    chat_type=_chat_type,
-                                    thread_id=sub.get("thread_id") or None,
-                                    user_id=sub.get("user_id"),
-                                    profile=sub_profile or None,
-                                )
-                                # deliver_wake preserves the synthetic
-                                # MessageEvent/handle_message path for
-                                # push-capable adapters (the non-push /
-                                # self-post branch is handled BEFORE the
-                                # cursor advance above).
-                                await deliver_wake(
-                                    adapter,
-                                    text=_synth,
-                                    session_id=_session_key,
-                                    source=_source,
-                                )
-                                logger.info(
-                                    "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
-                                    sub["task_id"], platform_str, sub["chat_id"], sub_profile or "default", _wake_kinds,
-                                )
+                                if _chat_type:
+                                    _source = SessionSource(
+                                        platform=plat,
+                                        chat_id=sub["chat_id"],
+                                        chat_type=_chat_type,
+                                        thread_id=sub.get("thread_id") or None,
+                                        user_id=sub.get("user_id"),
+                                        profile=sub_profile or None,
+                                    )
+                                    _resolved_session_key = (
+                                        self._session_key_for_source(_source)
+                                    )
+                                    if _resolved_session_key != _session_key:
+                                        logger.warning(
+                                            "kanban notifier: refusing wake for %s; persisted provenance resolves to %s, expected %s",
+                                            sub["task_id"],
+                                            _resolved_session_key,
+                                            _session_key,
+                                        )
+                                    else:
+                                        # deliver_wake preserves the synthetic
+                                        # MessageEvent/handle_message path for
+                                        # push-capable adapters.
+                                        await deliver_wake(
+                                            adapter,
+                                            text=_synth,
+                                            session_id=_session_key,
+                                            source=_source,
+                                        )
+                                        logger.info(
+                                            "kanban notifier: woke agent for %s on %s/%s profile=%s events=%s",
+                                            sub["task_id"], platform_str,
+                                            sub["chat_id"],
+                                            sub_profile or "default",
+                                            _wake_kinds,
+                                        )
                             except Exception as _wk_err:
                                 # Best-effort: the notification itself already
                                 # delivered and the cursor has advanced, so a
