@@ -3142,9 +3142,27 @@ def _normalize_managed_eol(git_cmd, repo_root):
         # Never let line-ending cleanup block an update.
         pass
 
-def _cmd_update_impl(args, gateway_mode: bool):
+def _cmd_update_impl(
+    args, gateway_mode: bool, branch: str | None = None, target=None
+):
     """Body of ``cmd_update`` — kept separate so the wrapper can always
     restore stdio even on ``sys.exit``."""
+    from hermes_cli.update_channel import UpdateTarget
+
+    if target is None:
+        if branch is not None:
+            # Keep the internal helper's historical direct-call contract for
+            # tests and non-wrapper callers. Normal CLI paths pass a resolver
+            # result above, so they retain the selected remote as well.
+            target = UpdateTarget(remote="origin", branch=branch)
+        elif (_m().PROJECT_ROOT / ".git").exists():
+            target = _m()._resolve_update_target(args)
+    if target is not None:
+        branch = target.branch
+        remote = target.remote
+    else:
+        remote = "origin"
+
     # In gateway mode, use file-based IPC for prompts instead of stdin
     gw_input_fn = (
         (lambda prompt, default="": _gateway_prompt(prompt, default))
@@ -3294,16 +3312,14 @@ def _cmd_update_impl(args, gateway_mode: bool):
     # Fetch and pull
     try:
 
-        # Resolve the target branch up front so the fetch can be scoped to it.
-        # A bare `git fetch origin` pulls every ref, and this repo carries
+        # The wrapper resolves the target up front so the fetch can be scoped
+        # to it. A bare fetch pulls every ref, and this repo carries
         # thousands of auto-generated branches — an unscoped fetch can stall for
         # minutes on a non-single-branch checkout. Fetch only what we update
         # against.
-        branch = _m()._resolve_update_branch(args)
-
         print("→ Fetching updates...")
         fetch_result = subprocess.run(
-            git_cmd + ["fetch", "origin", branch],
+            git_cmd + ["fetch", remote, branch],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3320,7 +3336,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "✗ Authentication failed — check your git credentials or SSH key."
                 )
             else:
-                print("✗ Failed to fetch updates from origin.")
+                print(f"✗ Failed to fetch updates from {remote}.")
                 if stderr:
                     print(f"  {stderr.splitlines()[0]}")
             sys.exit(1)
@@ -3357,11 +3373,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             )
             if checkout_result.returncode != 0:
                 # Local checkout doesn't have this branch yet. Try to set
-                # it up as a tracking branch of origin/<branch>. This is
+                # it up as a tracking branch of <remote>/<branch>. This is
                 # the common case when the requested branch exists upstream
                 # but was never checked out locally.
                 track_result = subprocess.run(
-                    git_cmd + ["checkout", "-B", branch, f"origin/{branch}"],
+                    git_cmd + ["checkout", "-B", branch, f"{remote}/{branch}"],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
@@ -3377,7 +3393,9 @@ def _cmd_update_impl(args, gateway_mode: bool):
                             prompt_user=False,
                             input_fn=gw_input_fn,
                         )
-                    print(f"✗ Branch '{branch}' does not exist locally or on origin.")
+                    print(
+                        f"✗ Branch '{branch}' does not exist locally or on {remote}."
+                    )
                     if track_result.stderr.strip():
                         print(f"  {track_result.stderr.strip().splitlines()[0]}")
                     sys.exit(1)
@@ -3392,7 +3410,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
 
         # Check if there are updates
         result = subprocess.run(
-            git_cmd + ["rev-list", f"HEAD..origin/{branch}", "--count"],
+            git_cmd + ["rev-list", f"HEAD..{remote}/{branch}", "--count"],
             cwd=_m().PROJECT_ROOT,
             capture_output=True,
             text=True, encoding="utf-8", errors="replace",
@@ -3404,7 +3422,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
-            if is_fork and branch == "main":
+            if remote == "origin" and is_fork and branch == "main":
                 _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
             # Restore stash and switch back to original branch if we moved
@@ -3516,11 +3534,11 @@ def _cmd_update_impl(args, gateway_mode: bool):
             # Merge the ref we already fetched above (→ Fetching updates...)
             # instead of `git pull`, which performs a SECOND network fetch of
             # the same branch (~0.5-1.5 s of redundant round-trip per update).
-            # `merge --ff-only origin/<branch>` is byte-identical in effect to
-            # `pull --ff-only origin <branch>` given the fresh tracking ref;
+            # `merge --ff-only <remote>/<branch>` is byte-identical in effect
+            # to `pull --ff-only <remote> <branch>` given the fresh tracking ref;
             # the divergence fallback below is unchanged.
             pull_result = subprocess.run(
-                git_cmd + ["merge", "--ff-only", f"origin/{branch}"],
+                git_cmd + ["merge", "--ff-only", f"{remote}/{branch}"],
                 cwd=_m().PROJECT_ROOT,
                 capture_output=True,
                 text=True, encoding="utf-8", errors="replace",
@@ -3533,17 +3551,18 @@ def _cmd_update_impl(args, gateway_mode: bool):
                     "  ⚠ Fast-forward not possible (history diverged), resetting to match remote..."
                 )
                 reset_result = subprocess.run(
-                    git_cmd + ["reset", "--hard", f"origin/{branch}"],
+                    git_cmd + ["reset", "--hard", f"{remote}/{branch}"],
                     cwd=_m().PROJECT_ROOT,
                     capture_output=True,
                     text=True, encoding="utf-8", errors="replace",
                 )
                 if reset_result.returncode != 0:
-                    print(f"✗ Failed to reset to origin/{branch}.")
+                    print(f"✗ Failed to reset to {remote}/{branch}.")
                     if reset_result.stderr.strip():
                         print(f"  {reset_result.stderr.strip()}")
                     print(
-                        f"  Try manually: git fetch origin && git reset --hard origin/{branch}"
+                        f"  Try manually: git fetch {remote} {branch} && "
+                        f"git reset --hard {remote}/{branch}"
                     )
                     sys.exit(1)
 
@@ -3629,7 +3648,7 @@ def _cmd_update_impl(args, gateway_mode: bool):
         _m()._record_bytecode_fingerprint()
 
         # Fork upstream sync logic (only for main branch on forks)
-        if is_fork and branch == "main":
+        if remote == "origin" and is_fork and branch == "main":
             _m()._sync_with_upstream_if_needed(git_cmd, _m().PROJECT_ROOT)
 
         # Reinstall Python dependencies. Prefer .[all], but if one optional extra

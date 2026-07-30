@@ -173,7 +173,7 @@ def _make_update_side_effect(
 
 
 def test_cmd_update_stig_release_uses_only_validated_stig_target(monkeypatch, tmp_path):
-    """Apply fetch, comparison, and pull must agree on stig/release/stig-tested."""
+    """Apply fetch, comparison, and merge must agree on stig/release/stig-tested."""
     _setup_update_mocks(monkeypatch, tmp_path)
     (tmp_path / ".git" / "config").write_text(
         '[remote "origin"]\n\turl = https://github.com/NousResearch/hermes-agent.git\n'
@@ -208,10 +208,9 @@ def test_cmd_update_stig_release_uses_only_validated_stig_target(monkeypatch, tm
     ] in recorded
     assert [
         "git",
-        "pull",
+        "merge",
         "--ff-only",
-        "stig",
-        "release/stig-tested",
+        "stig/release/stig-tested",
     ] in recorded
     assert not any("origin/release/stig-tested" in command for command in recorded)
 
