@@ -901,6 +901,7 @@ export function ChatSidebar({
     for (const session of messagingSessions) {
       if (!isPinnedSession(session)) {
         visibleSessions.push(session)
+
         continue
       }
 

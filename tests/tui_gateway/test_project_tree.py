@@ -331,8 +331,8 @@ def test_explicit_conversation_binding_claims_cwdless_session():
     node = next(p for p in tree["projects"] if p["id"] == "p_topic")
 
     assert node["sessionCount"] == 1
-    assert tree["scoped_session_ids"] == [bound["id"]]
-    assert unbound["id"] not in tree["scoped_session_ids"]
+    assert set(tree["scoped_session_ids"]) == {bound["id"], unbound["id"]}
+    assert _home_session_ids(tree) == [unbound["id"]]
     groups = [g for repo in node["repos"] for g in repo["groups"]]
     assert [g["label"] for g in groups] == ["Ops"]
     assert groups[0]["sessions"] == [bound]
@@ -388,7 +388,14 @@ def test_threadless_conversation_binding_matches_null_and_empty_thread():
 
     tree = pt.build_tree([project], [null_thread, empty_thread, other_thread], [], resolve=None, hydrate=True)
 
-    assert set(tree["scoped_session_ids"]) == {null_thread["id"], empty_thread["id"]}
+    node = next(p for p in tree["projects"] if p["id"] == "p_dm")
+    assert node["sessionCount"] == 2
+    assert set(tree["scoped_session_ids"]) == {
+        null_thread["id"],
+        empty_thread["id"],
+        other_thread["id"],
+    }
+    assert _home_session_ids(tree) == [other_thread["id"]]
 
 
 def test_overview_drops_session_rows_but_keeps_counts_and_previews():
