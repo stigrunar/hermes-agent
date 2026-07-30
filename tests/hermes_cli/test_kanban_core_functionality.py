@@ -789,6 +789,9 @@ def test_default_spawn_does_not_auto_load_any_skill(kanban_home, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr("subprocess.Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc().pid,
+    )
 
     conn = kb.connect()
     try:

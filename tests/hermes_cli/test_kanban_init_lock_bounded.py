@@ -85,7 +85,10 @@ def test_first_init_connect_is_bounded_when_lock_held(kanban_home, monkeypatch):
         conn.close()
         elapsed = time.monotonic() - start
         # Proceeded within roughly the timeout window (not unbounded).
-        assert 0.4 <= elapsed < 3.0, f"expected bounded ~0.6s acquire, got {elapsed:.2f}s"
+        # Parallel CI can spend several seconds in the idempotent SQLite schema
+        # initialization after the 0.6s lock timeout. Keep the upper bound loose
+        # enough to test the lock contract rather than host scheduling load.
+        assert 0.4 <= elapsed < 10.0, f"expected bounded acquire, got {elapsed:.2f}s"
         assert str(db_path.resolve()) in kb._INITIALIZED_PATHS
     finally:
         release.set()

@@ -75,6 +75,9 @@ agent:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc.pid,
+    )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -115,6 +118,9 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc.pid,
+    )
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -126,8 +132,11 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     # Profile selection is attached by the outer CLI bootstrap rather than
     # build_top_level_parser(); remove that already-validated prefix and parse
     # the worker flags/subcommand through the real shared parser.
-    assert captured["cmd"][1:3] == ["-p", "elias"]
-    args = parser.parse_args(captured["cmd"][3:])
+    # The launch identity gate wraps the real Hermes argv after its Python
+    # executable, script, and two pipe descriptors.
+    worker_cmd = captured["cmd"][5:]
+    assert worker_cmd[1:3] == ["-p", "elias"]
+    args = parser.parse_args(worker_cmd[3:])
 
     assert args.command == "chat"
     assert args.model == "gpt-5.6-sol"

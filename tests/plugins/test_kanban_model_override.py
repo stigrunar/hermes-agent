@@ -129,6 +129,9 @@ def _spawn_and_capture(monkeypatch, tmp_path, task):
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc.pid,
+    )
     workspace = tmp_path / "ws"
     workspace.mkdir(exist_ok=True)
     kb._default_spawn(task, str(workspace))

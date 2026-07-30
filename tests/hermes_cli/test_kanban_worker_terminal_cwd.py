@@ -52,6 +52,9 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(
+        kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc.pid,
+    )
     kb._default_spawn(_make_task(kb), workspace)
     return captured
 

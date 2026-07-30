@@ -255,6 +255,9 @@ class TestWorkerSpawnEnv:
             return FakeProc()
 
         monkeypatch.setattr(subprocess, "Popen", fake_popen)
+        monkeypatch.setattr(
+            kb, "_await_worker_launch_ready", lambda *_args, **_kwargs: FakeProc.pid,
+        )
         kb.create_board("spawntest")
 
         task = kb.Task(

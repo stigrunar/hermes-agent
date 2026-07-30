@@ -1449,6 +1449,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     thread_id     TEXT NOT NULL DEFAULT '',
     user_id       TEXT,
     notifier_profile TEXT,
+    session_key   TEXT,
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
@@ -2744,9 +2745,20 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "chat_type", "chat_type TEXT"
             )
+        if "session_key" not in notify_cols:
+            _add_column_if_missing(
+                conn, "kanban_notify_subs", "session_key", "session_key TEXT"
+            )
         if "delivery_metadata" not in notify_cols:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
+            )
+        if "baseline_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "baseline_event_id",
+                "baseline_event_id INTEGER",
             )
 
     # One-shot backfill: any task that is 'running' before runs existed
@@ -2822,10 +2834,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     _rebuild_drifted_tables(conn)
     # Legacy task_runs tables can lack ``outcome`` until the rebuild above, so
     # this diagnostic index must be created after schema repair.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_runs_task_outcome_id "
-        "ON task_runs(task_id, outcome, id)"
-    )
+    if conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='task_runs'"
+    ).fetchone():
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_runs_task_outcome_id "
+            "ON task_runs(task_id, outcome, id)"
+        )
     _baseline_legacy_notify_subs(conn)
 
     # Ultra Phase B: additive, backward-compatible terminal worker-reaping
@@ -2926,8 +2941,9 @@ _REBUILD_SPECS = {
         "CREATE TABLE kanban_notify_subs ("
         " task_id TEXT NOT NULL, platform TEXT NOT NULL, chat_id TEXT NOT NULL,"
         " chat_type TEXT, thread_id TEXT NOT NULL DEFAULT '', user_id TEXT,"
-        " notifier_profile TEXT, delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " notifier_profile TEXT, session_key TEXT, delivery_metadata TEXT,"
+        " created_at INTEGER NOT NULL,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, baseline_event_id INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -3235,6 +3251,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    _trusted_project_repo: Optional[str] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3306,7 +3323,17 @@ def create_task(
     project_repo: Optional[str] = None
     if project_id is not None:
         project_id = str(project_id).strip() or None
-    if project_id:
+    if _trusted_project_repo is not None:
+        if not project_id:
+            raise ValueError("trusted project repository requires project_id")
+        trusted_repo_path = Path(str(_trusted_project_repo)).expanduser()
+        if not trusted_repo_path.is_absolute() or ".." in trusted_repo_path.parts:
+            raise ValueError(
+                "trusted project repository must be absolute and traversal-free"
+            )
+        if workspace_kind == "worktree":
+            project_repo = str(trusted_repo_path)
+    elif project_id:
         from hermes_cli import projects_db as _pdb
 
         try:
@@ -3534,7 +3561,7 @@ def create_task(
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if (
-                    (project_obj is not None or _trusted_project_repo is not None)
+                    (project_obj is not None or project_repo is not None)
                     and workspace_kind == "worktree"
                 ):
                     if project_repo and not workspace_path:
@@ -7597,6 +7624,58 @@ def block_task(
         raise ValueError(
             f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None"
         )
+    # Validate policy-bearing terminal transitions before phase one accepts
+    # them. The worker exits after this call, so discovering an invalid review
+    # or dependency handoff only after reaping would strand the task.
+    if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
+        raise ValueError(
+            "explicit review successor gate remains protected until the review "
+            "handoff is approved"
+        )
+    review_required = bool(
+        reason and reason.strip().lower().startswith(REVIEW_REQUIRED_PREFIX)
+    )
+    if not _after_reap and review_required:
+        handoff = _review_handoff_row(conn, source_task_id=task_id)
+        if handoff is None:
+            raise ValueError(
+                "review-required handoff cannot activate: no explicit review "
+                "relationship (no registered review_handoff). Register exactly "
+                "one with kanban_link relationship='review_gate' before blocking; "
+                "no task state was changed"
+            )
+        if handoff["state"] != "active":
+            review = conn.execute(
+                "SELECT status FROM tasks WHERE id=?", (handoff["review_task_id"],)
+            ).fetchone()
+            if review is None or review["status"] not in ("todo", "ready", "blocked", "done"):
+                raise ValueError("registered review gate is not releasable")
+    accepted_dependency_payload = None
+    if kind == "dependency" and not _after_reap:
+        accepted_dependency_payload = _dependency_wait_payload(
+            conn, task_id, reason, dependency_task_id,
+        )
+        if not any(
+            (dependency := get_task(conn, dep_id)) is not None
+            and dependency.status not in TERMINAL_STATUSES
+            for dep_id in accepted_dependency_payload["dependency_ids"]
+        ):
+            raise ValueError("dependency_wait_requires_unfinished_parent")
+    terminal_payload = {
+        "reason": reason,
+        "kind": kind,
+        "dependency_task_id": dependency_task_id,
+    }
+    if accepted_dependency_payload is not None:
+        terminal_payload["dependency_wait_payload"] = accepted_dependency_payload
+    if not _after_reap and _request_terminal_transition(
+        conn,
+        task_id,
+        action="block",
+        payload=terminal_payload,
+        expected_run_id=expected_run_id,
+    ):
+        return True
     recurrences = 0
     with write_txn(conn):
         if not _after_reap and _protected_review_handoff_for_task(conn, task_id, role="next"):
