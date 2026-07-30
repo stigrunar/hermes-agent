@@ -12,6 +12,11 @@ from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any
 
+from hermes_cli.execution_contract import (
+    authority_names,
+    no_deploy_acceptance_mismatches,
+)
+
 QUALITY_MODES = ("SPIKE", "FEATURE", "RELEASE")
 RISK_TIERS = ("R0", "R1", "R2", "R3")
 REVIEW_POLICIES = ("owner_closeout", "one_exact_candidate", "release_gate")
@@ -201,6 +206,7 @@ def audit_execution_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     proof_not_required_present = "proof_not_required" in envelope
     proof_not_required = _string_list(envelope.get("proof_not_required"))
     stop_when = _string_list(envelope.get("stop_when"))
+    authority = authority_names(envelope.get("authority"))
     tools = _lower_names(envelope.get("tools_required"))
     skills = _lower_names(envelope.get("skills_required"))
     independent_raw = envelope.get("independent_packages", [])
@@ -235,6 +241,16 @@ def audit_execution_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     has_blocker_stop = _contains_any(stop_when, _BLOCKER_STOP_TERMS)
     if not has_acceptance_stop or not has_blocker_stop:
         findings.append(_finding("missing_stop_condition", "error", "execution_envelope.stop_when", "stop_when must include successful acceptance and genuine blocker semantics."))
+
+    for field_name in no_deploy_acceptance_mismatches(envelope):
+        findings.append(
+            _finding(
+                "authority_acceptance_mismatch",
+                "error",
+                f"execution_envelope.{field_name}",
+                "no_deploy authority cannot require deployment or live-runtime proof.",
+            )
+        )
 
     if quality_mode == "SPIKE" and risk_tier in {"R2", "R3"}:
         findings.append(_finding("mode_risk_mismatch", "warning", "execution_envelope", "SPIKE with R2/R3 risk requires an explicit higher-risk envelope justification."))
@@ -320,6 +336,7 @@ def audit_execution_envelope(payload: Mapping[str, Any]) -> dict[str, Any]:
     counts = Counter(item["severity"] for item in findings)
     normalized = {
         "acceptance_count": len(acceptance),
+        "authority": authority,
         "has_blocker_stop": has_blocker_stop,
         "has_outcome": bool(_text(envelope.get("outcome"))),
         "has_success_stop": has_acceptance_stop,

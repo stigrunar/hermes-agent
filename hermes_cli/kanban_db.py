@@ -3352,6 +3352,20 @@ def create_task(
         task_id = _new_task_id()
         try:
             with write_txn(conn):
+                # The optimistic lookup above keeps ordinary replay cheap, but
+                # it cannot collapse two creators that both observe a missing
+                # key before either acquires SQLite's writer lock. Re-check
+                # under BEGIN IMMEDIATE so stable-key creation is concurrent-
+                # safe as well as sequentially idempotent.
+                if idempotency_key:
+                    existing = conn.execute(
+                        "SELECT id FROM tasks WHERE idempotency_key = ? "
+                        "AND status != 'archived' "
+                        "ORDER BY created_at DESC LIMIT 1",
+                        (idempotency_key,),
+                    ).fetchone()
+                    if existing:
+                        return existing["id"]
                 # Determine task status from parent status, unless the caller
                 # parks it directly in blocked for human-ops review or in
                 # triage for a specifier.
@@ -4052,6 +4066,153 @@ def register_review_handoff(
                     {**payload, "reason": blocked_reason, "bounded": True},
                 )
         return dict(_review_handoff_row(conn, source_task_id=source_task_id))
+
+
+def _review_preparation_readback(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    review_task_id: str,
+) -> dict[str, Any]:
+    """Return the authoritative state for one prepared review handoff."""
+    source = get_task(conn, source_task_id)
+    review = get_task(conn, review_task_id)
+    handoff = _review_handoff_row(conn, source_task_id=source_task_id)
+    if source is None or review is None or handoff is None:
+        raise RuntimeError("prepared review handoff readback is incomplete")
+    return {
+        "source_task_id": source.id,
+        "source_status": source.status,
+        "review_task_id": review.id,
+        "review_status": review.status,
+        "handoff": dict(handoff),
+        "source_children": child_ids(conn, source_task_id),
+        "review_parents": parent_ids(conn, review_task_id),
+    }
+
+
+def prepare_review_gate(
+    conn: sqlite3.Connection,
+    source_task_id: str,
+    *,
+    title: str,
+    assignee: str,
+    idempotency_key: str,
+    body: Optional[str] = None,
+    next_task_id: Optional[str] = None,
+    created_by: Optional[str] = None,
+    workspace_kind: str = "scratch",
+    workspace_path: Optional[str] = None,
+    project_id: Optional[str] = None,
+    tenant: Optional[str] = None,
+    priority: int = 0,
+    max_runtime_seconds: Optional[int] = None,
+    skills: Optional[Iterable[str]] = None,
+    source_execution_envelope: Optional[Mapping[str, Any]] = None,
+    board: Optional[str] = None,
+) -> dict[str, Any]:
+    """Create/reuse, register, and read back one blocked-first review gate.
+
+    The review card is always created in ``blocked`` before registration, so a
+    dispatcher tick between the two durable writes cannot claim an
+    unregistered reviewer. A stable idempotency key plus the serialized
+    create-time recheck makes concurrent preparation converge on one card. If
+    the process stops after creation, replay reuses that blocked card and
+    finishes registration; no late-link repair is required.
+    """
+    stable_key = str(idempotency_key or "").strip()
+    if not stable_key:
+        raise ValueError("review preparation requires a stable idempotency_key")
+    if get_task(conn, source_task_id) is None:
+        raise ValueError(f"unknown review source task: {source_task_id}")
+    if source_execution_envelope is not None:
+        from hermes_cli.execution_contract import no_deploy_acceptance_mismatches
+
+        if not isinstance(source_execution_envelope, Mapping):
+            raise ValueError("source_execution_envelope must be a mapping")
+        mismatches = no_deploy_acceptance_mismatches(source_execution_envelope)
+        if mismatches:
+            raise ValueError(
+                "review source execution envelope violates no_deploy authority: "
+                + ", ".join(mismatches)
+            )
+
+    review_task_id = create_task(
+        conn,
+        title=title,
+        body=body,
+        assignee=assignee,
+        created_by=created_by,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        project_id=project_id,
+        tenant=tenant,
+        priority=priority,
+        parents=(source_task_id,),
+        idempotency_key=stable_key,
+        max_runtime_seconds=max_runtime_seconds,
+        skills=skills,
+        initial_status="blocked",
+        board=board,
+    )
+
+    review = get_task(conn, review_task_id)
+    if review is None:
+        raise RuntimeError("prepared review task disappeared before registration")
+    handoff = _review_handoff_row(conn, source_task_id=source_task_id)
+    expected = {
+        "title": str(title).strip(),
+        "body": body,
+        "assignee": _canonical_assignee(assignee),
+        "tenant": tenant,
+        "priority": priority,
+        "max_runtime_seconds": max_runtime_seconds,
+    }
+    observed = {
+        "title": review.title,
+        "body": review.body,
+        "assignee": review.assignee,
+        "tenant": review.tenant,
+        "priority": review.priority,
+        "max_runtime_seconds": review.max_runtime_seconds,
+    }
+    if project_id is None:
+        expected.update({
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+        })
+        observed.update({
+            "workspace_kind": review.workspace_kind,
+            "workspace_path": review.workspace_path,
+        })
+    conflicts = sorted(
+        field for field, value in expected.items() if observed[field] != value
+    )
+    if handoff is None:
+        if review.status != "blocked":
+            conflicts.append("initial_status")
+        if parent_ids(conn, review_task_id) != [source_task_id]:
+            conflicts.append("source_parent")
+    if conflicts:
+        raise ValueError(
+            "review idempotency key resolved to conflicting preparation content: "
+            + ", ".join(conflicts)
+        )
+    if handoff is not None and (
+        handoff["review_task_id"] != review_task_id
+        or handoff["next_task_id"] != next_task_id
+    ):
+        raise ValueError(
+            f"source {source_task_id} already has a different review preparation"
+        )
+
+    register_review_handoff(
+        conn,
+        source_task_id,
+        review_task_id,
+        next_task_id=next_task_id,
+        board=board,
+    )
+    return _review_preparation_readback(conn, source_task_id, review_task_id)
 
 
 def replace_review_handoff(

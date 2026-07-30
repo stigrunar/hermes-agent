@@ -65,6 +65,7 @@ def test_ordinary_feature_passes_with_structural_normalization_only():
     assert first["findings"] == []
     assert first["normalized_envelope"] == {
         "acceptance_count": 1,
+        "authority": [],
         "has_blocker_stop": True,
         "has_outcome": True,
         "has_success_stop": True,
@@ -126,6 +127,46 @@ def test_missing_stop_condition_is_reported():
     report = audit_execution_envelope(_payload(envelope))
 
     assert _codes(report) == ["missing_stop_condition"]
+
+
+def test_no_deploy_authority_rejects_deploy_or_live_acceptance_requirements():
+    envelope = _base_envelope(
+        authority=["source", "no_deploy"],
+        acceptance=["SECRET-B41 source passes review and deploys to the actual target"],
+        stop_when=[
+            "acceptance passes after live QA",
+            "an exact authority, resource, or safety blocker",
+        ],
+    )
+
+    report = audit_execution_envelope(_payload(envelope))
+
+    findings = [
+        finding for finding in report["findings"]
+        if finding["code"] == "authority_acceptance_mismatch"
+    ]
+    assert [finding["path"] for finding in findings] == [
+        "execution_envelope.acceptance",
+        "execution_envelope.stop_when",
+    ]
+    assert report["normalized_envelope"]["authority"] == ["no_deploy", "source"]
+    assert "SECRET-B41" not in json.dumps(report)
+
+
+def test_no_deploy_authority_allows_approved_not_live_source_completion():
+    envelope = _base_envelope(
+        authority="no_deploy",
+        acceptance=["exact candidate is approved_not_live and source is done"],
+        stop_when=[
+            "source acceptance passes as approved_not_live",
+            "an exact authority, resource, or safety blocker",
+        ],
+    )
+
+    report = audit_execution_envelope(_payload(envelope))
+
+    assert report["valid"] is True
+    assert report["normalized_envelope"]["authority"] == ["no_deploy"]
 
 
 def test_generic_full_suite_and_review_silently_promote_feature():

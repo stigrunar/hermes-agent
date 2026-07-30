@@ -213,6 +213,218 @@ def test_register_is_idempotent_and_rejects_ambiguous_graph(kanban_home):
             kb.register_review_handoff(conn, source3, review3)
 
 
+def test_prepare_review_gate_is_blocked_first_and_replay_safe(
+    kanban_home, monkeypatch: pytest.MonkeyPatch,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+        original_register = kb.register_review_handoff
+        attempted_claims = []
+
+        def register_after_aggressive_dispatcher(
+            db, source_task_id, review_task_id, **kwargs,
+        ):
+            kb.recompute_ready(db)
+            attempted_claims.append(
+                kb.claim_task(db, review_task_id, claimer="aggressive-dispatcher")
+            )
+            return original_register(
+                db, source_task_id, review_task_id, **kwargs,
+            )
+
+        monkeypatch.setattr(
+            kb, "register_review_handoff", register_after_aggressive_dispatcher,
+        )
+        first = kb.prepare_review_gate(
+            conn,
+            source,
+            title="exact candidate review",
+            body="review source candidate",
+            assignee="reviewer",
+            idempotency_key="review:source:exact-candidate",
+        )
+        second = kb.prepare_review_gate(
+            conn,
+            source,
+            title="exact candidate review",
+            body="review source candidate",
+            assignee="reviewer",
+            idempotency_key="review:source:exact-candidate",
+        )
+
+        assert attempted_claims == [None, None]
+        assert first == second
+        assert first["review_status"] == "blocked"
+        assert first["review_parents"] == [source]
+        assert first["handoff"]["state"] == "waiting"
+        assert first["source_children"] == [first["review_task_id"]]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_handoffs WHERE source_task_id=?",
+            (source,),
+        ).fetchone()[0] == 1
+        with pytest.raises(ValueError, match="conflicting preparation content: title"):
+            kb.prepare_review_gate(
+                conn,
+                source,
+                title="different review",
+                body="review source candidate",
+                assignee="reviewer",
+                idempotency_key="review:source:exact-candidate",
+            )
+
+
+def test_concurrent_prepare_review_gate_reuses_one_blocked_reviewer(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+
+    def prepare():
+        with kb.connect() as worker_conn:
+            return kb.prepare_review_gate(
+                worker_conn,
+                source,
+                title="review",
+                assignee="reviewer",
+                idempotency_key="review:source:concurrent",
+            )["review_task_id"]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as pool:
+        review_ids = list(pool.map(lambda _: prepare(), range(16)))
+
+    assert len(set(review_ids)) == 1
+    with kb.connect() as conn:
+        review = kb.get_task(conn, review_ids[0])
+        assert review is not None and review.status == "blocked"
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_handoffs WHERE source_task_id=?",
+            (source,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("review:source:concurrent",),
+        ).fetchone()[0] == 1
+
+
+def test_prepared_review_changes_requested_returns_source_without_successor(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+        prepared = kb.prepare_review_gate(
+            conn,
+            source,
+            title="review",
+            assignee="reviewer",
+            idempotency_key="review:source:recut",
+        )
+        review = prepared["review_task_id"]
+        _activate(conn, source)
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert claimed is not None
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict="changes_requested",
+            summary="candidate needs a recut",
+            expected_run_id=claimed.current_run_id,
+        )
+
+        source_task = kb.get_task(conn, source)
+        assert source_task is not None and source_task.status == "ready"
+        review_task = kb.get_task(conn, review)
+        assert review_task is not None and review_task.status == "done"
+        handoff = kb.list_review_handoffs(conn)[0]
+        assert handoff["state"] == "changes_requested"
+        assert handoff["next_task_id"] is None
+
+
+def test_prepare_review_rejects_no_deploy_acceptance_mismatch_before_creation(
+    kanban_home,
+):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+        with pytest.raises(
+            ValueError,
+            match="violates no_deploy authority: acceptance, stop_when",
+        ):
+            kb.prepare_review_gate(
+                conn,
+                source,
+                title="invalid review",
+                assignee="reviewer",
+                idempotency_key="review:invalid-no-deploy",
+                source_execution_envelope={
+                    "authority": ["source", "no_deploy"],
+                    "acceptance": ["SECRET-B41 deploy to the actual target"],
+                    "stop_when": ["acceptance passes after live QA"],
+                },
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("review:invalid-no-deploy",),
+        ).fetchone()[0] == 0
+
+
+def test_b41_no_deploy_source_closes_before_idempotent_deploy_creation(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="no-deploy source", assignee="builder")
+        prepared = kb.prepare_review_gate(
+            conn,
+            source,
+            title="exact source review",
+            assignee="reviewer",
+            idempotency_key="b41:source-review",
+            source_execution_envelope={
+                "authority": "no_deploy",
+                "acceptance": ["exact candidate is approved_not_live"],
+                "stop_when": ["source acceptance passes or authority blocks"],
+            },
+        )
+        review = prepared["review_task_id"]
+        assert prepared["handoff"]["next_task_id"] is None
+
+        _activate(conn, source)
+        claimed = kb.claim_review_task(conn, review, claimer="reviewer:1")
+        assert claimed is not None
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict="approved",
+            summary="approved_not_live",
+            expected_run_id=claimed.current_run_id,
+        )
+        source_task = kb.get_task(conn, source)
+        assert source_task is not None
+        assert source_task.status == "done"
+        assert source_task.result == "approved_not_live"
+
+        deploy_first = kb.create_task(
+            conn,
+            title="controller-created deploy",
+            assignee="operator",
+            parents=[source],
+            idempotency_key="b41:deploy-after-source",
+        )
+        deploy_second = kb.create_task(
+            conn,
+            title="controller-created deploy",
+            assignee="operator",
+            parents=[source],
+            idempotency_key="b41:deploy-after-source",
+        )
+        assert deploy_first == deploy_second
+        deploy_task = kb.get_task(conn, deploy_first)
+        assert deploy_task is not None and deploy_task.status == "ready"
+        assert kb.parent_ids(conn, deploy_first) == [source]
+        assert kb.parent_ids(conn, source) == []
+        # Activation detaches the parked reviewer before it can run; the later
+        # controller-created deploy is the source's only remaining DAG child.
+        assert kb.child_ids(conn, source) == [deploy_first]
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("b41:deploy-after-source",),
+        ).fetchone()[0] == 1
+
+
 def test_concurrent_registration_collapses_to_one_relationship(kanban_home):
     with kb.connect() as conn:
         source = kb.create_task(conn, title="source")

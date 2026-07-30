@@ -368,6 +368,37 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "to skip the brief running-to-blocked transition.")
     p_create.add_argument("--json", action="store_true", help="Emit JSON output")
 
+    p_prepare_review = sub.add_parser(
+        "prepare-review",
+        help="Create/reuse and register one blocked-first review gate",
+    )
+    p_prepare_review.add_argument("source_task_id")
+    p_prepare_review.add_argument("title", help="Review task title")
+    p_prepare_review.add_argument("--assignee", required=True)
+    p_prepare_review.add_argument("--idempotency-key", required=True)
+    p_prepare_review.add_argument("--body", default=None)
+    p_prepare_review.add_argument("--next-task", default=None)
+    p_prepare_review.add_argument(
+        "--source-execution-envelope",
+        default=None,
+        metavar="JSON",
+        help="Authoritative source execution envelope JSON for boundary validation",
+    )
+    p_prepare_review.add_argument(
+        "--workspace",
+        default="scratch",
+        help="scratch | worktree | worktree:<path> | dir:<path>",
+    )
+    p_prepare_review.add_argument("--project", default=None)
+    p_prepare_review.add_argument("--tenant", default=None)
+    p_prepare_review.add_argument("--priority", type=int, default=0)
+    p_prepare_review.add_argument("--max-runtime", default=None)
+    p_prepare_review.add_argument("--created-by", default="user")
+    p_prepare_review.add_argument(
+        "--skill", action="append", default=[], dest="skills",
+    )
+    p_prepare_review.add_argument("--json", action="store_true")
+
     # --- swarm ---
     p_swarm = sub.add_parser(
         "swarm",
@@ -1044,6 +1075,7 @@ def kanban_command(args: argparse.Namespace) -> int:
         handlers = {
             "init":     _cmd_init,
             "create":   _cmd_create,
+            "prepare-review": _cmd_prepare_review,
             "swarm":    _cmd_swarm,
             "list":     _cmd_list,
             "ls":       _cmd_list,
@@ -1477,6 +1509,52 @@ def _cmd_create(args: argparse.Namespace) -> int:
             running, message = _check_dispatcher_presence()
             if not running and message:
                 print(f"\n⚠  {message}", file=sys.stderr)
+    return 0
+
+
+def _cmd_prepare_review(args: argparse.Namespace) -> int:
+    try:
+        workspace_kind, workspace_path = _parse_workspace_flag(args.workspace)
+        max_runtime = _parse_duration(args.max_runtime)
+        source_execution_envelope = (
+            json.loads(args.source_execution_envelope)
+            if args.source_execution_envelope else None
+        )
+        if source_execution_envelope is not None and not isinstance(
+            source_execution_envelope, dict
+        ):
+            raise ValueError("source execution envelope must be a JSON object")
+    except (argparse.ArgumentTypeError, json.JSONDecodeError, ValueError) as exc:
+        print(f"kanban: {exc}", file=sys.stderr)
+        return 2
+    with kb.connect_closing() as conn:
+        prepared = kb.prepare_review_gate(
+            conn,
+            args.source_task_id,
+            title=args.title,
+            body=args.body,
+            assignee=args.assignee,
+            idempotency_key=args.idempotency_key,
+            next_task_id=args.next_task,
+            created_by=args.created_by or _profile_author(),
+            workspace_kind=workspace_kind,
+            workspace_path=workspace_path,
+            project_id=args.project,
+            tenant=args.tenant,
+            priority=args.priority,
+            max_runtime_seconds=max_runtime,
+            skills=args.skills or None,
+            source_execution_envelope=source_execution_envelope,
+            board=getattr(args, "board", None),
+        )
+    if args.json:
+        print(json.dumps(prepared, indent=2, ensure_ascii=False))
+    else:
+        print(
+            "Prepared review "
+            f"{prepared['source_task_id']} -> {prepared['review_task_id']} "
+            f"({prepared['review_status']}, {prepared['handoff']['state']})"
+        )
     return 0
 
 

@@ -1019,6 +1019,70 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_review_preparation_returns_registered_blocked_readback(worker_env):
+    from tools import kanban_tools as kt
+
+    args = {
+        "title": "exact candidate review",
+        "assignee": "reviewer",
+        "idempotency_key": "tool:blocked-first-review",
+        "review_source_task_id": worker_env,
+    }
+    first = json.loads(kt._handle_create(args))
+    second = json.loads(kt._handle_create(args))
+
+    assert first["ok"] is True
+    assert first == second
+    assert first["source_task_id"] == worker_env
+    assert first["review_status"] == "blocked"
+    assert first["review_parents"] == [worker_env]
+    assert first["handoff"]["state"] == "waiting"
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("tool:blocked-first-review",),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM review_handoffs WHERE source_task_id=?",
+            (worker_env,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_create_review_preparation_blocks_no_deploy_mismatch_without_leak(worker_env):
+    from tools import kanban_tools as kt
+
+    out = kt._handle_create({
+        "title": "invalid review",
+        "assignee": "reviewer",
+        "idempotency_key": "tool:invalid-no-deploy",
+        "review_source_task_id": worker_env,
+        "source_execution_envelope": {
+            "authority": "no_deploy",
+            "acceptance": ["SECRET-TOOL deploy to actual target"],
+            "stop_when": ["acceptance passes after live verification"],
+        },
+    })
+
+    result = json.loads(out)
+    assert "no_deploy authority" in result["error"]
+    assert "SECRET-TOOL" not in out
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE idempotency_key=?",
+            ("tool:invalid-no-deploy",),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
 def test_create_inherits_worker_dir_workspace(monkeypatch, worker_env):
     """A worker scoped to a dir: task that spawns a child without a
     workspace arg inherits the dir, not scratch (so follow-up code-gen

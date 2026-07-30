@@ -1325,6 +1325,9 @@ def _handle_create(args: dict, **kw) -> str:
     if bool_error:
         return tool_error(bool_error)
     idempotency_key = args.get("idempotency_key")
+    review_source_task_id = args.get("review_source_task_id")
+    review_next_task_id = args.get("review_next_task_id")
+    source_execution_envelope = args.get("source_execution_envelope")
     strict_idempotency_match = args.get("_strict_idempotency_match") is True
     trusted_project_binding = args.get("_trusted_project_binding")
     max_runtime_seconds = args.get("max_runtime_seconds")
@@ -1382,6 +1385,46 @@ def _handle_create(args: dict, **kw) -> str:
                         # whole subtree shares one repo + branch convention.
                         if project_id is None and _self_task.project_id:
                             project_id = _self_task.project_id
+            if review_source_task_id:
+                if not idempotency_key:
+                    raise ValueError("review preparation requires idempotency_key")
+                if parents and list(parents) != [review_source_task_id]:
+                    raise ValueError(
+                        "review preparation owns its single source parent; "
+                        "do not pass other parents"
+                    )
+                if triage or goal_mode:
+                    raise ValueError(
+                        "review preparation cannot use triage or goal_mode"
+                    )
+                prepared = kb.prepare_review_gate(
+                    conn,
+                    str(review_source_task_id),
+                    title=str(title).strip(),
+                    body=body,
+                    assignee=str(assignee),
+                    idempotency_key=str(idempotency_key),
+                    next_task_id=(
+                        str(review_next_task_id) if review_next_task_id else None
+                    ),
+                    created_by=os.environ.get("HERMES_PROFILE") or "worker",
+                    workspace_kind=str(workspace_kind),
+                    workspace_path=workspace_path,
+                    project_id=project_id,
+                    tenant=tenant,
+                    priority=int(priority) if priority is not None else 0,
+                    max_runtime_seconds=(
+                        int(max_runtime_seconds)
+                        if max_runtime_seconds is not None else None
+                    ),
+                    skills=skills,
+                    source_execution_envelope=source_execution_envelope,
+                    board=board,
+                )
+                return _ok(
+                    **prepared,
+                    board=kb.get_current_board() if board is None else board,
+                )
             if strict_idempotency_match:
                 if not idempotency_key:
                     raise ValueError(
@@ -2235,6 +2278,34 @@ KANBAN_CREATE_SCHEMA = {
                     "If a non-archived task with this key already "
                     "exists, return that task's id instead of creating "
                     "a duplicate. Useful for retry-safe automation."
+                ),
+            },
+            "review_source_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional source task id for blocked-first review preparation. "
+                    "When set, this call creates or reuses this task as a blocked "
+                    "reviewer, registers the exact review handoff, and returns "
+                    "authoritative source/review/readback state. Requires a stable "
+                    "idempotency_key; no separate kanban_link call is needed."
+                ),
+            },
+            "review_next_task_id": {
+                "type": "string",
+                "description": (
+                    "Optional existing successor released only by approval. Valid "
+                    "only with review_source_task_id. Omit for a no-deploy source; "
+                    "a controller may create deployment after source approval."
+                ),
+            },
+            "source_execution_envelope": {
+                "type": "object",
+                "description": (
+                    "Optional authoritative source execution envelope. During "
+                    "review preparation, a declared no_deploy authority is "
+                    "validated against acceptance and stop_when before any review "
+                    "card is created; incompatible deploy/live requirements are "
+                    "rejected without echoing candidate prose."
                 ),
             },
             "max_runtime_seconds": {

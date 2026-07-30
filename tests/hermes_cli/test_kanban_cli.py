@@ -92,6 +92,24 @@ def test_run_slash_create_and_list(kanban_home):
     assert "alice" in out
 
 
+def test_run_slash_prepare_review_returns_blocked_registered_readback(kanban_home):
+    with kb.connect() as conn:
+        source = kb.create_task(conn, title="source", assignee="builder")
+
+    command = (
+        f"prepare-review {source} 'exact candidate review' "
+        "--assignee reviewer --idempotency-key cli:review:source --json"
+    )
+    first = json.loads(kc.run_slash(command))
+    second = json.loads(kc.run_slash(command))
+
+    assert first == second
+    assert first["source_task_id"] == source
+    assert first["review_status"] == "blocked"
+    assert first["review_parents"] == [source]
+    assert first["handoff"]["state"] == "waiting"
+
+
 def test_run_slash_create_worktree_path_and_branch(kanban_home, tmp_path):
     target = tmp_path / ".worktrees" / "t6-wire"
     target_arg = target.as_posix()
