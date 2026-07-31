@@ -32,7 +32,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional, cast
 
 from agent.redact import redact_sensitive_text
 from hermes_cli.goals import judge_goal
@@ -1396,6 +1396,7 @@ def _handle_create(args: dict, **kw) -> str:
     review_source_task_id = args.get("review_source_task_id")
     review_next_task_id = args.get("review_next_task_id")
     source_execution_envelope = args.get("source_execution_envelope")
+    architect_routing = args.get("architect_routing")
     strict_idempotency_match = args.get("_strict_idempotency_match") is True
     trusted_project_binding = args.get("_trusted_project_binding")
     max_runtime_seconds = args.get("max_runtime_seconds")
@@ -1421,6 +1422,17 @@ def _handle_create(args: dict, **kw) -> str:
     if not isinstance(parents, (list, tuple)):
         return tool_error(
             f"parents must be a list of task ids, got {type(parents).__name__}"
+        )
+    canonical_assignee = str(assignee).strip().casefold().replace("_", "-")
+    is_architect_create = canonical_assignee == "dollyarchitect"
+    if is_architect_create and not isinstance(architect_routing, dict):
+        return tool_error(
+            "kanban_create: direct DollyArchitect creation requires the structured "
+            "architect_routing object; no task was created"
+        )
+    if architect_routing is not None and not is_architect_create:
+        return tool_error(
+            "kanban_create: architect_routing is only valid for assignee=dollyarchitect"
         )
     try:
         board, project_id, session_id = _resolve_gateway_create_routing(args)
@@ -1454,6 +1466,55 @@ def _handle_create(args: dict, **kw) -> str:
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
                         project_source_task_id = _self_task.id
+            if is_architect_create:
+                if review_source_task_id:
+                    raise ValueError(
+                        "DollyArchitect direct creation cannot also prepare a review gate"
+                    )
+                if triage or goal_mode:
+                    raise ValueError(
+                        "DollyArchitect direct creation cannot use triage or goal_mode"
+                    )
+                if not project_id:
+                    raise ValueError(
+                        "DollyArchitect direct creation requires a project binding"
+                    )
+                from hermes_cli import projects_db as _projects_db
+
+                with _projects_db.connect_readonly() as project_conn:
+                    architect_project = _projects_db.get_project(
+                        project_conn, str(project_id)
+                    )
+                if architect_project is None or not architect_project.primary_path:
+                    raise ValueError(
+                        "DollyArchitect direct creation requires a resolvable project "
+                        "with a primary repository"
+                    )
+                project_id = architect_project.id
+                if workspace_kind == "scratch" and architect_project.primary_path:
+                    workspace_kind = "worktree"
+                from agent.profile_runtime_policy import (
+                    materialize_direct_architect_create,
+                )
+
+                normalized_architect_routing = dict(
+                    cast(Mapping[str, Any], architect_routing)
+                )
+                if normalized_architect_routing.get("architecture_document_path") == "":
+                    normalized_architect_routing["architecture_document_path"] = None
+                body = materialize_direct_architect_create(
+                    title=str(title).strip(),
+                    body=str(body or ""),
+                    project_id=project_id,
+                    workspace_kind=str(workspace_kind),
+                    workspace_path=(str(workspace_path) if workspace_path else None),
+                    routing=normalized_architect_routing,
+                    model_override=(str(model_override) if model_override else None),
+                    provider_override=(
+                        str(provider_override) if provider_override else None
+                    ),
+                    skills=(list(skills) if skills is not None else None),
+                )
             if review_source_task_id:
                 if not idempotency_key:
                     raise ValueError("review preparation requires idempotency_key")
@@ -2362,6 +2423,44 @@ KANBAN_CREATE_SCHEMA = {
                     "validated against acceptance and stop_when before any review "
                     "card is created; incompatible deploy/live requirements are "
                     "rejected without echoing candidate prose."
+                ),
+            },
+            "architect_routing": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "architecture_document_path": {
+                        "type": "string",
+                        "description": (
+                            "Absolute architecture-document path for document-writing "
+                            "routes; use an empty string for handoff-only routes."
+                        ),
+                    },
+                    "bounded_file_cluster": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "non_goals": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "requested_actions": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                    "work_kind": {"type": "string"},
+                },
+                "required": [
+                    "architecture_document_path",
+                    "bounded_file_cluster",
+                    "non_goals",
+                    "requested_actions",
+                    "work_kind",
+                ],
+                "description": (
+                    "Required structured authority for direct DollyArchitect creation. "
+                    "Hermes materializes the exact dispatch contract and rejects malformed "
+                    "requests before any task row is created."
                 ),
             },
             "max_runtime_seconds": {

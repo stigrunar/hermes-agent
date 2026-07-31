@@ -11,7 +11,9 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import shutil
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 import pytest
 
@@ -415,6 +417,188 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def _architect_routing(**overrides):
+    routing = {
+        "architecture_document_path": "",
+        "bounded_file_cluster": ["src/contracts"],
+        "non_goals": ["no implementation; emit one DollyCode handoff"],
+        "requested_actions": ["architecture_decision"],
+        "work_kind": "cross_repo_contract",
+    }
+    routing.update(overrides)
+    return routing
+
+
+def _seed_architect_project(tmp_path, worker_env):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import projects_db
+
+    repo = tmp_path / "architect-project"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    with projects_db.connect_closing() as conn:
+        project_id = projects_db.create_project(
+            conn,
+            name="Architect project",
+            slug="architect-project",
+            primary_path=str(repo),
+        )
+    with kb.connect_closing() as conn:
+        conn.execute(
+            "UPDATE tasks SET project_id = ? WHERE id = ?",
+            (project_id, worker_env),
+        )
+        conn.commit()
+    return project_id, repo
+
+
+def _architect_db_receipt(worker_env):
+    from hermes_cli import kanban_db as kb
+
+    with kb.connect_closing() as conn:
+        source = kb.get_task(conn, worker_env)
+        assert source is not None
+        return {
+            "tasks": conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0],
+            "events": conn.execute("SELECT COUNT(*) FROM task_events").fetchone()[0],
+            "runs": conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0],
+            "subscriptions": conn.execute(
+                "SELECT COUNT(*) FROM kanban_notify_subs"
+            ).fetchone()[0],
+            "source_failures": source.consecutive_failures,
+        }
+
+
+@pytest.mark.parametrize(
+    ("mutation", "expected_error"),
+    [
+        ({"architect_routing": None}, "requires the structured architect_routing"),
+        (
+            {"body": "HERMES_ARCHITECT_DISPATCH_V1"},
+            "must not supply an architect dispatch marker",
+        ),
+        (
+            {
+                "body": "<!-- HERMES_ARCHITECT_DISPATCH_V1\n{}\n"
+                "HERMES_ARCHITECT_DISPATCH_V1 -->",
+            },
+            "must not supply an architect dispatch marker",
+        ),
+        (
+            {"workspace_kind": "dir", "workspace_path": "/tmp"},
+            "unknown workspace_kind",
+        ),
+        (
+            {"workspace_kind": "worktree", "workspace_path": "/tmp"},
+            "canonical task-id path",
+        ),
+        ({"model": "other-model"}, "model override must remain"),
+        (
+            {"model": "gpt-5.6-sol", "provider": "openrouter"},
+            "provider override must use the profile default",
+        ),
+        (
+            {"skills": ["release-candidate-evidence"]},
+            "force-loads excluded skill",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    requested_actions=["architecture_decision", "implementation"]
+                )
+            },
+            "exactly one architecture capability",
+        ),
+    ],
+)
+def test_direct_architect_create_rejects_before_any_durable_mutation(
+    worker_env, tmp_path, mutation, expected_error
+):
+    from tools import kanban_tools as kt
+
+    project_id, repo = _seed_architect_project(tmp_path, worker_env)
+    args = {
+        "title": "Design a bounded contract",
+        "body": "Return one architecture decision and one DollyCode handoff.",
+        "assignee": "dollyarchitect",
+        "project": project_id,
+        "architect_routing": _architect_routing(),
+        "idempotency_key": "architect-invalid-request",
+    }
+    args.update(mutation)
+    before = _architect_db_receipt(worker_env)
+    worktrees_root = repo / ".worktrees"
+    before_worktrees = set(worktrees_root.glob("*")) if worktrees_root.exists() else set()
+
+    result = json.loads(kt._handle_create(args))
+    deterministic_retry = json.loads(kt._handle_create(args))
+
+    assert expected_error in result["error"]
+    assert deterministic_retry["error"] == result["error"]
+    assert _architect_db_receipt(worker_env) == before
+    after_worktrees = set(worktrees_root.glob("*")) if worktrees_root.exists() else set()
+    assert after_worktrees == before_worktrees
+
+
+def test_direct_architect_create_materializes_one_contract_and_replays_idempotently(
+    worker_env, tmp_path
+):
+    from agent import profile_runtime_policy as policy
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    project_id, repo = _seed_architect_project(tmp_path, worker_env)
+    args = {
+        "title": "Design a bounded contract",
+        "body": "Return one architecture decision and one DollyCode handoff.",
+        "assignee": "dollyarchitect",
+        "project": project_id,
+        "architect_routing": _architect_routing(),
+        "idempotency_key": "architect-valid-request",
+    }
+
+    first = json.loads(kt._handle_create(args))
+    replay = json.loads(kt._handle_create(args))
+    assert first["ok"] is True, first
+    assert replay["ok"] is True, replay
+    assert replay["task_id"] == first["task_id"]
+
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, first["task_id"])
+    assert task is not None
+    assert task.body is not None
+    assert task.workspace_path is not None
+    assert task.project_id == project_id
+    assert task.workspace_kind == "worktree"
+    assert task.workspace_path == str(repo / ".worktrees" / task.id)
+    assert task.body.count(policy.DISPATCH_MARKER) == 2
+    payload = json.loads(task.body.splitlines()[-2])
+    assert payload["project_id"] == project_id
+    assert payload["workspace_kind"] == "worktree"
+    assert payload["implementation_repo"] == str(repo)
+
+    task_workspace = Path(task.workspace_path)
+    task_workspace.mkdir(parents=True)
+    profile_home = Path(os.environ["HERMES_HOME"]) / "profiles" / "dollyarchitect"
+    overlay = profile_home / policy.OVERLAY_RELATIVE_PATH
+    overlay.mkdir(parents=True)
+    source_overlay = Path(__file__).parents[2] / "profile_candidates" / "dollyarchitect"
+    for name in policy.EXPECTED_OVERLAY_HASHES:
+        shutil.copyfile(source_overlay / name, overlay / name)
+    (profile_home / "config.yaml").write_text(
+        """model:\n  default: gpt-5.6-sol\nagent:\n  max_turns: 60\n  reasoning_effort: high\n  runtime_policy:\n    id: dollyarchitect.v1\n    enabled: true\ntelegram:\n  dm_policy: allowlist\n  allow_from: [\"123456\"]\n  group_policy: disabled\ntoolsets: [hermes-cli]\nskills:\n  disabled:\n    - contract-driven-frontend-implementation\n    - external-upstream-pr-recuts\n    - mobile-ui-verification\n    - release-candidate-evidence\n""",
+        encoding="utf-8",
+    )
+    policy.reset_runtime_policy_state_for_tests()
+    dispatcher_payload = policy.prepare_dollyarchitect_spawn_env(
+        task=task,
+        workspace=str(task_workspace),
+        profile_name="dollyarchitect",
+        hermes_home=profile_home,
+    )
+    assert dispatcher_payload is not None
 
 
 def test_link_happy_path(worker_env):

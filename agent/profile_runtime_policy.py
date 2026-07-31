@@ -521,6 +521,123 @@ def materialize_structured_architect_route(
     return "DollyArchitect", f"{body.rstrip()}\n\n{block}".strip()
 
 
+def _validate_architect_task_overrides(task: Any) -> None:
+    """Reject per-task inputs that weaken the reviewed profile policy."""
+
+    if getattr(task, "model_override", None) not in (None, "", "gpt-5.6-sol"):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect task model override must remain gpt-5.6-sol"
+        )
+    if getattr(task, "provider_override", None) not in (None, ""):
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect task provider override must use the profile default"
+        )
+    forced_skills = {
+        str(item).strip()
+        for item in (getattr(task, "skills", None) or [])
+        if str(item).strip()
+    }
+    excluded = sorted(forced_skills & EXCLUDED_SKILLS)
+    if excluded:
+        raise ProfileRuntimePolicyError(
+            "DollyArchitect task force-loads excluded skill(s): "
+            + ", ".join(excluded)
+        )
+
+
+def materialize_direct_architect_create(
+    *,
+    title: str,
+    body: str,
+    project_id: str,
+    workspace_kind: str,
+    workspace_path: str | None,
+    routing: Mapping[str, Any],
+    model_override: str | None,
+    provider_override: str | None,
+    skills: list[str] | tuple[str, ...] | None,
+) -> str:
+    """Materialize and preflight one direct DollyArchitect create request."""
+
+    identity_seed = json.dumps(
+        {
+            "body": body,
+            "project_id": project_id,
+            "routing": dict(routing),
+            "title": title,
+            "workspace_kind": workspace_kind,
+            "workspace_path": workspace_path,
+        },
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    task = types.SimpleNamespace(
+        id="direct-" + hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:24],
+        project_id=project_id,
+        workspace_kind=workspace_kind,
+        workspace_path=workspace_path,
+        model_override=model_override,
+        provider_override=provider_override,
+        skills=skills,
+    )
+    routed, materialized_body = materialize_structured_architect_route(
+        source_task=task,
+        route_slot="direct-create",
+        body=body,
+        routing=routing,
+    )
+    if _canonical_profile_name(routed) != PROFILE_NAME:
+        raise ProfileRuntimePolicyError(
+            f"structured work_kind is not architect-fit; assign it to {routed}"
+        )
+    _validate_architect_task_overrides(task)
+
+    payload = _parse_exact_json_block(materialized_body, DISPATCH_MARKER)
+    from profile_candidates.dollyarchitect import hardening
+
+    try:
+        contract = hardening.validate_architecture_contract(
+            hardening.ArchitectureDispatchContract.from_mapping(payload)
+        )
+    except hardening.ContractValidationError as exc:
+        raise ProfileRuntimePolicyError(
+            f"generated architect dispatch contract rejected: {exc}"
+        ) from exc
+
+    if (
+        contract.implementation_workspace_policy
+        is hardening.ImplementationWorkspacePolicy.PROJECT_WORKTREE
+        and workspace_path
+    ):
+        raise ProfileRuntimePolicyError(
+            "direct DollyArchitect project worktrees must use the canonical task-id path"
+        )
+    if contract.writable_artifact_roots:
+        if not workspace_path:
+            raise ProfileRuntimePolicyError(
+                "direct document-writing routes require an explicit workspace path"
+            )
+        raw_workspace = Path(workspace_path)
+        if not raw_workspace.is_absolute() or ".." in raw_workspace.parts:
+            raise ProfileRuntimePolicyError(
+                "DollyArchitect workspace must be absolute and traversal-free"
+            )
+        resolved_workspace = raw_workspace.resolve(strict=True)
+        for raw_root in contract.writable_artifact_roots:
+            try:
+                resolved_root = Path(raw_root).resolve(strict=True)
+                relative = resolved_root.relative_to(resolved_workspace)
+            except (OSError, ValueError) as exc:
+                raise ProfileRuntimePolicyError(
+                    "DollyArchitect artifact roots must resolve beneath the task workspace"
+                ) from exc
+            if not relative.parts or not resolved_root.is_dir():
+                raise ProfileRuntimePolicyError(
+                    "DollyArchitect artifact roots must be existing strict workspace descendants"
+                )
+    return materialized_body
+
+
 def prepare_dollyarchitect_spawn_env(
     *,
     task: Any,
@@ -610,21 +727,7 @@ def prepare_dollyarchitect_spawn_env(
             raise ProfileRuntimePolicyError(
                 "DollyArchitect artifact roots must be existing strict workspace descendants"
             )
-    if getattr(task, "model_override", None) not in (None, "", "gpt-5.6-sol"):
-        raise ProfileRuntimePolicyError(
-            "DollyArchitect task model override must remain gpt-5.6-sol"
-        )
-    forced_skills = {
-        str(item).strip()
-        for item in (getattr(task, "skills", None) or [])
-        if str(item).strip()
-    }
-    excluded = sorted(forced_skills & EXCLUDED_SKILLS)
-    if excluded:
-        raise ProfileRuntimePolicyError(
-            "DollyArchitect task force-loads excluded skill(s): "
-            + ", ".join(excluded)
-        )
+    _validate_architect_task_overrides(task)
     canonical = {
         "contract": {
             **asdict(contract),
