@@ -323,6 +323,12 @@ def _resolve_kanban_notification_events(
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    def _release_kanban_dispatcher_lock(self) -> None:
+        """Clear dispatcher ownership before releasing the OS lock."""
+        handle = getattr(self, "_kanban_dispatcher_lock_handle", None)
+        self._kanban_dispatcher_lock_handle = None
+        _release_singleton_lock(handle)
+
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
         """Elect one eligible notifier owner and keep retrying while running.
 
@@ -461,10 +467,10 @@ class GatewayKanbanWatchersMixin:
         thread via ``asyncio.to_thread`` so the loop never blocks on the
         WAL lock. Failures in one tick don't stop subsequent ticks.
 
-        **Multi-board:** iterates every board discovered on disk per
-        tick. Subscriptions live inside each board's own DB and cannot
-        cross boards, so delivery semantics are unchanged — this is
-        purely a fan-out of the single-DB poll.
+        **Multi-board:** iterates every board discovered on disk per tick, but
+        queries and claims only subscriptions stamped for the profile whose
+        lease this worker owns. Subscriptions live inside each board's own DB
+        and cannot cross boards.
 
         Returning from this method relinquishes the notifier lease. In
         particular, adapter loss returns control to the election loop so a
@@ -518,6 +524,7 @@ class GatewayKanbanWatchersMixin:
             try:
                 def _collect():
                     deliveries: list[dict] = []
+                    notifier_profiles = {notifier_profile}
                     active_platforms = {
                         getattr(platform, "value", str(platform)).lower()
                         for platform in _kanban_adapters_for_profile(
@@ -578,10 +585,14 @@ class GatewayKanbanWatchersMixin:
                         # checkpoint traffic) is exactly the per-tick cost
                         # this skip avoids.
                         try:
-                            if _kb.count_notify_subs(board=slug) == 0:
+                            if _kb.count_notify_subs(
+                                board=slug,
+                                notifier_profiles=notifier_profiles,
+                                include_unowned=False,
+                            ) == 0:
                                 logger.debug(
-                                    "kanban notifier: board %s has no subscriptions; skipping open",
-                                    slug,
+                                    "kanban notifier: board %s has no subscriptions owned by %s; skipping open",
+                                    slug, sorted(notifier_profiles),
                                 )
                                 continue
                         except Exception as exc:
@@ -608,7 +619,11 @@ class GatewayKanbanWatchersMixin:
                             # a legacy DB. `_add_column_if_missing` now
                             # tolerates that race, but we still skip the
                             # redundant call to avoid the wasted work.
-                            subs = _kb.list_notify_subs(conn)
+                            subs = _kb.list_notify_subs(
+                                conn,
+                                notifier_profiles=notifier_profiles,
+                                include_unowned=False,
+                            )
                             if not subs:
                                 logger.debug("kanban notifier: board %s has no subscriptions", slug)
                             for sub in subs:
@@ -1814,8 +1829,7 @@ class GatewayKanbanWatchersMixin:
                         last_warn_at = now
             except asyncio.CancelledError:
                 logger.debug("kanban dispatcher: cancelled")
-                _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-                self._kanban_dispatcher_lock_handle = None
+                self._release_kanban_dispatcher_lock()
                 raise
             except Exception:
                 logger.exception("kanban dispatcher: unexpected watcher error")
@@ -1827,5 +1841,4 @@ class GatewayKanbanWatchersMixin:
                 await asyncio.sleep(min(1.0, interval - slept))
                 slept += 1.0
 
-        _release_singleton_lock(self._kanban_dispatcher_lock_handle)
-        self._kanban_dispatcher_lock_handle = None
+        self._release_kanban_dispatcher_lock()

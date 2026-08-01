@@ -1156,8 +1156,8 @@ def test_kanban_notifier_isolates_per_subscription_failure(tmp_path, monkeypatch
     # unordered SELECT's scan order.
     original_list = kb.list_notify_subs
 
-    def bad_first(conn, task_id=None):
-        subs = original_list(conn, task_id)
+    def bad_first(conn, task_id=None, **kwargs):
+        subs = original_list(conn, task_id, **kwargs)
         return sorted(subs, key=lambda s: 0 if s["task_id"] == tid_bad else 1)
 
     monkeypatch.setattr(kb, "list_notify_subs", bad_first)
