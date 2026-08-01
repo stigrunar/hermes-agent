@@ -5,6 +5,11 @@ from xml.etree import ElementTree as ET
 
 import pytest
 
+pytest.importorskip(
+    "defusedxml",
+    reason="WeCom callback tests require the optional wecom extra",
+)
+
 from gateway.config import PlatformConfig
 from plugins.platforms.wecom.callback_adapter import WecomCallbackAdapter
 from plugins.platforms.wecom.wecom_crypto import WXBizMsgCrypt

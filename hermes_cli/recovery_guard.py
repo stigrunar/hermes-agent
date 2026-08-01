@@ -218,7 +218,15 @@ def _http_json(url: str, timeout: float) -> dict[str, Any]:
 
 
 def _run(argv: list[str], timeout: float) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(argv, text=True, capture_output=True, timeout=timeout, check=False)
+    return subprocess.run(
+        argv,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 @dataclass
@@ -1067,7 +1075,16 @@ def arm(plan_path: Path, *, launch: Callable[[list[str]], subprocess.CompletedPr
         "--plan",
         str(snapshot_path),
     ]
-    launcher = launch or (lambda command: subprocess.run(command, text=True, capture_output=True, check=False))
+    launcher = launch or (
+        lambda command: subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            check=False,
+        )
+    )
     result = launcher(argv)
     if result.returncode != 0:
         raise GuardError(f"failed to launch out-of-process supervisor: {result.stderr.strip()}")
