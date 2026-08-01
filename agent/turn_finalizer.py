@@ -91,6 +91,16 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _accepted_kanban_terminal = None
+    try:
+        from agent.kanban_stop import accepted_kanban_terminal_intent
+
+        _accepted_kanban_terminal = accepted_kanban_terminal_intent()
+    except Exception:
+        logger.debug("finalize_turn Kanban terminal-intent probe failed", exc_info=True)
+    if _accepted_kanban_terminal is not None:
+        _turn_exit_reason = "kanban_terminal_intent_accepted"
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -99,6 +109,7 @@ def finalize_turn(
         budget_exhausted
         and not interrupted
         and not failed
+        and _accepted_kanban_terminal is None
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -154,6 +165,12 @@ def finalize_turn(
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
+                _kanban_expected_run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+            except (KeyError, TypeError, ValueError):
+                _kanban_expected_run_id = None
+            try:
+                if _kanban_expected_run_id is None:
+                    raise ValueError("missing or malformed HERMES_KANBAN_RUN_ID")
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
@@ -169,6 +186,7 @@ def finalize_turn(
                         outcome="timed_out",
                         release_claim=True,
                         end_run=True,
+                        expected_run_id=_kanban_expected_run_id,
                         event_payload_extra={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
