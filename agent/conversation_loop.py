@@ -6563,8 +6563,10 @@ def run_conversation(
                     f"Error during local message processing after "
                     f"OpenAI-compatible API call #{api_call_count}: {str(e)}"
                 )
+                session_error_msg = "Local response processing failed."
             else:
                 error_msg = f"Error during OpenAI-compatible API call #{api_call_count}: {str(e)}"
+                session_error_msg = error_msg
             try:
                 print(f"❌ {error_msg}")
             except (OSError, ValueError):
@@ -6600,7 +6602,7 @@ def run_conversation(
                                 "role": "tool",
                                 "name": _ra().AIAgent._get_tool_call_name_static(tc),
                                 "tool_call_id": tc["id"],
-                                "content": f"Error executing tool: {error_msg}",
+                                "content": f"Error executing tool: {session_error_msg}",
                             }
                             messages.append(err_msg)
                 break
@@ -6619,8 +6621,11 @@ def run_conversation(
                 or api_call_count >= agent.max_iterations - 1
             ):
                 if _local_processing_error:
-                    _turn_exit_reason = f"local_processing_error({error_msg[:80]})"
-                    final_response = f"I apologize, but I encountered an error while processing the model response: {error_msg}"
+                    _turn_exit_reason = "local_processing_error"
+                    final_response = (
+                        "I apologize, but I encountered an internal error while "
+                        "processing the model response."
+                    )
                 else:
                     _turn_exit_reason = f"error_near_max_iterations({error_msg[:80]})"
                     final_response = f"I apologize, but I encountered repeated errors: {error_msg}"

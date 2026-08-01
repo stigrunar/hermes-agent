@@ -133,7 +133,13 @@ def test_outer_loop_stops_after_one_response_for_local_processing_error(tmp_path
 
     assert agent.client.chat.completions.create.call_count == 1
     assert result["api_calls"] == 1
-    assert result["turn_exit_reason"].startswith("local_processing_error(")
+    assert result["turn_exit_reason"] == "local_processing_error"
+    assert result["final_response"] == (
+        "I apologize, but I encountered an internal error while processing the model response."
+    )
+    assert "expected string or bytes-like object" not in str(result["messages"])
+    roles = [message["role"] for message in result["messages"]]
+    assert all(left != right for left, right in zip(roles, roles[1:]))
 
 
 def test_outer_loop_retries_nonlocal_repeated_error_until_bound(tmp_path, monkeypatch):
