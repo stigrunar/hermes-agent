@@ -5550,6 +5550,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # secondary profiles do (#64674). Explicit config= injection (tests)
         # is left untouched.
         self.config = config if config is not None else load_gateway_config_for_runner()
+        # Live work is recorded even when the concurrency cap is disabled.
+        # Initialize and prune the shared registry before accepting work; do
+        # not catch registry errors because corrupt evidence must fail closed.
+        from hermes_cli.active_sessions import initialize_active_session_registry
+
+        initialize_active_session_registry()
         # Mark the process as a profile multiplexer when configured. This flips
         # agent.secret_scope.get_secret() to fail-closed on any unscoped
         # credential read, so a missed migration crashes loudly instead of

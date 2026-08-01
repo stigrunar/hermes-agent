@@ -18,8 +18,6 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-import yaml
-
 from hermes_constants import get_hermes_home
 POLICY_ID = "dollyarchitect.v1"
 PROFILE_NAME = "dollyarchitect"
@@ -110,7 +108,9 @@ def _home_identifies_dollyarchitect(home: Path) -> bool:
 def _read_raw_config(home: Path) -> dict[str, Any]:
     path = home / "config.yaml"
     try:
-        value = yaml.safe_load(path.read_text(encoding="utf-8"))
+        from hermes_cli.config import read_user_config_raw
+
+        value = read_user_config_raw(path)
     except Exception as exc:
         raise ProfileRuntimePolicyError(
             f"DollyArchitect activation config is missing or invalid: {path}"

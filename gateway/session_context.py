@@ -72,9 +72,10 @@ def session_subprocess_env_updates() -> dict[str, str | None]:
     """Return per-spawn updates for ``HERMES_SESSION_*`` environment vars.
 
     A string value must be exported into the child (including an explicit
-    empty string). ``None`` means the child must remove that variable.  An
-    unengaged single-session process returns no updates so the legacy
-    ``os.environ`` fallback remains intact for CLI/one-shot callers.
+    empty string). ``None`` means the child must remove that variable. An
+    unengaged single-session process returns no updates unless its task-local
+    session id is bound, preserving the legacy ``os.environ`` fallback for
+    CLI/one-shot callers while projecting delegated child identity safely.
 
     This is intentionally an update set rather than a complete environment:
     local foreground shells apply it *after* sourcing their persistent shell
@@ -82,7 +83,16 @@ def session_subprocess_env_updates() -> dict[str, str | None]:
     copy. Remote/container backends do not consume this helper.
     """
     if not _session_context_engaged:
-        return {}
+        # Delegated children bind only their task-local session id so they do
+        # not overwrite the parent's process-global identity. Project that
+        # bound id into this child's environment without changing the legacy
+        # fallback semantics for any other session variable.
+        session_id = _SESSION_ID.get()
+        if session_id is _UNSET:
+            return {}
+        return {
+            "HERMES_SESSION_ID": "" if session_id is None else str(session_id)
+        }
 
     updates: dict[str, str | None] = {}
     for name, var in _VAR_MAP.items():
