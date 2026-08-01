@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import datetime
 import hashlib
 import json
 import os
@@ -1007,6 +1008,13 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Explicit operator-owned hygiene metadata. These columns are the only
+    # inputs to batch hygiene; titles, prose, age, assignee, and tenant are
+    # deliberately ignored.
+    hygiene_class: Optional[str] = None
+    hygiene_reason: Optional[str] = None
+    hygiene_marked_by: Optional[str] = None
+    superseded_by: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1095,6 +1103,18 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            hygiene_class=(
+                row["hygiene_class"] if "hygiene_class" in keys else None
+            ),
+            hygiene_reason=(
+                row["hygiene_reason"] if "hygiene_reason" in keys else None
+            ),
+            hygiene_marked_by=(
+                row["hygiene_marked_by"] if "hygiene_marked_by" in keys else None
+            ),
+            superseded_by=(
+                row["superseded_by"] if "superseded_by" in keys else None
             ),
         )
 
@@ -1345,7 +1365,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    hygiene_class        TEXT,
+    hygiene_reason       TEXT,
+    hygiene_marked_by    TEXT,
+    superseded_by        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2426,7 +2450,8 @@ _READONLY_REQUIRED_COLUMNS = {
         "max_runtime_seconds", "last_heartbeat_at", "current_run_id",
         "workflow_template_id", "current_step_key", "skills", "model_override",
         "max_retries", "goal_mode", "goal_max_turns", "session_id", "block_kind",
-        "block_recurrences",
+        "block_recurrences", "hygiene_class", "hygiene_reason",
+        "hygiene_marked_by", "superseded_by",
     },
     "task_runs": {
         "id", "task_id", "profile", "step_key", "status", "claim_lock",
@@ -2705,6 +2730,26 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "tasks",
             "block_recurrences",
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
+        )
+
+    # Explicit, machine-readable Kanban hygiene marks. ``superseded_by`` may
+    # already exist on boards created by newer/host-local builds, so every
+    # addition remains independently idempotent and profile-safe.
+    if "hygiene_class" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "hygiene_class", "hygiene_class TEXT"
+        )
+    if "hygiene_reason" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "hygiene_reason", "hygiene_reason TEXT"
+        )
+    if "hygiene_marked_by" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "hygiene_marked_by", "hygiene_marked_by TEXT"
+        )
+    if "superseded_by" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "superseded_by", "superseded_by TEXT"
         )
 
     # Indexes over additive ``tasks`` columns must be created after the
@@ -5625,11 +5670,15 @@ def _dependency_wait_blocks_promotion(
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
     board: Optional[str] = None,
+    *,
+    task_ids: Optional[Iterable[str]] = None,
 ) -> int:
     """Promote ``todo`` tasks after graph and durable dependency waits clear.
 
     Returns the number of tasks promoted.  Safe to call inside or outside
-    an existing transaction; it opens its own IMMEDIATE txn.
+    an existing transaction; it opens its own IMMEDIATE txn. ``task_ids``
+    narrows reconciliation to named children for batch transitions that must
+    not perturb unrelated ready state; omitted preserves the board-wide pass.
 
     ``blocked`` tasks are also considered for promotion (so a task
     blocked purely by a parent dependency unblocks itself when the
@@ -5656,12 +5705,20 @@ def recompute_ready(
     """
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
+    scoped_ids = sorted(set(task_ids)) if task_ids is not None else None
+    if scoped_ids == []:
+        return 0
     promoted = 0
     with write_txn(conn):
-        todo_rows = conn.execute(
+        query = (
             "SELECT id, status, consecutive_failures, max_retries "
             "FROM tasks WHERE status IN ('todo', 'blocked')"
-        ).fetchall()
+        )
+        params: tuple[Any, ...] = ()
+        if scoped_ids is not None:
+            query += f" AND id IN ({','.join('?' for _ in scoped_ids)})"
+            params = tuple(scoped_ids)
+        todo_rows = conn.execute(query, params).fetchall()
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
@@ -8749,6 +8806,359 @@ def _protected_review_handoff_for_task(
         "LIMIT 1",
         params,
     ).fetchone()
+
+
+HYGIENE_CLASSES = frozenset({"superseded", "obsolete"})
+HYGIENE_REPLACEMENT_TERMINAL_STATUSES = frozenset({"done", "archived"})
+
+
+def mark_task_for_hygiene(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    classification: str,
+    reason: str,
+    actor: str,
+    replacement_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Durably mark one task for an explicit, later hygiene reconcile.
+
+    Marking never archives. Reconciliation reads only these columns, keeping
+    operator intent separate from heuristic properties such as title or age.
+    """
+    classification = (classification or "").strip().lower()
+    reason = (reason or "").strip()
+    actor = (actor or "").strip()
+    replacement_id = (replacement_id or "").strip() or None
+    if classification not in HYGIENE_CLASSES:
+        raise ValueError(
+            f"classification must be one of {sorted(HYGIENE_CLASSES)}"
+        )
+    if not reason:
+        raise ValueError("a non-empty durable hygiene reason is required")
+    if not actor:
+        raise ValueError("hygiene actor is required")
+    if classification == "superseded":
+        if not replacement_id:
+            raise ValueError("superseded hygiene marks require a replacement id")
+        if replacement_id == task_id:
+            raise ValueError("a task cannot supersede itself")
+    elif replacement_id is not None:
+        raise ValueError("obsolete hygiene marks cannot have a replacement")
+
+    now = int(time.time())
+    with write_txn(conn):
+        source = conn.execute(
+            "SELECT id, status FROM tasks WHERE id=?", (task_id,)
+        ).fetchone()
+        if source is None:
+            raise ValueError(f"unknown task {task_id}")
+        if source["status"] == "archived":
+            raise ValueError(f"task {task_id} is already archived")
+        if replacement_id is not None and conn.execute(
+            "SELECT 1 FROM tasks WHERE id=?", (replacement_id,)
+        ).fetchone() is None:
+            raise ValueError(f"unknown replacement task {replacement_id}")
+        conn.execute(
+            "UPDATE tasks SET hygiene_class=?, hygiene_reason=?, "
+            "hygiene_marked_by=?, superseded_by=? WHERE id=?",
+            (classification, reason, actor, replacement_id, task_id),
+        )
+        payload = {
+            "actor": actor,
+            "closure_class": classification,
+            "reason": reason,
+            "replacement": replacement_id,
+        }
+        _append_event(conn, task_id, "hygiene_marked", payload)
+        conn.execute(
+            "INSERT INTO task_comments (task_id, author, body, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                task_id,
+                actor,
+                "Kanban hygiene mark: "
+                + json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                now,
+            ),
+        )
+    return {
+        "id": task_id,
+        "classification": classification,
+        "replacement_id": replacement_id,
+        "reason": reason,
+        "actor": actor,
+    }
+
+
+def _hygiene_base_candidates(
+    conn: sqlite3.Connection,
+    candidate_ids: Optional[Iterable[str]] = None,
+) -> list[dict[str, Any]]:
+    params: list[Any] = []
+    where = "WHERE hygiene_class IN ('superseded', 'obsolete')"
+    if candidate_ids is not None:
+        ids = sorted(set(candidate_ids))
+        if not ids:
+            return []
+        where += f" AND id IN ({','.join('?' for _ in ids)})"
+        params.extend(ids)
+    rows = conn.execute(
+        "SELECT id, title, status, hygiene_class, hygiene_reason, "
+        "hygiene_marked_by, superseded_by, claim_lock, claim_expires, "
+        "current_run_id, worker_pid FROM tasks "
+        + where
+        + " ORDER BY id",
+        tuple(params),
+    ).fetchall()
+    results: list[dict[str, Any]] = []
+    for row in rows:
+        replacement = None
+        if row["superseded_by"]:
+            replacement = conn.execute(
+                "SELECT status FROM tasks WHERE id=?", (row["superseded_by"],)
+            ).fetchone()
+        result: dict[str, Any] = {
+            "id": row["id"],
+            "title": row["title"],
+            "status": row["status"],
+            "classification": row["hygiene_class"],
+            "replacement_id": row["superseded_by"],
+            "replacement_status": (
+                replacement["status"] if replacement is not None else None
+            ),
+            "reason": row["hygiene_reason"],
+            "marked_by": row["hygiene_marked_by"],
+            "eligible": False,
+            "applied": False,
+            "skipped_safety_reason": None,
+        }
+        skip = None
+        if row["status"] == "archived":
+            skip = "already_archived"
+        elif row["status"] in {"running", "ready"}:
+            skip = f"source_status_{row['status']}"
+        elif (
+            row["claim_lock"] is not None
+            or row["claim_expires"] is not None
+            or row["current_run_id"] is not None
+            or row["worker_pid"] is not None
+        ):
+            skip = "active_claim_or_worker"
+        elif conn.execute(
+            "SELECT 1 FROM task_runs WHERE task_id=? AND status='running' LIMIT 1",
+            (row["id"],),
+        ).fetchone() is not None:
+            skip = "running_task_run"
+        elif _protected_review_handoff_for_task(conn, row["id"]):
+            skip = "protected_review_handoff"
+        elif not row["hygiene_reason"] or not row["hygiene_reason"].strip():
+            skip = "missing_reason"
+        elif row["hygiene_class"] == "superseded":
+            if not row["superseded_by"]:
+                skip = "missing_replacement_id"
+            elif replacement is None:
+                skip = "replacement_missing"
+            elif replacement["status"] not in HYGIENE_REPLACEMENT_TERMINAL_STATUSES:
+                skip = "replacement_not_terminal"
+        elif row["hygiene_class"] == "obsolete":
+            if row["superseded_by"] is not None:
+                skip = "obsolete_has_replacement"
+        else:  # defensive against hand-edited DB rows
+            skip = "invalid_classification"
+        result["skipped_safety_reason"] = skip
+        result["eligible"] = skip is None
+        results.append(result)
+    return results
+
+
+def _apply_hygiene_child_release_guards(
+    conn: sqlite3.Connection, candidates: list[dict[str, Any]]
+) -> None:
+    """Remove unsafe candidates until the same-batch set reaches a fixed point."""
+    by_id = {item["id"]: item for item in candidates}
+    eligible = {item["id"] for item in candidates if item["eligible"]}
+    changed = True
+    while changed:
+        changed = False
+        for source_id in sorted(eligible):
+            source = by_id[source_id]
+            # A source that is already terminal cannot *newly* release a child.
+            if source["status"] in TERMINAL_STATUSES:
+                continue
+            children = conn.execute(
+                "SELECT child_id FROM task_links WHERE parent_id=? ORDER BY child_id",
+                (source_id,),
+            ).fetchall()
+            for child_row in children:
+                child_id = child_row["child_id"]
+                child = conn.execute(
+                    "SELECT status FROM tasks WHERE id=?", (child_id,)
+                ).fetchone()
+                if child is None or child["status"] in TERMINAL_STATUSES:
+                    continue
+                parents = conn.execute(
+                    "SELECT t.id, t.status FROM task_links l "
+                    "JOIN tasks t ON t.id=l.parent_id WHERE l.child_id=?",
+                    (child_id,),
+                ).fetchall()
+                released_after_batch = all(
+                    parent["status"] in TERMINAL_STATUSES
+                    or parent["id"] in eligible
+                    for parent in parents
+                )
+                if released_after_batch and child_id not in eligible:
+                    source["eligible"] = False
+                    source["skipped_safety_reason"] = (
+                        f"would_release_open_child:{child_id}"
+                    )
+                    eligible.remove(source_id)
+                    changed = True
+                    break
+    # If removal of one parent made another parent harmless, retaining the
+    # conservative removal is intentional: the operation is fail-closed and
+    # deterministic, not a maximum-cardinality optimizer.
+
+
+def preview_hygiene(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    """Return a deterministic, read-only hygiene reconciliation preview."""
+    candidates = _hygiene_base_candidates(conn)
+    _apply_hygiene_child_release_guards(conn, candidates)
+    return candidates
+
+
+def _create_hygiene_backup(conn: sqlite3.Connection) -> Path:
+    db_path = _connection_main_db_path(conn)
+    if db_path is None:
+        raise RuntimeError("hygiene apply requires an on-disk SQLite database")
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime(
+        "%Y%m%dT%H%M%S.%fZ"
+    )
+    backup_path = db_path.with_name(f"{db_path.name}.hygiene-{stamp}.bak")
+    with contextlib.closing(sqlite3.connect(str(backup_path))) as backup_conn:
+        conn.backup(backup_conn)
+    return backup_path
+
+
+def _hygiene_before_apply_txn(
+    conn: sqlite3.Connection, preview: list[dict[str, Any]]
+) -> None:
+    """No-op race-test seam called after backup and before BEGIN IMMEDIATE."""
+
+
+def apply_hygiene(conn: sqlite3.Connection, *, actor: str) -> dict[str, Any]:
+    """Archive one fail-closed hygiene batch and return its audit receipt."""
+    actor = (actor or "").strip()
+    if not actor:
+        raise ValueError("hygiene actor is required")
+    initial = preview_hygiene(conn)
+    if not initial:
+        return {
+            "mode": "apply",
+            "batch_id": None,
+            "backup_path": None,
+            "applied_count": 0,
+            "candidates": [],
+        }
+    initially_eligible = [item for item in initial if item["eligible"]]
+    backup_path: Optional[Path] = None
+    batch_id: Optional[str] = None
+    if initially_eligible:
+        backup_path = _create_hygiene_backup(conn)
+        _hygiene_before_apply_txn(conn, initial)
+        batch_id = "kh_" + uuid.uuid4().hex
+    initial_by_id = {item["id"]: item for item in initial}
+    candidate_ids = list(initial_by_id)
+    applied_ids: list[str] = []
+    with write_txn(conn):
+        current = _hygiene_base_candidates(conn, candidate_ids)
+        current_by_id = {item["id"]: item for item in current}
+        for task_id, before in initial_by_id.items():
+            item = current_by_id.get(task_id)
+            if item is None:
+                continue
+            fingerprint = (
+                "classification",
+                "replacement_id",
+                "reason",
+                "marked_by",
+            )
+            if any(item[key] != before[key] for key in fingerprint):
+                item["eligible"] = False
+                item["skipped_safety_reason"] = "mark_changed_since_preview"
+            elif not before["eligible"]:
+                item["eligible"] = False
+                item["skipped_safety_reason"] = before["skipped_safety_reason"]
+        _apply_hygiene_child_release_guards(conn, current)
+
+        now = int(time.time())
+        for item in current:
+            if not item["eligible"]:
+                continue
+            payload = {
+                "actor": actor,
+                "closure_class": item["classification"],
+                "reason": item["reason"],
+                "replacement": item["replacement_id"],
+                "batch_id": batch_id,
+                "prior_status": item["status"],
+            }
+            if batch_id is None:  # defensive: preview-ineligible stays closed
+                item["eligible"] = False
+                item["skipped_safety_reason"] = "not_eligible_at_apply_preview"
+                continue
+            cur = conn.execute(
+                "UPDATE tasks SET status='archived' "
+                "WHERE id=? AND status=? AND claim_lock IS NULL "
+                "AND claim_expires IS NULL AND current_run_id IS NULL "
+                "AND worker_pid IS NULL",
+                (item["id"], item["status"]),
+            )
+            if cur.rowcount != 1:
+                item["eligible"] = False
+                item["skipped_safety_reason"] = "archive_precondition_changed"
+                continue
+            _append_event(conn, item["id"], "hygiene_archived", payload)
+            conn.execute(
+                "INSERT INTO task_comments (task_id, author, body, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (
+                    item["id"],
+                    actor,
+                    "Kanban hygiene archive: "
+                    + json.dumps(payload, sort_keys=True, ensure_ascii=False),
+                    now,
+                ),
+            )
+            item["applied"] = True
+            applied_ids.append(item["id"])
+
+    if applied_ids:
+        placeholders = ",".join("?" for _ in applied_ids)
+        child_rows = conn.execute(
+            f"SELECT DISTINCT child_id FROM task_links "
+            f"WHERE parent_id IN ({placeholders}) ORDER BY child_id",
+            tuple(applied_ids),
+        ).fetchall()
+        recompute_ready(
+            conn, task_ids=[row["child_id"] for row in child_rows]
+        )
+    final_by_id = {item["id"]: item for item in current}
+    final: list[dict[str, Any]] = []
+    for task_id in candidate_ids:
+        item = final_by_id.get(task_id)
+        if item is None:
+            item = dict(initial_by_id[task_id])
+            item["eligible"] = False
+            item["skipped_safety_reason"] = "mark_removed_since_preview"
+        final.append(item)
+    return {
+        "mode": "apply",
+        "batch_id": batch_id,
+        "backup_path": str(backup_path) if backup_path is not None else None,
+        "applied_count": len(applied_ids),
+        "candidates": final,
+    }
 
 
 def archive_task(conn: sqlite3.Connection, task_id: str) -> bool:

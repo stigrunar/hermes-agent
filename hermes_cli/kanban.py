@@ -779,6 +779,43 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Permanently delete already-archived task ids from the board",
     )
 
+    # --- hygiene (explicit marks + preview-first batch archive) ---
+    p_hygiene = sub.add_parser(
+        "hygiene",
+        help="Explicitly mark and safely batch-archive obsolete tasks",
+    )
+    hygiene_sub = p_hygiene.add_subparsers(dest="hygiene_action")
+    p_hygiene_superseded = hygiene_sub.add_parser(
+        "mark-superseded",
+        help="Mark a task as replaced by another existing task",
+    )
+    p_hygiene_superseded.add_argument("task_id")
+    p_hygiene_superseded.add_argument("replacement_id")
+    p_hygiene_superseded.add_argument("--reason", required=True)
+    p_hygiene_superseded.add_argument("--actor", default=None)
+    p_hygiene_superseded.add_argument("--json", action="store_true")
+
+    p_hygiene_obsolete = hygiene_sub.add_parser(
+        "mark-obsolete",
+        help="Mark a task as obsolete without a replacement",
+    )
+    p_hygiene_obsolete.add_argument("task_id")
+    p_hygiene_obsolete.add_argument("--reason", required=True)
+    p_hygiene_obsolete.add_argument("--actor", default=None)
+    p_hygiene_obsolete.add_argument("--json", action="store_true")
+
+    p_hygiene_reconcile = hygiene_sub.add_parser(
+        "reconcile",
+        help="Preview marked candidates (default) or apply one safe batch",
+    )
+    p_hygiene_reconcile.add_argument(
+        "--apply",
+        action="store_true",
+        help="Create a backup and archive the currently eligible batch",
+    )
+    p_hygiene_reconcile.add_argument("--actor", default=None)
+    p_hygiene_reconcile.add_argument("--json", action="store_true")
+
     # --- tail ---
     p_tail = sub.add_parser("tail", help="Follow a task's event stream")
     p_tail.add_argument("task_id")
@@ -1117,12 +1154,24 @@ def kanban_command(args: argparse.Namespace) -> int:
         # without ever reaching the repair path.
         if action == "repair":
             return _cmd_repair(args)
-        # A dry-run dispatch is a strict preview: do not auto-init/migrate and
-        # do not open the normal WAL-enabled connection path.
+        # Strict previews do not auto-init/migrate and do not open the normal
+        # WAL-enabled connection path. Hygiene is preview-first, including
+        # bare ``hermes kanban hygiene`` with no nested action.
         if action == "dispatch" and bool(getattr(args, "dry_run", False)):
             try:
                 with kb.connect_readonly_closing() as conn:
                     return _cmd_dispatch(args, conn=conn)
+            except Exception as exc:
+                print(f"kanban: could not open read-only database: {exc}", file=sys.stderr)
+                return 1
+        if (
+            action == "hygiene"
+            and getattr(args, "hygiene_action", None) in {None, "reconcile"}
+            and not bool(getattr(args, "apply", False))
+        ):
+            try:
+                with kb.connect_readonly_closing() as conn:
+                    return _cmd_hygiene(args, conn=conn)
             except Exception as exc:
                 print(f"kanban: could not open read-only database: {exc}", file=sys.stderr)
                 return 1
@@ -1163,6 +1212,7 @@ def kanban_command(args: argparse.Namespace) -> int:
             "unblock":  _cmd_unblock,
             "promote":  _cmd_promote,
             "archive":  _cmd_archive,
+            "hygiene":  _cmd_hygiene,
             "tail":     _cmd_tail,
             "dispatch": _cmd_dispatch,
             "daemon":   _cmd_daemon,
@@ -1228,6 +1278,7 @@ _DELEGATED_CHILD_DENIED_ACTIONS: frozenset[str] = frozenset({
     "unblock",
     "promote",
     "archive",
+    "hygiene",
     "dispatch",
     "daemon",
     "repair",
@@ -2675,6 +2726,98 @@ def _cmd_archive(args: argparse.Namespace) -> int:
             else:
                 print(f"Archived {tid}")
     return 0 if not failed else 1
+
+
+def _cmd_hygiene(args: argparse.Namespace, *, conn=None) -> int:
+    action = getattr(args, "hygiene_action", None) or "reconcile"
+    actor = getattr(args, "actor", None) or _profile_author()
+    as_json = bool(getattr(args, "json", False))
+    connect_cm = contextlib.nullcontext(conn) if conn is not None else kb.connect_closing()
+    with connect_cm as hygiene_conn:
+        if action in {"mark-superseded", "mark-obsolete"}:
+            classification = (
+                "superseded" if action == "mark-superseded" else "obsolete"
+            )
+            marked = kb.mark_task_for_hygiene(
+                hygiene_conn,
+                args.task_id,
+                classification=classification,
+                reason=args.reason,
+                actor=actor,
+                replacement_id=getattr(args, "replacement_id", None),
+            )
+            if as_json:
+                print(json.dumps(marked, sort_keys=True, ensure_ascii=False))
+            else:
+                replacement = (
+                    f" -> {marked['replacement_id']}"
+                    if marked["replacement_id"]
+                    else ""
+                )
+                print(
+                    f"Marked {marked['id']} {marked['classification']}"
+                    f"{replacement}; run `hermes kanban hygiene reconcile` "
+                    "to preview."
+                )
+            return 0
+        if action != "reconcile":
+            raise ValueError(f"unknown hygiene action {action!r}")
+
+        if bool(getattr(args, "apply", False)):
+            result = kb.apply_hygiene(hygiene_conn, actor=actor)
+        else:
+            candidates = kb.preview_hygiene(hygiene_conn)
+            result = {
+                "mode": "preview",
+                "batch_id": None,
+                "backup_path": None,
+                "applied_count": 0,
+                "candidates": candidates,
+            }
+
+    if as_json:
+        print(json.dumps(result, sort_keys=True, ensure_ascii=False))
+        return 0
+
+    candidates = result["candidates"]
+    if result["mode"] == "preview":
+        if not candidates:
+            print("No explicitly marked hygiene candidates.")
+            return 0
+        eligible = sum(1 for item in candidates if item["eligible"])
+        skipped = len(candidates) - eligible
+        print(
+            f"Hygiene preview: {eligible} eligible, {skipped} safety-skipped; "
+            "no changes applied."
+        )
+        for item in candidates:
+            state = (
+                "eligible"
+                if item["eligible"]
+                else f"skipped ({item['skipped_safety_reason']})"
+            )
+            print(f"  {item['id']} [{item['classification']}] {state}")
+        return 0
+
+    actionable_skips = [
+        item
+        for item in candidates
+        if item["skipped_safety_reason"] not in {None, "already_archived"}
+    ]
+    if result["applied_count"]:
+        print(
+            f"Hygiene batch {result['batch_id']}: archived "
+            f"{result['applied_count']} task(s), "
+            f"{len(actionable_skips)} safety-skipped; "
+            f"backup {result['backup_path']}"
+        )
+        return 0
+    if actionable_skips:
+        print(
+            f"Hygiene apply: 0 archived, {len(actionable_skips)} safety-skipped."
+        )
+    # Healthy no-op applies are intentionally silent for cron/no-agent use.
+    return 0
 
 
 def _cmd_tail(args: argparse.Namespace) -> int:

@@ -736,6 +736,11 @@ hermes kanban block <id> "<reason>" [--ids <id>...]
 hermes kanban unblock <id>...
 hermes kanban archive <id>...
 
+# Explicit hygiene reconciliation (preview-first; no title/age inference):
+hermes kanban hygiene mark-superseded <id> <replacement-id> --reason "..."
+hermes kanban hygiene mark-obsolete <id> --reason "..."
+hermes kanban hygiene reconcile [--apply] [--actor NAME] [--json]
+
 hermes kanban tail <id>                                # follow a single task's event stream
 hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events to the terminal
         [--kinds completed,blocked,…] [--interval SECS]
@@ -761,6 +766,49 @@ hermes kanban gc [--event-retention-days N]            # workspaces + old events
 ```
 
 All commands are also available as a slash command in the interactive CLI and in the messaging gateway (see [`/kanban` slash command](#kanban-slash-command) below).
+
+### Preview-first hygiene archive
+
+Kanban hygiene is an operator-controlled batch archive for cards whose intent
+has been replaced or deliberately abandoned. It never guesses from titles,
+ages, version suffixes, body prose, status duration, assignees, or tenants.
+Only the explicit machine-readable marks written by `mark-superseded` and
+`mark-obsolete` are candidates.
+
+```bash
+# A replacement must already exist. It becomes eligible only when the
+# replacement is exactly done or archived.
+hermes kanban hygiene mark-superseded t_old t_replacement \
+  --reason "Replacement contains the accepted implementation"
+
+# No replacement: record the durable reason explicitly.
+hermes kanban hygiene mark-obsolete t_spike \
+  --reason "Experiment ended; no production follow-up is required"
+
+# Read-only is the default.
+hermes kanban hygiene reconcile
+hermes kanban hygiene reconcile --json
+
+# Mutation requires an explicit flag. A healthy zero-change non-JSON apply is
+# silent, so this command is suitable for deterministic cron execution.
+hermes kanban hygiene reconcile --apply --actor kanban-hygiene-cron
+```
+
+The apply path fails closed for `ready`/`running` sources, active claims or
+runs, protected review handoffs, missing/nonterminal replacements, and any
+archive that would newly release an open child outside the same eligible
+batch. It rechecks the preview under one `BEGIN IMMEDIATE` transaction, uses a
+single batch id, writes a dedicated `hygiene_archived` event and structured
+comment per archived card, and emits no ordinary completion lifecycle event.
+The same apply run is idempotent: already archived cards are a healthy no-op.
+
+Before the first mutation, Hermes creates a timestamped SQLite backup beside
+the actual connected board database, named
+`kanban.db.hygiene-<UTC timestamp>.bak`. Hygiene only archives; it never
+hard-deletes and does not provide automatic unarchive. To roll back, stop all
+Kanban writers, preserve the current database for investigation, and restore
+the reported backup file to that board's `kanban.db` path. Then restart the
+gateway/dispatcher and verify the board with `hermes kanban list --archived`.
 
 `--max-retries` is a per-task circuit-breaker override for the dispatcher. `--max-retries 1` blocks the task on the first non-successful attempt, while `--max-retries 3` allows two retries and blocks on the third failure. Omit it to use `kanban.failure_limit` from `config.yaml`, then the built-in default.
 
