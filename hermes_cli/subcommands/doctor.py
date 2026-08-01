@@ -20,7 +20,17 @@ def build_doctor_parser(subparsers, *, cmd_doctor: Callable) -> None:
         description="Diagnose issues with Hermes Agent setup",
     )
     doctor_parser.add_argument(
-        "--fix", action="store_true", help="Attempt to fix issues automatically"
+        "--fix",
+        action="store_true",
+        help=(
+            "Attempt to fix issues automatically (includes the deep state.db "
+            "integrity and FTS checks)"
+        ),
+    )
+    doctor_parser.add_argument(
+        "--deep",
+        action="store_true",
+        help="Run full state.db integrity and FTS read/write diagnostics",
     )
     doctor_parser.add_argument(
         "--ack",

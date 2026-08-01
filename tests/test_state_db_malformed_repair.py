@@ -53,6 +53,127 @@ def _corrupt_duplicate_fts(db_path: Path) -> None:
     conn.close()
 
 
+def test_doctor_basic_check_is_read_only_and_leaves_db_unchanged(
+    tmp_path, monkeypatch
+):
+    db_path = tmp_path / "state.db"
+    conn = sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT PRIMARY KEY)")
+    conn.execute("INSERT INTO sessions VALUES ('one')")
+    conn.commit()
+    conn.close()
+    before = db_path.read_bytes()
+
+    real_connect = sqlite3.connect
+    calls = []
+    statements = []
+
+    def recording_connect(database, *args, **kwargs):
+        calls.append((database, kwargs.copy()))
+        opened = real_connect(database, *args, **kwargs)
+        opened.set_trace_callback(statements.append)
+        return opened
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", recording_connect)
+    result = hermes_state._doctor_db_basic_check(db_path, budget_seconds=1.0)
+
+    assert result.status == "ok"
+    assert result.session_count == 1
+    assert calls[0][0].endswith("?mode=ro")
+    assert calls[0][1]["uri"] is True
+    assert any("PRAGMA query_only = ON" in sql for sql in statements)
+    assert not any(
+        token in sql.upper() for sql in statements for token in ("BEGIN", "INSERT", "REPAIR")
+    )
+    assert db_path.read_bytes() == before
+    assert not db_path.with_name("state.db-wal").exists()
+    assert not db_path.with_name("state.db-shm").exists()
+
+
+def test_doctor_basic_check_reports_open_schema_and_malformed_failures(tmp_path):
+    missing = hermes_state._doctor_db_basic_check(tmp_path / "missing.db")
+    assert missing.status == "error"
+
+    no_sessions_path = tmp_path / "no-sessions.db"
+    conn = sqlite3.connect(no_sessions_path)
+    conn.execute("CREATE TABLE other (id INTEGER)")
+    conn.close()
+    no_sessions = hermes_state._doctor_db_basic_check(no_sessions_path)
+    assert no_sessions.status == "error"
+    assert "sessions" in no_sessions.reason
+
+    malformed_path = tmp_path / "malformed.db"
+    _build_healthy_db(malformed_path)
+    _corrupt_duplicate_fts(malformed_path)
+    malformed = hermes_state._doctor_db_basic_check(malformed_path)
+    assert malformed.status == "error"
+    assert "malformed" in malformed.reason.lower()
+
+
+class _BasicCheckFakeCursor:
+    def __init__(self, row):
+        self._row = row
+
+    def fetchone(self):
+        return self._row
+
+
+class _BasicCheckFakeConnection:
+    def __init__(self, *, quick_result="ok", interrupt_quick=False):
+        self.quick_result = quick_result
+        self.interrupt_quick = interrupt_quick
+        self.progress = None
+        self.progress_cleared = False
+        self.closed = False
+
+    def set_progress_handler(self, callback, _steps):
+        self.progress = callback
+        if callback is None:
+            self.progress_cleared = True
+
+    def execute(self, sql):
+        if sql == "PRAGMA query_only":
+            return _BasicCheckFakeCursor((1,))
+        if "COUNT(*) FROM sessions" in sql:
+            return _BasicCheckFakeCursor((7,))
+        if sql == "PRAGMA quick_check(1)":
+            if self.interrupt_quick:
+                while not self.progress():
+                    pass
+                raise sqlite3.OperationalError("interrupted")
+            return _BasicCheckFakeCursor((self.quick_result,))
+        return _BasicCheckFakeCursor(("sessions",))
+
+    def close(self):
+        self.closed = True
+
+
+def test_doctor_basic_check_timeout_is_incomplete_and_cleans_up(monkeypatch, tmp_path):
+    fake = _BasicCheckFakeConnection(interrupt_quick=True)
+    ticks = iter((0.0, 0.5, 1.0))
+    monkeypatch.setattr(hermes_state.time, "monotonic", lambda: next(ticks))
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", lambda *a, **kw: fake)
+
+    result = hermes_state._doctor_db_basic_check(
+        tmp_path / "state.db", budget_seconds=1.0
+    )
+
+    assert result.status == "incomplete"
+    assert "1s budget" in result.reason
+    assert fake.progress_cleared is True
+    assert fake.closed is True
+
+
+def test_doctor_basic_check_rejects_non_ok_quick_check(monkeypatch, tmp_path):
+    fake = _BasicCheckFakeConnection(quick_result="page 4 is malformed")
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", lambda *a, **kw: fake)
+
+    result = hermes_state._doctor_db_basic_check(tmp_path / "state.db")
+
+    assert result.status == "error"
+    assert "page 4 is malformed" in result.reason
+
+
 def test_duplicate_fts_makes_every_statement_fail(tmp_path):
     """Document the failure: not even PRAGMA journal_mode survives."""
     db_path = tmp_path / "state.db"
@@ -393,5 +514,4 @@ def test_repair_stale_btree_index_preserves_rows(tmp_path):
         assert msgs[0]["content"] == "hello world 0"
     finally:
         db.close()
-
 
