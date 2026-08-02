@@ -4732,6 +4732,15 @@ def _structured_field_values(value: Any, field_names: set[str]) -> set[str]:
     return set()
 
 
+def _has_structured_review_verdict(metadata: Any, expected_verdict: str) -> bool:
+    """Validate an asserted verdict against supported immutable metadata fields."""
+    verdict_values = _structured_field_values(
+        metadata,
+        {"verdict", "review_verdict", "explicit_verdict_for_source"},
+    )
+    return expected_verdict in verdict_values
+
+
 def supersede_review_handoff(
     conn: sqlite3.Connection,
     source_task_id: str,
@@ -4873,11 +4882,12 @@ def supersede_review_handoff(
             tree_values = _structured_field_values(
                 metadata, {"tree", "candidate_tree"}
             )
-            verdict_values = _structured_field_values(metadata, {"verdict"})
             if (
                 replacement_commit not in commit_values
                 or replacement_tree not in tree_values
-                or asserted["verdict"] not in verdict_values
+                or not _has_structured_review_verdict(
+                    metadata, asserted["verdict"]
+                )
             ):
                 raise ValueError(
                     f"evidence identity mismatch for {asserted['task_id']}: "

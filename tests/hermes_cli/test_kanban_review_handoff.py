@@ -62,7 +62,12 @@ def _terminal_negative_handoff(conn):
     return source, review, nxt
 
 
-def _completed_evidence(conn, verdict: str = "approved") -> str:
+def _completed_evidence(
+    conn,
+    verdict: str = "approved",
+    *,
+    verdict_field: str = "verdict",
+) -> str:
     task_id = kb.create_task(conn, title=f"evidence {verdict}")
     assert kb.complete_task(
         conn,
@@ -73,10 +78,104 @@ def _completed_evidence(conn, verdict: str = "approved") -> str:
                 "commit": REPLACEMENT_COMMIT,
                 "tree": REPLACEMENT_TREE,
             },
-            "result": {"verdict": verdict},
+            "result": {verdict_field: verdict},
         },
     )
     return task_id
+
+
+@pytest.mark.parametrize(
+    "verdict_field",
+    ["verdict", "review_verdict", "explicit_verdict_for_source"],
+)
+def test_supersede_review_handoff_accepts_supported_typed_verdict_fields(
+    kanban_home,
+    verdict_field,
+):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        evidence_task = _completed_evidence(
+            conn, "approved", verdict_field=verdict_field,
+        )
+
+        result = kb.supersede_review_handoff(
+            conn,
+            source,
+            review,
+            replacement_commit=REPLACEMENT_COMMIT,
+            replacement_tree=REPLACEMENT_TREE,
+            evidence=[(evidence_task, "approved")],
+            reason=f"typed verdict evidence via {verdict_field}",
+        )
+
+        assert result["state"] == "superseded"
+        assert result["verdict"] == "changes_requested"
+
+
+@pytest.mark.parametrize(
+    "verdict_field",
+    ["review_verdict", "explicit_verdict_for_source"],
+)
+def test_supersede_review_handoff_rejects_typed_verdict_mismatch(
+    kanban_home,
+    verdict_field,
+):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        evidence_task = _completed_evidence(
+            conn, "changes_requested", verdict_field=verdict_field,
+        )
+
+        with pytest.raises(ValueError, match="evidence identity mismatch"):
+            kb.supersede_review_handoff(
+                conn,
+                source,
+                review,
+                replacement_commit=REPLACEMENT_COMMIT,
+                replacement_tree=REPLACEMENT_TREE,
+                evidence=[(evidence_task, "approved")],
+                reason=f"mismatched typed verdict via {verdict_field}",
+            )
+
+        handoff = kb.list_review_handoffs(conn)[0]
+        assert handoff["state"] == "changes_requested"
+        assert handoff["verdict"] == "changes_requested"
+
+
+def test_supersede_review_handoff_rejects_comment_only_verdict_evidence(kanban_home):
+    with kb.connect() as conn:
+        source, review, _ = _terminal_negative_handoff(conn)
+        evidence_task = kb.create_task(conn, title="comment-only evidence")
+        assert kb.complete_task(
+            conn,
+            evidence_task,
+            summary="exact replacement identity without typed verdict",
+            metadata={
+                "candidate_commit": REPLACEMENT_COMMIT,
+                "candidate_tree": REPLACEMENT_TREE,
+            },
+        )
+        kb.add_comment(
+            conn,
+            evidence_task,
+            "reviewer",
+            "explicit_verdict_for_source: approved",
+        )
+
+        with pytest.raises(ValueError, match="evidence identity mismatch"):
+            kb.supersede_review_handoff(
+                conn,
+                source,
+                review,
+                replacement_commit=REPLACEMENT_COMMIT,
+                replacement_tree=REPLACEMENT_TREE,
+                evidence=[(evidence_task, "approved")],
+                reason="comment prose is not structured evidence",
+            )
+
+        handoff = kb.list_review_handoffs(conn)[0]
+        assert handoff["state"] == "changes_requested"
+        assert handoff["verdict"] == "changes_requested"
 
 
 def test_supersede_review_handoff_is_audited_idempotent_and_preserves_verdict(
