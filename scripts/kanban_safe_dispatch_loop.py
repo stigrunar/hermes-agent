@@ -293,6 +293,14 @@ def _spawn_count(payload: Any) -> int:
     return len(spawned) if isinstance(spawned, list) else 0
 
 
+def _gateway_drain_requested() -> bool:
+    """Read the shared gateway admission fence for this Hermes home."""
+    sys.path.insert(0, str(REPO))
+    from gateway.drain_control import drain_requested
+
+    return drain_requested(home=ROOT)
+
+
 def _aggregate_payload(records: list[dict[str, Any]]) -> dict[str, Any]:
     aggregate: dict[str, Any] = {
         "spawned": [],
@@ -348,6 +356,21 @@ def _board_summaries(
 
 
 def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
+    if _gateway_drain_requested():
+        return {
+            "ok": True,
+            "skipped": "gateway_drain_requested",
+            "dry_run": dry_run,
+            "max_spawn": 0,
+            "boards": [],
+            "payload": _aggregate_payload([]),
+            "admission": {
+                "allowed": False,
+                "reason": "gateway_drain_requested",
+                "spawn_budget": 0,
+            },
+        }
+
     cfg = _load_config()
     if _root_dispatch_enabled(cfg):
         return {
@@ -512,6 +535,8 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
 def _interesting(result: dict[str, Any]) -> bool:
     if not result.get("ok"):
         return True
+    if result.get("skipped") == "gateway_drain_requested":
+        return True
     payload = result.get("payload") or {}
     if not isinstance(payload, dict):
         return False
@@ -529,6 +554,18 @@ def _interesting(result: dict[str, Any]) -> bool:
 def _summarize(result: dict[str, Any]) -> str:
     if not result.get("ok"):
         return json.dumps({"safe_dispatch_error": result}, ensure_ascii=False)
+    if result.get("skipped") == "gateway_drain_requested":
+        return json.dumps(
+            {
+                "safe_dispatch": "drain_skip",
+                "skipped": result["skipped"],
+                "dry_run": bool(result.get("dry_run")),
+                "admission": result.get("admission"),
+                "boards": result.get("boards", []),
+                "payload": result.get("payload", {}),
+            },
+            ensure_ascii=False,
+        )
     payload = result.get("payload") or {}
     if not isinstance(payload, dict):
         return ""

@@ -15,6 +15,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway import drain_control as dc
 from hermes_cli import kanban_db as kb
 
 
@@ -533,6 +534,107 @@ def test_embedded_dispatcher_refusal_is_a_clean_skip(monkeypatch):
     result = safe._dispatch_once()
     assert result["ok"] is True
     assert result["skipped"] == "embedded_dispatcher_enabled"
+
+
+def test_current_drain_marker_is_idempotent_zero_admission_without_side_effects(
+    monkeypatch, tmp_path
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    db_path = home / "kanban.db"
+    _seed_running_board(db_path, running=0, ready=1)
+    state_dir = home / "state"
+    state_dir.mkdir()
+    cursor = state_dir / "kanban-safe-dispatcher.cursor"
+    cursor.write_text("3\n", encoding="utf-8")
+    cron_dir = home / "cron"
+    cron_dir.mkdir()
+    (cron_dir / "jobs.json").write_text(
+        '[{"id":"unchanged-cron-row","enabled":true}]\n', encoding="utf-8"
+    )
+    monkeypatch.setattr(safe, "ROOT", home)
+    monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(state_dir))
+    monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "current-epoch")
+    dc.write_drain_request(home=home, principal="authenticated-test")
+    before = _snapshot_tree(home)
+    forbidden_calls = []
+
+    def forbidden(name):
+        def fail(*args, **kwargs):
+            forbidden_calls.append(name)
+            raise AssertionError(f"{name} must not run while drain is active")
+
+        return fail
+
+    for name in (
+        "_load_config",
+        "_parse_board_allowlist",
+        "_probe_db",
+        "_count_running",
+        "_read_cursor",
+        "_write_cursor",
+        "_dispatch_board",
+    ):
+        monkeypatch.setattr(safe, name, forbidden(name))
+
+    first = safe._dispatch_once(dry_run=True)
+    second = safe._dispatch_once(dry_run=True)
+
+    assert first == second
+    assert first["ok"] is True
+    assert first["skipped"] == "gateway_drain_requested"
+    assert first["admission"] == {
+        "allowed": False,
+        "reason": "gateway_drain_requested",
+        "spawn_budget": 0,
+    }
+    assert first["boards"] == []
+    assert first["payload"]["spawned"] == []
+    assert forbidden_calls == []
+    assert _snapshot_tree(home) == before
+    assert safe._interesting(first) is True
+    summary = json.loads(safe._summarize(first))
+    assert summary["safe_dispatch"] == "drain_skip"
+    assert summary["admission"]["spawn_budget"] == 0
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        {"action": "drain", "epoch": "stale-epoch"},
+        {"action": "drain", "epoch": "current-epoch", "target_pid": -1},
+    ],
+    ids=["stale-epoch", "invalid-target-pid"],
+)
+def test_stale_or_invalid_marker_preserves_normal_dry_run(
+    monkeypatch, tmp_path, marker
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setattr(safe, "ROOT", home)
+    monkeypatch.setattr(dc, "current_instantiation_epoch", lambda: "current-epoch")
+    dc.drain_request_path(home).write_text(json.dumps(marker), encoding="utf-8")
+    monkeypatch.setattr(
+        safe,
+        "_load_config",
+        lambda: {"kanban": {"dispatch_in_gateway": False}},
+    )
+    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["default"])
+    monkeypatch.setattr(safe, "_probe_db", lambda board: (True, "ok"))
+    monkeypatch.setattr(safe, "_count_running", lambda board: 0)
+    calls = []
+
+    def fake_dispatch(board, **kwargs):
+        calls.append((board, kwargs["dry_run"], kwargs["spawn_budget"]))
+        return {"ok": True, "board": board, "payload": {"spawned": []}}
+
+    monkeypatch.setattr(safe, "_dispatch_board", fake_dispatch)
+
+    result = safe._dispatch_once(dry_run=True)
+
+    assert result["ok"] is True
+    assert "skipped" not in result
+    assert calls == [("default", True, 0), ("default", True, 1)]
 
 
 def test_summary_and_interesting_include_board_maintenance_and_errors():
