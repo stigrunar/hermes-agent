@@ -20,6 +20,9 @@ from typing import Any, Iterable, Optional
 _TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+_TERMINALIZATION_CHECKPOINT_MAX_CALL = 40
+_TERMINALIZATION_RESERVE_CALLS = 10
+_TERMINALIZATION_CHECKPOINT_MARKER = "[System: Kanban terminalization checkpoint v1"
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -33,6 +36,81 @@ def kanban_stop_nudge_enabled() -> bool:
         return False
     task = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
     return bool(task)
+
+
+def kanban_terminalization_enabled() -> bool:
+    """True only for an exact dispatcher-owned, non-goal Kanban run."""
+    if os.environ.get("HERMES_KANBAN_GOAL_MODE") == "1":
+        return False
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = (os.environ.get("HERMES_KANBAN_RUN_ID") or "").strip()
+    try:
+        return bool(task_id) and int(run_id) > 0
+    except (TypeError, ValueError):
+        return False
+
+
+def accepted_kanban_terminal_intent() -> Optional[dict]:
+    """Read the DB authority for this process's exact current Kanban run."""
+    if not kanban_terminalization_enabled():
+        return None
+    task_id = (os.environ.get("HERMES_KANBAN_TASK") or "").strip()
+    run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+    try:
+        from hermes_cli import kanban_db
+
+        conn = kanban_db.connect()
+        try:
+            return kanban_db.accepted_terminal_intent(conn, task_id, run_id)
+        finally:
+            conn.close()
+    except Exception:
+        return None
+
+
+def terminalization_checkpoint_call(max_iterations: int) -> int:
+    """Return the one-shot provider-call threshold that reserves closeout room."""
+    return min(
+        _TERMINALIZATION_CHECKPOINT_MAX_CALL,
+        max(1, int(max_iterations) - _TERMINALIZATION_RESERVE_CALLS),
+    )
+
+
+def append_kanban_terminalization_checkpoint(
+    messages: list[dict],
+    *,
+    api_call_count: int,
+    max_iterations: int,
+) -> bool:
+    """Append one cache/alternation-safe closeout instruction to a tool tail."""
+    if not kanban_terminalization_enabled():
+        return False
+    if api_call_count < terminalization_checkpoint_call(max_iterations):
+        return False
+    if not messages or messages[-1].get("role") != "tool":
+        return False
+    content = messages[-1].get("content", "")
+    if _TERMINALIZATION_CHECKPOINT_MARKER in str(content):
+        return False
+    instruction = (
+        "\n\n[System: Kanban terminalization checkpoint v1. Stop broad work now. "
+        "Preserve all existing work and perform only deterministic closeout: "
+        "verify every referenced artifact path and every stated expected hash. "
+        "If all referenced evidence matches, call kanban_complete now. If one "
+        "path is missing or one expected hash differs from the actual hash, do "
+        "not overwrite, auto-approve, or invent precision; call kanban_block "
+        "with exactly one concrete expected-vs-actual mismatch. Do not repeat "
+        "setup, discovery, browser work, source reading, or the full test suite.]"
+    )
+    if isinstance(content, str):
+        messages[-1]["content"] = content + instruction
+    elif isinstance(content, list):
+        messages[-1]["content"] = list(content) + [
+            {"type": "text", "text": instruction}
+        ]
+    else:
+        messages[-1]["content"] = str(content) + instruction
+    return True
 
 
 def _tool_call_name(tc: Any) -> str:
@@ -82,7 +160,12 @@ def build_kanban_stop_nudge(
         return None
     if attempts >= max_attempts:
         return None
-    if session_called_kanban_terminal(messages):
+    if kanban_terminalization_enabled():
+        if accepted_kanban_terminal_intent() is not None:
+            return None
+    elif session_called_kanban_terminal(messages):
+        # Goal-mode and legacy task-only workers retain the old attempt-based
+        # stop-guard behavior. Exact non-goal workers use the DB journal above.
         return None
 
     tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
@@ -102,7 +185,11 @@ def build_kanban_stop_nudge(
 
 
 __all__ = [
+    "accepted_kanban_terminal_intent",
+    "append_kanban_terminalization_checkpoint",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
+    "kanban_terminalization_enabled",
     "session_called_kanban_terminal",
+    "terminalization_checkpoint_call",
 ]

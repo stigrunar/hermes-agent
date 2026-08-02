@@ -275,6 +275,12 @@ def _resolve_kanban_notification_events(
             ]
             if current:
                 return [current[-1]]
+            if expected_kind is not None:
+                # The card moved to a newer blocked/review run after this
+                # cursor range was claimed. An older failure is audit history,
+                # not the current block reason; the newer event is claimed on
+                # the next tick.
+                return current_status_event
         return [failures[-1]] if failures else current_status_event
 
     # Crash/timeout attempts return the task to ready for retry, but the latest
@@ -734,7 +740,40 @@ class GatewayKanbanWatchersMixin:
                             board_slug,
                         )
                         continue
+                    # Collection and delivery are separated by adapter lookup
+                    # and async scheduling. Re-read canonical task/run state at
+                    # the last safe point before any external send so a retry,
+                    # review handoff, or completion that won that race cannot
+                    # turn an old attempt failure into a current task verdict.
+                    try:
+                        task, current_events = await asyncio.to_thread(
+                            self._kanban_revalidate_delivery,
+                            sub["task_id"],
+                            d["events"],
+                            board_slug,
+                        )
+                    except Exception as state_exc:
+                        logger.warning(
+                            "kanban notifier: current-state revalidation failed "
+                            "for %s; rewinding claim: %s",
+                            sub["task_id"], state_exc,
+                        )
+                        await asyncio.to_thread(
+                            self._kanban_rewind,
+                            sub,
+                            d["cursor"],
+                            d.get("old_cursor", 0),
+                            board_slug,
+                        )
+                        continue
+                    d["events"] = current_events
                     title = (task.title if task else sub["task_id"])[:120]
+                    task_status = str(getattr(task, "status", "") or "unknown")
+                    task_state = {
+                        "ready": "queued for automatic retry",
+                        "running": "automatically resumed (running)",
+                        "review": "in review",
+                    }.get(task_status, task_status)
                     board_tag = f"[{board_slug}] " if board_slug else ""
                     # Per-subscription failure-counter key. Hoisted out of the
                     # event loop: the wake self-post path (in the loop's
@@ -782,22 +821,27 @@ class GatewayKanbanWatchersMixin:
                             err = ""
                             if ev.payload and ev.payload.get("error"):
                                 err = f"\n{str(ev.payload['error'])[:200]}"
+                            run = f" run {ev.run_id}" if ev.run_id is not None else ""
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} attempt{run} "
+                                f"exhausted retries; task state when checked: {task_state}{err}"
                             )
                         elif kind == "crashed":
+                            run = f" run {ev.run_id}" if ev.run_id is not None else ""
                             msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
-                                f"(pid gone); dispatcher will retry"
+                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} attempt{run} crashed "
+                                f"(pid gone); task state when checked: {task_state}"
                             )
                         elif kind == "timed_out":
                             limit = 0
                             if ev.payload and ev.payload.get("limit_seconds"):
                                 limit = int(ev.payload["limit_seconds"])
+                            run = f" run {ev.run_id}" if ev.run_id is not None else ""
+                            limit_note = f" (max_runtime={limit}s)" if limit else ""
                             msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
+                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} attempt{run} "
+                                f"timed out{limit_note}; task state when checked: "
+                                f"{task_state}"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -985,9 +1029,20 @@ class GatewayKanbanWatchersMixin:
                             _assignee = task.assignee if task else ""
                             _parts = []
                             if "completed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.completed"))
-                            if "gave_up" in _wake_kinds: _parts.append(t("gateway.kanban.wake.gave_up"))
-                            if "crashed" in _wake_kinds: _parts.append(t("gateway.kanban.wake.crashed"))
-                            if "timed_out" in _wake_kinds: _parts.append(t("gateway.kanban.wake.timed_out"))
+                            for _ev in d["events"]:
+                                _run = f" run {_ev.run_id}" if _ev.run_id is not None else ""
+                                if _ev.kind == "gave_up":
+                                    _parts.append(
+                                        f"attempt{_run} exhausted retries; task state when checked: {task_state}"
+                                    )
+                                elif _ev.kind == "crashed":
+                                    _parts.append(
+                                        f"attempt{_run} crashed; task state when checked: {task_state}"
+                                    )
+                                elif _ev.kind == "timed_out":
+                                    _parts.append(
+                                        f"attempt{_run} timed out; task state when checked: {task_state}"
+                                    )
                             if "blocked" in _wake_kinds: _parts.append(t("gateway.kanban.wake.blocked"))
                             _status = t("gateway.kanban.wake.status_joiner").join(_parts) or t("gateway.kanban.wake.status_default")
                             _synth = t(
@@ -1132,6 +1187,29 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_revalidate_delivery(
+        self,
+        task_id: str,
+        events: list,
+        board: Optional[str] = None,
+    ) -> tuple[Any, list]:
+        """Re-resolve a claimed event slice against current run/task truth."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            task = _kb.get_task(conn, task_id)
+            latest_run = _kb.latest_run(conn, task_id)
+            current = _resolve_kanban_notification_events(
+                task,
+                events,
+                latest_run,
+                terminal_statuses=_kb.TERMINAL_STATUSES,
+            )
+            return task, current
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

@@ -91,6 +91,16 @@ def finalize_turn(
     """
     from agent.conversation_loop import logger
 
+    _accepted_kanban_terminal = None
+    try:
+        from agent.kanban_stop import accepted_kanban_terminal_intent
+
+        _accepted_kanban_terminal = accepted_kanban_terminal_intent()
+    except Exception:
+        logger.debug("finalize_turn Kanban terminal-intent probe failed", exc_info=True)
+    if _accepted_kanban_terminal is not None:
+        _turn_exit_reason = "kanban_terminal_intent_accepted"
+
     budget_exhausted = (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -99,6 +109,7 @@ def finalize_turn(
         budget_exhausted
         and not interrupted
         and not failed
+        and _accepted_kanban_terminal is None
         and str(_turn_exit_reason) in {"unknown", "budget_exhausted"}
     )
     continuation_budget_exhausted = (
@@ -148,16 +159,22 @@ def finalize_turn(
         # came from the summary call or an explicitly pending continuation;
         # both exhausted the task budget and must advance the failure circuit.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # Route through the phase-B timeout request rather than directly
+        # releasing the claim: failure accounting still advances, but only
+        # after the exact worker scope is verified dead (#29747 gap 2).
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             try:
+                _kanban_expected_run_id = int(os.environ["HERMES_KANBAN_RUN_ID"])
+            except (KeyError, TypeError, ValueError):
+                _kanban_expected_run_id = None
+            try:
+                if _kanban_expected_run_id is None:
+                    raise ValueError("missing or malformed HERMES_KANBAN_RUN_ID")
                 from hermes_cli import kanban_db as _kb
                 _conn = _kb.connect()
                 try:
-                    _kb._record_task_failure(
+                    _kb.request_task_timeout(
                         _conn,
                         _kanban_task,
                         error=(
@@ -166,16 +183,14 @@ def finalize_turn(
                             "task could not complete within the allowed "
                             "iterations"
                         ),
-                        outcome="timed_out",
-                        release_claim=True,
-                        end_run=True,
-                        event_payload_extra={
+                        expected_run_id=_kanban_expected_run_id,
+                        event_payload={
                             "budget_used": api_call_count,
                             "budget_max": agent.max_iterations,
                         },
                     )
                     logger.info(
-                        "recorded budget-exhausted failure for task %s (%d/%d)",
+                        "requested budget-exhausted timeout for task %s (%d/%d)",
                         _kanban_task, api_call_count, agent.max_iterations,
                     )
                 finally:

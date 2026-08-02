@@ -16,6 +16,113 @@ from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
 
+def test_default_state_db_check_reports_incomplete_without_calling_deep(
+    monkeypatch, tmp_path, capsys
+):
+    import hermes_state
+
+    monkeypatch.setattr(doctor_mod, "_DHH", str(tmp_path))
+    monkeypatch.setattr(
+        hermes_state,
+        "_doctor_db_basic_check",
+        lambda _path: hermes_state._DoctorDBBasicCheckResult(
+            "incomplete", reason="basic SQLite check exceeded its 1s budget"
+        ),
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "_db_opens_cleanly",
+        lambda _path: pytest.fail("default doctor called the deep DB checker"),
+    )
+    issues = []
+
+    fixed = doctor_mod._check_state_db(
+        tmp_path / "state.db", should_fix=False, deep=False, issues=issues
+    )
+
+    out = capsys.readouterr().out
+    assert fixed == 0
+    assert "basic health check incomplete" in out
+    assert "hermes doctor --deep" in out
+    assert "corrupt" not in out.lower()
+    assert any("incomplete" in issue for issue in issues)
+
+
+def test_deep_state_db_check_calls_full_checker_and_propagates_failure(
+    monkeypatch, tmp_path, capsys
+):
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    conn = hermes_state.sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT)")
+    conn.close()
+    monkeypatch.setattr(doctor_mod, "_DHH", str(tmp_path))
+    monkeypatch.setattr(
+        hermes_state,
+        "_doctor_db_basic_check",
+        lambda _path: pytest.fail("deep doctor called the bounded basic checker"),
+    )
+    deep_calls = []
+    monkeypatch.setattr(
+        hermes_state,
+        "_db_opens_cleanly",
+        lambda path: deep_calls.append(path) or "deep failure",
+    )
+    issues = []
+
+    doctor_mod._check_state_db(
+        db_path, should_fix=False, deep=True, issues=issues
+    )
+
+    out = capsys.readouterr().out
+    assert deep_calls == [db_path]
+    assert "deep integrity/FTS health check" in out
+    assert "deep failure" in out
+    assert any("deep integrity/FTS check failed" in issue for issue in issues)
+
+
+def test_fix_state_db_check_uses_deep_diagnosis_and_preserves_repair(
+    monkeypatch, tmp_path
+):
+    import hermes_state
+
+    db_path = tmp_path / "state.db"
+    conn = hermes_state.sqlite3.connect(db_path)
+    conn.execute("CREATE TABLE sessions (id TEXT)")
+    conn.close()
+    monkeypatch.setattr(
+        hermes_state,
+        "_doctor_db_basic_check",
+        lambda _path: pytest.fail("--fix called the bounded basic checker"),
+    )
+    deep_calls = []
+    repair_calls = []
+    monkeypatch.setattr(
+        hermes_state,
+        "_db_opens_cleanly",
+        lambda path: deep_calls.append(path) or "needs repair",
+    )
+    monkeypatch.setattr(
+        hermes_state,
+        "repair_state_db_schema",
+        lambda path: repair_calls.append(path) or {
+            "repaired": True,
+            "strategy": "rebuild_fts",
+            "backup_path": None,
+            "error": None,
+        },
+    )
+
+    fixed = doctor_mod._check_state_db(
+        db_path, should_fix=True, deep=False, issues=[]
+    )
+
+    assert fixed == 1
+    assert deep_calls == [db_path]
+    assert repair_calls == [db_path]
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")

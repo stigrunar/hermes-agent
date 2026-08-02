@@ -28,6 +28,7 @@ import threading
 import time
 from collections import deque
 from contextlib import contextmanager
+from dataclasses import dataclass
 from pathlib import Path
 
 from agent.memory_manager import sanitize_context
@@ -78,6 +79,16 @@ except ImportError:  # pragma: no cover - stripped/scaffold installs only
     psutil = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
+
+
+DOCTOR_DB_BASIC_CHECK_BUDGET_SECONDS = 1.0
+
+
+@dataclass(frozen=True)
+class _DoctorDBBasicCheckResult:
+    status: str
+    session_count: Optional[int] = None
+    reason: Optional[str] = None
 
 _COMPRESSION_LOCK_HOLDER_PID_RE = re.compile(r"(?:^|:)pid=(\d+)(?::|$)")
 
@@ -1117,6 +1128,77 @@ def preflight_db_writability(
         p = db_path.with_name(db_path.name + suffix) if suffix else db_path
         if p.is_file():
             _ensure_writable(p)
+
+
+def _doctor_db_basic_check(
+    db_path: Path,
+    *,
+    budget_seconds: float = DOCTOR_DB_BASIC_CHECK_BUDGET_SECONDS,
+) -> _DoctorDBBasicCheckResult:
+    """Run the default doctor's bounded, read-only state DB probe.
+
+    The progress handler covers every statement after opening the connection,
+    including the session count and ``quick_check(1)``.  An interrupted probe
+    is intentionally distinct from a failed probe: a large healthy database
+    may simply need the explicit deep diagnostic path.
+    """
+    deadline = time.monotonic() + max(0.0, budget_seconds)
+    timed_out = False
+    conn = None
+
+    def _stop_at_deadline() -> int:
+        nonlocal timed_out
+        timed_out = time.monotonic() >= deadline
+        return 1 if timed_out else 0
+
+    try:
+        uri = f"{Path(db_path).absolute().as_uri()}?mode=ro"
+        conn = sqlite3.connect(
+            uri,
+            uri=True,
+            timeout=max(0.001, min(1.0, max(0.0, budget_seconds))),
+        )
+        conn.set_progress_handler(_stop_at_deadline, 1000)
+        conn.execute("PRAGMA query_only = ON")
+        query_only = conn.execute("PRAGMA query_only").fetchone()
+        if not query_only or query_only[0] != 1:
+            return _DoctorDBBasicCheckResult(
+                "error", reason="could not enable SQLite query-only mode"
+            )
+
+        # Parsing sqlite_master catches malformed schema before the canonical
+        # sessions read verifies the table contract and obtains the display
+        # count without opening a second, read-write connection.
+        conn.execute("SELECT name FROM sqlite_master LIMIT 1").fetchone()
+        session_count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        row = conn.execute("PRAGMA quick_check(1)").fetchone()
+        if not row:
+            return _DoctorDBBasicCheckResult(
+                "error", session_count=session_count,
+                reason="SQLite quick check returned no result",
+            )
+        quick_result = str(row[0])
+        if quick_result.lower() != "ok":
+            return _DoctorDBBasicCheckResult(
+                "error", session_count=session_count,
+                reason=f"SQLite quick check: {quick_result}",
+            )
+        return _DoctorDBBasicCheckResult("ok", session_count=session_count)
+    except sqlite3.DatabaseError as exc:
+        if timed_out:
+            return _DoctorDBBasicCheckResult(
+                "incomplete",
+                reason=(
+                    f"basic SQLite check exceeded its {budget_seconds:g}s budget"
+                ),
+            )
+        return _DoctorDBBasicCheckResult("error", reason=str(exc))
+    finally:
+        if conn is not None:
+            try:
+                conn.set_progress_handler(None, 0)
+            finally:
+                conn.close()
 
 
 def _db_opens_cleanly(db_path: Path) -> Optional[str]:

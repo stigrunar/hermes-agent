@@ -401,7 +401,7 @@ def test_terminal_task_ignores_delayed_historical_completion(
 
 @pytest.mark.parametrize(
     ("current_kind", "expected_text"),
-    [("blocked", "blocked"), ("gave_up", "gave up")],
+    [("blocked", "blocked"), ("gave_up", "exhausted retries")],
 )
 def test_current_failure_still_notifies_and_wakes(
     current_kind, expected_text, tmp_path, monkeypatch,
@@ -446,6 +446,94 @@ def test_current_failure_still_notifies_and_wakes(
         assert len(kb.list_notify_subs(conn, tid)) == 1
     finally:
         conn.close()
+
+
+def test_failure_claim_is_revalidated_when_retry_starts_before_delivery(
+    tmp_path, monkeypatch,
+):
+    """A collected old failure cannot become a current verdict after retry."""
+    db_path = tmp_path / "retry-wins-delivery-race.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="recovers before notification",
+            assignee="worker",
+            session_id="session-1",
+        )
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb._append_event(
+            conn,
+            tid,
+            kind="gave_up",
+            payload={"error": "old attempt exhausted retries"},
+        )
+        conn.execute("UPDATE tasks SET status='blocked' WHERE id=?", (tid,))
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+
+    def retry_before_delivery(_platform, _profile=None):
+        with kb.connect() as race_conn:
+            race_conn.execute(
+                "UPDATE tasks SET status='ready' WHERE id=?",
+                (tid,),
+            )
+            replacement = kb.claim_task(
+                race_conn, tid, claimer="replacement-worker",
+            )
+            assert replacement is not None
+            assert replacement.current_run_id is not None
+        return adapter
+
+    monkeypatch.setattr(runner, "_authorization_adapter", retry_before_delivery)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    with kb.connect() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "running"
+        assert task.current_run_id is not None
+        assert len(kb.list_notify_subs(conn, tid)) == 1
+
+
+def test_revalidation_failure_rewinds_claim_for_exact_once_retry(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "revalidation-rewind.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="retry notification", assignee="worker")
+        kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
+        kb.block_task(conn, tid, reason="still actionable", kind="needs_input")
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    monkeypatch.setattr(
+        runner,
+        "_kanban_revalidate_delivery",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            sqlite3.OperationalError("database temporarily unavailable")
+        ),
+    )
+    with patch.object(
+        runner, "_kanban_rewind", wraps=runner._kanban_rewind,
+    ) as rewind:
+        asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.sent == []
+    assert adapter.handled == []
+    rewind.assert_called_once()
+    assert [event.kind for event in _unseen_terminal_events(tid)] == ["blocked"]
 
 
 @pytest.mark.parametrize(
@@ -703,6 +791,7 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
         kb.add_notify_sub(conn, task_id=tid, platform="telegram", chat_id="chat-1")
         # First crash — fired by the dispatcher when the worker PID dies.
         kb._append_event(conn, tid, kind="crashed")
+        conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
     finally:
         conn.close()
 
@@ -713,6 +802,8 @@ def test_notifier_redelivers_same_kind_on_dispatch_cycle(tmp_path, monkeypatch):
     # First crash delivered.
     assert len(adapter.sent) == 1
     assert "crashed" in adapter.sent[0]["text"].lower()
+    assert "attempt" in adapter.sent[0]["text"].lower()
+    assert "queued for automatic retry" in adapter.sent[0]["text"].lower()
 
     # Subscription survives — the cursor advanced past event #1, but the
     # row is still there.
