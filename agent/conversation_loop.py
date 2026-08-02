@@ -1270,6 +1270,9 @@ def run_conversation(
     # reused as the final response — not merely because any interim was
     # streamed. (#65919 review: response-loss blocker)
     _pending_verification_response_previewed = False
+    # Dispatcher-owned one-shot workers get one tool-tail closeout checkpoint.
+    # This is a local per-turn latch: no config or mutable prompt prefix.
+    _kanban_terminalization_checkpoint_fired = False
     # If pre-API compression fires after MoA advisors have produced guidance,
     # retain that ephemeral output and rebase it onto the compacted transcript
     # on the next loop iteration. This prevents a second advisor fan-out.
@@ -6194,6 +6197,51 @@ def run_conversation(
                     final_response = ""
                     failed = True
                     break
+
+                # A terminal tool invocation is only an attempt signal. The
+                # exact-run phase-one DB journal is the sole authority that can
+                # stop a dispatcher-owned non-goal worker. A rejected call
+                # remains in the loop so the model can correct it.
+                try:
+                    from agent.kanban_stop import (
+                        accepted_kanban_terminal_intent,
+                        append_kanban_terminalization_checkpoint,
+                        session_called_kanban_terminal,
+                    )
+
+                    _terminal_attempted = session_called_kanban_terminal(messages)
+                    _accepted_terminal = (
+                        accepted_kanban_terminal_intent()
+                        if _terminal_attempted else None
+                    )
+                except Exception:
+                    logger.debug("kanban terminal-intent probe failed", exc_info=True)
+                    _accepted_terminal = None
+
+                if _accepted_terminal is not None:
+                    _turn_exit_reason = "kanban_terminal_intent_accepted"
+                    logger.info(
+                        "stopping after accepted Kanban terminal intent task=%s run=%s action=%s",
+                        os.environ.get("HERMES_KANBAN_TASK", ""),
+                        os.environ.get("HERMES_KANBAN_RUN_ID", ""),
+                        _accepted_terminal.get("action"),
+                    )
+                    break
+
+                if not _kanban_terminalization_checkpoint_fired:
+                    try:
+                        _kanban_terminalization_checkpoint_fired = (
+                            append_kanban_terminalization_checkpoint(
+                                messages,
+                                api_call_count=api_call_count,
+                                max_iterations=agent.max_iterations,
+                            )
+                        )
+                    except Exception:
+                        logger.debug(
+                            "kanban terminalization checkpoint failed",
+                            exc_info=True,
+                        )
 
                 if agent._tool_guardrail_halt_decision is not None:
                     decision = agent._tool_guardrail_halt_decision

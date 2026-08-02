@@ -76,6 +76,26 @@ SINGLE_HANDLER_CASES = [
 ]
 
 
+def test_doctor_parser_exposes_deep_diagnostics_contract(capsys):
+    parser = argparse.ArgumentParser(prog="hermes")
+    sub = parser.add_subparsers(dest="command")
+    build_doctor_parser(sub, cmd_doctor=_h("doctor"))
+
+    args = parser.parse_args(["doctor", "--deep"])
+    assert args.deep is True
+    assert args.fix is False
+
+    with pytest.raises(SystemExit) as exc_info:
+        parser.parse_args(["doctor", "--help"])
+    assert exc_info.value.code == 0
+    help_text = capsys.readouterr().out
+    normalized_help = " ".join(help_text.split())
+    assert "--deep" in help_text
+    assert "full state.db integrity and FTS read/write diagnostics" in normalized_help
+    assert "--fix" in help_text
+    assert "includes the deep state.db" in normalized_help
+
+
 
 
 def test_config_get_unset_subcommands_parse():

@@ -10138,6 +10138,52 @@ def _normalize_terminal_intent(action: str, payload: dict[str, Any]) -> dict[str
     return {"action": str(action), **normalize(payload)}
 
 
+def accepted_terminal_intent(
+    conn: sqlite3.Connection,
+    task_id: str,
+    expected_run_id: int,
+) -> Optional[dict[str, Any]]:
+    """Return the accepted phase-one complete/block intent for one exact run.
+
+    This is deliberately read-only and fail-closed.  Transcript tool calls,
+    stale runs, rejected requests, malformed journals, and maintenance terminal
+    actions are not completion authority.
+    """
+    try:
+        run_id = int(expected_run_id)
+    except (TypeError, ValueError):
+        return None
+    if not task_id or run_id <= 0:
+        return None
+    row = conn.execute(
+        "SELECT t.status, t.current_run_id, r.id AS run_id, r.ended_at, "
+        "r.terminal_payload, r.terminal_requested_at, r.reap_state "
+        "FROM tasks t JOIN task_runs r ON r.id=t.current_run_id "
+        "WHERE t.id=? AND t.current_run_id=? AND r.task_id=?",
+        (task_id, run_id, task_id),
+    ).fetchone()
+    if (
+        row is None
+        or row["status"] != "running"
+        or int(row["run_id"]) != run_id
+        or row["ended_at"] is not None
+        or type(row["terminal_requested_at"]) is not int
+        or int(row["terminal_requested_at"]) <= 0
+        or row["reap_state"] not in (_REAP_PENDING_STATES | {"reaped"})
+    ):
+        return None
+    try:
+        payload = json.loads(row["terminal_payload"])
+        if not isinstance(payload, dict):
+            return None
+        action = payload.get("action")
+        if action not in {"complete", "block"}:
+            return None
+        return _normalize_terminal_intent(str(action), payload)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _terminal_intent_json(intent: dict[str, Any]) -> str:
     return json.dumps(intent, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -12197,6 +12243,40 @@ def heartbeat_worker(
     return True
 
 
+def request_task_timeout(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    error: str,
+    expected_run_id: Optional[int],
+    event_payload: Optional[dict[str, Any]] = None,
+) -> bool:
+    """Fence an active attempt for timeout before releasing its claim.
+
+    Timeout writers run in both the dispatcher (wall-clock max runtime) and
+    the worker itself (iteration-budget exhaustion). They must share the
+    phase-B terminal transition so the exact worker tree is captured and
+    verified dead before the task can become claimable again.
+    """
+    if expected_run_id is None:
+        return False
+    return _request_terminal_transition(
+        conn,
+        task_id,
+        action="timed_out",
+        payload={
+            "task_status": _claim_retry_status(conn, task_id),
+            "run_status": "timed_out",
+            "outcome": "timed_out",
+            "event_kind": "timed_out",
+            "error": error,
+            "event_payload": dict(event_payload or {}),
+            "record_failure": True,
+        },
+        expected_run_id=expected_run_id,
+    )
+
+
 def enforce_max_runtime(
     conn: sqlite3.Connection,
     *,
@@ -12237,22 +12317,14 @@ def enforce_max_runtime(
             timed_out.append(tid)
             continue
         try:
-            requested = _request_terminal_transition(
+            requested = request_task_timeout(
                 conn,
                 tid,
-                action="timed_out",
-                payload={
-                    "task_status": _claim_retry_status(conn, tid),
-                    "run_status": "timed_out",
-                    "outcome": "timed_out",
-                    "event_kind": "timed_out",
-                    "error": error,
-                    "event_payload": {
-                        "pid": pid,
-                        "elapsed_seconds": int(elapsed),
-                        "limit_seconds": int(row["max_runtime_seconds"]),
-                    },
-                    "record_failure": True,
+                error=error,
+                event_payload={
+                    "pid": pid,
+                    "elapsed_seconds": int(elapsed),
+                    "limit_seconds": int(row["max_runtime_seconds"]),
                 },
                 expected_run_id=row["current_run_id"],
             )
@@ -12790,20 +12862,33 @@ def _record_task_failure(
             return False
         if expected_run_id is not None:
             expected_run_id = int(expected_run_id)
-            latest_ended_run = conn.execute(
-                "SELECT 1 FROM task_runs "
-                "WHERE id = ? AND task_id = ? AND ended_at IS NOT NULL "
-                "  AND id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?)",
-                (expected_run_id, task_id, task_id),
-            ).fetchone()
-            if not (
-                row["status"] == "ready"
-                and row["current_run_id"] is None
-                and row["claim_lock"] is None
-                and row["worker_pid"] is None
-                and latest_ended_run is not None
-            ):
-                return False
+            if release_claim and end_run:
+                exact_open_run = conn.execute(
+                    "SELECT 1 FROM task_runs WHERE id=? AND task_id=? "
+                    "AND ended_at IS NULL",
+                    (expected_run_id, task_id),
+                ).fetchone()
+                if not (
+                    row["status"] == "running"
+                    and row["current_run_id"] == expected_run_id
+                    and exact_open_run is not None
+                ):
+                    return False
+            else:
+                latest_ended_run = conn.execute(
+                    "SELECT 1 FROM task_runs "
+                    "WHERE id = ? AND task_id = ? AND ended_at IS NOT NULL "
+                    "  AND id = (SELECT MAX(id) FROM task_runs WHERE task_id = ?)",
+                    (expected_run_id, task_id, task_id),
+                ).fetchone()
+                if not (
+                    row["status"] == "ready"
+                    and row["current_run_id"] is None
+                    and row["claim_lock"] is None
+                    and row["worker_pid"] is None
+                    and latest_ended_run is not None
+                ):
+                    return False
         failures = int(row["consecutive_failures"]) + 1
 
         # Per-task override wins over both caller-supplied and default
@@ -14665,6 +14750,46 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         lines.append(f"Branch:   {task.branch_name}")
     lines.append("")
 
+    closed_runs = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    latest_closed_run = closed_runs[-1] if closed_runs else None
+    latest_error = (
+        (latest_closed_run.error or "").strip().lower()
+        if latest_closed_run is not None else ""
+    )
+    continuation_retry = bool(
+        not task.goal_mode
+        and latest_closed_run is not None
+        and latest_closed_run.outcome == "timed_out"
+        and (
+            "iteration budget exhausted" in latest_error
+            or "max_iterations" in latest_error
+            or "max iterations" in latest_error
+        )
+    )
+    if continuation_retry:
+        evidence_sources = ["preserved workspace/branch"]
+        if latest_closed_run.summary or latest_closed_run.error or latest_closed_run.metadata:
+            evidence_sources.append("source run summary/error/metadata")
+        if list_comments(conn, task_id):
+            evidence_sources.append("task comments")
+        if list_attachments(conn, task_id):
+            evidence_sources.append("task attachments")
+        lines.extend([
+            "## continuation_retry_v1",
+            f"Source run: {latest_closed_run.id}",
+            f"Source workspace: {task.workspace_path or '(unresolved)'}",
+            f"Source branch: {task.branch_name or '(none)'}",
+            f"Evidence sources: {', '.join(evidence_sources)}",
+            "Continuation instruction: before any setup, discovery, browser use, "
+            "source reread, or full-test repetition, inspect and preserve the existing "
+            "workspace evidence. Verify referenced artifact paths and every stated "
+            "expected hash. If they match, perform only the missing deterministic "
+            "closeout and call kanban_complete. If one path is missing or one hash "
+            "differs, do not overwrite or auto-approve: call kanban_block with exactly "
+            "one concrete expected-vs-actual mismatch.",
+            "",
+        ])
+
     if task.body and task.body.strip():
         lines.append("## Body")
         lines.append(_cap(task.body, _CTX_MAX_BODY_BYTES))
@@ -14758,7 +14883,7 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
     # Cap at _CTX_MAX_PRIOR_ATTEMPTS most-recent closed runs; older
     # attempts get collapsed into a one-line marker so the worker knows
     # more exist without bloating the prompt.
-    all_prior = [r for r in list_runs(conn, task_id) if r.ended_at is not None]
+    all_prior = closed_runs
     # list_runs returns ascending by started_at; "most recent" = last N
     if len(all_prior) > _CTX_MAX_PRIOR_ATTEMPTS:
         omitted = len(all_prior) - _CTX_MAX_PRIOR_ATTEMPTS

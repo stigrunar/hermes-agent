@@ -168,10 +168,11 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "77")
+    record = MagicMock(name="request_task_timeout")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db.request_task_timeout", record)
     agent = _LimitAgent()
 
     result = _finalize(
@@ -189,11 +190,32 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
             "Iteration budget exhausted (60/60) — task could not complete "
             "within the allowed iterations"
         ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        expected_run_id=77,
+        event_payload={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_accepted_exact_run_terminal_intent_suppresses_timeout_and_summary(monkeypatch):
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "77")
+    monkeypatch.setattr(
+        "agent.kanban_stop.accepted_kanban_terminal_intent",
+        lambda: {"action": "complete"},
+    )
+    record = MagicMock(name="record_task_failure")
+    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    agent = _LimitAgent()
+
+    result = _finalize(
+        agent,
+        final_response=None,
+        exit_reason="unknown",
+    )
+
+    assert result["turn_exit_reason"] == "kanban_terminal_intent_accepted"
+    assert agent._handle_max_iterations_called is False
+    record.assert_not_called()
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):

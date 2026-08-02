@@ -2740,6 +2740,52 @@ def test_timeout_breaker_gave_up_happens_only_after_reap(
         assert any(event.kind == "gave_up" for event in kb.list_events(conn, task_id))
 
 
+def test_worker_reported_timeout_cannot_overlap_replacement_claim(
+    kanban_home, process_harness, trusted_scope,
+):
+    states, _signals, send = process_harness
+    with kb.connect() as conn:
+        task_id, old_run_id, identity = _active_worker(
+            conn, title="iteration budget timeout",
+        )
+
+        assert kb.request_task_timeout(
+            conn,
+            task_id,
+            error="iteration budget exhausted",
+            expected_run_id=old_run_id,
+            event_payload={"budget_used": 60, "budget_max": 60},
+        )
+        pending = kb.get_task(conn, task_id)
+        assert pending.status == "running"
+        assert pending.current_run_id == old_run_id
+        assert kb.claim_task(conn, task_id, claimer="too-early") is None
+
+        states[identity.pid] = "gone"
+        trusted_scope()
+        decisions = kb.reconcile_worker_reaps(
+            conn,
+            now=9600,
+            signal_fn=send,
+            protected_pid_fn=lambda: set(),
+        )
+        assert decisions[0]["state"] == "finalized"
+        assert kb.get_task(conn, task_id).status == "ready"
+
+        replacement = kb.claim_task(conn, task_id, claimer="fresh-worker")
+        assert replacement is not None
+        assert replacement.current_run_id != old_run_id
+        old_run = kb.get_run(conn, old_run_id)
+        assert old_run.outcome == "timed_out"
+        timeout_events = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "timed_out"
+        ]
+        assert len(timeout_events) == 1
+        assert timeout_events[0].run_id == old_run_id
+        assert timeout_events[0].payload["budget_used"] == 60
+
+
 def test_diagnostics_show_lease_facts_without_corrupting_functional_payload(
     kanban_home, process_harness,
 ):

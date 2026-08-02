@@ -703,9 +703,141 @@ def managed_scope_check() -> None:
         check_info(f"managed dir set via HERMES_MANAGED_DIR={managed_dir}")
 
 
+def _check_state_db(
+    state_db_path: Path,
+    *,
+    should_fix: bool,
+    deep: bool,
+    issues: list[str],
+) -> int:
+    """Check state.db and return the number of repairs performed."""
+    import sqlite3
+
+    from hermes_state import (
+        _db_opens_cleanly,
+        _doctor_db_basic_check,
+        is_malformed_db_error,
+        repair_state_db_schema,
+    )
+
+    # Repair needs the same full integrity + FTS diagnosis as an explicit
+    # deep check. The normal no-fix path never opens the database for writes.
+    if not (deep or should_fix):
+        result = _doctor_db_basic_check(state_db_path)
+        if result.status == "ok":
+            check_ok(f"{_DHH}/state.db exists ({result.session_count} sessions)")
+        elif result.status == "incomplete":
+            check_warn(
+                f"{_DHH}/state.db basic health check incomplete",
+                f"({result.reason}; run 'hermes doctor --deep' for a full check)",
+            )
+            issues.append(
+                "state.db basic health check incomplete — run 'hermes doctor --deep'"
+            )
+        else:
+            check_warn(
+                f"{_DHH}/state.db failed its basic health check",
+                f"({result.reason})",
+            )
+            issues.append(
+                "state.db basic health check failed — run 'hermes doctor --deep' "
+                "for full integrity and FTS diagnostics"
+            )
+        return 0
+
+    try:
+        conn = sqlite3.connect(str(state_db_path))
+        try:
+            count = conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+        finally:
+            conn.close()
+        check_ok(f"{_DHH}/state.db exists ({count} sessions)")
+
+        reason = _db_opens_cleanly(state_db_path)
+        if reason is None:
+            return 0
+        check_warn(
+            f"{_DHH}/state.db fails the deep integrity/FTS health check",
+            f"({reason})",
+        )
+        if should_fix:
+            report = repair_state_db_schema(state_db_path)
+            if report.get("repaired"):
+                backup_name = (
+                    Path(report["backup_path"]).name
+                    if report.get("backup_path") else "n/a"
+                )
+                check_ok(
+                    "Repaired state.db integrity/FTS health",
+                    f"(strategy: {report.get('strategy')}; backup: {backup_name})",
+                )
+                return 1
+            check_warn(
+                "state.db integrity/FTS repair did not recover automatically",
+                f"({report.get('error')}; backup: {report.get('backup_path')})",
+            )
+            issues.append(
+                "state.db integrity/FTS repair failed — restore from the "
+                "backup copy beside state.db"
+            )
+        else:
+            issues.append(
+                "state.db deep integrity/FTS check failed — run 'hermes doctor --fix' "
+                "(or 'hermes sessions repair')"
+            )
+    except Exception as exc:
+        if is_malformed_db_error(exc):
+            check_warn(
+                f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
+                f"({exc})",
+            )
+            if should_fix:
+                report = repair_state_db_schema(state_db_path)
+                if report.get("repaired"):
+                    try:
+                        conn = sqlite3.connect(str(state_db_path))
+                        try:
+                            count = conn.execute(
+                                "SELECT COUNT(*) FROM sessions"
+                            ).fetchone()[0]
+                        finally:
+                            conn.close()
+                    except Exception:
+                        count = "?"
+                    backup_name = (
+                        Path(report["backup_path"]).name
+                        if report.get("backup_path") else "n/a"
+                    )
+                    check_ok(
+                        f"Repaired state.db schema ({count} sessions recovered)",
+                        f"(strategy: {report.get('strategy')}; backup: {backup_name})",
+                    )
+                    return 1
+                check_warn(
+                    "state.db schema repair did not recover automatically",
+                    f"({report.get('error')}; backup: {report.get('backup_path')})",
+                )
+                issues.append(
+                    "state.db schema malformed and auto-repair failed — "
+                    "restore from the backup copy beside state.db"
+                )
+            else:
+                issues.append(
+                    "state.db schema malformed — run 'hermes doctor --fix' "
+                    "(or 'hermes sessions repair') to recover hidden sessions"
+                )
+        else:
+            check_warn(f"{_DHH}/state.db exists but has issues: {exc}")
+            issues.append(
+                "state.db deep check failed — inspect the reported SQLite error"
+            )
+    return 0
+
+
 def run_doctor(args):
     """Run diagnostic checks."""
     should_fix = getattr(args, 'fix', False)
+    deep = getattr(args, 'deep', False)
     ack_target = getattr(args, 'ack', None)
 
     # Doctor runs from the interactive CLI, so CLI-gated tool availability
@@ -1497,101 +1629,12 @@ def run_doctor(args):
     # Check SQLite session store
     state_db_path = hermes_home / "state.db"
     if state_db_path.exists():
-        try:
-            import sqlite3
-            conn = sqlite3.connect(str(state_db_path))
-            cursor = conn.execute("SELECT COUNT(*) FROM sessions")
-            count = cursor.fetchone()[0]
-            conn.close()
-            check_ok(f"{_DHH}/state.db exists ({count} sessions)")
-
-            # FTS write-health probe (#50502): `SELECT COUNT(*)` above succeeds
-            # even when the FTS index is corrupt and every message write fails
-            # through the triggers. `_db_opens_cleanly` now drives a rolled-back
-            # write so this otherwise-silent corruption class is surfaced (and
-            # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
-
-            _write_reason = _db_opens_cleanly(state_db_path)
-            if _write_reason is not None:
-                check_warn(
-                    f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
-                    f"({_write_reason})",
-                )
-                if should_fix:
-                    report = repair_state_db_schema(state_db_path)
-                    if report.get("repaired"):
-                        backup_name = (
-                            Path(report["backup_path"]).name
-                            if report.get("backup_path") else "n/a"
-                        )
-                        check_ok(
-                            "Repaired state.db FTS write health",
-                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
-                        )
-                        fixed_count += 1
-                    else:
-                        check_warn(
-                            "state.db FTS write-health repair did not recover automatically",
-                            f"({report.get('error')}; backup: {report.get('backup_path')})",
-                        )
-                        issues.append(
-                            "state.db FTS write corruption and auto-repair failed — "
-                            "restore from the backup copy beside state.db"
-                        )
-                else:
-                    issues.append(
-                        "state.db FTS write corruption — run 'hermes doctor --fix' "
-                        "(or 'hermes sessions repair') to rebuild the FTS index"
-                    )
-        except Exception as e:
-            from hermes_state import is_malformed_db_error, repair_state_db_schema
-
-            if is_malformed_db_error(e):
-                # sqlite_master itself is malformed (e.g. duplicate
-                # messages_fts) — every statement fails before it runs, so
-                # this is NOT a plain FTS-index rebuild. Repair sqlite_master
-                # in place (backup first; sessions/messages preserved).
-                check_warn(
-                    f"{_DHH}/state.db schema is malformed (sessions hidden until repaired)",
-                    f"({e})",
-                )
-                if should_fix:
-                    report = repair_state_db_schema(state_db_path)
-                    if report.get("repaired"):
-                        try:
-                            conn = sqlite3.connect(str(state_db_path))
-                            count = conn.execute(
-                                "SELECT COUNT(*) FROM sessions"
-                            ).fetchone()[0]
-                            conn.close()
-                        except Exception:
-                            count = "?"
-                        backup_name = (
-                            Path(report["backup_path"]).name
-                            if report.get("backup_path") else "n/a"
-                        )
-                        check_ok(
-                            f"Repaired state.db schema ({count} sessions recovered)",
-                            f"(strategy: {report.get('strategy')}; backup: {backup_name})",
-                        )
-                        fixed_count += 1
-                    else:
-                        check_warn(
-                            "state.db schema repair did not recover automatically",
-                            f"({report.get('error')}; backup: {report.get('backup_path')})",
-                        )
-                        issues.append(
-                            "state.db schema malformed and auto-repair failed — "
-                            "restore from the backup copy beside state.db"
-                        )
-                else:
-                    issues.append(
-                        "state.db schema malformed — run 'hermes doctor --fix' "
-                        "(or 'hermes sessions repair') to recover hidden sessions"
-                    )
-            else:
-                check_warn(f"{_DHH}/state.db exists but has issues: {e}")
+        fixed_count += _check_state_db(
+            state_db_path,
+            should_fix=should_fix,
+            deep=deep,
+            issues=issues,
+        )
     else:
         check_info(f"{_DHH}/state.db not created yet (will be created on first session)")
 
