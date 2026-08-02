@@ -243,6 +243,15 @@ class TestMentionGating:
         await self._poll_with(adapter, _event("e1", content="hey @Chip can you help?", created_at=10))
         assert len(adapter._dispatched) == 1
 
+    @pytest.mark.asyncio
+    async def test_plain_display_name_is_not_a_mention(self, adapter):
+        await self._poll_with(adapter, _event("e1", content="Chip can handle the next step", created_at=10))
+        assert adapter._dispatched == []
+
+    def test_strip_mention_requires_at_for_display_name(self, adapter):
+        assert adapter._strip_mention("@Chip: /whoami") == "/whoami"
+        assert adapter._strip_mention("Chip is handling this") == "Chip is handling this"
+
 
     @pytest.mark.asyncio
     async def test_allowlist_blocks_unauthorized(self, adapter):

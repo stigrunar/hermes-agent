@@ -1113,14 +1113,17 @@ class BuzzAdapter(BasePlatformAdapter):
         logger.info("Buzz: conversation %s reclassified as DM (message p-tagged to self)", channel_id)
 
     def _is_mentioned(self, content: str) -> bool:
-        """True when the message addresses this agent (npub, hex, or name)."""
+        """True when the message addresses this agent (npub, hex, or @name)."""
         lowered = content.lower()
         if self._self_pubkey and self._self_pubkey in lowered:
             return True
         if self._self_npub and self._self_npub in lowered:
             return True
         if self._display_name:
-            pattern = rf"(?<!\w)@?{re.escape(self._display_name.lower())}(?!\w)"
+            # A display name in ordinary prose is not an address. Requiring the
+            # explicit ``@`` prevents peer agents from waking each other merely
+            # by referring to one another by name in a shared channel.
+            pattern = rf"(?<!\w)@{re.escape(self._display_name.lower())}(?!\w)"
             if re.search(pattern, lowered):
                 return True
         return False
@@ -1139,16 +1142,19 @@ class BuzzAdapter(BasePlatformAdapter):
         text = content.strip()
         candidates = []
         if self._display_name:
-            candidates.append(re.escape(self._display_name))
+            # Display names are mentions only with an explicit ``@``. Keep a
+            # plain leading name intact, especially in DMs where messages do
+            # not pass through the channel mention gate first.
+            candidates.append(rf"@{re.escape(self._display_name)}")
         if self._self_npub:
-            candidates.append(re.escape(self._self_npub))
+            candidates.append(rf"@?{re.escape(self._self_npub)}")
         if self._self_pubkey:
-            candidates.append(re.escape(self._self_pubkey))
+            candidates.append(rf"@?{re.escape(self._self_pubkey)}")
         if not candidates:
             return text
-        # Optional leading '@', one of the identity forms, optional trailing
-        # ':' or ',' and surrounding whitespace.
-        pattern = rf"^@?(?:{'|'.join(candidates)})[\s:,]*"
+        # One of the explicit identity forms, optional trailing ':' or ',' and
+        # surrounding whitespace.
+        pattern = rf"^(?:{'|'.join(candidates)})[\s:,]*"
         stripped = re.sub(pattern, "", text, count=1, flags=re.IGNORECASE)
         return stripped.strip()
 
