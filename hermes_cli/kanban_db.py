@@ -7173,38 +7173,68 @@ def apply_outcome_review_decision(
     task_id: str,
     *,
     decision: str,
-    actor: str,
+    actor: Optional[str] = None,
+    actor_profile: Optional[str] = None,
     reason: Optional[str] = None,
+    summary: Optional[str] = None,
+    mandatory_criterion_id: Optional[str] = None,
     findings: Optional[Iterable[Mapping[str, Any]]] = None,
     reviewer: Optional[str] = None,
-) -> bool:
+) -> dict[str, Any]:
     """Record an explicit review decision and apply only its bounded action."""
     try:
         decision_value = OutcomeReviewDecision(decision).value
         serialized_findings = _review_findings_payload(findings)
     except (TypeError, ValueError):
-        return False
-    actor = _canonical_assignee(actor) or actor
+        return {"ok": False, "reason": "invalid review decision or findings"}
+    actor = actor_profile or actor
+    actor = _canonical_assignee(actor) if actor else None
+    if actor != "default":
+        raise PermissionError(
+            "only canonical profile default may apply outcome review decisions"
+        )
+    effective_reason = reason or summary
     payload = {
         "decision": decision_value,
         "actor": actor,
-        "reason": redact_review_value(reason) if reason else None,
+        "reason": redact_review_value(effective_reason) if effective_reason else None,
         "findings": serialized_findings,
         "reviewer": _canonical_assignee(reviewer) if reviewer else None,
+    }
+    if mandatory_criterion_id:
+        payload["mandatory_criterion_id"] = redact_review_value(mandatory_criterion_id)
+    result = {
+        "ok": True,
+        "decision": decision_value,
+        "standard_review_budget": {
+            "qa": STANDARD_REVIEW_BUDGET.qa,
+            "bounded_remediation": STANDARD_REVIEW_BUDGET.bounded_remediation,
+            "targeted_recheck": STANDARD_REVIEW_BUDGET.targeted_recheck,
+        },
     }
     if decision_value in {
         OutcomeReviewDecision.MUTATE_FROZEN_SCOPE.value,
         OutcomeReviewDecision.REOPEN_SCOPE.value,
     }:
-        return False
-    if decision_value == OutcomeReviewDecision.HOLD_CLOSEOUT.value:
         with write_txn(conn):
             _append_event(conn, task_id, "outcome_review_decision", payload)
-        return True
+        return result
+    if decision_value == OutcomeReviewDecision.HOLD_CLOSEOUT.value:
+        with write_txn(conn):
+            event_kind = (
+                "targeted_evidence_needed"
+                if any(
+                    finding["classification"] == ReviewFindingClassification.NOT_VERIFIED.value
+                    for finding in serialized_findings
+                )
+                else "outcome_review_decision"
+            )
+            _append_event(conn, task_id, event_kind, payload)
+        return result
     if decision_value == OutcomeReviewDecision.AUTHORIZE_EXTRA_REVIEW.value:
         with write_txn(conn):
             _append_event(conn, task_id, "outcome_review_decision", payload)
-        return True
+        return result
     if decision_value in {
         OutcomeReviewDecision.ACCEPT_RISK.value,
         OutcomeReviewDecision.RELEASE.value,
@@ -7212,15 +7242,16 @@ def apply_outcome_review_decision(
     }:
         with write_txn(conn):
             _append_event(conn, task_id, "outcome_review_decision", payload)
-        if decision_value == OutcomeReviewDecision.HOLD_CLOSEOUT.value:
-            return True
-        return complete_task(
+        completed = complete_task(
             conn,
             task_id,
-            summary=reason or f"outcome review decision: {decision_value}",
+            summary=effective_reason or f"outcome review decision: {decision_value}",
             metadata={"outcome_review_decision": payload},
         )
-    return False
+        result["completed"] = completed
+        result["ok"] = completed
+        return result
+    return {"ok": False, "reason": "unsupported review decision"}
 
 
 def promote_task(
