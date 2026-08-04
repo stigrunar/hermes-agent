@@ -840,6 +840,7 @@ def _handle_complete(args: dict, **kw) -> str:
     metadata = args.get("metadata")
     result = args.get("result")
     review_verdict = args.get("review_verdict")
+    review_findings = args.get("review_findings")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -851,6 +852,14 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    if review_findings is not None:
+        try:
+            findings_json = json.dumps(review_findings)
+            review_findings = json.loads(
+                redact_sensitive_text(findings_json, force=True)
+            )
+        except (TypeError, json.JSONDecodeError):
+            return tool_error("review_findings must be a JSON array of objects")
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -924,6 +933,7 @@ def _handle_complete(args: dict, **kw) -> str:
                     tid,
                     verdict=str(review_verdict),
                     summary=summary or result,
+                    findings=review_findings,
                     expected_run_id=_worker_run_id(tid),
                 )
                 if not ok:
@@ -2140,6 +2150,46 @@ KANBAN_COMPLETE_SCHEMA = {
                     "Explicit verdict for a registered active review gate. "
                     "Omit for ordinary completion; completing a review without "
                     "this field is rejected and never implies approval."
+                ),
+            },
+            "review_findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["classification"],
+                    "properties": {
+                        "classification": {
+                            "type": "string",
+                            "enum": [
+                                "blocker",
+                                "follow_up",
+                                "accepted_risk",
+                                "unrelated",
+                                "not_verified",
+                            ],
+                        },
+                        "basis": {
+                            "type": "string",
+                            "enum": [
+                                "frozen_acceptance",
+                                "user_outcome",
+                                "severe_regression",
+                                "explicit_security_boundary",
+                            ],
+                        },
+                        "evidence_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "outcome_impact": {"type": "string"},
+                        "minimum_fix": {"type": "string"},
+                        "criterion_id": {"type": "string"},
+                    },
+                },
+                "description": (
+                    "Typed review findings. changes_requested requires a valid "
+                    "blocker; prose alone never mutates the task graph."
                 ),
             },
             "metadata": {

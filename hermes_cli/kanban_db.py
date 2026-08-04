@@ -89,6 +89,7 @@ import time
 import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Optional
 
@@ -142,6 +143,146 @@ def _terminal_status_sql() -> tuple[str, tuple[str, ...]]:
 
 REVIEW_REQUIRED_PREFIX = "review-required:"
 VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
+
+
+class ReviewFindingClassification(str, Enum):
+    BLOCKER = "blocker"
+    FOLLOW_UP = "follow_up"
+    ACCEPTED_RISK = "accepted_risk"
+    UNRELATED = "unrelated"
+    NOT_VERIFIED = "not_verified"
+
+
+class ReviewFindingBasis(str, Enum):
+    FROZEN_ACCEPTANCE = "frozen_acceptance"
+    USER_OUTCOME = "user_outcome"
+    SEVERE_REGRESSION = "severe_regression"
+    EXPLICIT_SECURITY_BOUNDARY = "explicit_security_boundary"
+
+
+class OutcomeReviewDecision(str, Enum):
+    MUTATE_FROZEN_SCOPE = "mutate_frozen_scope"
+    REOPEN_SCOPE = "reopen_scope"
+    ACCEPT_RISK = "accept_risk"
+    AUTHORIZE_EXTRA_REVIEW = "authorize_extra_review"
+    RELEASE = "release"
+    CLOSEOUT = "closeout"
+    HOLD_CLOSEOUT = "hold_closeout"
+
+
+@dataclass(frozen=True)
+class ReviewBudget:
+    qa: int = 1
+    bounded_remediation: int = 1
+    targeted_recheck: int = 1
+
+
+STANDARD_REVIEW_BUDGET = ReviewBudget()
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    """Typed review evidence; only a valid blocker may drive a recut."""
+
+    classification: ReviewFindingClassification
+    basis: Optional[ReviewFindingBasis] = None
+    evidence_refs: tuple[str, ...] = ()
+    outcome_impact: Optional[str] = None
+    minimum_fix: Optional[str] = None
+    criterion_id: Optional[str] = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ReviewFinding":
+        if not isinstance(value, Mapping):
+            raise ValueError("review finding must be an object mapping")
+        allowed = {
+            "classification",
+            "basis",
+            "evidence_refs",
+            "outcome_impact",
+            "minimum_fix",
+            "criterion_id",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unknown review finding fields: {unknown}")
+        try:
+            classification = ReviewFindingClassification(value.get("classification"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid review finding classification") from exc
+        raw_basis = value.get("basis")
+        try:
+            basis = ReviewFindingBasis(raw_basis) if raw_basis is not None else None
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid review finding basis") from exc
+        raw_refs = value.get("evidence_refs", ())
+        if isinstance(raw_refs, (str, bytes)) or not isinstance(
+            raw_refs, (list, tuple)
+        ):
+            raise ValueError("review finding evidence_refs must be a list")
+        evidence_refs = tuple(
+            ref.strip() for ref in raw_refs if isinstance(ref, str) and ref.strip()
+        )
+        if len(evidence_refs) != len(raw_refs):
+            raise ValueError(
+                "review finding evidence_refs must contain non-empty strings"
+            )
+
+        def optional_text(name: str) -> Optional[str]:
+            raw = value.get(name)
+            if raw is None:
+                return None
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"review finding {name} must be a non-empty string")
+            return raw.strip()
+
+        finding = cls(
+            classification=classification,
+            basis=basis,
+            evidence_refs=evidence_refs,
+            outcome_impact=optional_text("outcome_impact"),
+            minimum_fix=optional_text("minimum_fix"),
+            criterion_id=optional_text("criterion_id"),
+        )
+        if finding.classification is ReviewFindingClassification.BLOCKER:
+            if finding.basis is None:
+                raise ValueError("blocking review finding requires an allowed basis")
+            if not finding.evidence_refs:
+                raise ValueError("blocking review finding requires evidence_refs")
+            if finding.outcome_impact is None:
+                raise ValueError("blocking review finding requires outcome_impact")
+            if finding.minimum_fix is None:
+                raise ValueError("blocking review finding requires minimum_fix")
+            if (
+                finding.basis is ReviewFindingBasis.FROZEN_ACCEPTANCE
+                and finding.criterion_id is None
+            ):
+                raise ValueError("frozen_acceptance blocker requires criterion_id")
+        return finding
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "classification": self.classification.value,
+            "basis": self.basis.value if self.basis is not None else None,
+            "evidence_refs": list(self.evidence_refs),
+            "outcome_impact": self.outcome_impact,
+            "minimum_fix": self.minimum_fix,
+            "criterion_id": self.criterion_id,
+        }
+
+
+def validate_review_findings(
+    findings: Optional[Iterable[Mapping[str, Any]]],
+) -> tuple[ReviewFinding, ...]:
+    if findings is None:
+        return ()
+    if isinstance(findings, (str, bytes, Mapping)):
+        raise ValueError("review findings must be a list of object mappings")
+    try:
+        return tuple(ReviewFinding.from_mapping(item) for item in findings)
+    except TypeError as exc:
+        raise ValueError("review findings must be iterable") from exc
+
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -8084,6 +8225,7 @@ def submit_review_verdict(
     *,
     verdict: str,
     summary: Optional[str] = None,
+    findings: Optional[Iterable[Mapping[str, Any]]] = None,
     expected_run_id: Optional[int] = None,
     _after_reap: bool = False,
 ) -> bool:
@@ -8097,6 +8239,34 @@ def submit_review_verdict(
     if verdict not in VALID_REVIEW_VERDICTS:
         raise ValueError(
             f"review verdict must be one of {sorted(VALID_REVIEW_VERDICTS)}"
+        )
+    typed_findings = validate_review_findings(findings)
+    if any(
+        finding.classification is ReviewFindingClassification.ACCEPTED_RISK
+        for finding in typed_findings
+    ):
+        raise PermissionError(
+            "accepted_risk requires a canonical-default outcome review decision"
+        )
+    if verdict == "changes_requested" and not any(
+        finding.classification is ReviewFindingClassification.BLOCKER
+        for finding in typed_findings
+    ):
+        raise ValueError("changes_requested requires at least one valid typed blocker")
+    serialized_findings = [finding.to_mapping() for finding in typed_findings]
+    preflight_handoff = _review_handoff_row(conn, review_task_id=review_task_id)
+    if (
+        preflight_handoff is not None
+        and preflight_handoff["state"] == verdict
+        and preflight_handoff["verdict"] == verdict
+    ):
+        return True
+    if preflight_handoff is not None:
+        _assert_review_budget_allows_verdict(
+            conn,
+            source_task_id=preflight_handoff["source_task_id"],
+            review_task_id=review_task_id,
+            verdict=verdict,
         )
     # A reviewer worker may still be mutating its checkout when it submits a
     # verdict.  Journal the exact verdict first and let the same Phase B reaper
@@ -8132,6 +8302,7 @@ def submit_review_verdict(
                 payload={
                     "verdict": verdict,
                     "summary": summary,
+                    "findings": serialized_findings,
                     "review_task_id": review_task_id,
                     "source_task_id": handoff["source_task_id"],
                     "next_task_id": handoff["next_task_id"],
@@ -8150,6 +8321,12 @@ def submit_review_verdict(
             raise ValueError(
                 f"review handoff is {handoff['state']}, not active; verdict rejected"
             )
+        _assert_review_budget_allows_verdict(
+            conn,
+            source_task_id=handoff["source_task_id"],
+            review_task_id=review_task_id,
+            verdict=verdict,
+        )
         review = conn.execute(
             "SELECT status, current_run_id, worker_pid FROM tasks WHERE id = ?",
             (review_task_id,),
@@ -8175,7 +8352,10 @@ def submit_review_verdict(
             outcome="completed",
             status="done",
             summary=summary or verdict,
-            metadata={"review_verdict": verdict},
+            metadata={
+                "review_verdict": verdict,
+                "review_findings": serialized_findings,
+            },
         )
         if run_id is None:
             run_id = _synthesize_ended_run(
@@ -8183,7 +8363,10 @@ def submit_review_verdict(
                 review_task_id,
                 outcome="completed",
                 summary=summary or verdict,
-                metadata={"review_verdict": verdict},
+                metadata={
+                    "review_verdict": verdict,
+                    "review_findings": serialized_findings,
+                },
             )
         conn.execute(
             "UPDATE tasks SET status='done', result=?, completed_at=?, "
@@ -8202,6 +8385,7 @@ def submit_review_verdict(
             "review_task_id": review_task_id,
             "next_task_id": handoff["next_task_id"],
             "summary": summary,
+            "findings": serialized_findings,
         }
         _append_event(
             conn, review_task_id, "review_verdict", verdict_payload, run_id=run_id,
@@ -8277,6 +8461,135 @@ def submit_review_verdict(
                     )
         return True
 
+
+def _assert_review_budget_allows_verdict(
+    conn: sqlite3.Connection,
+    *,
+    source_task_id: str,
+    review_task_id: str,
+    verdict: str,
+) -> None:
+    prior = conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='review_verdict'",
+        (review_task_id,),
+    ).fetchone()[0]
+    needs_extra_review = prior >= 2 or (prior >= 1 and verdict == "changes_requested")
+    if not needs_extra_review:
+        return
+    last_verdict_id = conn.execute(
+        "SELECT COALESCE(MAX(id), 0) FROM task_events "
+        "WHERE task_id=? AND kind='review_verdict'",
+        (review_task_id,),
+    ).fetchone()[0]
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? "
+        "AND kind='outcome_review_decision' AND id>? ORDER BY id DESC",
+        (source_task_id, last_verdict_id),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if (
+            payload.get("decision")
+            == OutcomeReviewDecision.AUTHORIZE_EXTRA_REVIEW.value
+        ):
+            return
+    raise ValueError(
+        "standard review budget exhausted; canonical default must authorize extra review"
+    )
+
+
+def apply_outcome_review_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    actor_profile: str,
+    decision: str,
+    findings: Optional[Iterable[Mapping[str, Any]]] = None,
+    summary: Optional[str] = None,
+    mandatory_criterion_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Apply a delivery-control decision owned only by canonical default.
+
+    Apart from ``closeout``, decisions are durable authorizations or holds and
+    deliberately do not create tasks, links, or status transitions.
+    """
+    actor = _canonical_assignee(actor_profile)
+    if actor != "default":
+        raise PermissionError(
+            "outcome review control decisions require canonical profile default"
+        )
+    try:
+        typed_decision = OutcomeReviewDecision(decision)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("invalid outcome review decision") from exc
+    typed_findings = validate_review_findings(findings)
+    if typed_decision is OutcomeReviewDecision.CLOSEOUT and any(
+        finding.classification is ReviewFindingClassification.BLOCKER
+        for finding in typed_findings
+    ):
+        raise ValueError("delivery closeout cannot accept blocking findings")
+
+    criterion = (
+        mandatory_criterion_id.strip()
+        if isinstance(mandatory_criterion_id, str) and mandatory_criterion_id.strip()
+        else None
+    )
+    if typed_decision is OutcomeReviewDecision.HOLD_CLOSEOUT:
+        not_verified = [
+            finding
+            for finding in typed_findings
+            if finding.classification is ReviewFindingClassification.NOT_VERIFIED
+        ]
+        if criterion is None or not not_verified:
+            raise ValueError(
+                "hold_closeout requires a mandatory criterion and not_verified finding"
+            )
+        if any(
+            finding.criterion_id is not None and finding.criterion_id != criterion
+            for finding in not_verified
+        ):
+            raise ValueError("not_verified finding criterion does not match hold")
+    elif criterion is not None:
+        raise ValueError("mandatory_criterion_id is valid only for hold_closeout")
+
+    payload = {
+        "actor_profile": actor,
+        "decision": typed_decision.value,
+        "summary": summary,
+        "findings": [finding.to_mapping() for finding in typed_findings],
+        "standard_review_budget": {
+            "qa": STANDARD_REVIEW_BUDGET.qa,
+            "bounded_remediation": STANDARD_REVIEW_BUDGET.bounded_remediation,
+            "targeted_recheck": STANDARD_REVIEW_BUDGET.targeted_recheck,
+        },
+    }
+    if criterion is not None:
+        payload["mandatory_criterion_id"] = criterion
+
+    if typed_decision is OutcomeReviewDecision.CLOSEOUT:
+        completed = complete_task(
+            conn,
+            task_id,
+            summary=summary or "delivery closeout authorized by canonical default",
+            metadata={"outcome_review_decision": payload},
+        )
+        if not completed:
+            raise ValueError("delivery task is not eligible for closeout")
+        return payload
+
+    event_kind = (
+        "targeted_evidence_needed"
+        if typed_decision is OutcomeReviewDecision.HOLD_CLOSEOUT
+        else "outcome_review_decision"
+    )
+    with write_txn(conn):
+        if conn.execute("SELECT 1 FROM tasks WHERE id=?", (task_id,)).fetchone() is None:
+            raise ValueError(f"unknown task {task_id}")
+        _append_event(conn, task_id, event_kind, payload)
+    return payload
 
 
 def promote_task(
@@ -11688,6 +12001,7 @@ def _finalize_reaped_run(
                 "source_task_id": payload.get("source_task_id"),
                 "review_task_id": payload.get("review_task_id", task_id),
                 "next_task_id": payload.get("next_task_id"),
+                "findings": payload.get("findings", []),
                 "historical": True,
             }
             return _finalize_generic_terminal(
@@ -11740,6 +12054,7 @@ def _finalize_reaped_run(
             task_id,
             verdict=str(payload.get("verdict") or ""),
             summary=payload.get("summary"),
+            findings=payload.get("findings"),
             expected_run_id=run_id,
             _after_reap=True,
         )
