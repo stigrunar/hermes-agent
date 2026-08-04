@@ -15,6 +15,17 @@ REPLACEMENT_COMMIT = "9d89df8043fc60cae7352c66037db0e8a7263c4e"
 REPLACEMENT_TREE = "d334f4a850cdc020dd4bd4e496aa9df5187c76d2"
 
 
+def _valid_blocker():
+    return {
+        "classification": "blocker",
+        "basis": "frozen_acceptance",
+        "evidence_refs": ["pytest:contract::AC7"],
+        "outcome_impact": "AC7 review handoff requires a recut before release",
+        "minimum_fix": "recut the candidate and submit it for review again",
+        "criterion_id": "AC7",
+    }
+
+
 @pytest.fixture
 def kanban_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     home = tmp_path / ".hermes"
@@ -57,6 +68,7 @@ def _terminal_negative_handoff(conn):
         review,
         verdict="changes_requested",
         summary="stale exact candidate",
+        findings=[_valid_blocker()],
         expected_run_id=claimed.current_run_id,
     )
     return source, review, nxt
@@ -325,6 +337,7 @@ def test_prepared_review_changes_requested_returns_source_without_successor(
             review,
             verdict="changes_requested",
             summary="candidate needs a recut",
+            findings=[_valid_blocker()],
             expected_run_id=claimed.current_run_id,
         )
 
@@ -599,6 +612,7 @@ def test_changes_requested_recuts_then_approved_releases_only_next(kanban_home):
             review,
             verdict="changes_requested",
             summary="add regression coverage",
+            findings=[_valid_blocker()],
             expected_run_id=claimed_review.current_run_id,
         )
         assert kb.get_task(conn, source).status == "ready"
@@ -608,7 +622,7 @@ def test_changes_requested_recuts_then_approved_releases_only_next(kanban_home):
         assert kb.get_task(conn, nxt).status == "todo"
         # Identical verdict delivery is idempotent.
         assert kb.submit_review_verdict(
-            conn, review, verdict="changes_requested",
+            conn, review, verdict="changes_requested", findings=[_valid_blocker()],
         )
 
         source_claim = kb.claim_task(conn, source, claimer="builder:2")
@@ -1136,6 +1150,7 @@ def test_review_successor_cannot_be_force_promoted_before_approval(kanban_home, 
                 review,
                 verdict="changes_requested",
                 summary="please recut",
+                findings=[_valid_blocker()],
                 expected_run_id=claimed.current_run_id,
             )
 
@@ -1161,6 +1176,7 @@ def test_review_successor_blocks_all_ordinary_mutations(kanban_home, state):
                 review,
                 verdict="changes_requested",
                 summary="please recut",
+                findings=[_valid_blocker()],
                 expected_run_id=claimed.current_run_id,
             )
 
@@ -1201,6 +1217,7 @@ def test_review_lifecycle_protects_all_three_task_roles(kanban_home, state):
                 review,
                 verdict="changes_requested",
                 summary="please recut",
+                findings=[_valid_blocker()],
                 expected_run_id=claimed.current_run_id,
             )
         for task_id in (source, review, nxt):
