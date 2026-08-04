@@ -488,12 +488,64 @@ def _architect_db_receipt(worker_env):
         ),
         (
             {"workspace_kind": "dir", "workspace_path": "/tmp"},
-            "unknown workspace_kind",
+            "requires workspace_kind=worktree",
         ),
         (
             {"workspace_kind": "worktree", "workspace_path": "/tmp"},
-            "canonical task-id path",
+            "must omit workspace_path",
         ),
+        (
+            {
+                "workspace_kind": "worktree",
+                "workspace_path": "/tmp/project/.worktrees/t_future",
+            },
+            "must omit workspace_path",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    architecture_document_path="/tmp/architecture.md",
+                    requested_actions=["write_architecture_document"],
+                )
+            },
+            "clean relative path",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    architecture_document_path="docs/../../outside.md",
+                    requested_actions=["write_architecture_document"],
+                )
+            },
+            "clean relative path",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    architecture_document_path=".",
+                    requested_actions=["write_architecture_document"],
+                )
+            },
+            "clean relative path",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    architecture_document_path="",
+                    requested_actions=["write_architecture_document"],
+                )
+            },
+            "requires architecture_document_path",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
+                    architecture_document_path="docs/architecture.md",
+                )
+            },
+            "handoff-only routes require architecture_document_path=null",
+        ),
+        ({"project": "missing-project"}, "refusing requested project"),
         ({"model": "other-model"}, "model override must remain"),
         (
             {"model": "gpt-5.6-sol", "provider": "openrouter"},
@@ -524,6 +576,7 @@ def test_direct_architect_create_rejects_before_any_durable_mutation(
         "body": "Return one architecture decision and one DollyCode handoff.",
         "assignee": "dollyarchitect",
         "project": project_id,
+        "workspace_kind": "worktree",
         "architect_routing": _architect_routing(),
         "idempotency_key": "architect-invalid-request",
     }
@@ -555,7 +608,11 @@ def test_direct_architect_create_materializes_one_contract_and_replays_idempoten
         "body": "Return one architecture decision and one DollyCode handoff.",
         "assignee": "dollyarchitect",
         "project": project_id,
-        "architect_routing": _architect_routing(),
+        "workspace_kind": "worktree",
+        "architect_routing": _architect_routing(
+            architecture_document_path="docs/architecture.md",
+            requested_actions=["write_architecture_document"],
+        ),
         "idempotency_key": "architect-valid-request",
     }
 
@@ -578,9 +635,13 @@ def test_direct_architect_create_materializes_one_contract_and_replays_idempoten
     assert payload["project_id"] == project_id
     assert payload["workspace_kind"] == "worktree"
     assert payload["implementation_repo"] == str(repo)
+    expected_document = Path(task.workspace_path) / "docs" / "architecture.md"
+    assert payload["writable_artifact_roots"] == [str(expected_document.parent)]
+    assert payload["architecture_document_paths"] == [str(expected_document)]
 
     task_workspace = Path(task.workspace_path)
     task_workspace.mkdir(parents=True)
+    expected_document.parent.mkdir()
     profile_home = Path(os.environ["HERMES_HOME"]) / "profiles" / "dollyarchitect"
     overlay = profile_home / policy.OVERLAY_RELATIVE_PATH
     overlay.mkdir(parents=True)
@@ -599,6 +660,37 @@ def test_direct_architect_create_materializes_one_contract_and_replays_idempoten
         hermes_home=profile_home,
     )
     assert dispatcher_payload is not None
+
+
+def test_direct_architect_handoff_only_persists_no_write_authority(
+    worker_env, tmp_path
+):
+    from agent import profile_runtime_policy as policy
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    project_id, repo = _seed_architect_project(tmp_path, worker_env)
+    result = json.loads(
+        kt._handle_create(
+            {
+                "title": "Decide a bounded contract",
+                "body": "Return one inline decision and DollyCode handoff.",
+                "assignee": "dollyarchitect",
+                "project": project_id,
+                "architect_routing": _architect_routing(),
+            }
+        )
+    )
+    assert result["ok"] is True, result
+    with kb.connect_closing() as conn:
+        task = kb.get_task(conn, result["task_id"])
+    assert task is not None
+    assert task.workspace_path == str(repo / ".worktrees" / task.id)
+    payload = json.loads(task.body.splitlines()[-2])
+    assert payload["requested_actions"] == ["architecture_decision"]
+    assert payload["writable_artifact_roots"] == []
+    assert payload["architecture_document_paths"] == []
+    assert task.body.count(policy.DISPATCH_MARKER) == 2
 
 
 def test_link_happy_path(worker_env):

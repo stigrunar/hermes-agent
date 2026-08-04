@@ -556,8 +556,43 @@ def materialize_direct_architect_create(
     model_override: str | None,
     provider_override: str | None,
     skills: list[str] | tuple[str, ...] | None,
+    task_id: str | None = None,
+    canonical_workspace_path: str | None = None,
 ) -> str:
     """Materialize and preflight one direct DollyArchitect create request."""
+
+    if workspace_kind != "worktree":
+        raise ProfileRuntimePolicyError(
+            "direct DollyArchitect project creation requires workspace_kind=worktree"
+        )
+    if workspace_path is not None:
+        raise ProfileRuntimePolicyError(
+            "direct DollyArchitect project worktrees must omit workspace_path and use "
+            "the canonical task-id path"
+        )
+
+    raw_document = routing.get("architecture_document_path")
+    materialized_routing = dict(routing)
+    if raw_document is not None:
+        if not isinstance(raw_document, str) or not raw_document:
+            raise ProfileRuntimePolicyError(
+                "architecture_document_path must be a non-empty relative path"
+            )
+        relative_document = Path(raw_document)
+        if (
+            raw_document != raw_document.strip()
+            or "\\" in raw_document
+            or relative_document.is_absolute()
+            or relative_document == Path(".")
+            or ".." in relative_document.parts
+            or raw_document != relative_document.as_posix()
+        ):
+            raise ProfileRuntimePolicyError(
+                "architecture_document_path must be a clean relative path beneath "
+                "the canonical task workspace"
+            )
+
+    project_repo = _resolve_project_primary_repo(project_id)
 
     identity_seed = json.dumps(
         {
@@ -571,11 +606,40 @@ def materialize_direct_architect_create(
         separators=(",", ":"),
         sort_keys=True,
     )
+    materialized_task_id = task_id or (
+        "t_preflight_" + hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:12]
+    )
+    expected_workspace = project_repo / ".worktrees" / materialized_task_id
+    materialized_workspace = (
+        Path(canonical_workspace_path)
+        if canonical_workspace_path is not None
+        else expected_workspace
+    )
+    if (
+        not materialized_workspace.is_absolute()
+        or ".." in materialized_workspace.parts
+        or materialized_workspace != expected_workspace
+    ):
+        raise ProfileRuntimePolicyError(
+            "authoritative DollyArchitect workspace must be the canonical task-id path"
+        )
+    if raw_document is not None:
+        materialized_document = materialized_workspace / relative_document
+        try:
+            materialized_document.relative_to(materialized_workspace)
+        except ValueError as exc:
+            raise ProfileRuntimePolicyError(
+                "architecture_document_path escapes the canonical task workspace"
+            ) from exc
+        materialized_routing["architecture_document_path"] = str(
+            materialized_document
+        )
+
     task = types.SimpleNamespace(
-        id="direct-" + hashlib.sha256(identity_seed.encode("utf-8")).hexdigest()[:24],
+        id=materialized_task_id,
         project_id=project_id,
         workspace_kind=workspace_kind,
-        workspace_path=workspace_path,
+        workspace_path=str(materialized_workspace),
         model_override=model_override,
         provider_override=provider_override,
         skills=skills,
@@ -584,7 +648,7 @@ def materialize_direct_architect_create(
         source_task=task,
         route_slot="direct-create",
         body=body,
-        routing=routing,
+        routing=materialized_routing,
     )
     if _canonical_profile_name(routed) != PROFILE_NAME:
         raise ProfileRuntimePolicyError(
@@ -604,37 +668,6 @@ def materialize_direct_architect_create(
             f"generated architect dispatch contract rejected: {exc}"
         ) from exc
 
-    if (
-        contract.implementation_workspace_policy
-        is hardening.ImplementationWorkspacePolicy.PROJECT_WORKTREE
-        and workspace_path
-    ):
-        raise ProfileRuntimePolicyError(
-            "direct DollyArchitect project worktrees must use the canonical task-id path"
-        )
-    if contract.writable_artifact_roots:
-        if not workspace_path:
-            raise ProfileRuntimePolicyError(
-                "direct document-writing routes require an explicit workspace path"
-            )
-        raw_workspace = Path(workspace_path)
-        if not raw_workspace.is_absolute() or ".." in raw_workspace.parts:
-            raise ProfileRuntimePolicyError(
-                "DollyArchitect workspace must be absolute and traversal-free"
-            )
-        resolved_workspace = raw_workspace.resolve(strict=True)
-        for raw_root in contract.writable_artifact_roots:
-            try:
-                resolved_root = Path(raw_root).resolve(strict=True)
-                relative = resolved_root.relative_to(resolved_workspace)
-            except (OSError, ValueError) as exc:
-                raise ProfileRuntimePolicyError(
-                    "DollyArchitect artifact roots must resolve beneath the task workspace"
-                ) from exc
-            if not relative.parts or not resolved_root.is_dir():
-                raise ProfileRuntimePolicyError(
-                    "DollyArchitect artifact roots must be existing strict workspace descendants"
-                )
     return materialized_body
 
 

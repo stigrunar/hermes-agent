@@ -90,7 +90,7 @@ import uuid
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Optional
+from typing import Any, Callable, Iterable, Mapping, Optional
 
 from agent.redact import redact_sensitive_text as _redact_sensitive_text
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -3311,6 +3311,7 @@ def create_task(
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     _trusted_project_repo: Optional[str] = None,
+    _preinsert_body_materializer: Optional[Callable[[str, str], Optional[str]]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3345,6 +3346,11 @@ def create_task(
     in its own projects.db, a matching canonical project-linked task in this
     board can supply the repo and branch convention. Its literal worktree is
     never reused; the new task still gets its own task-id-keyed path.
+
+    ``_preinsert_body_materializer`` is the narrow direct-Architect seam. It
+    receives the generated task id and resolved workspace inside the write
+    transaction, immediately before the task body is inserted; any rejection
+    rolls back the task, links, event, and inherited subscriptions together.
     """
     model_override = (model_override or "").strip() or None
     provider_override = (provider_override or "").strip() or None
@@ -3650,6 +3656,14 @@ def create_task(
                     if not branch_name and project_id:
                         branch_name = f"{project_id}/{task_id}"
 
+                insert_body = body
+                if _preinsert_body_materializer is not None:
+                    if not workspace_path:
+                        raise ValueError(
+                            "pre-insert body materialization requires a resolved workspace"
+                        )
+                    insert_body = _preinsert_body_materializer(task_id, workspace_path)
+
                 conn.execute(
                     """
                     INSERT INTO tasks (
@@ -3664,7 +3678,7 @@ def create_task(
                     (
                         task_id,
                         title.strip(),
-                        body,
+                        insert_body,
                         assignee,
                         task_status,
                         priority,

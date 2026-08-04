@@ -1476,6 +1476,7 @@ def _handle_create(args: dict, **kw) -> str:
     review_next_task_id = args.get("review_next_task_id")
     source_execution_envelope = args.get("source_execution_envelope")
     architect_routing = args.get("architect_routing")
+    architect_body_materializer = None
     strict_idempotency_match = args.get("_strict_idempotency_match") is True
     trusted_project_binding = args.get("_trusted_project_binding")
     max_runtime_seconds = args.get("max_runtime_seconds")
@@ -1581,7 +1582,7 @@ def _handle_create(args: dict, **kw) -> str:
                 )
                 if normalized_architect_routing.get("architecture_document_path") == "":
                     normalized_architect_routing["architecture_document_path"] = None
-                body = materialize_direct_architect_create(
+                materialize_direct_architect_create(
                     title=str(title).strip(),
                     body=str(body or ""),
                     project_id=project_id,
@@ -1594,6 +1595,27 @@ def _handle_create(args: dict, **kw) -> str:
                     ),
                     skills=(list(skills) if skills is not None else None),
                 )
+
+                def architect_body_materializer(
+                    task_id: str, canonical_workspace_path: str
+                ) -> str:
+                    return materialize_direct_architect_create(
+                        title=str(title).strip(),
+                        body=str(body or ""),
+                        project_id=str(project_id),
+                        workspace_kind=str(workspace_kind),
+                        workspace_path=None,
+                        routing=normalized_architect_routing,
+                        model_override=(
+                            str(model_override) if model_override else None
+                        ),
+                        provider_override=(
+                            str(provider_override) if provider_override else None
+                        ),
+                        skills=(list(skills) if skills is not None else None),
+                        task_id=task_id,
+                        canonical_workspace_path=canonical_workspace_path,
+                    )
             if review_source_task_id:
                 if not idempotency_key:
                     raise ValueError("review preparation requires idempotency_key")
@@ -1760,6 +1782,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                _preinsert_body_materializer=architect_body_materializer,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -2511,8 +2534,9 @@ KANBAN_CREATE_SCHEMA = {
                     "architecture_document_path": {
                         "type": "string",
                         "description": (
-                            "Absolute architecture-document path for document-writing "
-                            "routes; use an empty string for handoff-only routes."
+                            "Clean relative architecture-document path beneath the future "
+                            "canonical task worktree for document-writing routes; use an "
+                            "empty string for handoff-only routes."
                         ),
                     },
                     "bounded_file_cluster": {
