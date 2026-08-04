@@ -668,6 +668,8 @@ def _handle_complete(args: dict, **kw) -> str:
     summary = args.get("summary")
     metadata = args.get("metadata")
     result = args.get("result")
+    review_verdict = args.get("review_verdict")
+    review_findings = args.get("review_findings")
     if summary:
         summary = redact_sensitive_text(str(summary), force=True)
     if result:
@@ -679,6 +681,14 @@ def _handle_complete(args: dict, **kw) -> str:
             metadata = json.loads(meta_json)
         except json.JSONDecodeError:
             pass
+    if review_findings is not None:
+        try:
+            findings_json = json.dumps(review_findings)
+            review_findings = json.loads(
+                redact_sensitive_text(findings_json, force=True)
+            )
+        except (TypeError, json.JSONDecodeError):
+            return tool_error("review_findings must be a JSON array of objects")
     created_cards = args.get("created_cards")
     artifacts = args.get("artifacts")
     if created_cards is not None:
@@ -746,6 +756,20 @@ def _handle_complete(args: dict, **kw) -> str:
     try:
         kb, conn = _connect(board=board)
         try:
+            if review_verdict is not None:
+                ok = kb.submit_review_verdict(
+                    conn,
+                    tid,
+                    verdict=str(review_verdict),
+                    summary=summary or result,
+                    findings=review_findings,
+                    expected_run_id=_worker_run_id(tid),
+                )
+                if not ok:
+                    return tool_error(
+                        "review verdict could not be applied; provide a valid typed finding and retry/reclaim the review run"
+                    )
+                return _ok(task_id=tid, review_verdict=review_verdict)
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
@@ -1812,6 +1836,49 @@ KANBAN_COMPLETE_SCHEMA = {
                     "possible; this exists for compatibility with "
                     "callers that still set --result on the CLI."
                 ),
+            },
+            "review_verdict": {
+                "type": "string",
+                "enum": ["approved", "changes_requested"],
+                "description": (
+                    "Optional typed review verdict. ``changes_requested`` "
+                    "requires at least one valid blocker finding."
+                ),
+            },
+            "review_findings": {
+                "type": "array",
+                "description": (
+                    "Typed review evidence. Each object may contain "
+                    "classification, basis, evidence_refs, outcome_impact, "
+                    "minimum_fix, and criterion_id."
+                ),
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "classification": {
+                            "type": "string",
+                            "enum": [
+                                "blocker", "follow_up", "accepted_risk",
+                                "unrelated", "not_verified",
+                            ],
+                        },
+                        "basis": {
+                            "type": "string",
+                            "enum": [
+                                "frozen_acceptance", "user_outcome",
+                                "severe_regression", "explicit_security_boundary",
+                            ],
+                        },
+                        "evidence_refs": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                        "outcome_impact": {"type": "string"},
+                        "minimum_fix": {"type": "string"},
+                        "criterion_id": {"type": "string"},
+                    },
+                    "required": ["classification"],
+                },
             },
             "created_cards": {
                 "type": "array",

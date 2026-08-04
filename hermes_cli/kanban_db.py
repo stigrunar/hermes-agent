@@ -86,6 +86,7 @@ import logging
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
@@ -101,6 +102,138 @@ _log = logging.getLogger(__name__)
 
 VALID_STATUSES = {"triage", "todo", "scheduled", "ready", "running", "blocked", "review", "done", "archived"}
 VALID_INITIAL_STATUSES = {"running", "blocked"}
+VALID_REVIEW_VERDICTS = {"approved", "changes_requested"}
+
+
+class ReviewFindingClassification(str, Enum):
+    BLOCKER = "blocker"
+    FOLLOW_UP = "follow_up"
+    ACCEPTED_RISK = "accepted_risk"
+    UNRELATED = "unrelated"
+    NOT_VERIFIED = "not_verified"
+
+
+class ReviewFindingBasis(str, Enum):
+    FROZEN_ACCEPTANCE = "frozen_acceptance"
+    USER_OUTCOME = "user_outcome"
+    SEVERE_REGRESSION = "severe_regression"
+    EXPLICIT_SECURITY_BOUNDARY = "explicit_security_boundary"
+
+
+class OutcomeReviewDecision(str, Enum):
+    MUTATE_FROZEN_SCOPE = "mutate_frozen_scope"
+    REOPEN_SCOPE = "reopen_scope"
+    ACCEPT_RISK = "accept_risk"
+    AUTHORIZE_EXTRA_REVIEW = "authorize_extra_review"
+    RELEASE = "release"
+    CLOSEOUT = "closeout"
+    HOLD_CLOSEOUT = "hold_closeout"
+
+
+@dataclass(frozen=True)
+class ReviewBudget:
+    qa: int = 1
+    bounded_remediation: int = 1
+    targeted_recheck: int = 1
+
+
+STANDARD_REVIEW_BUDGET = ReviewBudget()
+
+
+@dataclass(frozen=True)
+class ReviewFinding:
+    """Typed review evidence; only a valid blocker may drive a recut."""
+
+    classification: ReviewFindingClassification
+    basis: Optional[ReviewFindingBasis] = None
+    evidence_refs: tuple[str, ...] = ()
+    outcome_impact: Optional[str] = None
+    minimum_fix: Optional[str] = None
+    criterion_id: Optional[str] = None
+
+    @classmethod
+    def from_mapping(cls, value: Mapping[str, Any]) -> "ReviewFinding":
+        if not isinstance(value, Mapping):
+            raise ValueError("review finding must be an object mapping")
+        allowed = {
+            "classification", "basis", "evidence_refs", "outcome_impact",
+            "minimum_fix", "criterion_id",
+        }
+        unknown = sorted(set(value) - allowed)
+        if unknown:
+            raise ValueError(f"unknown review finding fields: {unknown}")
+        try:
+            classification = ReviewFindingClassification(value.get("classification"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid review finding classification") from exc
+        raw_basis = value.get("basis")
+        try:
+            basis = ReviewFindingBasis(raw_basis) if raw_basis is not None else None
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid review finding basis") from exc
+        raw_refs = value.get("evidence_refs", ())
+        if isinstance(raw_refs, (str, bytes)) or not isinstance(raw_refs, (list, tuple)):
+            raise ValueError("review finding evidence_refs must be a list")
+        evidence_refs = tuple(
+            ref.strip() for ref in raw_refs if isinstance(ref, str) and ref.strip()
+        )
+        if len(evidence_refs) != len(raw_refs):
+            raise ValueError("review finding evidence_refs must contain non-empty strings")
+
+        def optional_text(name: str) -> Optional[str]:
+            raw = value.get(name)
+            if raw is None:
+                return None
+            if not isinstance(raw, str) or not raw.strip():
+                raise ValueError(f"review finding {name} must be a non-empty string")
+            return raw.strip()
+
+        finding = cls(
+            classification=classification,
+            basis=basis,
+            evidence_refs=evidence_refs,
+            outcome_impact=optional_text("outcome_impact"),
+            minimum_fix=optional_text("minimum_fix"),
+            criterion_id=optional_text("criterion_id"),
+        )
+        if finding.classification is ReviewFindingClassification.BLOCKER:
+            if finding.basis is None:
+                raise ValueError("blocking review finding requires an allowed basis")
+            if not finding.evidence_refs:
+                raise ValueError("blocking review finding requires evidence_refs")
+            if finding.outcome_impact is None:
+                raise ValueError("blocking review finding requires outcome_impact")
+            if finding.minimum_fix is None:
+                raise ValueError("blocking review finding requires minimum_fix")
+            if (
+                finding.basis is ReviewFindingBasis.FROZEN_ACCEPTANCE
+                and finding.criterion_id is None
+            ):
+                raise ValueError("frozen_acceptance blocker requires criterion_id")
+        return finding
+
+    def to_mapping(self) -> dict[str, Any]:
+        return {
+            "classification": self.classification.value,
+            "basis": self.basis.value if self.basis is not None else None,
+            "evidence_refs": list(self.evidence_refs),
+            "outcome_impact": self.outcome_impact,
+            "minimum_fix": self.minimum_fix,
+            "criterion_id": self.criterion_id,
+        }
+
+
+def validate_review_findings(
+    findings: Optional[Iterable[Mapping[str, Any]]],
+) -> tuple[ReviewFinding, ...]:
+    if findings is None:
+        return ()
+    if isinstance(findings, (str, bytes, Mapping)):
+        raise ValueError("review findings must be a list of object mappings")
+    try:
+        return tuple(ReviewFinding.from_mapping(item) for item in findings)
+    except TypeError as exc:
+        raise ValueError("review findings must be iterable") from exc
 
 # Typed block reasons. Distinguishes the two fundamentally different things a
 # worker (or human) means by "blocked", so each can be routed differently
@@ -6825,6 +6958,269 @@ def request_changes(
             run_id=run_id,
         )
     return True, implementer
+
+
+def _review_findings_payload(
+    findings: Optional[Iterable[Mapping[str, Any]]],
+) -> list[dict[str, Any]]:
+    """Validate, redact, and serialize typed findings at the DB boundary."""
+    typed = validate_review_findings(findings)
+    return [redact_review_value(item.to_mapping()) for item in typed]
+
+
+def _review_verdict_payload(
+    *,
+    verdict: str,
+    findings: list[dict[str, Any]],
+    summary: Optional[str],
+) -> dict[str, Any]:
+    return {
+        "verdict": verdict,
+        "findings": findings,
+        "summary": redact_review_value(summary) if summary else None,
+    }
+
+
+def _latest_review_verdict(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, Any]]:
+    row = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None or not row["payload"]:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+    except (TypeError, json.JSONDecodeError):
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _review_budget_allows(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    verdict: str,
+    budget: ReviewBudget,
+) -> bool:
+    """Bound repeated review loops unless an explicit extra-review decision exists."""
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id = ? AND kind = 'review_verdict' ORDER BY id",
+        (task_id,),
+    ).fetchall()
+    if not rows:
+        return True
+    prior_verdicts: list[str] = []
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if isinstance(payload, dict) and isinstance(payload.get("verdict"), str):
+            prior_verdicts.append(payload["verdict"])
+    # One bounded remediation and one targeted review are the standard loop.
+    if verdict == "changes_requested" and len(prior_verdicts) >= budget.bounded_remediation:
+        decision = conn.execute(
+            "SELECT payload FROM task_events "
+            "WHERE task_id = ? AND kind = 'outcome_review_decision' "
+            "ORDER BY id DESC LIMIT 1",
+            (task_id,),
+        ).fetchone()
+        if decision is None:
+            return False
+        try:
+            payload = json.loads(decision["payload"]) if decision["payload"] else {}
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        if not isinstance(payload, dict) or payload.get("decision") != OutcomeReviewDecision.AUTHORIZE_EXTRA_REVIEW.value:
+            return False
+    return len(prior_verdicts) < (
+        budget.qa + budget.bounded_remediation + budget.targeted_recheck + 1
+    )
+
+
+def _merge_latest_run_review_metadata(
+    conn: sqlite3.Connection,
+    task_id: str,
+    metadata: dict[str, Any],
+) -> None:
+    row = conn.execute(
+        "SELECT id, metadata FROM task_runs WHERE task_id = ? "
+        "ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return
+    existing: dict[str, Any] = {}
+    if row["metadata"]:
+        try:
+            decoded = json.loads(row["metadata"])
+            if isinstance(decoded, dict):
+                existing = decoded
+        except (TypeError, json.JSONDecodeError):
+            pass
+    existing.update(metadata)
+    conn.execute(
+        "UPDATE task_runs SET metadata = ? WHERE id = ?",
+        (json.dumps(redact_review_value(existing), ensure_ascii=False), int(row["id"])),
+    )
+
+
+def submit_review_verdict(
+    conn: sqlite3.Connection,
+    review_task_id: str,
+    *,
+    verdict: str,
+    summary: Optional[str] = None,
+    findings: Optional[Iterable[Mapping[str, Any]]] = None,
+    expected_run_id: Optional[int] = None,
+    budget: ReviewBudget = STANDARD_REVIEW_BUDGET,
+) -> bool:
+    """Apply a typed verdict to the current first-class review lane.
+
+    The current graph uses one task that moves ``review -> running`` for the
+    reviewer, unlike the older ``review_handoffs`` table. This function keeps
+    the R1 typed contract while delegating state transitions to the canonical
+    current lifecycle helpers, so review is never encoded as a block.
+    """
+    verdict = str(verdict or "").strip().lower()
+    if verdict not in VALID_REVIEW_VERDICTS:
+        return False
+    try:
+        serialized_findings = _review_findings_payload(findings)
+    except ValueError:
+        return False
+    if verdict == "changes_requested" and not any(
+        finding["classification"] == ReviewFindingClassification.BLOCKER.value
+        for finding in serialized_findings
+    ):
+        # A requested recut must be justified by a typed blocker; prose alone
+        # cannot mutate the graph.
+        return False
+    with write_txn(conn):
+        prior = _latest_review_verdict(conn, review_task_id)
+        payload = _review_verdict_payload(
+            verdict=verdict, findings=serialized_findings, summary=summary,
+        )
+        if prior == payload:
+            return True
+        if not _review_budget_allows(
+            conn, review_task_id, verdict=verdict, budget=budget,
+        ):
+            return False
+
+    if verdict == "changes_requested":
+        ok, _detail = request_changes(
+            conn,
+            review_task_id,
+            reason=summary or "typed blocker requires a bounded recut",
+            expected_run_id=expected_run_id,
+        )
+        if not ok:
+            return False
+        with write_txn(conn):
+            _merge_latest_run_review_metadata(
+                conn,
+                review_task_id,
+                {"review_verdict": verdict, "review_findings": serialized_findings},
+            )
+            run = conn.execute(
+                "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+                (review_task_id,),
+            ).fetchone()
+            _append_event(
+                conn,
+                review_task_id,
+                "review_verdict",
+                payload,
+                run_id=int(run["id"]) if run else None,
+            )
+        return True
+
+    completed = complete_task(
+        conn,
+        review_task_id,
+        summary=summary or "review approved",
+        metadata={
+            "review_verdict": verdict,
+            "review_findings": serialized_findings,
+        },
+        expected_run_id=expected_run_id,
+    )
+    if not completed:
+        return False
+    with write_txn(conn):
+        run = conn.execute(
+            "SELECT id FROM task_runs WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+            (review_task_id,),
+        ).fetchone()
+        _append_event(
+            conn,
+            review_task_id,
+            "review_verdict",
+            payload,
+            run_id=int(run["id"]) if run else None,
+        )
+    return True
+
+
+def apply_outcome_review_decision(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    decision: str,
+    actor: str,
+    reason: Optional[str] = None,
+    findings: Optional[Iterable[Mapping[str, Any]]] = None,
+    reviewer: Optional[str] = None,
+) -> bool:
+    """Record an explicit review decision and apply only its bounded action."""
+    try:
+        decision_value = OutcomeReviewDecision(decision).value
+        serialized_findings = _review_findings_payload(findings)
+    except (TypeError, ValueError):
+        return False
+    actor = _canonical_assignee(actor) or actor
+    payload = {
+        "decision": decision_value,
+        "actor": actor,
+        "reason": redact_review_value(reason) if reason else None,
+        "findings": serialized_findings,
+        "reviewer": _canonical_assignee(reviewer) if reviewer else None,
+    }
+    if decision_value in {
+        OutcomeReviewDecision.MUTATE_FROZEN_SCOPE.value,
+        OutcomeReviewDecision.REOPEN_SCOPE.value,
+    }:
+        return False
+    if decision_value == OutcomeReviewDecision.HOLD_CLOSEOUT.value:
+        with write_txn(conn):
+            _append_event(conn, task_id, "outcome_review_decision", payload)
+        return True
+    if decision_value == OutcomeReviewDecision.AUTHORIZE_EXTRA_REVIEW.value:
+        with write_txn(conn):
+            _append_event(conn, task_id, "outcome_review_decision", payload)
+        return True
+    if decision_value in {
+        OutcomeReviewDecision.ACCEPT_RISK.value,
+        OutcomeReviewDecision.RELEASE.value,
+        OutcomeReviewDecision.CLOSEOUT.value,
+    }:
+        with write_txn(conn):
+            _append_event(conn, task_id, "outcome_review_decision", payload)
+        if decision_value == OutcomeReviewDecision.HOLD_CLOSEOUT.value:
+            return True
+        return complete_task(
+            conn,
+            task_id,
+            summary=reason or f"outcome review decision: {decision_value}",
+            metadata={"outcome_review_decision": payload},
+        )
+    return False
 
 
 def promote_task(
