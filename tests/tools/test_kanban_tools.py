@@ -504,6 +504,15 @@ def _architect_db_receipt(worker_env):
         (
             {
                 "architect_routing": _architect_routing(
+                    architecture_document_path="architecture.md",
+                    requested_actions=["write_architecture_document"],
+                )
+            },
+            "strict descendant directory",
+        ),
+        (
+            {
+                "architect_routing": _architect_routing(
                     architecture_document_path="/tmp/architecture.md",
                     requested_actions=["write_architecture_document"],
                 )

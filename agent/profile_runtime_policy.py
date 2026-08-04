@@ -591,6 +591,11 @@ def materialize_direct_architect_create(
                 "architecture_document_path must be a clean relative path beneath "
                 "the canonical task workspace"
             )
+        if len(relative_document.parts) < 2:
+            raise ProfileRuntimePolicyError(
+                "architecture_document_path must place the document beneath a "
+                "strict descendant directory of the canonical task workspace"
+            )
 
     project_repo = _resolve_project_primary_repo(project_id)
 
