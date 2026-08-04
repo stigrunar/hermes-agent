@@ -76,6 +76,7 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _TELEGRAM_CONNECT_TIMEOUT_SECS_DEFAULT = 180.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
+_IDLE_RUNTIME_STATUS_HEARTBEAT_INTERVAL_SECONDS = 10.0
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
 _GATEWAY_HYGIENE_PLATFORM = "gateway_hygiene"
 
@@ -7569,7 +7570,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         self._update_runtime_status("running", drain_quiesced=False)
 
-    async def _drain_control_watcher(self, interval: float = 1.0) -> None:
+    async def _drain_control_watcher(
+        self,
+        interval: float = 1.0,
+        runtime_status_heartbeat_interval: float = (
+            _IDLE_RUNTIME_STATUS_HEARTBEAT_INTERVAL_SECONDS
+        ),
+    ) -> None:
         """Background task: reconcile gateway accept-state with the drain marker.
 
         Polls ``.drain_request.json`` (presence-based contract,
@@ -7580,13 +7587,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         instantiation epoch (one that survived a machine restart on the durable
         HERMES_HOME volume — NS-570) is treated as absent by ``drain_requested``
         and is NOT honoured; only a marker from the current instantiation flips
-        the gateway into drain. Best-effort: any tick error is logged and the
-        loop continues (a transient stat() failure must not wedge the gateway).
+        the gateway into drain. While no marker is present, the same loop
+        refreshes the coherent runtime work snapshot every 10s. This keeps the
+        canonical process-home status fresh for external pre-arm checks without
+        writing on every 1s marker poll. Best-effort: any tick error is logged
+        and the loop continues (a transient stat() failure must not wedge the
+        gateway).
         """
         from gateway.drain_control import drain_requested
 
+        next_runtime_status_heartbeat = time.monotonic()
         while self._running:
             try:
+                now = time.monotonic()
                 if drain_requested():
                     self._enter_external_drain()
                     # Seal only after one event-loop tick atomically observes
@@ -7608,8 +7621,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     else:
                         self._persist_active_agents()
+                    # Drain reconciliation already refreshes runtime status.
+                    next_runtime_status_heartbeat = (
+                        now + runtime_status_heartbeat_interval
+                    )
                 else:
                     self._exit_external_drain()
+                    if now >= next_runtime_status_heartbeat:
+                        self._persist_active_agents()
+                        next_runtime_status_heartbeat = (
+                            now + runtime_status_heartbeat_interval
+                        )
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

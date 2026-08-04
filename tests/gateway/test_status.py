@@ -153,12 +153,15 @@ class TestGatewayPidState:
         token = set_hermes_home_override(str(profile_home))
         try:
             status.write_pid_file()
+            status.write_runtime_status(gateway_state="running", active_agents=0)
         finally:
             reset_hermes_home_override(token)
 
         # PID file must land in the process-level home, not the profile home.
         assert (process_home / "gateway.pid").exists()
         assert not (profile_home / "gateway.pid").exists()
+        assert (process_home / "gateway_state.json").exists()
+        assert not (profile_home / "gateway_state.json").exists()
 
         payload = json.loads((process_home / "gateway.pid").read_text())
         assert payload["pid"] == os.getpid()

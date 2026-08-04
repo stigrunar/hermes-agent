@@ -1150,7 +1150,8 @@ def derive_gateway_busy(
     zero when absent/unparseable so older status records remain readable.
 
     NOTE: liveness keys off ``gateway_running`` (a live PID / health probe),
-    NEVER ``updated_at`` — a healthy idle gateway never advances that timestamp.
+    NEVER ``updated_at``. The runtime heartbeat advances that timestamp, but a
+    delayed best-effort status write must not make a live gateway look down.
     """
     if not gateway_running:
         return False

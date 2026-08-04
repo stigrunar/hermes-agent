@@ -12,6 +12,7 @@ Q-B, exercises a real `hermes gateway run`); these lock the unit contract.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import socket
 from pathlib import Path
@@ -21,7 +22,11 @@ from aiohttp import ClientSession
 import pytest
 
 import gateway.drain_control as dc
-from gateway.run import GatewayRunner
+import gateway.status as gateway_status
+from gateway.run import (
+    GatewayRunner,
+    _IDLE_RUNTIME_STATUS_HEARTBEAT_INTERVAL_SECONDS,
+)
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent, MessageType
 from gateway.status import read_runtime_status
@@ -172,6 +177,70 @@ class TestDrainStateMachine:
 
 
 class TestDrainWatcher:
+
+    def test_idle_runtime_status_heartbeat_is_bounded_below_prearm_ttl(self):
+        assert 0 < _IDLE_RUNTIME_STATUS_HEARTBEAT_INTERVAL_SECONDS < 20
+
+    @pytest.mark.asyncio
+    async def test_idle_watcher_refreshes_truthful_process_home_status(
+        self, home, tmp_path
+    ):
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+        profile_home = tmp_path / "profiles" / "worker"
+        profile_home.mkdir(parents=True)
+        gateway_status.write_runtime_status(
+            gateway_state="running",
+            active_agents=0,
+            active_cron_jobs=0,
+            active_api_runs=0,
+            drain_quiesced=False,
+        )
+        initial = gateway_status.read_runtime_status()
+        assert initial is not None
+
+        runner, _ = _drain_runner()
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        token = set_hermes_home_override(str(profile_home))
+        task = None
+        try:
+            task = asyncio.create_task(
+                runner._drain_control_watcher(
+                    interval=0.005,
+                    runtime_status_heartbeat_interval=0.08,
+                )
+            )
+            await asyncio.sleep(0.02)
+            first = gateway_status.read_runtime_status()
+            assert first is not None
+            assert first["updated_at"] != initial["updated_at"]
+
+            # The 5ms marker watcher must not rewrite status on every tick.
+            await asyncio.sleep(0.03)
+            unchanged = gateway_status.read_runtime_status()
+            assert unchanged is not None
+            assert unchanged["updated_at"] == first["updated_at"]
+
+            await asyncio.sleep(0.06)
+            refreshed = gateway_status.read_runtime_status()
+            assert refreshed is not None
+        finally:
+            runner._running = False
+            if task is not None:
+                await task
+            reset_hermes_home_override(token)
+
+        assert refreshed["updated_at"] != first["updated_at"]
+        assert refreshed["gateway_state"] == "running"
+        assert refreshed["drain_quiesced"] is False
+        assert refreshed["active_agents"] == 0
+        assert refreshed["active_cron_jobs"] == 0
+        assert refreshed["active_api_runs"] == 0
+        assert refreshed["active_work"] == 0
+        assert not (profile_home / "gateway_state.json").exists()
+        assert json.loads((home / "gateway_state.json").read_text()) == refreshed
 
     @pytest.mark.asyncio
     async def test_watcher_enters_then_exits_with_marker(self, home):
