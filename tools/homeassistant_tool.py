@@ -41,6 +41,7 @@ def _get_config():
         (
             (_HASS_URL if legacy_globals_allowed else "")
             or get_secret("HASS_URL", "http://homeassistant.local:8123")
+            or "http://homeassistant.local:8123"
         ).rstrip("/"),
         (_HASS_TOKEN if legacy_globals_allowed else "")
         or get_secret("HASS_TOKEN", ""),
