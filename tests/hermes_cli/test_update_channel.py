@@ -76,10 +76,25 @@ def test_configured_versioned_tested_branch_without_stig_remote_fails_closed(tmp
         )
 
 
-def test_incomplete_versioned_tested_branch_fails_closed(tmp_path):
+@pytest.mark.parametrize("branch", ["release/stig-tested-", "release/stig-tested-u3-"])
+@pytest.mark.parametrize("explicit", [True, False], ids=["explicit", "configured"])
+def test_incomplete_versioned_tested_branch_fails_closed(tmp_path, branch, explicit):
     with pytest.raises(UpdateChannelError, match="version suffix"):
+        if explicit:
+            resolve_update_target(branch, project_root=_repo(tmp_path), config={})
+        else:
+            resolve_update_target(
+                project_root=_repo(tmp_path),
+                config={"updates": {"release_channel": branch}},
+            )
+
+
+def test_invalid_explicit_versioned_branch_is_rejected_before_target_selection(tmp_path):
+    with pytest.raises(UpdateChannelError, match="valid branch"):
         resolve_update_target(
-            "release/stig-tested-", project_root=_repo(tmp_path), config={}
+            "release/stig-tested-u3 bad",
+            project_root=_repo(tmp_path, stig=True),
+            config={},
         )
 
 

@@ -116,9 +116,10 @@ def _has_remote(project_root: Path, name: str) -> bool:
 
 def _is_versioned_stig_tested_release(branch: str) -> bool:
     """Return whether ``branch`` is a versioned private tested release ref."""
-    return branch.startswith(STIG_TESTED_RELEASE_VERSIONED_PREFIX) and len(
-        branch
-    ) > len(STIG_TESTED_RELEASE_VERSIONED_PREFIX)
+    if not branch.startswith(STIG_TESTED_RELEASE_VERSIONED_PREFIX):
+        return False
+    suffix = branch[len(STIG_TESTED_RELEASE_VERSIONED_PREFIX) :]
+    return bool(suffix) and not suffix.startswith("-") and not suffix.endswith("-")
 
 
 def _private_tested_target(branch: str, project_root: Path) -> Optional[UpdateTarget]:
