@@ -25,6 +25,7 @@ class UpdateChannelError(ValueError):
 
 _MISSING = object()
 STIG_TESTED_RELEASE_BRANCH = "release/stig-tested"
+STIG_TESTED_RELEASE_VERSIONED_PREFIX = f"{STIG_TESTED_RELEASE_BRANCH}-"
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,28 @@ def _has_remote(project_root: Path, name: str) -> bool:
     return re.search(pattern, text, flags=re.MULTILINE) is not None
 
 
+def _is_versioned_stig_tested_release(branch: str) -> bool:
+    """Return whether ``branch`` is a versioned private tested release ref."""
+    return branch.startswith(STIG_TESTED_RELEASE_VERSIONED_PREFIX) and len(
+        branch
+    ) > len(STIG_TESTED_RELEASE_VERSIONED_PREFIX)
+
+
+def _private_tested_target(branch: str, project_root: Path) -> Optional[UpdateTarget]:
+    """Resolve versioned private tested refs without falling back to origin."""
+    if not branch.startswith(STIG_TESTED_RELEASE_VERSIONED_PREFIX):
+        return None
+    if not _is_versioned_stig_tested_release(branch):
+        raise UpdateChannelError(
+            "versioned private tested release refs must include a version suffix"
+        )
+    if not _has_remote(project_root, "stig"):
+        raise UpdateChannelError(
+            f"private tested release {branch!r} requires the configured 'stig' remote"
+        )
+    return UpdateTarget(remote="stig", branch=branch)
+
+
 def resolve_update_target(
     explicit_branch: Optional[str] = None,
     *,
@@ -128,8 +151,12 @@ def resolve_update_target(
     """
     if explicit_branch is not None:
         branch = _validate_branch(explicit_branch, source="--branch")
+        project_root = Path(project_root)
+        versioned_target = _private_tested_target(branch, project_root)
+        if versioned_target is not None:
+            return versioned_target
         remote = "stig" if branch == STIG_TESTED_RELEASE_BRANCH and _has_remote(
-            Path(project_root), "stig"
+            project_root, "stig"
         ) else "origin"
         return UpdateTarget(remote=remote, branch=branch)
 
@@ -140,7 +167,18 @@ def resolve_update_target(
         raise UpdateChannelError("update config must be a mapping")
 
     configured = _configured_channel(config)
-    has_stig_remote = _has_remote(Path(project_root), "stig")
+    if configured is not None:
+        configured = _validate_branch(configured, source="updates.release_channel")
+    project_root = Path(project_root)
+    versioned_target = (
+        _private_tested_target(configured, project_root)
+        if configured is not None
+        else None
+    )
+    if versioned_target is not None:
+        return versioned_target
+
+    has_stig_remote = _has_remote(project_root, "stig")
     if has_stig_remote:
         if configured != STIG_TESTED_RELEASE_BRANCH:
             detail = (

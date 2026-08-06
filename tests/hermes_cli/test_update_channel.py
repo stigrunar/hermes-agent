@@ -44,6 +44,53 @@ def test_explicit_tested_branch_selects_stig_remote(tmp_path):
     ) == UpdateTarget("stig", "release/stig-tested")
 
 
+def test_explicit_versioned_tested_branch_selects_stig_remote(tmp_path):
+    root = _repo(tmp_path, stig=True)
+    branch = "release/stig-tested-u3-a9bfde9d"
+    assert resolve_update_target(
+        branch, project_root=root, config={"updates": {}}
+    ) == UpdateTarget("stig", branch)
+
+
+def test_configured_versioned_tested_branch_selects_stig_remote(tmp_path):
+    root = _repo(tmp_path, stig=True)
+    branch = "release/stig-tested-u3-a9bfde9d"
+    assert resolve_update_target(
+        project_root=root,
+        config={"updates": {"release_channel": branch}},
+    ) == UpdateTarget("stig", branch)
+
+
+def test_explicit_versioned_tested_branch_without_stig_remote_fails_closed(tmp_path):
+    branch = "release/stig-tested-u3-a9bfde9d"
+    with pytest.raises(UpdateChannelError, match="configured 'stig' remote"):
+        resolve_update_target(branch, project_root=_repo(tmp_path), config={})
+
+
+def test_configured_versioned_tested_branch_without_stig_remote_fails_closed(tmp_path):
+    branch = "release/stig-tested-u3-a9bfde9d"
+    with pytest.raises(UpdateChannelError, match="configured 'stig' remote"):
+        resolve_update_target(
+            project_root=_repo(tmp_path),
+            config={"updates": {"release_channel": branch}},
+        )
+
+
+def test_incomplete_versioned_tested_branch_fails_closed(tmp_path):
+    with pytest.raises(UpdateChannelError, match="version suffix"):
+        resolve_update_target(
+            "release/stig-tested-", project_root=_repo(tmp_path), config={}
+        )
+
+
+def test_invalid_configured_versioned_branch_is_rejected_on_stig_checkout(tmp_path):
+    with pytest.raises(UpdateChannelError, match="valid branch"):
+        resolve_update_target(
+            project_root=_repo(tmp_path, stig=True),
+            config={"updates": {"release_channel": "release/stig-tested-u3 bad"}},
+        )
+
+
 def test_explicit_other_branch_on_stig_checkout_uses_origin(tmp_path):
     root = _repo(tmp_path, stig=True)
     assert resolve_update_target(

@@ -1040,6 +1040,44 @@ class TestWebServerEndpoints:
             (["update", "--branch", "main"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
         ]
 
+    def test_update_hermes_forwards_versioned_private_branch(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+        from hermes_cli.update_channel import UpdateTarget
+
+        class Proc:
+            pid = 54321
+
+        branch = "release/stig-tested-u3-a9bfde9d"
+        calls = []
+
+        def fake_spawn(subcommand, name, *, env_overrides=None):
+            calls.append((subcommand, name, env_overrides))
+            return Proc()
+
+        monkeypatch.setattr(web_server, "_dashboard_local_update_managed_externally", lambda: False)
+        monkeypatch.setattr(web_server, "detect_install_method", lambda _root: "git")
+        monkeypatch.setattr(
+            "hermes_cli.update_channel.resolve_update_target",
+            lambda **_kwargs: UpdateTarget("stig", branch),
+        )
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "c" * 32)
+        monkeypatch.setattr(web_server, "_spawn_hermes_action", fake_spawn)
+        web_server._ACTION_PROCS.pop("hermes-update", None)
+        web_server._ACTION_RESULTS.pop("hermes-update", None)
+
+        resp = self.client.post("/api/hermes/update")
+
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "ok": True,
+            "pid": 54321,
+            "name": "hermes-update",
+            "action_id": "c" * 32,
+        }
+        assert calls == [
+            (["update", "--branch", branch], "hermes-update", {"HERMES_ACTION_ID": "c" * 32})
+        ]
+
     def test_update_hermes_reuses_running_action(self, monkeypatch):
         import hermes_cli.web_server as web_server
         from hermes_cli.update_channel import UpdateTarget
