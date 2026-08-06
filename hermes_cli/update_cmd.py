@@ -1246,6 +1246,8 @@ def _restore_stashed_changes(
     stash_ref: str,
     prompt_user: bool = False,
     input_fn=None,
+    *,
+    drop_on_success: bool = True,
 ) -> bool:
     if prompt_user:
         print()
@@ -1321,10 +1323,13 @@ def _restore_stashed_changes(
         )
         print("Working tree reset to clean state.")
         print(f"Restore your changes later with: git stash apply {stash_ref}")
-        # Don't sys.exit — the code update itself succeeded, only the stash
-        # restore had conflicts.  Let cmd_update continue with pip install,
-        # skill sync, and gateway restart.
         return False
+
+    if not drop_on_success:
+        print(
+            "  ℹ Exact update autostash retained until post-restore validation passes."
+        )
+        return True
 
     stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
     if stash_selector is None:
@@ -1358,6 +1363,135 @@ def _restore_stashed_changes(
     print("⚠ Local changes were restored on top of the updated codebase.")
     print("  Review `git diff` / `git status` if Hermes behaves unexpectedly.")
     return True
+
+
+def _drop_verified_autostash(
+    git_cmd: list[str],
+    cwd: Path,
+    stash_ref: str,
+) -> bool:
+    """Drop only the exact autostash whose restored overlay passed validation."""
+    stash_selector = _resolve_stash_selector(git_cmd, cwd, stash_ref)
+    if stash_selector is None:
+        print(
+            "⚠ Restored overlay passed validation, but Hermes couldn't find its "
+            "exact autostash entry to drop."
+        )
+        _print_stash_cleanup_guidance(stash_ref)
+        return False
+
+    drop = subprocess.run(
+        git_cmd + ["stash", "drop", stash_selector],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if drop.returncode != 0:
+        print(
+            "⚠ Restored overlay passed validation, but its exact autostash "
+            "could not be dropped."
+        )
+        if drop.stderr.strip():
+            print(f"  {drop.stderr.strip().splitlines()[0]}")
+        _print_stash_cleanup_guidance(stash_ref, stash_selector)
+        return False
+    return True
+
+
+def _validate_restored_python_overlay(
+    git_cmd: list[str],
+    cwd: Path,
+) -> tuple[bool, str | None, str | None]:
+    """Compile every changed/untracked Python file restored by autostash.
+
+    The regular post-pull guard validates Hermes' fixed startup-critical set.
+    A local overlay can modify other Python files, so validate the actual dirty
+    paths too before deleting the only automatic recovery copy or restarting.
+    """
+    import py_compile
+    import tempfile
+
+    cwd = Path(cwd).resolve()
+    commands = (
+        git_cmd + ["diff", "--name-only", "-z", "--diff-filter=ACMR"],
+        git_cmd + ["ls-files", "--others", "--exclude-standard", "-z"],
+    )
+    changed: set[str] = set()
+    for command in commands:
+        result = subprocess.run(
+            command,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout or "git path scan failed").strip()
+            return False, None, detail.splitlines()[0]
+        changed.update(path for path in result.stdout.split("\0") if path)
+
+    with tempfile.TemporaryDirectory(prefix="hermes-overlay-syntax-") as tmpdir:
+        for relpath in sorted(changed):
+            if not relpath.endswith(".py"):
+                continue
+            path = (cwd / relpath).resolve()
+            try:
+                path.relative_to(cwd)
+            except ValueError:
+                return False, relpath, "changed path escapes the repository root"
+            if not path.is_file():
+                continue
+            cfile = Path(tmpdir) / (relpath.replace("/", "__") + "c")
+            try:
+                py_compile.compile(str(path), cfile=str(cfile), doraise=True)
+            except py_compile.PyCompileError as exc:
+                return False, relpath, str(exc)
+            except OSError as exc:
+                return False, relpath, f"could not read: {exc}"
+    return True, None, None
+
+
+def _restore_pre_update_overlay(
+    git_cmd: list[str],
+    cwd: Path,
+    pre_pull_sha: str | None,
+    stash_ref: str,
+) -> bool:
+    """Fail closed to the prior checkout and reapply its exact local overlay."""
+    target = pre_pull_sha or "HEAD"
+    reset = subprocess.run(
+        git_cmd + ["reset", "--hard", target],
+        cwd=cwd,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+    if reset.returncode != 0:
+        print(f"  ✗ Could not restore prior checkout {target}.")
+        if reset.stderr.strip():
+            print(f"    {reset.stderr.strip().splitlines()[0]}")
+        print(f"  Local overlay remains recoverable from stash {stash_ref}.")
+        return False
+    if pre_pull_sha is None:
+        print("  ⚠ Pre-update HEAD was unavailable; the exact overlay remains stashed.")
+        return False
+
+    restored = _restore_stashed_changes(
+        git_cmd,
+        cwd,
+        stash_ref,
+        prompt_user=False,
+        drop_on_success=False,
+    )
+    if restored:
+        print("  ✓ Prior checkout and local overlay restored; update was not activated.")
+    else:
+        print(f"  ✗ Prior checkout restored, but apply stash {stash_ref} manually.")
+    return restored
 
 def _discard_stashed_changes(
     git_cmd: list[str],
@@ -3763,6 +3897,8 @@ def _cmd_update_impl(
         return
 
     # Fetch and pull
+    pre_pull_sha: str | None = None
+    restored_overlay_ref: str | None = None
     try:
 
         # The wrapper resolves the target up front so the fetch can be scoped
@@ -4080,13 +4216,57 @@ def _cmd_update_impl(
                         auto_stash_ref,
                     )
                 else:
-                    _m()._restore_stashed_changes(
+                    restored = _m()._restore_stashed_changes(
                         git_cmd,
                         _m().PROJECT_ROOT,
                         auto_stash_ref,
-                        prompt_user=prompt_for_restore,
+                        # A real update must preserve the local overlay
+                        # automatically. The no-update path above keeps the
+                        # historical interactive prompt because no checkout
+                        # changed underneath the user's work.
+                        prompt_user=False,
                         input_fn=gw_input_fn,
+                        drop_on_success=False,
                     )
+
+                    if not restored:
+                        print()
+                        print(
+                            "→ Restore failed; rolling back the code update before "
+                            "any dependency install or gateway restart..."
+                        )
+                        _restore_pre_update_overlay(
+                            git_cmd,
+                            _m().PROJECT_ROOT,
+                            pre_pull_sha,
+                            auto_stash_ref,
+                        )
+                        sys.exit(1)
+                    restored_overlay_ref = auto_stash_ref
+
+        if restored_overlay_ref is not None:
+            syntax_ok, failing_path, syntax_error = _validate_restored_python_overlay(
+                git_cmd, _m().PROJECT_ROOT
+            )
+            if not syntax_ok:
+                print()
+                print("✗ Restored local overlay failed the Python syntax gate.")
+                print(f"  Python syntax: {failing_path or 'path scan'}")
+                if syntax_error:
+                    for line in str(syntax_error).splitlines()[:6]:
+                        print(f"    {line}")
+                print(
+                    "→ Rolling back the code update before any dependency install "
+                    "or gateway restart..."
+                )
+                _restore_pre_update_overlay(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_pull_sha,
+                    restored_overlay_ref,
+                )
+                sys.exit(1)
+            print("✓ Restored local Python overlay passed syntax validation.")
 
         _invalidate_update_cache()
 
@@ -4223,11 +4403,36 @@ def _cmd_update_impl(
             _m().PROJECT_ROOT
         )
         if not import_ok:
+            if restored_overlay_ref is not None:
+                print()
+                print("✗ Restored local overlay failed the post-install import gate.")
+                print(f"  Critical import: {failing_module or 'unknown'}")
+                if import_error:
+                    print(f"    {import_error}")
+                print(
+                    "→ Rolling back the code update before any Node build or "
+                    "gateway restart..."
+                )
+                _restore_pre_update_overlay(
+                    git_cmd,
+                    _m().PROJECT_ROOT,
+                    pre_pull_sha,
+                    restored_overlay_ref,
+                )
+                sys.exit(1)
             print()
             print(f"  ⚠ {failing_module} still fails to import after updating:")
             print(f"      {import_error}")
             print("    Run `hermes update` again — if it persists, reinstall:")
             print("    https://hermes-agent.nousresearch.com")
+        elif restored_overlay_ref is not None:
+            _drop_verified_autostash(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                restored_overlay_ref,
+            )
+            restored_overlay_ref = None
+            print("✓ Local overlay restored and fast validation passed.")
 
         node_failures = _update_node_dependencies()
         _m()._build_web_ui(_m().PROJECT_ROOT / "web")
@@ -5456,6 +5661,16 @@ def _cmd_update_impl(
             sys.exit(1)
 
     except subprocess.CalledProcessError as e:
+        if restored_overlay_ref is not None:
+            print(f"✗ Update failed after restoring the local overlay: {e}")
+            print("→ Rolling back to the prior checkout and overlay...")
+            _restore_pre_update_overlay(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                pre_pull_sha,
+                restored_overlay_ref,
+            )
+            sys.exit(1)
         if sys.platform == "win32":
             print(f"⚠ Git update failed: {e}")
             print("→ Falling back to ZIP download...")
@@ -5464,6 +5679,17 @@ def _cmd_update_impl(
         else:
             print(f"✗ Update failed: {e}")
             sys.exit(1)
+    except Exception:
+        if restored_overlay_ref is not None:
+            print("✗ Update failed after restoring the local overlay.")
+            print("→ Rolling back to the prior checkout and overlay...")
+            _restore_pre_update_overlay(
+                git_cmd,
+                _m().PROJECT_ROOT,
+                pre_pull_sha,
+                restored_overlay_ref,
+            )
+        raise
 
 # --- Hoisted from the body of _cmd_update_impl (self-contained, no closure state) ---
 

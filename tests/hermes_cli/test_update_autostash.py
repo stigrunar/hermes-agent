@@ -7,6 +7,7 @@ import pytest
 
 from hermes_cli import config as hermes_config
 from hermes_cli import main as hermes_main
+from hermes_cli import update_cmd
 
 
 # ---------------------------------------------------------------------------
@@ -395,3 +396,170 @@ def test_update_autostash_survives_undeletable_untracked_dir(tmp_path):
         assert (pkg / "hermes-agent.rb").read_text() == "formula\n"
     finally:
         os.chmod(pkg, 0o755)
+
+
+def _init_overlay_repo(tmp_path):
+    import subprocess
+
+    def git(*args, check=True):
+        return subprocess.run(
+            ["git", *args],
+            cwd=tmp_path,
+            capture_output=True,
+            text=True,
+            check=check,
+        )
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "t@example.com")
+    git("config", "user.name", "t")
+    (tmp_path / "overlay.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    git("add", "overlay.py")
+    git("commit", "-qm", "base")
+    return git
+
+
+def test_verified_overlay_keeps_exact_stash_until_fast_gate_passes(tmp_path):
+    git = _init_overlay_repo(tmp_path)
+    (tmp_path / "overlay.py").write_text("VALUE = 'local'\n", encoding="utf-8")
+
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+    assert update_cmd._restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, drop_on_success=False
+    )
+    assert stash_ref in git("stash", "list", "--format=%H").stdout.splitlines()
+
+    assert update_cmd._validate_restored_python_overlay(
+        ["git"], tmp_path
+    ) == (True, None, None)
+    assert update_cmd._drop_verified_autostash(["git"], tmp_path, stash_ref)
+    assert stash_ref not in git("stash", "list", "--format=%H").stdout.splitlines()
+    assert (tmp_path / "overlay.py").read_text(encoding="utf-8") == "VALUE = 'local'\n"
+
+
+def test_restored_python_overlay_syntax_failure_is_detected(tmp_path):
+    _init_overlay_repo(tmp_path)
+    (tmp_path / "overlay.py").write_text("def broken(:\n", encoding="utf-8")
+
+    ok, failing_path, error = update_cmd._validate_restored_python_overlay(
+        ["git"], tmp_path
+    )
+
+    assert ok is False
+    assert failing_path == "overlay.py"
+    assert error is not None
+    assert "SyntaxError" in error
+
+
+def test_restore_conflict_recovers_prior_head_and_overlay(tmp_path):
+    git = _init_overlay_repo(tmp_path)
+    pre_pull_sha = git("rev-parse", "HEAD").stdout.strip()
+    (tmp_path / "overlay.py").write_text("VALUE = 'local'\n", encoding="utf-8")
+    stash_ref = hermes_main._stash_local_changes_if_needed(["git"], tmp_path)
+    assert stash_ref
+
+    (tmp_path / "overlay.py").write_text("VALUE = 'upstream'\n", encoding="utf-8")
+    git("add", "overlay.py")
+    git("commit", "-qm", "upstream")
+
+    assert not update_cmd._restore_stashed_changes(
+        ["git"], tmp_path, stash_ref, drop_on_success=False
+    )
+    assert update_cmd._restore_pre_update_overlay(
+        ["git"], tmp_path, pre_pull_sha, stash_ref
+    )
+    assert git("rev-parse", "HEAD").stdout.strip() == pre_pull_sha
+    assert (tmp_path / "overlay.py").read_text(encoding="utf-8") == "VALUE = 'local'\n"
+    assert stash_ref in git("stash", "list", "--format=%H").stdout.splitlines()
+
+
+def test_cmd_update_restore_failure_rolls_back_before_install(
+    monkeypatch, tmp_path, capsys
+):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    stash_ref = "abc123deadbeef"
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *args, **kwargs: stash_ref,
+    )
+    restore_kwargs = []
+    monkeypatch.setattr(
+        hermes_main,
+        "_restore_stashed_changes",
+        lambda *args, **kwargs: restore_kwargs.append(kwargs) or False,
+    )
+    rollback_calls = []
+    monkeypatch.setattr(
+        update_cmd,
+        "_restore_pre_update_overlay",
+        lambda *args: rollback_calls.append(args) or True,
+    )
+    side_effect, recorded = _make_update_side_effect()
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    with pytest.raises(SystemExit, match="1"):
+        hermes_main.cmd_update(SimpleNamespace())
+
+    assert restore_kwargs == [
+        {
+            "prompt_user": False,
+            "input_fn": None,
+            "drop_on_success": False,
+        }
+    ]
+    assert rollback_calls and rollback_calls[0][-1] == stash_ref
+    assert not any("pip" in " ".join(map(str, command)) for command in recorded)
+    assert "before any dependency install or gateway restart" in capsys.readouterr().out
+
+
+def test_cmd_update_drops_exact_stash_only_after_fast_gate(monkeypatch, tmp_path):
+    _setup_update_mocks(monkeypatch, tmp_path)
+    stash_ref = "abc123deadbeef"
+    monkeypatch.setattr(
+        hermes_main,
+        "_stash_local_changes_if_needed",
+        lambda *args, **kwargs: stash_ref,
+    )
+    order = []
+
+    def restore(*args, **kwargs):
+        order.append(("restore", args[2], kwargs))
+        return True
+
+    monkeypatch.setattr(hermes_main, "_restore_stashed_changes", restore)
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_restored_python_overlay",
+        lambda *args: order.append(("syntax",)) or (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_validate_critical_modules_import",
+        lambda *args: order.append(("imports",)) or (True, None, None),
+    )
+    monkeypatch.setattr(
+        update_cmd,
+        "_drop_verified_autostash",
+        lambda *args: order.append(("drop", args[2])) or True,
+    )
+    side_effect, _ = _make_update_side_effect()
+    monkeypatch.setattr(hermes_main.subprocess, "run", side_effect)
+
+    hermes_main.cmd_update(SimpleNamespace())
+
+    assert order[:4] == [
+        (
+            "restore",
+            stash_ref,
+            {
+                "prompt_user": False,
+                "input_fn": None,
+                "drop_on_success": False,
+            },
+        ),
+        ("syntax",),
+        ("imports",),
+        ("drop", stash_ref),
+    ]
