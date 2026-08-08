@@ -152,12 +152,13 @@ def _profile_notifier_lock_path(kanban_home: Path, profile: str) -> Path:
 
 
 _KANBAN_VISIBLE_FINAL_STATUSES = {"done", "archived"}
-_KANBAN_FAILURE_KINDS = {"blocked", "gave_up", "crashed", "timed_out"}
+_KANBAN_FAILURE_KINDS = {"blocked", "gave_up", "crashed", "timed_out", "iteration_exhausted"}
 _KANBAN_OUTCOME_EVENT_KIND = {
     "blocked": "blocked",
     "gave_up": "gave_up",
     "crashed": "crashed",
     "timed_out": "timed_out",
+    "iteration_exhausted": "iteration_exhausted",
 }
 _KANBAN_SILENT_COMPLETION_KINDS = {
     "board_hygiene",
@@ -486,7 +487,7 @@ class GatewayKanbanWatchersMixin:
 
         # "status" covers dashboard drag-drop and `_set_status_direct()`
         # writes — surface those transitions to subscribers too.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected")
+        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "iteration_exhausted", "status", "archived", "unblocked", "block_loop_detected")
         # Subscriptions are removed only when the task reaches a truly final
         # status (done / archived). We used to also unsub on any terminal
         # event kind (gave_up / crashed / timed_out / blocked), but that
@@ -778,26 +779,45 @@ class GatewayKanbanWatchersMixin:
                             if ev.payload and ev.payload.get("reason"):
                                 reason = f": {str(ev.payload['reason'])[:160]}"
                             msg = f"⏸ {board_tag}{tag}Kanban {sub['task_id']} blocked{reason}"
-                        elif kind == "gave_up":
-                            err = ""
-                            if ev.payload and ev.payload.get("error"):
-                                err = f"\n{str(ev.payload['error'])[:200]}"
-                            msg = (
-                                f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
-                                f"after repeated spawn failures{err}"
+                        elif kind in {"gave_up", "timed_out", "iteration_exhausted"}:
+                            payload = ev.payload or {}
+                            error_text = str(payload.get("error") or "")
+                            iteration_exhausted = (
+                                kind == "iteration_exhausted"
+                                or "iteration budget exhausted" in error_text.casefold()
+                                or str(payload.get("blocker_type") or "").casefold() == "iteration_exhausted"
                             )
+                            if iteration_exhausted:
+                                used = payload.get("budget_used")
+                                maximum = payload.get("budget_max")
+                                budget = (
+                                    f" ({used}/{maximum})"
+                                    if used is not None and maximum is not None
+                                    else ""
+                                )
+                                run_id = getattr(ev, "run_id", None) or payload.get("terminal_run_id")
+                                run = f" · run {run_id}" if run_id is not None else ""
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} iteration budget exhausted"
+                                    f"{budget}{run}; terminal for this revision, no automatic retry"
+                                )
+                            elif kind == "gave_up":
+                                err = f"\n{error_text[:200]}" if error_text else ""
+                                msg = (
+                                    f"✖ {board_tag}{tag}Kanban {sub['task_id']} gave up "
+                                    f"after repeated spawn failures{err}"
+                                )
+                            else:
+                                limit = payload.get("limit_seconds")
+                                limit_text = f" (max_runtime={int(limit)}s)" if limit is not None else ""
+                                msg = (
+                                    f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out"
+                                    f"{limit_text}; will retry"
+                                )
                         elif kind == "crashed":
                             msg = (
                                 f"✖ {board_tag}{tag}Kanban {sub['task_id']} worker crashed "
                                 f"(pid gone); dispatcher will retry"
-                            )
-                        elif kind == "timed_out":
-                            limit = 0
-                            if ev.payload and ev.payload.get("limit_seconds"):
-                                limit = int(ev.payload["limit_seconds"])
-                            msg = (
-                                f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
-                                f"(max_runtime={limit}s); will retry"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -961,7 +981,7 @@ class GatewayKanbanWatchersMixin:
                         task_terminal = (
                             task and task.status in _kb.TERMINAL_STATUSES
                         )
-                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "iteration_exhausted", "blocked")
                         _wake_kinds = {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
 

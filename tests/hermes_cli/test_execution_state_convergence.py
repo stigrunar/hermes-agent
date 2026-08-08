@@ -121,7 +121,7 @@ def test_c4_iteration_exhaustion_is_terminal_for_automation(kanban_home):
         )
         _age_latest_block(conn, tid)
         state = kb.get_reconciled_execution_state(conn, tid)
-        assert state.blocker_type is BlockerType.TERMINAL
+        assert state.blocker_type is BlockerType.ITERATION_EXHAUSTED
         assert state.resume_policy is ResumePolicy.NEVER
         assert state.resume_action == "do_not_resume"
         assert kb.reconcile_execution_states(conn, now=10**12) == []

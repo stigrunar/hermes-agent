@@ -1442,6 +1442,55 @@ def _handle_attachments(args: dict, **kw) -> str:
         return tool_error(f"kanban_attachments: {e}")
 
 
+_LONG_RUNNING_GOAL_WORK_KINDS = frozenset({
+    "broad_end_state",
+    "multi_phase_goal",
+    "unattended_goal",
+})
+
+
+def _normalize_goal_mode_admission(
+    *,
+    requested: bool,
+    quality_mode: object,
+    work_kind: object,
+    goal_mode_reason: object,
+    stop_when: object,
+) -> tuple[bool, Optional[dict[str, Any]]]:
+    """Deterministically admit only explicit long-running goal ownership.
+
+    Ordinary bounded implementation is one-shot. Goal mode is retained only
+    when the caller names a supported broad/multi-phase/unattended work kind,
+    a same-worker ownership reason, and an explicit stop condition.
+    """
+    if not requested:
+        return False, None
+    quality = str(quality_mode or "").strip().upper()
+    kind = str(work_kind or "").strip().casefold()
+    reason = str(goal_mode_reason or "").strip()
+    stop = str(stop_when or "").strip()
+    valid = kind in _LONG_RUNNING_GOAL_WORK_KINDS and bool(reason) and bool(stop)
+    if valid:
+        return True, {
+            "requested_goal_mode": True,
+            "effective_goal_mode": True,
+            "quality_mode": quality or None,
+            "work_kind": kind,
+            "goal_mode_reason": reason,
+            "stop_when": stop,
+            "reason": "explicit_long_running_goal_contract",
+        }
+    receipt = {
+        "requested_goal_mode": True,
+        "effective_goal_mode": False,
+        "quality_mode": quality or None,
+        "work_kind": kind or None,
+        "reason": "missing_explicit_long_running_goal_contract",
+        "required": ["goal_mode_reason", "stop_when", "broad_or_multi_phase_or_unattended_work_kind"],
+    }
+    return False, receipt
+
+
 def _handle_create(args: dict, **kw) -> str:
     """Create a child task. Orchestrator workers use this to fan out.
 
@@ -1514,9 +1563,15 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             f"skills must be a list of skill names, got {type(skills).__name__}"
         )
-    goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
+    requested_goal_mode, goal_bool_error = _parse_bool_arg(args, "goal_mode")
     if goal_bool_error:
         return tool_error(goal_bool_error)
+    goal_mode = requested_goal_mode
+    goal_mode_receipt = None
+    quality_mode = args.get("quality_mode")
+    work_kind = args.get("work_kind")
+    goal_mode_reason = args.get("goal_mode_reason")
+    stop_when = args.get("stop_when")
     goal_max_turns = args.get("goal_max_turns")
     model_override = args.get("model")
     provider_override = args.get("provider")
@@ -1539,6 +1594,16 @@ def _handle_create(args: dict, **kw) -> str:
         return tool_error(
             "kanban_create: architect_routing is only valid for assignee=dollyarchitect"
         )
+    if not is_architect_create:
+        goal_mode, goal_mode_receipt = _normalize_goal_mode_admission(
+            requested=bool(requested_goal_mode),
+            quality_mode=quality_mode,
+            work_kind=work_kind,
+            goal_mode_reason=goal_mode_reason,
+            stop_when=stop_when,
+        )
+        if not goal_mode:
+            goal_max_turns = None
     try:
         board, project_id, session_id = _resolve_gateway_create_routing(args)
         trusted_project_repo = None
@@ -1809,6 +1874,19 @@ def _handle_create(args: dict, **kw) -> str:
                 session_id=session_id,
                 _preinsert_body_materializer=architect_body_materializer,
             )
+            if goal_mode_receipt is not None:
+                goal_event_kind = (
+                    "goal_mode_admitted"
+                    if goal_mode_receipt.get("effective_goal_mode") is True
+                    else "goal_mode_normalized"
+                )
+                with kb.write_txn(conn):
+                    kb._append_event(
+                        conn,
+                        new_tid,
+                        goal_event_kind,
+                        dict(goal_mode_receipt),
+                    )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
             return _ok(
@@ -1819,6 +1897,12 @@ def _handle_create(args: dict, **kw) -> str:
                 subscribed=subscribed,
                 board=kb.get_current_board() if board is None else board,
                 project_id=new_task.project_id if new_task else project_id,
+                goal_mode=bool(new_task.goal_mode) if new_task else bool(goal_mode),
+                goal_mode_normalized=(
+                    goal_mode_receipt is not None
+                    and goal_mode_receipt.get("effective_goal_mode") is False
+                ),
+                goal_mode_receipt=goal_mode_receipt,
             )
         finally:
             conn.close()
@@ -2660,6 +2744,35 @@ KANBAN_CREATE_SCHEMA = {
                     "task, ['github-code-review'] for a reviewer task. "
                     "The names must match skills installed on the "
                     "assignee's profile."
+                ),
+            },
+            "quality_mode": {
+                "type": "string",
+                "description": (
+                    "Optional deterministic execution classification such as FEATURE. "
+                    "Bounded FEATURE implementation remains one-shot even when goal_mode "
+                    "is accidentally requested."
+                ),
+            },
+            "work_kind": {
+                "type": "string",
+                "description": (
+                    "Execution shape for goal-mode admission. Long-running goal mode is "
+                    "admitted only for broad_end_state, multi_phase_goal, or unattended_goal."
+                ),
+            },
+            "goal_mode_reason": {
+                "type": "string",
+                "description": (
+                    "Required with goal_mode=true: explicit reason the same worker/session "
+                    "must own a broad or multi-phase end state."
+                ),
+            },
+            "stop_when": {
+                "type": "string",
+                "description": (
+                    "Required with goal_mode=true: explicit terminal condition for the "
+                    "long-running ownership loop."
                 ),
             },
             "goal_mode": {

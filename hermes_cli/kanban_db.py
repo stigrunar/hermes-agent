@@ -313,7 +313,7 @@ def validate_review_findings(
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient", "iteration_exhausted"}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -5944,7 +5944,8 @@ def _task_is_execution_current(conn: sqlite3.Connection, task_id: str) -> bool:
 def _latest_block_payload(conn: sqlite3.Connection, task_id: str) -> tuple[str, str, int]:
     row = conn.execute(
         "SELECT payload, created_at FROM task_events "
-        "WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+        "WHERE task_id=? AND kind IN ('blocked','iteration_exhausted') "
+        "ORDER BY id DESC LIMIT 1",
         (task_id,),
     ).fetchone()
     if row is None:
@@ -5956,8 +5957,8 @@ def _latest_block_payload(conn: sqlite3.Connection, task_id: str) -> tuple[str, 
     if not isinstance(payload, dict):
         payload = {}
     return (
-        str(payload.get("reason") or payload.get("summary") or "").strip(),
-        str(payload.get("kind") or "").strip(),
+        str(payload.get("reason") or payload.get("summary") or payload.get("error") or "").strip(),
+        str(payload.get("kind") or payload.get("blocker_type") or "").strip(),
         int(row["created_at"] or 0),
     )
 
@@ -6231,6 +6232,11 @@ def recompute_ready(
         for row in todo_rows:
             task_id = row["id"]
             cur_status = row["status"]
+            execution_state = get_reconciled_execution_state(
+                conn, task_id, failure_limit=failure_limit,
+            )
+            if execution_state is not None and not execution_state.executable:
+                continue
             if (
                 cur_status == "todo"
                 and _dependency_wait_blocks_promotion(conn, task_id)
@@ -6347,6 +6353,19 @@ def claim_task(
             return None
         if is_non_executable_hygiene(current_row["hygiene_class"]) or current_row["superseded_by"]:
             _append_event(conn, task_id, "claim_rejected", {"reason": "historical_or_superseded"})
+            return None
+        execution_state = get_reconciled_execution_state(conn, task_id)
+        if execution_state is not None and not execution_state.executable:
+            _append_event(
+                conn,
+                task_id,
+                "claim_rejected",
+                {
+                    "reason": "execution_state_non_executable",
+                    "blocker_type": execution_state.blocker_type.value,
+                    "revision": execution_state.revision,
+                },
+            )
             return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
@@ -13614,6 +13633,96 @@ def _record_task_failure(
     return blocked
 
 
+def _record_iteration_exhaustion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    error: Optional[str] = None,
+) -> Optional[int]:
+    """Atomically terminalize the current revision after its turn budget ends.
+
+    Iteration exhaustion is a concrete worker end reason, not a machine timeout
+    and not a spawn failure. It therefore bypasses the generic failure circuit:
+    the exact run is closed as ``iteration_exhausted``, the task is made
+    non-running/non-retryable before the user-visible event is appended, and
+    the existing workspace is retained as the artifact checkpoint.
+    """
+    used = max(0, int(budget_used))
+    maximum = max(0, int(budget_max))
+    message = _redact_diagnostic(
+        error
+        or f"Iteration budget exhausted ({used}/{maximum}) — task could not complete within the allowed iterations"
+    )[:500]
+    now = int(time.time())
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT status, current_run_id, consecutive_failures, workspace_path "
+            "FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+
+        run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+        # A repeated finalizer call after the exact run has already been closed
+        # is idempotent: never synthesize another run or another terminal event.
+        if row["status"] == "blocked" and run_id is None:
+            latest = conn.execute(
+                "SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if latest and latest["outcome"] == "iteration_exhausted":
+                return int(latest["id"])
+
+        failures = int(row["consecutive_failures"] or 0) + 1
+        workspace_path = str(row["workspace_path"] or "")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='iteration_exhausted', "
+            "max_retries=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=?, last_failure_error=? "
+            "WHERE id=?",
+            (failures, message, task_id),
+        )
+        closed_run_id = None
+        if run_id is not None:
+            closed_run_id = _end_run(
+                conn,
+                task_id,
+                outcome="iteration_exhausted",
+                status="iteration_exhausted",
+                error=message,
+                metadata={
+                    "budget_used": used,
+                    "budget_max": maximum,
+                    "checkpoint_required": True,
+                    "workspace_path": workspace_path,
+                    "retryable": False,
+                    "resume_policy": "never",
+                },
+            )
+        payload = {
+            "error": message,
+            "budget_used": used,
+            "budget_max": maximum,
+            "blocker_type": "iteration_exhausted",
+            "resume_policy": "never",
+            "retryable": False,
+            "checkpoint_required": True,
+            "workspace_path": workspace_path,
+            "terminal_run_id": closed_run_id,
+        }
+        _append_diagnostic_event(
+            conn,
+            task_id,
+            "iteration_exhausted",
+            payload,
+            run_id=closed_run_id,
+        )
+    return closed_run_id
+
+
 # Backward-compat alias. Old name is referenced from tests and possibly
 # third-party callers. New code should call ``_record_task_failure``.
 def _record_spawn_failure(
@@ -14147,6 +14256,11 @@ def _preview_dispatch_maintenance(
         "AND superseded_by IS NULL"
     ).fetchall()
     for row in candidates:
+        execution_state = get_reconciled_execution_state(
+            conn, row["id"], failure_limit=failure_limit,
+        )
+        if execution_state is not None and not execution_state.executable:
+            continue
         if (
             row["status"] == "todo"
             and _dependency_wait_blocks_promotion(conn, row["id"])
@@ -14371,6 +14485,12 @@ def _dispatch_once_locked(
             # there, with the existing diagnostic.
             _default_assignee_resolved = True
     for row in ready_rows:
+        execution_state = get_reconciled_execution_state(
+            conn, row["id"], failure_limit=failure_limit,
+        )
+        if execution_state is not None and not execution_state.executable:
+            result.skipped_nonspawnable.append(row["id"])
+            continue
         if max_spawn is not None and running_count + spawned >= max_spawn:
             break
         if spawn_budget is not None and spawned >= spawn_budget:

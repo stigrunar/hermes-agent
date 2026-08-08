@@ -31,6 +31,7 @@ class BlockerType(str, Enum):
     DEPENDENCY = "dependency"
     MACHINE = "machine"
     MANUAL = "manual"
+    ITERATION_EXHAUSTED = "iteration_exhausted"
     TERMINAL = "terminal"
 
 
@@ -168,6 +169,21 @@ def build_reconciled_state(
         block_kind=block_kind,
         reason=reason,
     )
+
+    # The concrete worker stop reason outranks legacy task status and generic
+    # failure classification. A stale writer must never turn an exhausted
+    # revision back into a ready/running or transient-retryable task.
+    iteration_exhausted = (
+        block_kind == "iteration_exhausted"
+        or bool(_TERMINAL_REASON_RE.search(reason))
+    )
+    if iteration_exhausted:
+        return ReconciledExecutionState(
+            task_id, contract_id, revision, BlockerType.ITERATION_EXHAUSTED, reason,
+            "new authoritative revision or explicit replacement required",
+            "dolly/default", ResumePolicy.NEVER, "do_not_resume", retry_count,
+            max_retries, fp, workspace_path, False,
+        )
 
     recurrence_escalated = (
         status == "triage"

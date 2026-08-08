@@ -555,6 +555,7 @@ def _architect_db_receipt(worker_env):
             "handoff-only routes require architecture_document_path=null",
         ),
         ({"project": "missing-project"}, "refusing requested project"),
+        ({"goal_mode": True}, "cannot use triage or goal_mode"),
         ({"model": "other-model"}, "model override must remain"),
         (
             {"model": "gpt-5.6-sol", "provider": "openrouter"},
