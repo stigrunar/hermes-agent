@@ -95,6 +95,15 @@ from typing import Any, Callable, Iterable, Mapping, Optional
 
 from agent.redact import redact_sensitive_text as _redact_sensitive_text
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.execution_state import (
+    BlockerType as ExecutionBlockerType,
+    ResumePolicy as ExecutionResumePolicy,
+    build_reconciled_state,
+    is_non_executable_hygiene,
+    read_repo_execution_states,
+    resolve_canon_path,
+    resolve_contract_identity,
+)
 from toolsets import get_toolset_names
 
 # Unit tests replace ``subprocess.Popen`` to capture worker launches. Keep
@@ -5916,6 +5925,255 @@ def _dependency_wait_blocks_promotion(
     )
 
 
+
+def _task_is_execution_current(conn: sqlite3.Connection, task_id: str) -> bool:
+    """Fail closed when a task is historical/superseded execution evidence."""
+    row = conn.execute(
+        "SELECT status, hygiene_class, superseded_by FROM tasks WHERE id=?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return False
+    if is_non_executable_hygiene(row["hygiene_class"]):
+        return False
+    if row["superseded_by"]:
+        return False
+    return row["status"] not in TERMINAL_STATUSES
+
+
+def _latest_block_payload(conn: sqlite3.Connection, task_id: str) -> tuple[str, str, int]:
+    row = conn.execute(
+        "SELECT payload, created_at FROM task_events "
+        "WHERE task_id=? AND kind='blocked' ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return "", "", 0
+    try:
+        payload = json.loads(row["payload"]) if row["payload"] else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return (
+        str(payload.get("reason") or payload.get("summary") or "").strip(),
+        str(payload.get("kind") or "").strip(),
+        int(row["created_at"] or 0),
+    )
+
+
+def _execution_auto_resume_count(
+    conn: sqlite3.Connection,
+    task_id: str,
+    blocker_fingerprint: str,
+) -> int:
+    rows = conn.execute(
+        "SELECT payload FROM task_events "
+        "WHERE task_id=? AND kind='execution_state_auto_resumed' ORDER BY id ASC",
+        (task_id,),
+    ).fetchall()
+    count = 0
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"]) if row["payload"] else {}
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("blocker_fingerprint") == blocker_fingerprint:
+            count += 1
+    return count
+
+
+def get_reconciled_execution_state(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    failure_limit: Optional[int] = None,
+):
+    """Return one deterministic typed execution-state projection for a task."""
+    if failure_limit is None:
+        failure_limit = 2
+    task = get_task(conn, task_id)
+    if task is None:
+        return None
+    reason, event_kind, _created_at = _latest_block_payload(conn, task_id)
+    dependency_open = _dependency_wait_blocks_promotion(conn, task_id)
+    if not dependency_open:
+        dependency_open = conn.execute(
+            "SELECT 1 FROM task_links l JOIN tasks p ON p.id=l.parent_id "
+            "WHERE l.child_id=? AND p.status NOT IN ('done','archived') LIMIT 1",
+            (task_id,),
+        ).fetchone() is not None
+    initial = build_reconciled_state(
+        task,
+        latest_block_reason=reason,
+        dependency_open=dependency_open,
+        failure_limit=failure_limit,
+        same_fingerprint_auto_resumes=0,
+    )
+    auto_resume_count = _execution_auto_resume_count(
+        conn, task_id, initial.blocker_fingerprint
+    )
+    if auto_resume_count:
+        return build_reconciled_state(
+            task,
+            latest_block_reason=reason,
+            dependency_open=dependency_open,
+            failure_limit=failure_limit,
+            same_fingerprint_auto_resumes=auto_resume_count,
+        )
+    return initial
+
+
+
+def reconcile_repo_canon_projection(conn: sqlite3.Connection) -> list[str]:
+    """Project explicit repo-canon currentness into Kanban, never the reverse.
+
+    A durable task opts into deterministic reconciliation with ``canon_path:``
+    plus its ``contract_id``/``revision`` in the task body. The named markdown
+    file remains canonical; the reconciler only reads its machine marker and
+    writes a non-executable hygiene fence to Kanban when the repository says
+    this projected revision is closed or superseded. Missing/unparseable canon
+    is a no-op rather than guessed state.
+    """
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE body IS NOT NULL "
+        "AND status NOT IN ('done','archived','cancelled') "
+        "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+        "AND superseded_by IS NULL ORDER BY created_at ASC"
+    ).fetchall()
+    changed: list[str] = []
+    terminal_repo_status = {"done", "superseded", "cancelled", "archived"}
+    for row in rows:
+        task_id = row["id"]
+        task = get_task(conn, task_id)
+        if task is None:
+            continue
+        canon_path = resolve_canon_path(task)
+        if not canon_path:
+            continue
+        contract_id, revision = resolve_contract_identity(task)
+        try:
+            repo_states = read_repo_execution_states(canon_path)
+        except (OSError, UnicodeError):
+            continue
+        repo_state = repo_states.get(contract_id)
+        if not repo_state:
+            continue
+        repo_revision = str(repo_state.get("revision") or "").strip()
+        repo_status = str(repo_state.get("status") or "").strip().casefold()
+        if repo_revision == revision and repo_status not in terminal_repo_status:
+            continue
+        reason = (
+            "repo canon made projected revision non-current: "
+            f"contract_id={contract_id} task_revision={revision} "
+            f"repo_revision={repo_revision or 'missing'} repo_status={repo_status or 'missing'}"
+        )
+        # A correction that lands while the old revision is already running
+        # must stop that exact run before any later dispatch can revive it.
+        if task.status == "running":
+            cancel_task(
+                conn,
+                task_id,
+                reason=reason,
+                expected_run_id=task.current_run_id,
+            )
+        fresh = get_task(conn, task_id)
+        if fresh is None or fresh.status == "archived":
+            continue
+        try:
+            mark_task_for_hygiene(
+                conn,
+                task_id,
+                classification="obsolete",
+                reason=reason,
+                actor="hermes-execution-state-reconciler",
+            )
+        except ValueError as exc:
+            # Idempotent mark or a concurrently archived row is already safe.
+            if "already archived" not in str(exc).casefold():
+                raise
+        changed.append(task_id)
+    return changed
+
+def reconcile_execution_states(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: Optional[int] = None,
+    now: Optional[int] = None,
+    transient_retry_delay_seconds: int = 60,
+) -> list[str]:
+    """Resume only machine-resolvable blocks under one bounded owner.
+
+    Dependency waits remain owned by ``recompute_ready`` and review progress by
+    the existing review-handoff state machine.  Human/capability blocks stay
+    sticky.  A transient block receives at most one automatic same-revision
+    retry for an unchanged blocker fingerprint after a deterministic delay.
+    Iteration exhaustion, retry-limit exhaustion and all obsolete/superseded
+    revisions are never resumed here.
+    """
+    if failure_limit is None:
+        failure_limit = 2
+    now = int(time.time()) if now is None else int(now)
+    rows = conn.execute(
+        "SELECT id FROM tasks WHERE status='blocked' "
+        "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+        "AND superseded_by IS NULL ORDER BY created_at ASC"
+    ).fetchall()
+    resumed: list[str] = []
+    for row in rows:
+        task_id = row["id"]
+        state = get_reconciled_execution_state(
+            conn, task_id, failure_limit=failure_limit,
+        )
+        if state is None or state.blocker_type is not ExecutionBlockerType.MACHINE:
+            continue
+        if state.resume_policy is not ExecutionResumePolicy.BOUNDED_RETRY:
+            continue
+        reason, _kind, blocked_at = _latest_block_payload(conn, task_id)
+        if blocked_at <= 0 or now - blocked_at < max(0, int(transient_retry_delay_seconds)):
+            continue
+        # Re-read exact identity immediately before the state mutation.  The
+        # contract/revision/workspace tuple must still match the state we just
+        # classified; otherwise a correction/replacement won the race.
+        fresh = get_reconciled_execution_state(
+            conn, task_id, failure_limit=failure_limit,
+        )
+        if fresh is None or (
+            fresh.task_id,
+            fresh.contract_id,
+            fresh.revision,
+            fresh.workspace_path,
+            fresh.blocker_fingerprint,
+        ) != (
+            state.task_id,
+            state.contract_id,
+            state.revision,
+            state.workspace_path,
+            state.blocker_fingerprint,
+        ):
+            continue
+        if not _task_is_execution_current(conn, task_id):
+            continue
+        if not unblock_task(conn, task_id):
+            continue
+        with write_txn(conn):
+            _append_event(
+                conn,
+                task_id,
+                "execution_state_auto_resumed",
+                {
+                    "contract_id": state.contract_id,
+                    "revision": state.revision,
+                    "workspace_path": state.workspace_path,
+                    "blocker_fingerprint": state.blocker_fingerprint,
+                    "reason": reason,
+                    "resume_policy": state.resume_policy.value,
+                    "resume_action": state.resume_action,
+                },
+            )
+        resumed.append(task_id)
+    return resumed
+
 def recompute_ready(
     conn: sqlite3.Connection, failure_limit: int = None,
     board: Optional[str] = None,
@@ -5961,7 +6219,9 @@ def recompute_ready(
     with write_txn(conn):
         query = (
             "SELECT id, status, consecutive_failures, max_retries "
-            "FROM tasks WHERE status IN ('todo', 'blocked')"
+            "FROM tasks WHERE status IN ('todo', 'blocked') "
+            "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+            "AND superseded_by IS NULL"
         )
         params: tuple[Any, ...] = ()
         if scoped_ids is not None:
@@ -6079,6 +6339,15 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        current_row = conn.execute(
+            "SELECT hygiene_class, superseded_by FROM tasks WHERE id=? AND status='ready'",
+            (task_id,),
+        ).fetchone()
+        if current_row is None:
+            return None
+        if is_non_executable_hygiene(current_row["hygiene_class"]) or current_row["superseded_by"]:
+            _append_event(conn, task_id, "claim_rejected", {"reason": "historical_or_superseded"})
+            return None
         # Structural invariant: never transition ready -> running while any
         # parent is not yet 'done'. This is the single enforcement point
         # regardless of which writer (create_task, link_tasks, unblock_task,
@@ -8706,10 +8975,12 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, hygiene_class, superseded_by FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
+    if is_non_executable_hygiene(row["hygiene_class"]) or row["superseded_by"]:
+        return False, f"task {task_id} is historical/superseded and non-executable"
     if _protected_review_handoff_for_task(conn, task_id, role="next"):
         return False, (
             "explicit review successor gate remains protected until the review "
@@ -8829,9 +9100,12 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
             (task_id,),
         ).fetchone()
         stale = conn.execute(
-            "SELECT current_run_id FROM tasks WHERE id = ? AND status IN ('blocked', 'scheduled')",
+            "SELECT current_run_id, hygiene_class, superseded_by FROM tasks "
+            "WHERE id = ? AND status IN ('blocked', 'scheduled')",
             (task_id,),
         ).fetchone()
+        if stale and (is_non_executable_hygiene(stale["hygiene_class"]) or stale["superseded_by"]):
+            return False
         if stale and stale["current_run_id"]:
             conn.execute(
                 """
@@ -10146,6 +10420,12 @@ class DispatchResult:
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
     """Task ids auto-blocked by the spawn-failure circuit breaker."""
+    auto_resumed: list[str] = field(default_factory=list)
+    """Machine-resolvable task ids resumed exactly once for their current
+    blocker fingerprint by the Hermes-owned execution-state reconciler."""
+    repo_reconciled_noncurrent: list[str] = field(default_factory=list)
+    """Task ids made non-executable because their explicit repo-canon marker
+    superseded/closed the exact contract revision projected on Kanban."""
     timed_out: list[str] = field(default_factory=list)
     """Task ids whose workers exceeded ``max_runtime_seconds``."""
     stale: list[str] = field(default_factory=list)
@@ -13862,7 +14142,9 @@ def _preview_dispatch_maintenance(
 
     candidates = conn.execute(
         "SELECT id, status, consecutive_failures, max_retries "
-        "FROM tasks WHERE status IN ('todo', 'blocked')"
+        "FROM tasks WHERE status IN ('todo', 'blocked') "
+        "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+        "AND superseded_by IS NULL"
     ).fetchall()
     for row in candidates:
         if (
@@ -13992,6 +14274,10 @@ def _dispatch_once_locked(
             getattr(enforce_max_runtime, "_last_transition_conflicts", [])
         )
         _park_invalid_review_gates(conn, board=board)
+        result.repo_reconciled_noncurrent = reconcile_repo_canon_projection(conn)
+        result.auto_resumed = reconcile_execution_states(
+            conn, failure_limit=failure_limit,
+        )
         result.promoted = recompute_ready(
             conn, failure_limit=failure_limit, board=board,
         )
@@ -14029,6 +14315,8 @@ def _dispatch_once_locked(
     ready_rows = conn.execute(
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
+        "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+        "AND superseded_by IS NULL "
         "ORDER BY priority DESC, created_at ASC"
     ).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
