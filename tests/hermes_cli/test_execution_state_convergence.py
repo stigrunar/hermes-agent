@@ -86,6 +86,25 @@ def test_c3_manual_block_is_sticky_and_never_auto_resumed(kanban_home):
         ).fetchone()[0] == 1
 
 
+
+def test_manual_needs_input_keeps_manual_authority_even_with_old_failure_count(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="manual after worker failures",
+            assignee="dollycode",
+            body="contract_id: esc-manual-failures\nrevision: r1",
+        )
+        _claim_and_block(conn, tid, kind="needs_input", reason="operator must choose recovery")
+        conn.execute("UPDATE tasks SET consecutive_failures=9 WHERE id=?", (tid,))
+        conn.commit()
+        state = kb.get_reconciled_execution_state(conn, tid, failure_limit=2)
+        assert state.blocker_type is BlockerType.MANUAL
+        assert state.resume_policy is ResumePolicy.MANUAL_ONCE
+        assert state.resume_action == "wait_for_owner_once"
+        assert kb.reconcile_execution_states(conn, now=10**12) == []
+
+
 def test_c4_iteration_exhaustion_is_terminal_for_automation(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(

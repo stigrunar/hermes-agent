@@ -199,14 +199,32 @@ def build_reconciled_state(
         )
 
     if status == "blocked":
-        if _TERMINAL_REASON_RE.search(reason) or retry_count >= max_retries:
+        # A semantic terminal reason wins regardless of the legacy block kind.
+        if _TERMINAL_REASON_RE.search(reason):
             return ReconciledExecutionState(
                 task_id, contract_id, revision, BlockerType.TERMINAL, reason,
                 "new authoritative revision or explicit operator recovery required",
                 "dolly/default", ResumePolicy.NEVER, "do_not_resume", retry_count,
                 max_retries, fp, workspace_path, False,
             )
+        # Human/capability ownership is semantic authority. Historical worker
+        # failure counters must not silently convert an explicit manual gate
+        # into a terminal execution verdict.
+        if block_kind in {"needs_input", "capability", ""}:
+            return ReconciledExecutionState(
+                task_id, contract_id, revision, BlockerType.MANUAL, reason,
+                "named human/capability decision resolves the blocker",
+                "dolly/default", ResumePolicy.MANUAL_ONCE, "wait_for_owner_once",
+                retry_count, max_retries, fp, workspace_path, True,
+            )
         if block_kind == "transient":
+            if retry_count >= max_retries:
+                return ReconciledExecutionState(
+                    task_id, contract_id, revision, BlockerType.TERMINAL, reason,
+                    "bounded retry budget is exhausted; owner must issue a new authoritative recovery revision",
+                    "dolly/default", ResumePolicy.NEVER, "do_not_resume", retry_count,
+                    max_retries, fp, workspace_path, False,
+                )
             if not has_explicit_contract_identity(task):
                 return ReconciledExecutionState(
                     task_id, contract_id, revision, BlockerType.MANUAL, reason,
@@ -226,9 +244,16 @@ def build_reconciled_state(
                 same_fingerprint_auto_resumes, 1, fp, workspace_path,
                 same_fingerprint_auto_resumes == 0,
             )
+        if retry_count >= max_retries:
+            return ReconciledExecutionState(
+                task_id, contract_id, revision, BlockerType.TERMINAL, reason,
+                "bounded retry budget is exhausted; owner must issue a new authoritative recovery revision",
+                "dolly/default", ResumePolicy.NEVER, "do_not_resume", retry_count,
+                max_retries, fp, workspace_path, False,
+            )
         return ReconciledExecutionState(
             task_id, contract_id, revision, BlockerType.MANUAL, reason,
-            "named human/capability decision resolves the blocker",
+            "named owner resolves the unclassified blocker",
             "dolly/default", ResumePolicy.MANUAL_ONCE, "wait_for_owner_once",
             retry_count, max_retries, fp, workspace_path, True,
         )
