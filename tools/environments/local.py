@@ -531,6 +531,10 @@ def _scrub_terminal_spawn_kanban_env(env: dict[str, str]) -> dict[str, str]:
     Delegated children additionally keep the lineage marker (strip + marker);
     plain nested spawns are stripped without the marker — they are not
     delegate_task children.
+
+    Fail closed: if the delegation module cannot be imported, the
+    ``HERMES_KANBAN_*`` prefix sweep still strips the dispatcher identity —
+    the env must never reach a terminal child unscrubbed.
     """
     try:
         from agent.delegation_context import (
@@ -543,8 +547,13 @@ def _scrub_terminal_spawn_kanban_env(env: dict[str, str]) -> dict[str, str]:
             return scrub_kanban_env(env)
         return strip_kanban_env(env)
     except Exception:
-        pass
-    return env
+        # Fail-closed fallback: prefix sweep is robust to any future
+        # HERMES_KANBAN_* key without duplicating the canonical key list.
+        return {
+            key: value
+            for key, value in env.items()
+            if not key.startswith("HERMES_KANBAN_")
+        }
 
 
 def _scrub_delegated_child_kanban_env(env: dict[str, str]) -> dict[str, str]:
