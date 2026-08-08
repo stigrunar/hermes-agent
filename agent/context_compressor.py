@@ -230,6 +230,76 @@ def _strip_persistence_markers(messages: List[Dict[str, Any]]) -> None:
             msg.pop(_DB_PERSISTED_MARKER, None)
 
 
+def _prune_stale_reasoning_replay(messages: List[Dict[str, Any]]) -> int:
+    """Strip stale per-turn replay items (``codex_reasoning_items``) from
+    assistant messages that belong to turns older than the active one.
+
+    During Codex/Responses sessions, every retained assistant message carries
+    encrypted reasoning blobs (``codex_reasoning_items``) that are only needed
+    for replaying the *current* turn's reasoning chain.  Prior-turn items are
+    pure re-billed weight: the compaction boundary has already invalidated the
+    prompt-cache prefix, and ``conversation_loop.py`` already drops these
+    wholesale when ``api_mode != "codex_responses"``.
+
+    Operates in place on the fully assembled compacted message list.  Returns
+    the number of messages that were pruned (for diagnostics).  #71058.
+
+    Two safety rules define the prune:
+
+    * **Turn boundary is the last user message, not the last assistant
+      message.** A single Codex turn spans several assistant messages
+      (assistant+tool_calls -> tool -> assistant+tool_calls -> ... -> final
+      assistant), and the Responses API requires the reasoning items that
+      bridge those function calls to be replayed together.  Everything after
+      the last user message is the active turn and keeps its items; only
+      messages at or before that boundary are stale.  (An earlier draft used
+      the last assistant message and would have stripped reasoning mid-chain
+      from the in-flight turn.)
+
+    * **Native compaction checkpoints are exempt.** ``type: "compaction"``
+      items in the same sidecar are the server-side stand-in for already
+      pruned history (see ``agent/native_compaction.py``) — cumulative
+      context carriers, not per-turn reasoning.  They must survive on every
+      retained message, so pruning filters items instead of popping the key.
+    """
+    # Find the last real user message — everything after it is the active
+    # turn.  Synthetic continuation rows and tool results never mark a turn
+    # boundary.
+    last_user_idx = -1
+    for i in range(len(messages) - 1, -1, -1):
+        msg = messages[i]
+        if isinstance(msg, dict) and msg.get("role") == "user":
+            last_user_idx = i
+            break
+    if last_user_idx < 0:
+        # No user boundary found — cannot distinguish the active turn, so
+        # prune nothing (fail open toward correctness, not size).
+        return 0
+
+    pruned = 0
+    for i in range(last_user_idx):
+        msg = messages[i]
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            continue
+        for key in _STALE_REPLAY_PRUNE_KEYS:
+            items = msg.get(key)
+            if not isinstance(items, list) or not items:
+                continue
+            kept = [
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("type") == "compaction"
+            ]
+            if len(kept) == len(items):
+                continue  # nothing stale in this sidecar
+            if kept:
+                msg[key] = kept
+            else:
+                msg.pop(key, None)
+            pruned += 1
+    return pruned
+
+
 # Appended to every standalone summary message (and to the merged-into-tail
 # prefix) so the model has an unambiguous "summary ends here" boundary.
 # Without it, weak models read the verbatim "## Active Task" quote as fresh
