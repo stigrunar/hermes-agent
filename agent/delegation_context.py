@@ -34,6 +34,14 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar(
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# Caller contract for the two Kanban env helpers:
+#   * scrub_kanban_env  — delegate_task children: strip + set the lineage
+#     marker so the child process (and ITS subprocesses) are recognized as
+#     delegated and keep the kanban tool fencing.
+#   * strip_kanban_env  — plain nested spawns (terminal tool, execute_code)
+#     that must NOT inherit the parent worker's dispatcher identity, but are
+#     NOT delegated children: strip without the marker (#81508).
+
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
