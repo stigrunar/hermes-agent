@@ -1564,6 +1564,42 @@ class TestKanbanNestedSpawnScrub:
         for key in self._WORKER_ENV:
             assert key not in env, f"{key} leaked via background spawn env"
 
+    def test_worker_terminal_spawn_real_subprocess_sees_no_kanban_env(self):
+        """End-to-end: a REAL spawned child must not see HERMES_KANBAN_*.
+
+        Unlike the mocked-Popen tests above, this spawns an actual
+        subprocess through ``_make_run_env`` and asserts the dispatcher
+        identity never crosses the process boundary (#81508).
+        """
+        import subprocess
+        import sys
+
+        from tools.environments.local import _make_run_env
+
+        with patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", "HOME": "/tmp", **self._WORKER_ENV},
+            clear=True,
+        ):
+            run_env = _make_run_env(dict(os.environ))
+
+        probe = (
+            "import os;"
+            "leaked=[k for k in os.environ if k.startswith('HERMES_KANBAN_')];"
+            "print('LEAK:' + ','.join(sorted(leaked)) if leaked else 'CLEAN')"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        assert "LEAK:" not in result.stdout
+        # Plain nested spawns are not delegated children — no false marker.
+        assert "HERMES_DELEGATED_CHILD_CONTEXT" not in run_env
+
     def test_worker_execute_code_spawn_strips_kanban_env(self):
         """execute_code sandbox children must not inherit Kanban identity.
 
