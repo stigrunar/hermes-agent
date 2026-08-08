@@ -186,6 +186,8 @@ class TestDelegatedChildMarker:
         assert env["HERMES_KANBAN_TASK"] == "t_parent"
         assert env["HERMES_KANBAN_RUN_ID"] == "123"
         assert env["HERMES_KANBAN_DB"] == "/tmp/parent-kanban.db"
+        # Plain (non-delegated) spawns must not receive the lineage marker.
+        assert env.get("HERMES_DELEGATED_CHILD_CONTEXT") is None
 
 
 _INTERNAL_DYNAMIC_SAMPLE = {
