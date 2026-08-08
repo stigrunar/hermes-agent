@@ -286,6 +286,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     # explicit passthrough cannot re-grant a nested process (delegated child
     # OR plain worker-spawned sandbox) the parent's board mutation capability
     # (#81508).  Delegated children additionally keep the lineage marker.
+    # Fail closed: on import failure the prefix sweep still strips the
+    # dispatcher identity.
     try:
         from agent.delegation_context import (
             is_delegated_child_process_context,
@@ -298,7 +300,11 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
         else:
             scrubbed = strip_kanban_env(scrubbed)
     except Exception:
-        pass
+        scrubbed = {
+            key: value
+            for key, value in scrubbed.items()
+            if not key.startswith("HERMES_KANBAN_")
+        }
     return scrubbed
 
 
