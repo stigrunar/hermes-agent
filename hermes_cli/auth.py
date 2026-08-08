@@ -8072,8 +8072,17 @@ def _xai_oauth_device_code_login(
     }
 
 
-def _codex_device_code_login() -> Dict[str, Any]:
-    """Run the OpenAI device code login flow and return credentials dict."""
+def _codex_device_code_login(
+    *,
+    device_code_callback: Optional[Callable[[str, str], None]] = None,
+) -> Dict[str, Any]:
+    """Run the OpenAI device code login flow and return credentials dict.
+
+    ``device_code_callback`` lets non-terminal surfaces (for example the
+    Telegram gateway) deliver the verification URL and one-time user code
+    without scraping ANSI-formatted stdout. CLI callers keep the existing
+    printed flow when no callback is supplied.
+    """
     import time as _time
 
     issuer = "https://auth.openai.com"
@@ -8148,13 +8157,19 @@ def _codex_device_code_login() -> Dict[str, Any]:
             provider="openai-codex", code="device_code_incomplete",
         )
 
-    # Step 2: Show user the code
-    print("To continue, follow these steps:\n")
-    print("  1. Open this URL in your browser:")
-    print(f"     \033[94m{issuer}/codex/device\033[0m\n")
-    print("  2. Enter this code:")
-    print(f"     \033[94m{user_code}\033[0m\n")
-    print("Waiting for sign-in... (press Ctrl+C to cancel)")
+    # Step 2: Show user the code. Gateway callers can provide a callback so
+    # the one-time code is delivered on the authenticated messaging surface
+    # instead of being scraped from terminal output.
+    verification_url = f"{issuer}/codex/device"
+    if device_code_callback is not None:
+        device_code_callback(verification_url, user_code)
+    else:
+        print("To continue, follow these steps:\n")
+        print("  1. Open this URL in your browser:")
+        print(f"     \033[94m{verification_url}\033[0m\n")
+        print("  2. Enter this code:")
+        print(f"     \033[94m{user_code}\033[0m\n")
+        print("Waiting for sign-in... (press Ctrl+C to cancel)")
 
     # Step 3: Poll for authorization code
     max_wait = 15 * 60  # 15 minutes

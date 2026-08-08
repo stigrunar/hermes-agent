@@ -2,7 +2,7 @@ from hermes_state import AsyncSessionDB
 """Tests for gateway /usage command — agent cache lookup and output fields."""
 
 import threading
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -236,4 +236,164 @@ class TestUsageContextBreakdown:
         assert "60%" in result     # 6000 / 10000
         # Zero-token category is dropped, not rendered.
         assert "Conversation" not in result
+
+
+class TestTelegramAuthCommand:
+    def _event(self, args=""):
+        from gateway.config import Platform
+
+        event = MagicMock()
+        event.get_command_args.return_value = args
+        event.source.platform = Platform.TELEGRAM
+        event.source.chat_type = "dm"
+        event.source.chat_id = "12345"
+        return event
+
+    def _runner(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        adapter = MagicMock()
+        adapter.send = AsyncMock(return_value=None)
+        runner._adapter_for_source = MagicMock(return_value=adapter)
+        runner._thread_metadata_for_source = MagicMock(return_value={})
+        return runner, adapter
+
+    @pytest.mark.asyncio
+    async def test_auth_list_is_registered_and_never_exposes_tokens(self, monkeypatch):
+        from hermes_cli.commands import is_gateway_known_command
+
+        assert is_gateway_known_command("auth")
+        runner, _adapter = self._runner()
+        entry = MagicMock()
+        entry.id = "abc123"
+        entry.label = "private-pro-fallback"
+        entry.auth_type = "oauth"
+        entry.source = "manual:device_code"
+        entry.last_status = None
+        entry.access_token = "SECRET_ACCESS_TOKEN"
+        pool = MagicMock()
+        pool.entries.return_value = [entry]
+        pool.peek.return_value = entry
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr(
+            "hermes_cli.auth.read_credential_pool",
+            lambda provider=None: {"openai-codex": [{"access_token": "SECRET_ACCESS_TOKEN"}]},
+        )
+
+        result = await runner._handle_auth_command(self._event("list openai-codex"))
+
+        assert "private-pro-fallback" in result
+        assert "SECRET_ACCESS_TOKEN" not in result
+
+    @pytest.mark.asyncio
+    async def test_auth_rejects_non_dm_surface(self):
+        from gateway.config import Platform
+
+        runner, _adapter = self._runner()
+        event = self._event("list")
+        event.source.chat_type = "group"
+        result = await runner._handle_auth_command(event)
+        assert "only" in result.lower()
+        assert "Telegram DM" in result
+
+    @pytest.mark.asyncio
+    async def test_auth_reset_clears_local_pool_status(self, monkeypatch):
+        runner, _adapter = self._runner()
+        pool = MagicMock()
+        pool.reset_statuses.return_value = 3
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        result = await runner._handle_auth_command(self._event("reset openai-codex"))
+
+        assert result == "Reset local cooldown/status on 3 openai-codex credential(s)."
+        pool.reset_statuses.assert_called_once_with()
+
+    @pytest.mark.asyncio
+    async def test_auth_add_codex_delivers_device_code_and_persists_without_token_echo(self, monkeypatch):
+        from agent.credential_pool import PooledCredential
+
+        runner, adapter = self._runner()
+        pool = MagicMock()
+        pool.entries.side_effect = [[], []]
+        pool.resolve_target.return_value = (None, None, "not found")
+
+        added_entry = None
+
+        def add_entry(entry):
+            nonlocal added_entry
+            added_entry = entry
+            return entry
+
+        pool.add_entry.side_effect = add_entry
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+        monkeypatch.setattr("hermes_cli.auth.mark_provider_active_if_unset", lambda provider: None)
+
+        def fake_login(*, device_code_callback=None):
+            assert device_code_callback is not None
+            device_code_callback("https://auth.openai.com/codex/device", "ABCD-EFGH")
+            return {
+                "tokens": {"access_token": "SECRET_ACCESS_TOKEN", "refresh_token": "SECRET_REFRESH_TOKEN"},
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "last_refresh": 123.0,
+            }
+
+        monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", fake_login)
+
+        result = await runner._handle_auth_command(
+            self._event("add openai-codex --label new-pro")
+        )
+
+        assert "new-pro" in result
+        assert "SECRET_ACCESS_TOKEN" not in result
+        assert isinstance(added_entry, PooledCredential)
+        assert added_entry.access_token == "SECRET_ACCESS_TOKEN"
+        sent = adapter.send.await_args.args[1]
+        assert "ABCD-EFGH" in sent
+        assert "SECRET_ACCESS_TOKEN" not in sent
+
+    @pytest.mark.asyncio
+    async def test_auth_reauth_replaces_tokens_and_clears_stale_cooldown(self, monkeypatch):
+        from agent.credential_pool import PooledCredential
+
+        runner, _adapter = self._runner()
+        existing = PooledCredential(
+            provider="openai-codex",
+            id="abc123",
+            label="private-pro-fallback",
+            auth_type="oauth",
+            priority=1,
+            source="manual:device_code",
+            access_token="OLD_TOKEN",
+            refresh_token="OLD_REFRESH",
+            last_status="exhausted",
+            last_status_at=123.0,
+            last_error_code=429,
+            last_error_reason="rate_limit",
+        )
+        pool = MagicMock()
+        pool.resolve_target.return_value = (2, existing, None)
+        monkeypatch.setattr("agent.credential_pool.load_pool", lambda provider: pool)
+
+        def fake_login(*, device_code_callback=None):
+            device_code_callback("https://auth.openai.com/codex/device", "ZXCV-1234")
+            return {
+                "tokens": {"access_token": "NEW_TOKEN", "refresh_token": "NEW_REFRESH"},
+                "base_url": "https://chatgpt.com/backend-api/codex",
+                "last_refresh": 456.0,
+            }
+
+        monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", fake_login)
+
+        result = await runner._handle_auth_command(
+            self._event("reauth openai-codex private-pro-fallback")
+        )
+
+        updated = pool._replace_entry.call_args.args[1]
+        assert updated.access_token == "NEW_TOKEN"
+        assert updated.refresh_token == "NEW_REFRESH"
+        assert updated.last_status is None
+        assert updated.last_error_code is None
+        assert "private-pro-fallback" in result
+        pool._persist.assert_called_once_with()
 

@@ -15290,6 +15290,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if canonical == "usage":
             return await self._handle_usage_command(event)
 
+        if canonical == "auth":
+            return await self._handle_auth_command(event)
+
         if canonical == "topup":
             return await self._handle_topup_command(event)
 

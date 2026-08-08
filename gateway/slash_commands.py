@@ -2487,6 +2487,198 @@ class GatewaySlashCommandsMixin:
 
         return await _finish_switch()
 
+    async def _handle_auth_command(self, event: MessageEvent) -> str:
+        """Manage credential-pool auth from an authenticated Telegram DM.
+
+        The messaging surface intentionally exposes only non-secret pool
+        inspection, cooldown reset, and OpenAI Codex device-code OAuth. Raw API
+        keys, logout, and credential deletion stay terminal-only so secrets and
+        destructive auth operations never travel through chat.
+        """
+        source = event.source
+        if source.platform != Platform.TELEGRAM or source.chat_type != "dm":
+            return "🔒 `/auth` is available only in an authenticated Telegram DM."
+
+        from agent.credential_pool import (
+            AUTH_TYPE_OAUTH,
+            SOURCE_MANUAL_DEVICE_CODE,
+            PooledCredential,
+            load_pool,
+        )
+        from hermes_cli import auth as auth_mod
+        from hermes_cli.auth_commands import _format_exhausted_status, _normalize_provider
+
+        raw_args = event.get_command_args().strip()
+        try:
+            args = shlex.split(raw_args) if raw_args else []
+        except ValueError as exc:
+            return f"❌ Invalid /auth arguments: {exc}"
+
+        action = args[0].lower() if args else "list"
+
+        def _render_provider(provider: str) -> list[str]:
+            pool = load_pool(provider)
+            entries = pool.entries()
+            if not entries:
+                return []
+            current = pool.peek()
+            lines = [f"{provider} ({len(entries)} credentials):"]
+            for idx, entry in enumerate(entries, start=1):
+                marker = " ←" if current is not None and entry.id == current.id else ""
+                status = _format_exhausted_status(entry)
+                lines.append(
+                    f"  #{idx} {entry.label} — {entry.auth_type}/{entry.source}{status}{marker}"
+                )
+            return lines
+
+        if action in {"list", "ls"}:
+            provider_filter = _normalize_provider(args[1]) if len(args) > 1 else ""
+            if provider_filter:
+                providers = [provider_filter]
+            else:
+                pool_data = auth_mod.read_credential_pool(None)
+                providers = sorted(
+                    key for key, value in pool_data.items()
+                    if isinstance(value, list) and value
+                )
+            blocks = [block for provider in providers if (block := _render_provider(provider))]
+            if not blocks:
+                return "No pooled credentials found."
+            return "\n\n".join("\n".join(block) for block in blocks)
+
+        if action == "status":
+            if len(args) != 2:
+                return "Usage: `/auth status <provider>`"
+            provider = _normalize_provider(args[1])
+            lines = _render_provider(provider)
+            if not lines:
+                status = await asyncio.to_thread(auth_mod.get_auth_status, provider)
+                return f"{provider}: {'logged in' if status.get('logged_in') else 'logged out'}"
+            return "\n".join(lines)
+
+        if action == "reset":
+            if len(args) != 2:
+                return "Usage: `/auth reset <provider>`"
+            provider = _normalize_provider(args[1])
+            pool = load_pool(provider)
+            count = await asyncio.to_thread(pool.reset_statuses)
+            return f"Reset local cooldown/status on {count} {provider} credential(s)."
+
+        if action not in {"add", "reauth"}:
+            return (
+                "Usage: `/auth [list [provider]|status <provider>|reset <provider>|"
+                "add openai-codex [--label name]|reauth openai-codex <label>]`"
+            )
+
+        if len(args) < 2:
+            return f"Usage: `/auth {action} openai-codex ...`"
+        provider = _normalize_provider(args[1])
+        if provider != "openai-codex":
+            return (
+                "🔒 Messaging auth currently supports device-code OAuth only for "
+                "`openai-codex`. Use terminal `hermes auth` for other providers or API keys."
+            )
+
+        label = ""
+        target = ""
+        if action == "reauth":
+            if len(args) != 3:
+                return "Usage: `/auth reauth openai-codex <label-or-index>`"
+            target = args[2]
+        else:
+            if len(args) > 2:
+                if len(args) == 4 and args[2] == "--label":
+                    label = args[3].strip()
+                else:
+                    return "Usage: `/auth add openai-codex [--label name]`"
+
+        pool = load_pool(provider)
+        existing = None
+        existing_index = None
+        if action == "reauth":
+            existing_index, existing, error = pool.resolve_target(target)
+            if existing is None:
+                return f"❌ {error or 'Credential not found.'}"
+            label = existing.label
+        elif label:
+            existing_index, existing, _ = pool.resolve_target(label)
+            if existing is not None:
+                return (
+                    f"Credential label `{label}` already exists. Use "
+                    f"`/auth reauth openai-codex {label}` to replace its OAuth grant."
+                )
+
+        adapter = self._adapter_for_source(source)
+        if adapter is None:
+            return "❌ Telegram adapter is unavailable."
+        loop = asyncio.get_running_loop()
+        metadata = self._thread_metadata_for_source(source)
+
+        def _deliver_device_code(url: str, code: str) -> None:
+            message = (
+                "🔐 OpenAI Codex sign-in\n\n"
+                f"Open: {url}\n"
+                f"Code: `{code}`\n\n"
+                "Complete sign-in in the browser. The code is one-time; do not forward it."
+            )
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send(str(source.chat_id), message, metadata=metadata),
+                loop,
+            )
+            future.result(timeout=20)
+
+        try:
+            creds = await asyncio.to_thread(
+                auth_mod._codex_device_code_login,
+                device_code_callback=_deliver_device_code,
+            )
+        except Exception as exc:
+            logger.warning("Telegram /auth Codex device login failed: %s", exc)
+            return f"❌ OpenAI Codex sign-in failed: {exc}"
+
+        tokens = creds.get("tokens") or {}
+        access_token = tokens.get("access_token") or ""
+        if not access_token:
+            return "❌ OpenAI Codex sign-in returned no access token."
+
+        if existing is not None:
+            updated = dataclasses.replace(
+                existing,
+                access_token=access_token,
+                refresh_token=tokens.get("refresh_token"),
+                base_url=creds.get("base_url") or existing.base_url,
+                last_refresh=creds.get("last_refresh"),
+                last_status=None,
+                last_status_at=None,
+                last_error_code=None,
+                last_error_reason=None,
+                last_error_message=None,
+                last_error_reset_at=None,
+            )
+            pool._replace_entry(existing, updated)
+            pool._persist()
+            return f"✅ Re-authenticated openai-codex credential #{existing_index}: `{updated.label}`."
+
+        if not label:
+            from agent.credential_pool import label_from_token
+            label = label_from_token(access_token, f"openai-codex-oauth-{len(pool.entries()) + 1}")
+        entry = PooledCredential(
+            provider=provider,
+            id=hashlib.sha256(f"{time.time_ns()}:{label}".encode()).hexdigest()[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=SOURCE_MANUAL_DEVICE_CODE,
+            access_token=access_token,
+            refresh_token=tokens.get("refresh_token"),
+            base_url=creds.get("base_url"),
+            last_refresh=creds.get("last_refresh"),
+        )
+        added = pool.add_entry(entry)
+        if len(pool.entries()) == 1:
+            auth_mod.mark_provider_active_if_unset(provider)
+        return f"✅ Added openai-codex credential: `{added.label}`."
+
     async def _handle_codex_runtime_command(self, event: MessageEvent) -> str:
         """Handle /codex-runtime command in the gateway.
 
