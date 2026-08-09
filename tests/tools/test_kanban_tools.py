@@ -374,6 +374,29 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_prefers_session_scoped_profile(worker_env):
+    from gateway.session_context import clear_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    tokens = set_session_vars(profile="default")
+    try:
+        out = kt._handle_comment({
+            "task_id": worker_env,
+            "body": "owner scoped comment",
+        })
+    finally:
+        clear_session_vars(tokens)
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        assert comments[0].author == "default"
+    finally:
+        conn.close()
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment

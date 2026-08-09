@@ -1192,16 +1192,21 @@ def _handle_comment(args: dict, **kw) -> str:
     if not body or not str(body).strip():
         return tool_error("body is required")
     body = redact_sensitive_text(str(body), force=True)
-    # Author is intentionally derived from the worker's own runtime
-    # identity, NOT from caller-supplied args. Comments are injected
-    # into the next worker's system prompt by ``build_worker_context``
-    # as ``**{author}** (timestamp): {body}`` — accepting an
-    # ``args["author"]`` override let a worker forge a comment from
-    # an authoritative-looking name like ``hermes-system`` and poison
-    # the future-worker context with what reads as a system directive.
-    # Cross-task commenting itself remains unrestricted (see #19713) —
-    # comments are the deliberate handoff channel between tasks.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    # Author is intentionally derived from trusted runtime identity, NOT
+    # caller-supplied args. Gateway turns are concurrent and bind profile in a
+    # task-local ContextVar, so session-scoped identity must win over the
+    # process-global HERMES_PROFILE fallback. Otherwise the default gateway
+    # (whose global profile may be unset) records a real Dolly/default comment
+    # as anonymous ``worker`` and loses owner-control provenance.
+    # Cross-task commenting itself remains unrestricted (see #19713); only the
+    # author label is protected from caller forgery.
+    from gateway.session_context import get_session_env
+
+    author = (
+        get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        or os.environ.get("HERMES_PROFILE")
+        or "worker"
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
