@@ -1127,6 +1127,26 @@ def test_create_respects_auto_subscribe_on_create_false(monkeypatch, worker_env,
     assert _list_subs_for_task(d["task_id"]) == []
 
 
+def test_auto_subscribe_persists_originating_session_key(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+
+    monkeypatch.setenv("HERMES_SESSION_PLATFORM", "telegram")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-session-key")
+    monkeypatch.setenv("HERMES_SESSION_CHAT_TYPE", "group")
+    monkeypatch.setenv("HERMES_SESSION_THREAD_ID", "87")
+    monkeypatch.setenv("HERMES_SESSION_KEY", "agent:main:telegram:group:chat-session-key:87")
+
+    out = kt._handle_create({
+        "title": "auto-sub keeps wake session",
+        "assignee": "peer",
+    })
+    result = json.loads(out)
+    assert result["ok"] is True
+    assert result["subscribed"] is True
+    [sub] = _list_subs_for_task(result["task_id"])
+    assert sub["session_key"] == "agent:main:telegram:group:chat-session-key:87"
+
+
 def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worker_env):
     """If add_notify_sub itself raises (e.g. DB locked, schema drift),
     _maybe_auto_subscribe must NOT bubble that up and fail the parent

@@ -1992,6 +1992,15 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         user_id = get_session_env("HERMES_SESSION_USER_ID", "") or None
         chat_type = get_session_env("HERMES_SESSION_CHAT_TYPE", "") or None
         message_id = get_session_env("HERMES_SESSION_MESSAGE_ID", "") or ""
+        # Persist the exact originating gateway session when available. The
+        # notifier's generic continuation path already consumes this field;
+        # omitting it made push-adapter task subscriptions notify the topic but
+        # silently skip the internal continuation branch.
+        current_session_key = (
+            get_session_env("HERMES_SESSION_KEY", "")
+            or os.environ.get("HERMES_SESSION_KEY", "")
+            or ""
+        )
         notifier_profile = (
             get_session_env("HERMES_SESSION_PROFILE", "")
             or os.environ.get("HERMES_PROFILE")
@@ -2026,6 +2035,7 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
             chat_type=chat_type,
             thread_id=thread_id, user_id=user_id,
             notifier_profile=notifier_profile,
+            session_key=current_session_key or None,
             delivery_metadata=delivery_metadata or None,
         )
         return True

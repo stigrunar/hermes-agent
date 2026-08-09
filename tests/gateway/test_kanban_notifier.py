@@ -1224,3 +1224,298 @@ def test_notifier_delivers_block_loop_detected_triage_ping(tmp_path, monkeypatch
     finally:
         conn.close()
     assert remaining == []
+
+
+def _create_iteration_exhausted_owner_replan_subscription() -> str:
+    conn = kb.connect()
+    try:
+        tid = kb.create_task(
+            conn,
+            title="terminal artifact needs owner",
+            body="contract_id: gateway-owner-replan\nrevision: r1",
+            assignee="dollycode",
+            tenant="fixture-project",
+            workspace_kind="dir",
+            workspace_path="/tmp/gateway-owner-replan-fixture",
+            max_retries=0,
+        )
+        claimed = kb.claim_task(conn, tid, claimer="fixture-worker")
+        assert claimed is not None
+        kb.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            thread_id="87",
+            notifier_profile="default",
+        )
+        kb._record_iteration_exhaustion(conn, tid, budget_used=60, budget_max=60)
+        return tid
+    finally:
+        conn.close()
+
+
+def test_terminal_iteration_exhaustion_wakes_default_owner_exactly_once(tmp_path, monkeypatch):
+    db_path = tmp_path / "owner-replan-once.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_iteration_exhausted_owner_replan_subscription()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    assert "iteration budget exhausted" in adapter.sent[0]["text"].lower()
+    assert len(adapter.handled) == 1
+    wake_text = adapter.handled[0].text
+    assert "HERMES OWNER REPLAN" in wake_text
+    assert "complete_candidate" in wake_text
+    assert "useful_incomplete_patch" in wake_text
+    assert "owner_replan_ack:" in wake_text
+
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='needs_owner_replan'",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_wake_claimed'",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_delivered'",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?",
+            (tid,),
+        ).fetchone()[0] == 1
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.max_retries == 0
+    finally:
+        conn.close()
+
+    # Duplicate processing: no second text ping and no second internal wake.
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+
+
+class OwnerWakeFailAdapter(RecordingAdapter):
+    def __init__(self):
+        super().__init__()
+        self.wake_attempts = 0
+
+    async def handle_message(self, event):
+        self.wake_attempts += 1
+        raise RuntimeError("simulated owner wake failure")
+
+
+def test_terminal_text_send_failure_does_not_consume_owner_replan(tmp_path, monkeypatch):
+    db_path = tmp_path / "owner-replan-send-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_iteration_exhausted_owner_replan_subscription()
+
+    failing = FailingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(failing)))
+
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_wake_claimed'",
+            (tid,),
+        ).fetchone()[0] == 0
+        _, unseen = kb.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="87",
+            kinds=["iteration_exhausted"],
+        )
+        assert [event.kind for event in unseen] == ["iteration_exhausted"]
+    finally:
+        conn.close()
+
+    recovered = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(recovered)))
+    assert len(recovered.sent) == 1
+    assert len(recovered.handled) == 1
+    assert "HERMES OWNER REPLAN" in recovered.handled[0].text
+
+    conn = kb.connect()
+    try:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_wake_claimed'",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_delivered'",
+            (tid,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+
+def test_interrupted_owner_claim_becomes_manual_failure_without_second_wake(tmp_path, monkeypatch):
+    db_path = tmp_path / "owner-replan-interrupted-claim.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_iteration_exhausted_owner_replan_subscription()
+
+    conn = kb.connect()
+    try:
+        _, cursor, terminal_events = kb.claim_unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="87",
+            kinds=["iteration_exhausted"],
+        )
+        assert [event.kind for event in terminal_events] == ["iteration_exhausted"]
+        claimed = kb.claim_owner_replan_for_route(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="87",
+        )
+        assert claimed is not None
+        kb.advance_notify_cursor(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="87",
+            new_cursor=cursor,
+        )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_wake_claimed'",
+            (tid,),
+        ).fetchone()[0] == 1
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='owner_replan_delivered'",
+            (tid,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.handled == []
+    assert len(adapter.sent) == 1
+    assert "interrupted after its one wake claim" in adapter.sent[0]["text"].lower()
+    assert "no automatic retry" in adapter.sent[0]["text"].lower()
+
+    conn = kb.connect()
+    try:
+        failed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='owner_replan_failed'",
+            (tid,),
+        ).fetchall()
+        assert len(failed) == 1
+        assert __import__("json").loads(failed[0]["payload"])["resume_policy"] == "manual"
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.handled == []
+    assert len(adapter.sent) == 1
+
+
+def test_suppressed_iteration_exhaustion_never_falls_back_to_creator_wake(tmp_path, monkeypatch):
+    db_path = tmp_path / "owner-replan-suppressed-no-creator.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+
+    conn = kb.connect()
+    try:
+        old = kb.create_task(
+            conn,
+            title="old r1",
+            body="contract_id: suppression-contract\nrevision: r1",
+            assignee="dollycode",
+            tenant="fixture-project",
+            max_retries=0,
+        )
+        old_run = kb.claim_task(conn, old, claimer="old-worker")
+        assert old_run is not None
+        kb.add_notify_sub(
+            conn,
+            task_id=old,
+            platform="telegram",
+            chat_id="chat-1",
+            chat_type="group",
+            thread_id="87",
+            notifier_profile="default",
+            session_key="creator-session-must-not-wake",
+        )
+        replacement = kb.create_task(
+            conn,
+            title="current r2",
+            body="contract_id: suppression-contract\nrevision: r2",
+            assignee="default",
+            tenant="fixture-project",
+        )
+        assert kb.claim_task(conn, replacement, claimer="owner") is not None
+        kb._record_iteration_exhaustion(conn, old, budget_used=60, budget_max=60)
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='needs_owner_replan'",
+            (old,),
+        ).fetchone()[0] == 0
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert "iteration budget exhausted" in adapter.sent[0]["text"].lower()
+    assert adapter.handled == []
+
+
+def test_owner_replan_wake_failure_escalates_manual_once_without_loop(tmp_path, monkeypatch):
+    db_path = tmp_path / "owner-replan-failure.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kb.init_db()
+    tid = _create_iteration_exhausted_owner_replan_subscription()
+
+    adapter = OwnerWakeFailAdapter()
+    runner = _make_runner(adapter)
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert adapter.wake_attempts == 1
+    # One terminal progress ping + one concise manual escalation.
+    assert len(adapter.sent) == 2
+    assert "no automatic retry" in adapter.sent[1]["text"].lower()
+    assert "manual owner action required" in adapter.sent[1]["text"].lower()
+
+    conn = kb.connect()
+    try:
+        failed = conn.execute(
+            "SELECT payload FROM task_events WHERE task_id=? AND kind='owner_replan_failed'",
+            (tid,),
+        ).fetchall()
+        assert len(failed) == 1
+        payload = __import__("json").loads(failed[0]["payload"])
+        assert payload["resume_policy"] == "manual"
+        assert payload["retryable"] is False
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id=?",
+            (tid,),
+        ).fetchone()[0] == 1
+    finally:
+        conn.close()
+
+    runner._running = True
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    assert adapter.wake_attempts == 1
+    assert len(adapter.sent) == 2
