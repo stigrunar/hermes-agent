@@ -72,6 +72,18 @@ def test_repo_defaults_to_runtime_agent_root_not_script_location(monkeypatch, tm
     assert loaded.REPO != SCRIPT.parent.parent
 
 
+def test_admission_lock_uses_exact_custom_state_dir(monkeypatch, tmp_path):
+    custom = tmp_path / "custom-state"
+    fallback = tmp_path / "fallback-state"
+    monkeypatch.setattr(safe, "STATE_DIR", fallback)
+    monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(custom))
+
+    assert safe._admission_lock_path() == custom / "outcome-execution-admission.lock"
+    with safe._execution_admission_lock():
+        assert safe._admission_lock_path().is_file()
+    assert not (fallback / "outcome-execution-admission.lock").exists()
+
+
 def test_write_cursor_replaces_sibling_temp_without_truncating_existing_file(
     monkeypatch, tmp_path
 ):
@@ -738,6 +750,8 @@ def _seed_outcome_task(
             title=f"outcome-{task_id_suffix}",
             body=body,
             assignee="alice",
+            workspace_kind="dir",
+            workspace_path=str(db_path.parent / f"repo-{task_id_suffix}"),
             project_id=f"p_{task_id_suffix}",
         )
         if running:

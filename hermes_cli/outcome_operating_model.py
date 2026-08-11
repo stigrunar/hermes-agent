@@ -63,6 +63,7 @@ _MARKER_KEYS = (
     "maturity",
     "execution_mode",
     "execution_access",
+    "shared_authority_scope",
     "authority_scope",
     "outcome_kind",
     "outcome_owner",
@@ -78,6 +79,7 @@ _OUTCOME_STATE_KEYS = frozenset(
         "maturity",
         "execution_mode",
         "execution_access",
+        "shared_authority_scope",
         "authority_scope",
         "outcome_kind",
         "outcome_owner",
@@ -139,8 +141,12 @@ def normalize_owner(value: Any) -> str:
     return OUTCOME_OWNER
 
 
-def canonical_authority_scope(path: Any) -> str:
-    """Resolve a filesystem workdir to a stable repository/authority scope."""
+def canonical_repository_scope(path: Any) -> str:
+    """Resolve a workdir to a stable repository/workspace identity.
+
+    Git common-dir wins so sibling worktrees are always the same repository.
+    This identity is mechanical and cannot be overridden by task metadata.
+    """
     raw = str(path or "").strip()
     if not raw:
         return "unscoped"
@@ -184,20 +190,33 @@ def canonical_authority_scope(path: Any) -> str:
     return f"workspace:{normalized.rstrip('/')}"
 
 
-def _derive_authority_scope(task: Any, markers: Mapping[str, str]) -> str:
-    explicit = str(markers.get("authority_scope") or "").strip()
-    if explicit:
-        return explicit
+# Backward-compatible helper name for callers from the first candidate. The
+# returned value is repository/workspace identity, never logical shared scope.
+def canonical_authority_scope(path: Any) -> str:
+    return canonical_repository_scope(path)
 
+
+def _derive_repository_scope(task: Any) -> str:
     workspace = str(_field(task, "workspace_path", "") or "").strip()
     if workspace:
-        return canonical_authority_scope(workspace)
+        return canonical_repository_scope(workspace)
 
     project_id = str(_field(task, "project_id", "") or "").strip()
     if project_id:
         return f"project:{project_id}"
 
     return "unscoped"
+
+
+def _derive_shared_authority_scope(markers: Mapping[str, str]) -> str:
+    # ``authority_scope`` was the marker name in the first candidate. Preserve
+    # it as an alias, but it is now additive logical scope and can never replace
+    # repository identity.
+    return str(
+        markers.get("shared_authority_scope")
+        or markers.get("authority_scope")
+        or ""
+    ).strip()
 
 
 @dataclass(frozen=True)
@@ -210,13 +229,19 @@ class TaskExecutionClaim:
     maturity: Optional[Maturity]
     mode: ExecutionMode
     access: ExecutionAccess
-    authority_scope: str
+    repository_scope: str
+    shared_authority_scope: str
     kind: OutcomeKind
     owner: str
     status: str = ""
     created_at: int = 0
     priority: int = 0
     explicit_outcome: bool = False
+
+    @property
+    def authority_scope(self) -> str:
+        """Backward-compatible name for mechanical repository/workspace scope."""
+        return self.repository_scope
 
     @property
     def mutating(self) -> bool:
@@ -278,7 +303,8 @@ def task_execution_claim(task: Any, *, board: str = "default") -> TaskExecutionC
         maturity=maturity,
         mode=mode,
         access=access,
-        authority_scope=_derive_authority_scope(task, markers),
+        repository_scope=_derive_repository_scope(task),
+        shared_authority_scope=_derive_shared_authority_scope(markers),
         kind=kind,
         owner=owner,
         status=str(_field(task, "status", "") or "").strip().casefold(),
@@ -377,8 +403,14 @@ def admit_execution(
         sorted(
             claim.task_id
             for claim in active_mutating
-            if claim.authority_scope == candidate.authority_scope
-            and claim.task_id != candidate.task_id
+            if claim.task_id != candidate.task_id
+            and (
+                claim.repository_scope == candidate.repository_scope
+                or (
+                    bool(candidate.shared_authority_scope)
+                    and claim.shared_authority_scope == candidate.shared_authority_scope
+                )
+            )
         )
     )
     if collisions:

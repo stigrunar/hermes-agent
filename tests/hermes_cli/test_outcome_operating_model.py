@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import re
 import sqlite3
+import subprocess
 from types import SimpleNamespace
 
 import pytest
@@ -31,9 +33,15 @@ def _task(
     )
 
 
-def _claim(task_id: str, **markers):
+def _claim(task_id: str, *, workspace_path: str | None = None, **markers):
     body = "\n".join(f"{key}: {value}" for key, value in markers.items())
-    return oom.task_execution_claim(_task(task_id, body=body), board="demo")
+    if workspace_path is None:
+        logical = str(markers.get("shared_authority_scope") or markers.get("authority_scope") or task_id)
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "-", logical).strip("-") or task_id
+        workspace_path = f"/repos/{safe}"
+    return oom.task_execution_claim(
+        _task(task_id, body=body, workspace_path=workspace_path), board="demo"
+    )
 
 
 def _resume_receipt(**overrides):
@@ -181,6 +189,138 @@ def test_global_two_mutating_workers_and_one_per_authority_scope_fail_closed():
     assert collision.allowed is False
     assert collision.reason == "authority_scope_collision"
     assert collision.collides_with == ("t_a",)
+
+
+def test_same_repository_collides_even_when_explicit_shared_scopes_differ():
+    active = _claim(
+        "t_repo_a",
+        workspace_path="/repos/shared-repo/.worktrees/a",
+        outcome_id="o_a",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        authority_scope="logical:a",
+    )
+    candidate = _claim(
+        "t_repo_b",
+        workspace_path="/repos/shared-repo/.worktrees/b",
+        outcome_id="o_b",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        authority_scope="logical:b",
+    )
+
+    decision = oom.admit_execution(candidate, active_claims=[active])
+
+    assert active.repository_scope == candidate.repository_scope == "workspace:/repos/shared-repo"
+    assert active.shared_authority_scope == "logical:a"
+    assert candidate.shared_authority_scope == "logical:b"
+    assert decision.allowed is False
+    assert decision.reason == "authority_scope_collision"
+
+
+def test_cross_repository_same_shared_authority_scope_collides():
+    active = _claim(
+        "t_shared_a",
+        workspace_path="/repos/a",
+        outcome_id="o_a",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        shared_authority_scope="finance-ledger",
+    )
+    candidate = _claim(
+        "t_shared_b",
+        workspace_path="/repos/b",
+        outcome_id="o_b",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        shared_authority_scope="finance-ledger",
+    )
+
+    decision = oom.admit_execution(candidate, active_claims=[active])
+
+    assert active.repository_scope != candidate.repository_scope
+    assert decision.allowed is False
+    assert decision.reason == "authority_scope_collision"
+    assert decision.collides_with == ("t_shared_a",)
+
+
+def test_cross_repository_different_or_empty_shared_scopes_can_run_when_capacity_exists():
+    active = _claim(
+        "t_distinct_a",
+        workspace_path="/repos/a",
+        outcome_id="o_a",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        shared_authority_scope="ledger-a",
+    )
+    different = _claim(
+        "t_distinct_b",
+        workspace_path="/repos/b",
+        outcome_id="o_b",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        shared_authority_scope="ledger-b",
+    )
+    no_shared = _claim(
+        "t_distinct_c",
+        workspace_path="/repos/c",
+        outcome_id="o_c",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+    )
+
+    assert oom.admit_execution(different, active_claims=[active]).allowed is True
+    assert oom.admit_execution(no_shared, active_claims=[active]).allowed is True
+
+
+def test_separate_git_worktrees_from_same_common_dir_collide(tmp_path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(
+        [
+            "git", "-C", str(repo), "-c", "user.email=test@example.invalid",
+            "-c", "user.name=Test", "commit", "--allow-empty", "-qm", "init",
+        ],
+        check=True,
+    )
+    wt_a = tmp_path / "wt-a"
+    wt_b = tmp_path / "wt-b"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-qb", "a", str(wt_a)], check=True)
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-qb", "b", str(wt_b)], check=True)
+
+    active = _claim(
+        "t_wt_a",
+        workspace_path=str(wt_a),
+        outcome_id="o_a",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        authority_scope="logical:a",
+    )
+    candidate = _claim(
+        "t_wt_b",
+        workspace_path=str(wt_b),
+        outcome_id="o_b",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        authority_scope="logical:b",
+    )
+
+    decision = oom.admit_execution(candidate, active_claims=[active])
+
+    assert active.repository_scope == candidate.repository_scope
+    assert active.repository_scope.startswith("git:")
+    assert decision.allowed is False
+    assert decision.collides_with == ("t_wt_a",)
 
 
 def test_incident_requests_preemption_instead_of_becoming_third_mutating_worker():

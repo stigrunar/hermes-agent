@@ -34,7 +34,6 @@ DB = Path(os.environ.get("HERMES_KANBAN_DB") or str(ROOT / "kanban.db"))
 _DEFAULT_DB_AT_IMPORT = DB
 STATE_DIR = ROOT / "state"
 LOCK_PATH = STATE_DIR / "kanban-safe-dispatcher.lock"
-ADMISSION_LOCK_PATH = STATE_DIR / "outcome-execution-admission.lock"
 CURSOR_PATH = STATE_DIR / "kanban-safe-dispatcher.cursor"
 DEFAULT_INTERVAL = 60
 DEFAULT_MAX_SPAWN = 1
@@ -167,6 +166,10 @@ def _cursor_path() -> Path:
     return _state_dir() / CURSOR_PATH.name
 
 
+def _admission_lock_path() -> Path:
+    return _state_dir() / "outcome-execution-admission.lock"
+
+
 def _read_cursor(board_count: int) -> int:
     if board_count <= 0:
         return 0
@@ -255,8 +258,9 @@ def _count_running(board: str) -> int:
 
 @contextmanager
 def _execution_admission_lock():
-    STATE_DIR.mkdir(parents=True, exist_ok=True)
-    with open(ADMISSION_LOCK_PATH, "a+", encoding="utf-8") as lock_file:
+    path = _admission_lock_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+", encoding="utf-8") as lock_file:
         fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
         try:
             yield
@@ -368,7 +372,8 @@ def _collect_direct_codex_claims() -> list[Any]:
                 maturity=None,
                 mode=outcome.ExecutionMode.DIRECT,
                 access=outcome.ExecutionAccess.MUTATING,
-                authority_scope=outcome.canonical_authority_scope(workdir),
+                repository_scope=outcome.canonical_repository_scope(workdir),
+                shared_authority_scope="",
                 kind=outcome.OutcomeKind.NORMAL,
                 owner=outcome.OUTCOME_OWNER,
                 status="running",
@@ -763,7 +768,9 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
                     "board": board,
                     "task_id": admitted_candidate.task_id,
                     "outcome_id": admitted_candidate.outcome_id,
-                    "authority_scope": admitted_candidate.authority_scope,
+                    "repository_scope": admitted_candidate.repository_scope,
+                    "shared_authority_scope": admitted_candidate.shared_authority_scope,
+                    "authority_scope": admitted_candidate.repository_scope,
                     "execution_access": admitted_candidate.access.value,
                     "execution_mode": admitted_candidate.mode.value,
                     **decision.as_dict(),
