@@ -54,7 +54,7 @@ class ExecutionAccess(str, Enum):
 OUTCOME_OWNER = "default"
 OUTCOME_OWNER_ALIASES = frozenset({"default", "dolly/default"})
 DEFAULT_MAX_NORMAL_FOCUS_OUTCOMES = 3
-DEFAULT_MAX_MUTATING_WORKERS = 2
+DEFAULT_MAX_MUTATING_WORKERS = 3
 DEFAULT_MAX_INCIDENT_OUTCOMES = 1
 
 _MARKER_KEYS = (
@@ -361,7 +361,7 @@ def admit_execution(
 
     The function never stops or reclassifies existing work. An incident that
     needs capacity returns ``preempt_required=True`` so Dolly/default can choose
-    what to preempt; it never manufactures a third mutating slot.
+    what to preempt; it never manufactures an extra mutating slot beyond the configured cap.
     """
 
     if max_mutating_workers < 1 or max_normal_focus_outcomes < 1 or max_incident_outcomes < 1:

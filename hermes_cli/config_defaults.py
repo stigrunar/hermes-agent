@@ -2306,7 +2306,7 @@ DEFAULT_CONFIG = {
         # block is an execution gate only, not a new workflow store.
         "outcome_operating_model": {
             "enabled": False,
-            "max_mutating_workers": 2,
+            "max_mutating_workers": 3,
             "max_normal_focus_outcomes": 3,
             "max_incident_outcomes": 1,
         },

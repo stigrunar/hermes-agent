@@ -762,7 +762,7 @@ def _seed_outcome_task(
 def _enabled_outcome_config(**overrides):
     policy = {
         "enabled": True,
-        "max_mutating_workers": 2,
+        "max_mutating_workers": 3,
         "max_normal_focus_outcomes": 3,
         "max_incident_outcomes": 1,
     }
@@ -776,23 +776,25 @@ def _enabled_outcome_config(**overrides):
     }
 
 
-def test_outcome_gate_defers_third_mutating_worker_without_stopping_existing_work(
+def test_outcome_gate_defers_fourth_mutating_worker_without_stopping_existing_work(
     monkeypatch, tmp_path
 ):
-    paths = {name: tmp_path / f"{name}.db" for name in ("a", "b", "c")}
-    _seed_outcome_task(
-        paths["a"], task_id_suffix="a", outcome_id="o_a", scope="repo:a", running=True
-    )
-    _seed_outcome_task(
-        paths["b"], task_id_suffix="b", outcome_id="o_b", scope="repo:b", running=True
-    )
+    paths = {name: tmp_path / f"{name}.db" for name in ("a", "b", "c", "d")}
+    for name in ("a", "b", "c"):
+        _seed_outcome_task(
+            paths[name],
+            task_id_suffix=name,
+            outcome_id=f"o_{name}",
+            scope=f"repo:{name}",
+            running=True,
+        )
     candidate = _seed_outcome_task(
-        paths["c"], task_id_suffix="c", outcome_id="o_c", scope="repo:c"
+        paths["d"], task_id_suffix="d", outcome_id="o_a", scope="repo:d"
     )
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_MAX", "4")
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(safe, "_load_config", _enabled_outcome_config)
-    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "c"])
+    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "c", "d"])
     monkeypatch.setattr(safe, "_global_execution_boards", lambda boards: list(boards))
     monkeypatch.setattr(safe, "_collect_direct_codex_claims", lambda: [])
     monkeypatch.setattr(safe, "_board_db_path", paths.__getitem__)
@@ -802,7 +804,7 @@ def test_outcome_gate_defers_third_mutating_worker_without_stopping_existing_wor
     def fake_dispatch(board, *, dry_run, spawn_budget, only_task_id=None, **kwargs):
         if spawn_budget == 0:
             return {"ok": True, "board": board, "payload": {"spawned": []}}
-        if board == "c" and dry_run:
+        if board == "d" and dry_run:
             return {
                 "ok": True,
                 "board": board,
@@ -822,8 +824,8 @@ def test_outcome_gate_defers_third_mutating_worker_without_stopping_existing_wor
     deferred = result["deferred_admission"][0]
     assert deferred["task_id"] == candidate
     assert deferred["reason"] == "global_mutating_capacity"
-    assert deferred["active_mutating"] == 2
-    for board in ("a", "b"):
+    assert deferred["active_mutating"] == 3
+    for board in ("a", "b", "c"):
         with kb.connect_readonly_closing(db_path=paths[board]) as conn:
             assert conn.execute("SELECT COUNT(*) FROM tasks WHERE status='running'").fetchone()[0] == 1
 
@@ -858,25 +860,30 @@ def test_outcome_gate_blocks_same_authority_scope_even_with_global_slot(monkeypa
     assert deferred["collides_with"] == [active]
 
 
-def test_outcome_gate_allows_explicit_read_only_lane_without_consuming_mutating_slot(
+def test_outcome_gate_allows_explicit_read_only_lane_when_three_mutating_slots_are_full(
     monkeypatch, tmp_path
 ):
-    paths = {name: tmp_path / f"{name}.db" for name in ("a", "review")}
-    _seed_outcome_task(
-        paths["a"], task_id_suffix="a", outcome_id="o_a", scope="repo:shared", running=True
-    )
+    paths = {name: tmp_path / f"{name}.db" for name in ("a", "b", "c", "review")}
+    for name in ("a", "b", "c"):
+        _seed_outcome_task(
+            paths[name],
+            task_id_suffix=name,
+            outcome_id=f"o_{name}",
+            scope=f"repo:{name}",
+            running=True,
+        )
     candidate = _seed_outcome_task(
         paths["review"],
         task_id_suffix="review",
         outcome_id="o_review",
-        scope="repo:shared",
+        scope="repo:a",
         access="read_only",
         tier="warm",
     )
-    monkeypatch.setenv("HERMES_SAFE_DISPATCH_MAX", "2")
+    monkeypatch.setenv("HERMES_SAFE_DISPATCH_MAX", "4")
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(safe, "_load_config", _enabled_outcome_config)
-    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "review"])
+    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "c", "review"])
     monkeypatch.setattr(safe, "_global_execution_boards", lambda boards: list(boards))
     monkeypatch.setattr(safe, "_collect_direct_codex_claims", lambda: [])
     monkeypatch.setattr(safe, "_board_db_path", paths.__getitem__)
@@ -910,12 +917,18 @@ def test_outcome_gate_allows_explicit_read_only_lane_without_consuming_mutating_
     assert result["deferred_admission"] == []
 
 
-def test_incident_at_full_mutating_capacity_reports_preemption_without_third_slot(
+def test_incident_at_full_mutating_capacity_reports_preemption_without_fourth_slot(
     monkeypatch, tmp_path
 ):
-    paths = {name: tmp_path / f"{name}.db" for name in ("a", "b", "incident")}
-    _seed_outcome_task(paths["a"], task_id_suffix="a", outcome_id="o_a", scope="repo:a", running=True)
-    _seed_outcome_task(paths["b"], task_id_suffix="b", outcome_id="o_b", scope="repo:b", running=True)
+    paths = {name: tmp_path / f"{name}.db" for name in ("a", "b", "c", "incident")}
+    for name in ("a", "b", "c"):
+        _seed_outcome_task(
+            paths[name],
+            task_id_suffix=name,
+            outcome_id=f"o_{name}",
+            scope=f"repo:{name}",
+            running=True,
+        )
     candidate = _seed_outcome_task(
         paths["incident"],
         task_id_suffix="incident",
@@ -926,7 +939,7 @@ def test_incident_at_full_mutating_capacity_reports_preemption_without_third_slo
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_MAX", "4")
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(tmp_path))
     monkeypatch.setattr(safe, "_load_config", _enabled_outcome_config)
-    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "incident"])
+    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "c", "incident"])
     monkeypatch.setattr(safe, "_global_execution_boards", lambda boards: list(boards))
     monkeypatch.setattr(safe, "_collect_direct_codex_claims", lambda: [])
     monkeypatch.setattr(safe, "_board_db_path", paths.__getitem__)
@@ -947,7 +960,7 @@ def test_incident_at_full_mutating_capacity_reports_preemption_without_third_slo
     deferred = result["deferred_admission"][0]
     assert deferred["reason"] == "incident_preemption_required"
     assert deferred["preempt_required"] is True
-    assert result["running"] == 2
+    assert result["running"] == 3
 
 
 def test_global_mutating_census_includes_running_board_outside_dispatch_allowlist(
@@ -959,6 +972,7 @@ def test_global_mutating_census_includes_running_board_outside_dispatch_allowlis
         "a": boards_root / "a" / "kanban.db",
         "candidate": boards_root / "candidate" / "kanban.db",
         "extra": boards_root / "extra" / "kanban.db",
+        "extra2": boards_root / "extra2" / "kanban.db",
     }
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -968,10 +982,17 @@ def test_global_mutating_census_includes_running_board_outside_dispatch_allowlis
     _seed_outcome_task(
         paths["extra"], task_id_suffix="extra", outcome_id="o_extra", scope="repo:extra", running=True
     )
+    _seed_outcome_task(
+        paths["extra2"],
+        task_id_suffix="extra2",
+        outcome_id="o_extra2",
+        scope="repo:extra2",
+        running=True,
+    )
     candidate = _seed_outcome_task(
         paths["candidate"],
         task_id_suffix="candidate",
-        outcome_id="o_candidate",
+        outcome_id="o_a",
         scope="repo:candidate",
     )
     monkeypatch.setattr(safe, "ROOT", home)
@@ -994,19 +1015,34 @@ def test_global_mutating_census_includes_running_board_outside_dispatch_allowlis
 
     result = safe._dispatch_once()
 
-    assert safe._global_execution_boards(["a", "candidate"]) == ["a", "candidate", "extra"]
+    assert safe._global_execution_boards(["a", "candidate"]) == [
+        "a",
+        "candidate",
+        "extra",
+        "extra2",
+    ]
     deferred = result["deferred_admission"][0]
     assert deferred["task_id"] == candidate
     assert deferred["reason"] == "global_mutating_capacity"
-    assert deferred["active_mutating"] == 2
+    assert deferred["active_mutating"] == 3
 
 
-def test_running_direct_codex_writer_counts_against_durable_mutating_cap(monkeypatch, tmp_path):
+def test_one_direct_and_two_durable_writers_fill_three_slot_global_cap(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
-    candidate_db = home / "kanban" / "boards" / "candidate" / "kanban.db"
-    candidate_db.parent.mkdir(parents=True, exist_ok=True)
+    boards_root = home / "kanban" / "boards"
+    paths = {
+        name: boards_root / name / "kanban.db" for name in ("a", "b", "candidate")
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    active_a = _seed_outcome_task(
+        paths["a"], task_id_suffix="a", outcome_id="o_a", scope="repo:a", running=True
+    )
+    active_b = _seed_outcome_task(
+        paths["b"], task_id_suffix="b", outcome_id="o_b", scope="repo:b", running=True
+    )
     candidate = _seed_outcome_task(
-        candidate_db,
+        paths["candidate"],
         task_id_suffix="candidate",
         outcome_id="o_candidate",
         scope="repo:candidate",
@@ -1015,11 +1051,12 @@ def test_running_direct_codex_writer_counts_against_durable_mutating_cap(monkeyp
     active_workdir.mkdir()
     jobs = home / "codex-jobs"
     jobs.mkdir(parents=True)
-    (jobs / ("c" * 32 + ".json")).write_text(
+    direct_id = "c" * 32
+    (jobs / f"{direct_id}.json").write_text(
         json.dumps(
             {
-                "job_id": "c" * 32,
-                "status": "running",
+                "job_id": direct_id,
+                "status": "starting",
                 "sandbox": "workspace-write",
                 "workdir": str(active_workdir),
             }
@@ -1029,18 +1066,18 @@ def test_running_direct_codex_writer_counts_against_durable_mutating_cap(monkeyp
     monkeypatch.setattr(safe, "ROOT", home)
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_MAX", "4")
     monkeypatch.setenv("HERMES_SAFE_DISPATCH_STATE_DIR", str(tmp_path))
-    monkeypatch.setattr(
-        safe,
-        "_load_config",
-        lambda: _enabled_outcome_config(max_mutating_workers=1),
-    )
-    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["candidate"])
+    monkeypatch.setattr(safe, "_load_config", _enabled_outcome_config)
+    monkeypatch.setattr(safe, "_parse_board_allowlist", lambda: ["a", "b", "candidate"])
     monkeypatch.setattr(safe, "_global_execution_boards", lambda boards: list(boards))
-    monkeypatch.setattr(safe, "_board_db_path", lambda board: candidate_db)
+    monkeypatch.setattr(safe, "_board_db_path", paths.__getitem__)
     monkeypatch.setattr(safe, "_probe_db", lambda board: (True, "ok"))
 
     def fake_dispatch(board, *, dry_run, spawn_budget, **kwargs):
-        spawned = [{"task_id": candidate}] if dry_run and spawn_budget else []
+        spawned = (
+            [{"task_id": candidate}]
+            if board == "candidate" and dry_run and spawn_budget
+            else []
+        )
         return {"ok": True, "board": board, "payload": {"spawned": spawned}}
 
     monkeypatch.setattr(safe, "_dispatch_board", fake_dispatch)
@@ -1050,8 +1087,8 @@ def test_running_direct_codex_writer_counts_against_durable_mutating_cap(monkeyp
     deferred = result["deferred_admission"][0]
     assert deferred["task_id"] == candidate
     assert deferred["reason"] == "global_mutating_capacity"
-    assert deferred["active_mutating"] == 1
-    assert deferred["collides_with"] == [f"codex:{'c' * 32}"]
+    assert deferred["active_mutating"] == 3
+    assert set(deferred["collides_with"]) == {active_a, active_b, f"codex:{direct_id}"}
 
 
 def test_native_dispatch_only_task_id_fences_previewed_candidate(

@@ -341,7 +341,7 @@ def _collect_task_claims(boards: list[str], *, running_only: bool = False) -> li
 
 
 def _collect_direct_codex_claims() -> list[Any]:
-    """Project running direct workspace-write Codex jobs into the same cap."""
+    """Project fail-closed starting/running direct workspace-write jobs into the same cap."""
     jobs_root = ROOT / "codex-jobs"
     if not jobs_root.is_dir():
         return []
@@ -354,7 +354,7 @@ def _collect_direct_codex_claims() -> list[Any]:
             continue
         if not isinstance(meta, dict):
             continue
-        if str(meta.get("status") or "").strip().casefold() != "running":
+        if str(meta.get("status") or "").strip().casefold() not in {"starting", "running"}:
             continue
         if str(meta.get("sandbox") or "").strip().casefold() != "workspace-write":
             continue

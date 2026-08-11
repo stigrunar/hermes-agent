@@ -146,7 +146,34 @@ def test_read_only_specialist_can_run_separately_from_mutating_capacity_and_scop
     assert decision.reason == "read_only_separate_capacity"
 
 
-def test_global_two_mutating_workers_and_one_per_authority_scope_fail_closed():
+def test_read_only_specialist_can_run_when_three_mutating_slots_are_full():
+    active = [
+        _claim(
+            f"t_mutating_{index}",
+            outcome_id=f"o_mutating_{index}",
+            outcome_tier="focus",
+            execution_mode="durable",
+            execution_access="mutating",
+            authority_scope=f"repo:mutating:{index}",
+        )
+        for index in range(3)
+    ]
+    candidate = _claim(
+        "t_read_only_full",
+        outcome_id="o_read_only",
+        outcome_tier="warm",
+        execution_mode="specialist",
+        execution_access="read_only",
+        authority_scope="repo:mutating:0",
+    )
+
+    decision = oom.admit_execution(candidate, active_claims=active)
+
+    assert decision.allowed is True
+    assert decision.reason == "read_only_separate_capacity"
+
+
+def test_global_three_mutating_workers_and_one_per_authority_scope_fail_closed():
     active_a = _claim(
         "t_a",
         outcome_id="o_a",
@@ -171,6 +198,14 @@ def test_global_two_mutating_workers_and_one_per_authority_scope_fail_closed():
         execution_access="mutating",
         authority_scope="repo:c",
     )
+    fourth = _claim(
+        "t_d",
+        outcome_id="o_d",
+        outcome_tier="focus",
+        execution_mode="durable",
+        execution_access="mutating",
+        authority_scope="repo:d",
+    )
     same_scope = _claim(
         "t_same",
         outcome_id="o_same",
@@ -180,12 +215,16 @@ def test_global_two_mutating_workers_and_one_per_authority_scope_fail_closed():
         authority_scope="repo:a",
     )
 
-    capacity = oom.admit_execution(third, active_claims=[active_a, active_b])
+    third_slot = oom.admit_execution(third, active_claims=[active_a, active_b])
+    capacity = oom.admit_execution(fourth, active_claims=[active_a, active_b, third])
     collision = oom.admit_execution(same_scope, active_claims=[active_a])
 
+    assert third_slot.allowed is True
+    assert third_slot.reason == "mutating_capacity_available"
+    assert third_slot.active_mutating == 2
     assert capacity.allowed is False
     assert capacity.reason == "global_mutating_capacity"
-    assert capacity.active_mutating == 2
+    assert capacity.active_mutating == 3
     assert collision.allowed is False
     assert collision.reason == "authority_scope_collision"
     assert collision.collides_with == ("t_a",)
@@ -323,7 +362,7 @@ def test_separate_git_worktrees_from_same_common_dir_collide(tmp_path):
     assert decision.collides_with == ("t_wt_a",)
 
 
-def test_incident_requests_preemption_instead_of_becoming_third_mutating_worker():
+def test_incident_requests_preemption_instead_of_becoming_fourth_mutating_worker():
     active = [
         _claim(
             f"t_{index}",
@@ -333,7 +372,7 @@ def test_incident_requests_preemption_instead_of_becoming_third_mutating_worker(
             execution_access="mutating",
             authority_scope=f"repo:{index}",
         )
-        for index in range(2)
+        for index in range(3)
     ]
     incident = _claim(
         "t_incident",
@@ -350,7 +389,7 @@ def test_incident_requests_preemption_instead_of_becoming_third_mutating_worker(
     assert decision.allowed is False
     assert decision.reason == "incident_preemption_required"
     assert decision.preempt_required is True
-    assert decision.active_mutating == 2
+    assert decision.active_mutating == 3
 
 
 def test_over_capacity_focus_set_requires_owner_instead_of_guessing_priority():
