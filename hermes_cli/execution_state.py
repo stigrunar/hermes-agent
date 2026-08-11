@@ -350,6 +350,11 @@ def upsert_repo_execution_state(path: str, state: Mapping[str, Any]) -> None:
         raise ValueError("repo execution state requires contract_id and revision")
     if status not in {"active", "blocked", "done", "superseded", "cancelled", "archived"}:
         raise ValueError("invalid repo execution status")
+    from hermes_cli.outcome_operating_model import validate_outcome_state_payload
+
+    outcome_errors = validate_outcome_state_payload(payload)
+    if outcome_errors:
+        raise ValueError("invalid outcome operating-model metadata: " + "; ".join(outcome_errors))
     payload["contract_id"] = contract_id
     payload["revision"] = revision
     payload["status"] = status

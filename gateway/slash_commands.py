@@ -581,7 +581,21 @@ class GatewaySlashCommandsMixin:
         return output or t("gateway.kanban.no_output")
 
     async def _handle_status_command(self, event: MessageEvent) -> str:
-        """Handle /status command."""
+        """Handle /status command, including the outcome-first portfolio projection."""
+        command_args = (
+            event.get_command_args().strip()
+            if hasattr(event, "get_command_args")
+            else ""
+        )
+        if not command_args:
+            text = str(getattr(event, "text", "") or "").strip()
+            if text.startswith("/status"):
+                command_args = text[len("/status"):].strip()
+        if command_args.casefold() in {"portfolio", "outcomes"}:
+            from hermes_cli.outcome_operating_model import render_current_portfolio_status
+
+            return await asyncio.to_thread(render_current_portfolio_status)
+
         from gateway.run import _AGENT_PENDING_SENTINEL, _load_gateway_config, _resolve_gateway_model
 
         source = event.source

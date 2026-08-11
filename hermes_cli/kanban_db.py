@@ -14551,6 +14551,7 @@ def dispatch_once(
     max_spawn: Optional[int] = None,
     spawn_budget: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    only_task_id: Optional[str] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
@@ -14584,6 +14585,7 @@ def dispatch_once(
             max_spawn=max_spawn,
             spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
+            only_task_id=only_task_id,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
@@ -14604,6 +14606,7 @@ def dispatch_once(
             max_spawn=max_spawn,
             spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
+            only_task_id=only_task_id,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
@@ -14621,6 +14624,7 @@ def dispatch_once(
             max_spawn=max_spawn,
             spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
+            only_task_id=only_task_id,
             failure_limit=failure_limit,
             stale_timeout_seconds=stale_timeout_seconds,
             board=board,
@@ -14744,6 +14748,7 @@ def _dispatch_once_locked(
     max_spawn: Optional[int] = None,
     spawn_budget: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    only_task_id: Optional[str] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
@@ -14872,13 +14877,18 @@ def _dispatch_once_locked(
             ).fetchone()[0]
         )
 
-    ready_rows = conn.execute(
+    ready_query = (
         "SELECT id, assignee FROM tasks "
         "WHERE status = 'ready' AND claim_lock IS NULL "
         "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
         "AND superseded_by IS NULL "
-        "ORDER BY priority DESC, created_at ASC"
-    ).fetchall()
+    )
+    ready_params: list[Any] = []
+    if only_task_id:
+        ready_query += "AND id = ? "
+        ready_params.append(only_task_id)
+    ready_query += "ORDER BY priority DESC, created_at ASC"
+    ready_rows = conn.execute(ready_query, ready_params).fetchall()
     # Honour kanban.max_in_progress: if the board already has enough running
     # tasks, skip spawning this tick so slow workers (local LLMs,
     # resource-constrained hosts) can finish what they have before more tasks

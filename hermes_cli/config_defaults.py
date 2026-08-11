@@ -2297,6 +2297,19 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Outcome-first operating-model admission. Off by default so landing
+        # the code cannot activate or reclassify existing boards. When an
+        # operator later enables it, the existing external safe dispatcher
+        # treats unmarked legacy workers as mutating, caps mutating work
+        # globally, and prevents concurrent mutation of one authority scope.
+        # Project/outcome classification remains project-canon authority; this
+        # block is an execution gate only, not a new workflow store.
+        "outcome_operating_model": {
+            "enabled": False,
+            "max_mutating_workers": 2,
+            "max_normal_focus_outcomes": 3,
+            "max_incident_outcomes": 1,
+        },
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

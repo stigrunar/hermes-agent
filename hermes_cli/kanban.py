@@ -832,6 +832,8 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                         help="Per-board live concurrency cap")
     p_disp.add_argument("--spawn-budget", type=int, default=None,
                         help="Bound new spawns from this invocation only")
+    p_disp.add_argument("--only-task-id", default=None,
+                        help="Admission fence: only this ready task may spawn in this pass")
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -2892,6 +2894,7 @@ def _cmd_dispatch(args: argparse.Namespace, *, conn=None) -> int:
             max_spawn=max_spawn,
             spawn_budget=spawn_budget,
             max_in_progress=max_in_progress,
+            only_task_id=getattr(args, "only_task_id", None),
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,

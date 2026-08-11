@@ -16,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any
 
@@ -33,6 +34,7 @@ DB = Path(os.environ.get("HERMES_KANBAN_DB") or str(ROOT / "kanban.db"))
 _DEFAULT_DB_AT_IMPORT = DB
 STATE_DIR = ROOT / "state"
 LOCK_PATH = STATE_DIR / "kanban-safe-dispatcher.lock"
+ADMISSION_LOCK_PATH = STATE_DIR / "outcome-execution-admission.lock"
 CURSOR_PATH = STATE_DIR / "kanban-safe-dispatcher.cursor"
 DEFAULT_INTERVAL = 60
 DEFAULT_MAX_SPAWN = 1
@@ -56,6 +58,13 @@ def _kanban_module():
     from hermes_cli import kanban_db
 
     return kanban_db
+
+
+def _outcome_module():
+    sys.path.insert(0, str(REPO))
+    from hermes_cli import outcome_operating_model
+
+    return outcome_operating_model
 
 
 def _positive_int(value: Any, default: int, *, minimum: int = 1) -> int:
@@ -86,6 +95,29 @@ def _dispatch_limits(cfg: dict[str, Any]) -> tuple[int, int]:
         kanban.get("failure_limit"), DEFAULT_FAILURE_LIMIT
     )
     return max_spawn, failure_limit
+
+
+def _outcome_policy(cfg: dict[str, Any]) -> dict[str, Any]:
+    kanban = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(kanban, dict):
+        kanban = {}
+    raw = kanban.get("outcome_operating_model", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    oom = _outcome_module()
+    return {
+        "enabled": bool(raw.get("enabled", False)),
+        "max_mutating_workers": _positive_int(
+            raw.get("max_mutating_workers"), oom.DEFAULT_MAX_MUTATING_WORKERS
+        ),
+        "max_normal_focus_outcomes": _positive_int(
+            raw.get("max_normal_focus_outcomes"),
+            oom.DEFAULT_MAX_NORMAL_FOCUS_OUTCOMES,
+        ),
+        "max_incident_outcomes": _positive_int(
+            raw.get("max_incident_outcomes"), oom.DEFAULT_MAX_INCIDENT_OUTCOMES
+        ),
+    }
 
 
 def _parse_board_allowlist(raw: str | None = None) -> list[str]:
@@ -221,9 +253,135 @@ def _count_running(board: str) -> int:
         return int(row[0] if row else 0)
 
 
+@contextmanager
+def _execution_admission_lock():
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    with open(ADMISSION_LOCK_PATH, "a+", encoding="utf-8") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
+def _claim_columns() -> str:
+    return (
+        "id, body, project_id, workspace_path, status, created_at, priority"
+    )
+
+
+def _read_task_claim(board: str, task_id: str):
+    resolved = _board_db_path(board).resolve()
+    kanban_db = _kanban_module()
+    with kanban_db.connect_readonly_closing(db_path=resolved) as con:
+        row = con.execute(
+            f"SELECT {_claim_columns()} FROM tasks WHERE id = ?",
+            (task_id,),
+        ).fetchone()
+    if row is None:
+        raise RuntimeError(f"admission candidate {task_id!r} disappeared from board {board!r}")
+    return _outcome_module().task_execution_claim(row, board=board)
+
+
+def _global_execution_boards(allowlisted: list[str]) -> list[str]:
+    """Return board DBs that can contribute live global execution occupancy.
+
+    Dispatch authority remains the explicit allowlist. This discovery is
+    read-only capacity census only, so a worker started manually/on another
+    board cannot be invisible to the global mutating cap.
+    """
+    ordered: list[str] = []
+    seen: set[str] = set()
+
+    def add(board: str) -> None:
+        slug = str(board or "").strip().casefold()
+        if not slug or slug in seen:
+            return
+        seen.add(slug)
+        ordered.append(slug)
+
+    for board in allowlisted:
+        add(board)
+    if (ROOT / "kanban.db").is_file():
+        add("default")
+    boards_root = ROOT / "kanban" / "boards"
+    if boards_root.is_dir():
+        for db_path in sorted(boards_root.glob("*/kanban.db")):
+            if db_path.parent.name.startswith("_"):
+                continue
+            add(db_path.parent.name)
+    return ordered
+
+
+def _collect_task_claims(boards: list[str], *, running_only: bool = False) -> list[Any]:
+    claims: list[Any] = []
+    kanban_db = _kanban_module()
+    outcome = _outcome_module()
+    for board in boards:
+        resolved = _board_db_path(board).resolve()
+        with kanban_db.connect_readonly_closing(db_path=resolved) as con:
+            if running_only:
+                rows = con.execute(
+                    f"SELECT {_claim_columns()} FROM tasks WHERE status = 'running'"
+                ).fetchall()
+            else:
+                rows = con.execute(
+                    f"SELECT {_claim_columns()} FROM tasks "
+                    "WHERE status NOT IN ('done', 'archived') "
+                    "AND COALESCE(hygiene_class,'') NOT IN ('obsolete','superseded') "
+                    "AND superseded_by IS NULL"
+                ).fetchall()
+        for row in rows:
+            claims.append(outcome.task_execution_claim(row, board=board))
+    return claims
+
+
+def _collect_direct_codex_claims() -> list[Any]:
+    """Project running direct workspace-write Codex jobs into the same cap."""
+    jobs_root = ROOT / "codex-jobs"
+    if not jobs_root.is_dir():
+        return []
+    outcome = _outcome_module()
+    claims: list[Any] = []
+    for path in sorted(jobs_root.glob("*.json")):
+        try:
+            meta = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(meta, dict):
+            continue
+        if str(meta.get("status") or "").strip().casefold() != "running":
+            continue
+        if str(meta.get("sandbox") or "").strip().casefold() != "workspace-write":
+            continue
+        job_id = str(meta.get("job_id") or path.stem).strip()
+        workdir = str(meta.get("workdir") or "").strip()
+        if not job_id or not workdir:
+            raise RuntimeError(f"running Codex job metadata is incomplete: {path}")
+        claims.append(
+            outcome.TaskExecutionClaim(
+                task_id=f"codex:{job_id}",
+                board="direct-codex",
+                outcome_id=f"direct:{job_id}",
+                project_id="",
+                tier=None,
+                maturity=None,
+                mode=outcome.ExecutionMode.DIRECT,
+                access=outcome.ExecutionAccess.MUTATING,
+                authority_scope=outcome.canonical_authority_scope(workdir),
+                kind=outcome.OutcomeKind.NORMAL,
+                owner=outcome.OUTCOME_OWNER,
+                status="running",
+                explicit_outcome=False,
+            )
+        )
+    return claims
+
+
 def _dispatch_board(
     board: str, *, failure_limit: int, dry_run: bool,
     max_spawn: int = 1, spawn_budget: int = 1,
+    only_task_id: str | None = None,
 ) -> dict[str, Any]:
     env = os.environ.copy()
     env["HERMES_HOME"] = str(ROOT)
@@ -245,6 +403,8 @@ def _dispatch_board(
         str(failure_limit),
         "--json",
     ]
+    if only_task_id:
+        cmd.extend(["--only-task-id", only_task_id])
     if dry_run:
         cmd.append("--dry-run")
     try:
@@ -380,7 +540,8 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
     try:
         boards = _parse_board_allowlist()
         max_spawn, failure_limit = _dispatch_limits(cfg)
-    except ValueError as exc:
+        outcome_policy = _outcome_policy(cfg)
+    except (ImportError, ValueError) as exc:
         return {"ok": False, "error": str(exc)}
 
     # Probe every selected DB before dispatching any board. This prevents a
@@ -451,6 +612,32 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
             ),
         }
 
+    active_claims: list[Any] = []
+    portfolio_claims: list[Any] = []
+    global_execution_boards: list[str] = []
+    simulated_active_claims: list[Any] = []
+    admission_records: list[dict[str, Any]] = []
+    deferred_admission: list[dict[str, Any]] = []
+    if outcome_policy["enabled"]:
+        try:
+            global_execution_boards = _global_execution_boards(boards)
+            active_claims = _collect_task_claims(global_execution_boards, running_only=True)
+            active_claims.extend(_collect_direct_codex_claims())
+            portfolio_claims = _collect_task_claims(global_execution_boards, running_only=False)
+        except Exception as exc:
+            return {
+                "ok": False,
+                "dry_run": dry_run,
+                "max_spawn": max_spawn,
+                "boards": _board_summaries(records, boards),
+                "payload": _aggregate_payload(records),
+                "operating_model": outcome_policy,
+                "error": (
+                    "outcome admission inventory failed closed: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            }
+
     # This is the conservative floor for allocation. Reclamation may have
     # freed a slot, but a later reclaim/race must not manufacture another one
     # during this tick.
@@ -490,13 +677,112 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
                     "payload": _aggregate_payload(records),
                     "error": f"could not count board {board!r}: {type(exc).__name__}: {exc}",
                 }
-            record = _dispatch_board(
-                board,
-                failure_limit=failure_limit,
-                dry_run=dry_run,
-                max_spawn=max(1, board_running + 1),
-                spawn_budget=1,
-            )
+            admitted_candidate = None
+            if outcome_policy["enabled"]:
+                preview = _dispatch_board(
+                    board,
+                    failure_limit=failure_limit,
+                    dry_run=True,
+                    max_spawn=max(1, board_running + 1),
+                    spawn_budget=1,
+                )
+                if not preview.get("ok"):
+                    return {
+                        "ok": False,
+                        "max_spawn": max_spawn,
+                        "boards": _board_summaries(records, boards),
+                        "payload": _aggregate_payload(records),
+                        "operating_model": outcome_policy,
+                        "error": f"admission preview failed on board {board!r}",
+                    }
+                preview_spawned = (preview.get("payload") or {}).get("spawned") or []
+                if not preview_spawned:
+                    continue
+                preview_item = preview_spawned[0]
+                task_id = (
+                    preview_item.get("task_id")
+                    if isinstance(preview_item, dict)
+                    else None
+                )
+                if not task_id:
+                    return {
+                        "ok": False,
+                        "max_spawn": max_spawn,
+                        "boards": _board_summaries(records, boards),
+                        "payload": _aggregate_payload(records),
+                        "operating_model": outcome_policy,
+                        "error": f"admission preview returned no task id on board {board!r}",
+                    }
+                try:
+                    lock_context = nullcontext() if dry_run else _execution_admission_lock()
+                    with lock_context:
+                        # Re-census under the same cross-path admission lock that
+                        # direct Codex uses. This prevents a direct writer and a
+                        # durable worker from both consuming the final slot.
+                        active_claims = _collect_task_claims(
+                            global_execution_boards, running_only=True
+                        )
+                        active_claims.extend(_collect_direct_codex_claims())
+                        if dry_run:
+                            active_claims.extend(simulated_active_claims)
+                        portfolio_claims = _collect_task_claims(
+                            global_execution_boards, running_only=False
+                        )
+                        admitted_candidate = _read_task_claim(board, str(task_id))
+                        decision = _outcome_module().admit_execution(
+                            admitted_candidate,
+                            active_claims=active_claims,
+                            portfolio_claims=portfolio_claims,
+                            max_mutating_workers=outcome_policy["max_mutating_workers"],
+                            max_normal_focus_outcomes=outcome_policy["max_normal_focus_outcomes"],
+                            max_incident_outcomes=outcome_policy["max_incident_outcomes"],
+                        )
+                        record = None
+                        if decision.allowed:
+                            record = preview if dry_run else _dispatch_board(
+                                board,
+                                failure_limit=failure_limit,
+                                dry_run=False,
+                                max_spawn=max(1, board_running + 1),
+                                spawn_budget=1,
+                                only_task_id=admitted_candidate.task_id,
+                            )
+                except Exception as exc:
+                    return {
+                        "ok": False,
+                        "max_spawn": max_spawn,
+                        "boards": _board_summaries(records, boards),
+                        "payload": _aggregate_payload(records),
+                        "operating_model": outcome_policy,
+                        "error": (
+                            f"admission classification failed for {task_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    }
+                admission_record = {
+                    "board": board,
+                    "task_id": admitted_candidate.task_id,
+                    "outcome_id": admitted_candidate.outcome_id,
+                    "authority_scope": admitted_candidate.authority_scope,
+                    "execution_access": admitted_candidate.access.value,
+                    "execution_mode": admitted_candidate.mode.value,
+                    **decision.as_dict(),
+                }
+                admission_records.append(admission_record)
+                if not decision.allowed:
+                    deferred_admission.append(admission_record)
+                    continue
+                if dry_run and admitted_candidate.mutating:
+                    simulated_active_claims.append(admitted_candidate)
+                assert record is not None
+            else:
+                record = _dispatch_board(
+                    board,
+                    failure_limit=failure_limit,
+                    dry_run=dry_run,
+                    max_spawn=max(1, board_running + 1),
+                    spawn_budget=1,
+                )
             records.append(record)
             if not record.get("ok"):
                 return {
@@ -515,6 +801,23 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
                     "payload": _aggregate_payload(records),
                     "error": f"board {board!r} exceeded one-spawn budget",
                 }
+            if count and outcome_policy["enabled"] and admitted_candidate is not None:
+                actual_spawned = (record.get("payload") or {}).get("spawned") or []
+                actual_item = actual_spawned[0] if actual_spawned else {}
+                actual_task_id = actual_item.get("task_id") if isinstance(actual_item, dict) else None
+                if actual_task_id != admitted_candidate.task_id:
+                    return {
+                        "ok": False,
+                        "max_spawn": max_spawn,
+                        "boards": _board_summaries(records, boards),
+                        "payload": _aggregate_payload(records),
+                        "operating_model": outcome_policy,
+                        "error": (
+                            "admission fence mismatch: evaluated "
+                            f"{admitted_candidate.task_id!r}, spawned {actual_task_id!r}"
+                        ),
+                    }
+                active_claims.append(admitted_candidate)
             spawned_total += count
             round_spawned += count
         if round_spawned == 0:
@@ -529,6 +832,9 @@ def _dispatch_once(*, dry_run: bool = False) -> dict[str, Any]:
         "running": baseline_running + spawned_total,
         "boards": _board_summaries(records, boards),
         "payload": _aggregate_payload(records),
+        "operating_model": outcome_policy,
+        "admission": admission_records,
+        "deferred_admission": deferred_admission,
     }
 
 
@@ -548,6 +854,7 @@ def _interesting(result: dict[str, Any]) -> bool:
         or payload.get("stale")
         or payload.get("auto_blocked")
         or payload.get("promoted")
+        or result.get("deferred_admission")
     )
 
 
@@ -588,6 +895,8 @@ def _summarize(result: dict[str, Any]) -> str:
         "stale": payload.get("stale", []),
         "auto_blocked": payload.get("auto_blocked", []),
         "promoted": payload.get("promoted", 0),
+        "operating_model": result.get("operating_model"),
+        "deferred_admission": result.get("deferred_admission", []),
     }
     return json.dumps(summary, ensure_ascii=False)
 
