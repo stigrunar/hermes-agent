@@ -3505,6 +3505,9 @@ def _cmd_update_impl(
             check=True,
         )
         current_branch = result.stdout.strip()
+        configured_gateway_target_activated = (
+            gateway_mode and current_branch != branch
+        )
 
         # If user is on a different branch than the update target, switch
         # to the target. When the target is "main" this is the historical
@@ -3573,7 +3576,7 @@ def _cmd_update_impl(
         )
         commit_count = int(result.stdout.strip())
 
-        if commit_count == 0:
+        if commit_count == 0 and not configured_gateway_target_activated:
             _invalidate_update_cache()
 
             # Even if origin is up to date, the fork may be behind upstream
@@ -3675,7 +3678,13 @@ def _cmd_update_impl(
             _m()._resume_windows_gateways_after_update(_windows_gateway_resume)
             return
 
-        print(f"→ Found {commit_count} new commit(s)")
+        if configured_gateway_target_activated and commit_count == 0:
+            print(
+                "→ Activated configured gateway release target "
+                f"{remote}/{branch}"
+            )
+        else:
+            print(f"→ Found {commit_count} new commit(s)")
 
         print("→ Pulling updates...")
         update_succeeded = False

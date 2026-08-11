@@ -512,6 +512,112 @@ class TestCmdUpdateBranchFlag:
         assert "does not exist locally or on origin" in out
         assert "nonexistent" in out
 
+    def test_gateway_target_checkout_with_no_remote_commits_continues_apply_path(
+        self, monkeypatch, capsys
+    ):
+        """Gateway updates activate a configured release branch even when current."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as update_module
+        from hermes_cli.update_channel import UpdateTarget
+
+        target = UpdateTarget("stig", "release/stig-tested")
+        commands = []
+
+        def run_side_effect(cmd, **kwargs):
+            commands.append(list(cmd))
+            joined = " ".join(str(part) for part in cmd)
+            if "rev-parse --abbrev-ref HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="feature/work\n", stderr=""
+                )
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        class ApplyPathReached(Exception):
+            pass
+
+        def stop_at_dependencies(*_args, **_kwargs):
+            raise ApplyPathReached
+
+        monkeypatch.setattr(subprocess, "run", run_side_effect)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(
+            update_module, "_discard_lockfile_churn", lambda *_args: None
+        )
+        monkeypatch.setattr(update_module, "_normalize_managed_eol", lambda *_args: None)
+        monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "git@example/hermes.git")
+        monkeypatch.setattr(hm, "_stash_local_changes_if_needed", lambda *_args: None)
+        monkeypatch.setattr(update_module, "_invalidate_update_cache", lambda: None)
+        monkeypatch.setattr(
+            update_module,
+            "_validate_critical_files_syntax",
+            lambda _root: (True, None, None),
+        )
+        monkeypatch.setattr(hm, "_clear_bytecode_cache", lambda _root: 0)
+        monkeypatch.setattr(hm, "_record_bytecode_fingerprint", lambda: None)
+        monkeypatch.setattr(update_module, "_write_update_incomplete_marker", lambda: None)
+        monkeypatch.setattr(
+            hm,
+            "_install_python_dependencies_with_optional_fallback",
+            stop_at_dependencies,
+        )
+        monkeypatch.setattr(hm.shutil, "which", lambda _name: None)
+
+        with pytest.raises(ApplyPathReached):
+            hm._cmd_update_impl(
+                SimpleNamespace(), gateway_mode=True, target=target
+            )
+
+        assert ["git", "checkout", "release/stig-tested"] in commands
+        assert ["git", "checkout", "feature/work"] not in commands
+        assert ["git", "merge", "--ff-only", "stig/release/stig-tested"] in commands
+        assert (
+            "Activated configured gateway release target"
+            in capsys.readouterr().out
+        )
+
+    def test_non_gateway_no_update_restores_original_branch(self, monkeypatch):
+        """Ordinary CLI updates retain the historical branch-restore behavior."""
+        from hermes_cli import main as hm
+        from hermes_cli import update_cmd as update_module
+        from hermes_cli.update_channel import UpdateTarget
+
+        target = UpdateTarget("stig", "release/stig-tested")
+        commands = []
+
+        def run_side_effect(cmd, **kwargs):
+            commands.append(list(cmd))
+            joined = " ".join(str(part) for part in cmd)
+            if "rev-parse --abbrev-ref HEAD" in joined:
+                return subprocess.CompletedProcess(
+                    cmd, 0, stdout="feature/work\n", stderr=""
+                )
+            if "rev-list" in joined:
+                return subprocess.CompletedProcess(cmd, 0, stdout="0\n", stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        monkeypatch.setattr(subprocess, "run", run_side_effect)
+        monkeypatch.setattr(hm, "_run_pre_update_backup", lambda _args: None)
+        monkeypatch.setattr(hm, "_pause_windows_gateways_for_update", lambda: None)
+        monkeypatch.setattr(
+            update_module, "_discard_lockfile_churn", lambda *_args: None
+        )
+        monkeypatch.setattr(update_module, "_normalize_managed_eol", lambda *_args: None)
+        monkeypatch.setattr(hm, "_get_origin_url", lambda *_args: "git@example/hermes.git")
+        monkeypatch.setattr(hm, "_stash_local_changes_if_needed", lambda *_args: None)
+        monkeypatch.setattr(update_module, "_invalidate_update_cache", lambda: None)
+        monkeypatch.setattr(
+            update_module, "_venv_core_imports_healthy", lambda: (True, "")
+        )
+
+        hm._cmd_update_impl(SimpleNamespace(), gateway_mode=False, target=target)
+
+        assert ["git", "checkout", "release/stig-tested"] in commands
+        assert ["git", "checkout", "feature/work"] in commands
+        assert not any("merge" in command for command in commands)
+
 
 class TestCmdUpdateCheckBranchFlag:
     """``hermes update --check --branch <name>`` honors the branch override.
