@@ -24,7 +24,7 @@ import {
   setSessions,
   workspaceCwdForNewSession
 } from '@/store/session'
-import type { ProjectInfo, ProjectsPayload } from '@/types/hermes'
+import type { ConversationBindingInfo, ProjectInfo, ProjectsPayload } from '@/types/hermes'
 
 // First-class, per-profile Projects (named, multi-folder workspaces). State is
 // served by the live gateway's `projects.*` JSON-RPC methods, which wrap the
@@ -1004,6 +1004,66 @@ export async function deleteProject(id: string): Promise<void> {
 export async function setActiveProject(id: null | string): Promise<void> {
   const res = await gatewayRequest<{ active_id: null | string }>('projects.set_active', { id })
   $activeProjectId.set(res.active_id ?? null)
+}
+
+export interface BindConversationInput {
+  projectId: string
+  targetRef: string
+  alias?: null | string
+}
+
+export async function bindConversationToProject(input: BindConversationInput): Promise<void> {
+  const snap = snapshotProjects()
+  const targetRef = input.targetRef.trim()
+
+  const optimistic: ConversationBindingInfo = {
+    alias: input.alias?.trim() || null,
+    created_at: 0,
+    project_id: input.projectId,
+    target_ref: targetRef,
+    updated_at: 0
+  }
+
+  $projects.set(
+    snap.projects.map(project => {
+      const withoutTarget = (project.conversation_bindings ?? []).filter(binding => binding.target_ref !== targetRef)
+
+      return project.id === input.projectId
+        ? { ...project, conversation_bindings: [...withoutTarget, optimistic] }
+        : { ...project, conversation_bindings: withoutTarget }
+    })
+  )
+
+  await persistOrRollback(snap, () =>
+    gatewayRequest('projects.bind_messaging_target', {
+      id: input.projectId,
+      target_ref: targetRef,
+      alias: input.alias ?? null
+    })
+  )
+  reconcileProjects()
+}
+
+export async function unbindConversationFromProject(
+  input: Omit<BindConversationInput, 'alias' | 'projectId'> & { projectId?: null | string }
+): Promise<void> {
+  const snap = snapshotProjects()
+  const targetRef = input.targetRef.trim()
+
+  $projects.set(
+    snap.projects.map(project => ({
+      ...project,
+      conversation_bindings: (project.conversation_bindings ?? []).filter(binding => binding.target_ref !== targetRef)
+    }))
+  )
+
+  await persistOrRollback(snap, () =>
+    gatewayRequest('projects.unbind_messaging_target', {
+      id: input.projectId ?? null,
+      target_ref: targetRef
+    })
+  )
+  reconcileProjects()
 }
 
 // ── Project management dialog ────────────────────────────────────────────────

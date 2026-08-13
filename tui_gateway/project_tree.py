@@ -500,6 +500,157 @@ def _project_for_session(session: dict, index: _FolderIndex, resolve: Optional[R
     return best
 
 
+def _normalize_text(value: Any) -> str:
+    return str(value).strip() if value is not None else ""
+
+
+def _normalize_thread(value: Any) -> Optional[str]:
+    return _normalize_text(value) or None
+
+
+def _session_origin(session: dict) -> dict:
+    """Return server-private canonical metadata used only during tree build."""
+    origin = session.get("_messaging_target")
+    return origin if isinstance(origin, dict) else {}
+
+
+def _origin_value(origin: dict, *names: str) -> str:
+    for name in names:
+        value = _normalize_text(origin.get(name))
+        if value:
+            return value
+    return ""
+
+
+def _session_conversation_target(
+    session: dict,
+) -> Optional[tuple[str, str, Optional[str]]]:
+    origin = _session_origin(session)
+    conversation_id = _origin_value(origin, "chat_id")
+    if not conversation_id:
+        return None
+    platform = _origin_value(origin, "platform").lower()
+    if not platform:
+        platform = _normalize_text(session.get("source")).lower()
+    if not platform:
+        return None
+    topic_id = _normalize_thread(_origin_value(origin, "thread_id"))
+    return platform, conversation_id, topic_id
+
+
+def _conversation_key(
+    platform: str, conversation_id: str, topic_id: Optional[str]
+) -> tuple[str, str, Optional[str]]:
+    return platform.lower(), conversation_id, topic_id
+
+
+class _ConversationBindingIndex:
+    def __init__(self, projects: list[dict]) -> None:
+        self._by_target: dict[tuple[str, str, Optional[str]], dict] = {}
+        self._binding_by_project_target: dict[
+            tuple[str, tuple[str, str, Optional[str]]], dict
+        ] = {}
+        for project in projects:
+            for binding in project.get("conversation_bindings") or []:
+                platform = _normalize_text(binding.get("platform")).lower()
+                conversation_id = _normalize_text(binding.get("chat_id"))
+                if not platform or not conversation_id:
+                    continue
+                key = _conversation_key(
+                    platform,
+                    conversation_id,
+                    _normalize_thread(binding.get("thread_id")),
+                )
+                self._by_target[key] = project
+                self._binding_by_project_target[(project["id"], key)] = binding
+
+    def match(self, session: dict) -> Optional[dict]:
+        target = _session_conversation_target(session)
+        return self._by_target.get(_conversation_key(*target)) if target else None
+
+    def binding_for(self, project_id: str, session: dict) -> Optional[dict]:
+        target = _session_conversation_target(session)
+        if target is None:
+            return None
+        return self._binding_by_project_target.get(
+            (project_id, _conversation_key(*target))
+        )
+
+
+def _conversation_label(session: dict, binding: Optional[dict], *, topic: bool) -> str:
+    alias = _normalize_text((binding or {}).get("alias"))
+    if alias:
+        return alias
+    origin = _session_origin(session)
+    if topic:
+        label = _origin_value(origin, "topic_label")
+        return label or "Topic"
+    label = _origin_value(origin, "display_label")
+    return label or "Conversation"
+
+
+def _build_conversation_repos(
+    project_id: str,
+    sessions: list[dict],
+    binding_index: _ConversationBindingIndex,
+    hydrate: bool,
+) -> list[dict]:
+    repos: dict[str, dict] = {}
+    for session in sessions:
+        target = _session_conversation_target(session)
+        binding = binding_index.binding_for(project_id, session)
+        if target is None or binding is None:
+            continue
+        origin = _session_origin(session)
+        repo_ref = _origin_value(origin, "conversation_ref", "target_ref")
+        target_ref = _origin_value(origin, "target_ref")
+        if not repo_ref or not target_ref:
+            continue
+        repo_id = f"conversation::{repo_ref}"
+        group_id = f"{repo_id}::target::{target_ref}"
+        repo = repos.setdefault(
+            repo_id,
+            {
+                "id": repo_id,
+                "label": _conversation_label(session, None, topic=False),
+                "path": None,
+                "groups": [],
+                "sessionCount": 0,
+            },
+        )
+        group = next((item for item in repo["groups"] if item["id"] == group_id), None)
+        if group is None:
+            group = {
+                "id": group_id,
+                "label": _conversation_label(session, binding, topic=True),
+                "path": None,
+                "isConversation": True,
+                "sessions": [],
+            }
+            repo["groups"].append(group)
+        group["sessions"].append(session)
+        repo["sessionCount"] += 1
+
+    for repo in repos.values():
+        for group in repo["groups"]:
+            group["sessions"].sort(key=_session_time, reverse=True)
+        repo["groups"].sort(
+            key=lambda group: (
+                -max(
+                    (_session_time(session) for session in group["sessions"]),
+                    default=0.0,
+                ),
+                group["label"].lower(),
+            )
+        )
+        if not hydrate:
+            for group in repo["groups"]:
+                group["sessions"] = []
+    return sorted(
+        repos.values(), key=lambda repo: (-repo["sessionCount"], repo["label"].lower())
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public builder
 # ---------------------------------------------------------------------------
@@ -586,11 +737,17 @@ def build_tree(
     _junk_cwd = is_junk_cwd or (lambda _cwd: False)
     _exists = exists or (lambda _path: True)
     folder_index = _FolderIndex(active_projects)
+    binding_index = _ConversationBindingIndex(active_projects)
 
     by_project: dict[str, list[dict]] = {}
     unowned: list[dict] = []
     for session in sessions:
-        owner = _project_for_session(session, folder_index, resolve)
+        # An explicit conversation binding is stronger than filesystem
+        # placement. This is what keeps a Desktop/TUI continuation under the
+        # messaging topic's chosen Project even when it later gains a cwd.
+        owner = binding_index.match(session) or _project_for_session(
+            session, folder_index, resolve
+        )
         if owner:
             by_project.setdefault(owner["id"], []).append(session)
         else:
@@ -612,9 +769,25 @@ def build_tree(
     # Tier 1: explicit, user-created projects (always shown, even with 0 sessions).
     for project in active_projects:
         psessions = by_project.get(project["id"], [])
+        conversation_sessions: list[dict] = []
+        filesystem_sessions: list[dict] = []
+        for session in psessions:
+            target = (
+                conversation_sessions
+                if binding_index.binding_for(project["id"], session) is not None
+                else filesystem_sessions
+            )
+            target.append(session)
         scoped_ids.extend(s["id"] for s in psessions if s.get("id"))
         repos = _seed_folder_repos(
-            _build_repos(psessions, resolve, hydrate), project.get("folders") or [], resolve
+            _build_repos(filesystem_sessions, resolve, hydrate),
+            project.get("folders") or [],
+            resolve,
+        )
+        repos.extend(
+            _build_conversation_repos(
+                project["id"], conversation_sessions, binding_index, hydrate
+            )
         )
         result.append(
             _project_node(
@@ -783,4 +956,8 @@ def build_tree(
             ),
         )
 
+    # Canonical routing metadata is build-only authority. Returned project-tree
+    # rows are Desktop/TUI transport and must never expose it.
+    for session in sessions:
+        session.pop("_messaging_target", None)
     return {"projects": result, "scoped_session_ids": scoped_ids}

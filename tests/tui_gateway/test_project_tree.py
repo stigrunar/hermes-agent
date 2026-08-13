@@ -42,6 +42,16 @@ def _project(pid, name, folders, **over):
     return row
 
 
+def _binding(project_id, *, platform="telegram", chat_id="chat", thread_id="topic", alias=None):
+    return {
+        "project_id": project_id,
+        "platform": platform,
+        "chat_id": chat_id,
+        "thread_id": thread_id,
+        "alias": alias,
+    }
+
+
 def _resolver(mapping):
     """Build a resolve() from {cwd: (repo_root, worktree_root)}."""
 
@@ -546,6 +556,80 @@ def test_home_bucket_leads_the_tree_and_is_lossless():
         cwdless["id"],
         junked["id"],
     }
+
+
+def test_conversation_binding_claims_topic_and_desktop_continuation():
+    project = _project(
+        "p_topic",
+        "Topic Project",
+        [],
+        conversation_bindings=[_binding("p_topic", alias="Operations")],
+    )
+    target = {
+        "platform": "telegram",
+        "chat_id": "chat",
+        "thread_id": "topic",
+        "target_ref": "opaque-topic",
+        "conversation_ref": "opaque-chat",
+        "display_label": "Engineering",
+        "topic_label": "Deployments",
+    }
+    messaging = _session(None, source="telegram", _messaging_target=target)
+    continuation = _session(None, source="desktop", _messaging_target=target)
+    unbound = _session(
+        None,
+        source="telegram",
+        _messaging_target={**target, "thread_id": "other", "target_ref": "opaque-other", "topic_label": "Other"},
+    )
+
+    tree = pt.build_tree(
+        [project], [messaging, continuation, unbound], [], hydrate=True
+    )
+    node = next(item for item in tree["projects"] if item["id"] == "p_topic")
+    group = node["repos"][0]["groups"][0]
+
+    assert node["sessionCount"] == 2
+    assert group["label"] == "Operations"
+    assert {row["id"] for row in group["sessions"]} == {
+        messaging["id"],
+        continuation["id"],
+    }
+    assert unbound["id"] in _home_session_ids(tree)
+
+
+def test_conversation_binding_overrides_filesystem_project_without_duplication():
+    folder_project = _project("p_folder", "Folder", ["/repo"])
+    topic_project = _project(
+        "p_topic",
+        "Topic",
+        [],
+        conversation_bindings=[_binding("p_topic")],
+    )
+    session = _session(
+        "/repo",
+        source="desktop",
+        _messaging_target={
+            "platform": "telegram",
+            "chat_id": "chat",
+            "thread_id": "topic",
+            "target_ref": "opaque-topic",
+            "conversation_ref": "opaque-chat",
+        },
+    )
+
+    tree = pt.build_tree(
+        [folder_project, topic_project],
+        [session],
+        [],
+        resolve=lambda _cwd: None,
+        hydrate=True,
+    )
+    by_id = {project["id"]: project for project in tree["projects"]}
+
+    assert by_id["p_folder"]["sessionCount"] == 0
+    assert by_id["p_topic"]["sessionCount"] == 1
+    assert [row["id"] for row in _sessions_of(by_id["p_topic"])] == [session["id"]]
+    assert all("_messaging_target" not in row for row in _sessions_of(by_id["p_topic"]))
 
 
 def test_colliding_repo_basenames_disambiguate_labels():

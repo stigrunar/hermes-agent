@@ -11614,8 +11614,32 @@ class _NoProject(Exception):
 def _projects_payload(conn) -> dict:
     from hermes_cli import projects_db as pdb
 
+    def public_project(project) -> dict:
+        payload = project.to_dict()
+        safe_bindings = []
+        state_db = _get_db()
+        if state_db is not None:
+            for binding in project.conversation_bindings:
+                target_ref = state_db.gateway_target_ref(
+                    platform=binding.platform,
+                    chat_id=binding.chat_id,
+                    thread_id=binding.thread_id,
+                )
+                if target_ref:
+                    safe_bindings.append(
+                        {
+                            "project_id": binding.project_id,
+                            "target_ref": target_ref,
+                            "alias": binding.alias,
+                            "created_at": binding.created_at,
+                            "updated_at": binding.updated_at,
+                        }
+                    )
+        payload["conversation_bindings"] = safe_bindings
+        return payload
+
     return {
-        "projects": [p.to_dict() for p in pdb.list_projects(conn, include_archived=True)],
+        "projects": [public_project(p) for p in pdb.list_projects(conn, include_archived=True)],
         "active_id": pdb.get_active_id(conn),
     }
 
@@ -11745,6 +11769,48 @@ def _(rid, params, pdb, conn) -> dict:
 def _(rid, params, pdb, conn) -> dict:
     pdb.set_active(conn, _require_project(pdb, conn, params).id if params.get("id") else None)
     return _ok(rid, {"active_id": pdb.get_active_id(conn)})
+
+
+def _resolve_project_target_ref(params: dict) -> dict:
+    target_ref = str(params.get("target_ref") or "").strip()
+    state_db = _get_db()
+    target = state_db.resolve_gateway_target(target_ref) if state_db is not None else None
+    if target is None:
+        raise ValueError("unknown or stale target_ref")
+    return target
+
+
+@_projects_method("projects.bind_messaging_target")
+def _(rid, params, pdb, conn) -> dict:
+    project = _require_project(pdb, conn, params)
+    target = _resolve_project_target_ref(params)
+    pdb.bind_conversation(
+        conn,
+        project.id,
+        platform=target["platform"],
+        chat_id=target["chat_id"],
+        thread_id=target["thread_id"],
+        alias=params.get("alias"),
+    )
+    return _ok(rid, _projects_payload(conn))
+
+
+@_projects_method("projects.unbind_messaging_target")
+def _(rid, params, pdb, conn) -> dict:
+    project_id = str(params.get("id") or "").strip() or None
+    if project_id and pdb.get_project(conn, project_id) is None:
+        raise _NoProject
+    target = _resolve_project_target_ref(params)
+    removed = pdb.unbind_conversation(
+        conn,
+        platform=target["platform"],
+        chat_id=target["chat_id"],
+        thread_id=target["thread_id"],
+        project_id=project_id,
+    )
+    payload = _projects_payload(conn)
+    payload["removed"] = removed
+    return _ok(rid, payload)
 
 
 @_projects_method("projects.for_cwd")
@@ -12027,6 +12093,30 @@ def _project_tree_inputs(
         compact_rows=True,
     )
     sessions = [_project_tree_row(r) for r in rows]
+    metadata = db.get_gateway_session_metadata([session["id"] for session in sessions])
+    from hermes_cli.session_origins import session_origin_metadata
+
+    for session in sessions:
+        row = metadata.get(session["id"])
+        if row:
+            safe_origin = session_origin_metadata(row) or {}
+            session["_messaging_target"] = {
+                "platform": str(row.get("source") or "").strip().lower(),
+                "chat_id": str(row.get("chat_id") or "").strip(),
+                "thread_id": str(row.get("thread_id")).strip()
+                if row.get("thread_id") not in (None, "")
+                else None,
+                "target_ref": db.gateway_target_ref(
+                    platform=row.get("source"),
+                    chat_id=row.get("chat_id"),
+                    thread_id=row.get("thread_id"),
+                ),
+                "conversation_ref": db.gateway_conversation_ref(
+                    platform=row.get("source"), chat_id=row.get("chat_id")
+                ),
+                "display_label": safe_origin.get("display_label") or "Conversation",
+                "topic_label": safe_origin.get("topic_label") or "Topic",
+            }
     # Parallel-warm the git cache so build_tree's resolver reads it instead of
     # cold-probing each cwd in sequence (matters on the drill-in path, which
     # skips the discovery warm-up below).
@@ -12043,7 +12133,7 @@ def _project_tree_inputs(
                 policy_key,
                 preserve_unversioned=_repo_discovery_policy_is_default(policy),
             )
-        projects = [p.to_dict() for p in pdb.list_projects(conn)]
+        projects = [p.to_private_dict() for p in pdb.list_projects(conn)]
         active_id = pdb.get_active_id(conn)
         # backfill stays off the hot tree path — grouping uses the live resolver.
         discovered = (
@@ -12109,6 +12199,8 @@ def _build_project_tree(
         is_junk_cwd=_is_session_cwd_junk,
         exists=_dir_exists_cached,
     )
+    for session in sessions:
+        session.pop("_messaging_target", None)
     return tree, active_id
 
 

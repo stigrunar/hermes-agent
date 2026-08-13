@@ -1629,7 +1629,15 @@ export const ar = defineLocale({
       enter: label => `فتح ${label}`,
       reorder: label => `إعادة ترتيب ${label}`,
       toggle: (label, open) => `${open ? 'إظهار' : 'إخفاء'} جلسات ${label}`,
-      back: 'كل المشاريع'
+      back: 'كل المشاريع',
+      topicBindAction: 'ربط بالمشروع',
+      topicManageAction: 'إدارة ربط المشروع',
+      topicProjectDescription: 'احتفظ بموضوع المراسلة ومتابعات سطح المكتب أو TUI في مشروع واحد.',
+      topicProjectPlaceholder: 'اختر مشروعًا',
+      topicAliasPlaceholder: 'اسم محلي اختياري',
+      topicBind: 'ربط بالمشروع',
+      topicSave: 'حفظ الربط',
+      topicUnbind: 'إلغاء الربط'
     },
     newSessionIn: label => `جلسة جديدة في ${label}`,
     showMoreIn: (count, label) => `إظهار ${count} أخرى في ${label}`,

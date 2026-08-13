@@ -101,3 +101,103 @@ def test_per_profile_isolation(tmp_path):
         b.close()
 
 
+def test_conversation_binding_is_unique_moves_and_unbinds(conn):
+    first = pdb.create_project(conn, name="First")
+    second = pdb.create_project(conn, name="Second")
+
+    original = pdb.bind_conversation(
+        conn,
+        first,
+        platform=" Telegram ",
+        chat_id=" chat-1 ",
+        thread_id=" topic-1 ",
+        alias="Operations",
+    )
+    moved = pdb.bind_conversation(
+        conn,
+        second,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+        alias="Incidents",
+    )
+
+    assert moved.project_id == second
+    assert moved.created_at == original.created_at
+    assert moved.alias == "Incidents"
+    assert pdb.list_conversation_bindings(conn, project_id=first) == []
+    assert [binding.project_id for binding in pdb.list_conversation_bindings(conn)] == [second]
+
+    # A stale dialog scoped to the old project cannot remove the moved binding.
+    assert pdb.unbind_conversation(
+        conn,
+        project_id=first,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+    ) is False
+    assert pdb.unbind_conversation(
+        conn,
+        project_id=second,
+        platform="telegram",
+        chat_id="chat-1",
+        thread_id="topic-1",
+    ) is True
+    assert pdb.list_conversation_bindings(conn) == []
+
+
+def test_threadless_binding_normalizes_empty_thread_and_rejects_archive(conn):
+    project_id = pdb.create_project(conn, name="Messages")
+    binding = pdb.bind_conversation(
+        conn,
+        project_id,
+        platform="slack",
+        chat_id="C123",
+        thread_id="",
+    )
+
+    assert binding.thread_id is None
+    assert pdb.get_conversation_binding(
+        conn, platform="slack", chat_id="C123", thread_id=None
+    ) == binding
+
+    pdb.archive_project(conn, project_id)
+    with pytest.raises(ValueError, match="archived project"):
+        pdb.bind_conversation(
+            conn,
+            project_id,
+            platform="slack",
+            chat_id="C456",
+        )
+    assert pdb.list_conversation_bindings(conn, project_id=project_id) == []
+
+
+def test_public_project_payload_never_serializes_private_routing_keys(conn):
+    project_id = pdb.create_project(conn, name="Messages")
+    pdb.bind_conversation(conn, project_id, platform="telegram", chat_id="secret-chat", thread_id="secret-topic")
+
+    payload = pdb.get_project(conn, project_id).to_dict()
+
+    assert "conversation_bindings" not in payload
+    assert "secret-chat" not in repr(payload)
+    assert "secret-topic" not in repr(payload)
+
+
+def test_conversation_bindings_are_profile_local(tmp_path):
+    first = pdb.connect(db_path=tmp_path / "first" / "projects.db")
+    second = pdb.connect(db_path=tmp_path / "second" / "projects.db")
+    try:
+        project_id = pdb.create_project(first, name="First profile")
+        pdb.bind_conversation(
+            first,
+            project_id,
+            platform="discord",
+            chat_id="channel-1",
+            thread_id="thread-1",
+        )
+
+        assert len(pdb.list_conversation_bindings(first)) == 1
+        assert pdb.list_conversation_bindings(second) == []
+    finally:
+        first.close()
+        second.close()

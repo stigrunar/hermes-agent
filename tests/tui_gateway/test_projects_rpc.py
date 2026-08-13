@@ -54,6 +54,8 @@ def test_methods_registered():
         "projects.set_primary",
         "projects.archive",
         "projects.set_active",
+        "projects.bind_messaging_target",
+        "projects.unbind_messaging_target",
         "projects.for_cwd",
     ):
         assert m in server._methods
@@ -272,6 +274,87 @@ def test_update_and_archive(tmp_path):
     assert all(p["id"] != pid or p["archived"] for p in payload["projects"])
 
 
+def test_bind_move_unbind_conversation_roundtrip(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    state = SessionDB(db_path=tmp_path / "state.db")
+    state.create_session("opaque-target", source="telegram")
+    state.record_gateway_session_peer(
+        "opaque-target", source="telegram", session_key="private", chat_id="chat-1", thread_id="topic-1"
+    )
+    monkeypatch.setattr(server, "_db", state)
+    first = _call("projects.create", {"name": "First"})["project"]["id"]
+    second = _call("projects.create", {"name": "Second"})["project"]["id"]
+
+    bound = _call(
+        "projects.bind_messaging_target",
+        {
+            "id": first,
+            "target_ref": "opaque-target",
+            "alias": "Ops",
+        },
+    )
+    moved = _call(
+        "projects.bind_messaging_target",
+        {
+            "id": second,
+            "target_ref": "opaque-target",
+        },
+    )
+
+    assert bound["projects"]
+    assert moved["projects"]
+    listing = _call("projects.list")["projects"]
+    assert next(p for p in listing if p["id"] == first)["conversation_bindings"] == []
+    assert len(next(p for p in listing if p["id"] == second)["conversation_bindings"]) == 1
+    assert "chat-1" not in repr(listing)
+    assert "topic-1" not in repr(listing)
+
+    assert _call(
+        "projects.unbind_messaging_target",
+        {
+            "id": second,
+            "target_ref": "opaque-target",
+        },
+    )["removed"] is True
+    state.close()
+
+
+def test_bind_conversation_refuses_archived_project(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    state = SessionDB(db_path=tmp_path / "state.db")
+    state.create_session("opaque-target", source="slack")
+    state.record_gateway_session_peer("opaque-target", source="slack", session_key="private", chat_id="C1")
+    monkeypatch.setattr(server, "_db", state)
+    project_id = _call("projects.create", {"name": "Archived"})["project"]["id"]
+    _call("projects.archive", {"id": project_id})
+
+    response = server._methods["projects.bind_messaging_target"](
+        1,
+        {"id": project_id, "target_ref": "opaque-target"},
+    )
+
+    assert response["error"]["message"] == "cannot bind conversation to archived project: " + project_id
+    state.close()
+
+
+def test_unknown_target_ref_fails_closed_without_mutating(monkeypatch, tmp_path):
+    from hermes_state import SessionDB
+
+    state = SessionDB(db_path=tmp_path / "state.db")
+    monkeypatch.setattr(server, "_db", state)
+    project_id = _call("projects.create", {"name": "Safe"})["project"]["id"]
+
+    response = server._methods["projects.bind_messaging_target"](
+        1, {"id": project_id, "target_ref": "stale-or-invented"}
+    )
+
+    assert response["error"]["message"] == "unknown or stale target_ref"
+    assert _call("projects.list")["projects"][-1]["conversation_bindings"] == []
+    state.close()
+
+
 def test_get_unknown_returns_error():
     resp = server._methods["projects.get"](1, {"id": "nope"})
     assert "error" in resp
@@ -458,5 +541,3 @@ def test_nondefault_policy_rejects_stale_or_legacy_results(monkeypatch, tmp_path
     assert stale["accepted"] is False
     assert accepted["accepted"] is True
     assert any(item["root"] == str(root) for item in accepted["repos"])
-
-
