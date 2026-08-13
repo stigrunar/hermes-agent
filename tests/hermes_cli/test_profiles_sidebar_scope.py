@@ -11,6 +11,8 @@ Two behaviors that only show up with more than one profile on disk:
   coexist in one list.
 """
 
+import json
+
 import pytest
 
 
@@ -84,6 +86,32 @@ def _seed_session(home, session_id, *, source, cwd=None, tokens=None, cost=None)
         conn.close()
 
 
+def _seed_gateway_session(home, session_id, *, source, chat_type, display_name):
+    from hermes_state import SessionDB
+
+    db = SessionDB(db_path=home / "state.db")
+    try:
+        db.create_session(session_id, source=source)
+        db.record_gateway_session_peer(
+            session_id,
+            source=source,
+            session_key=f"agent:main:{source}:{chat_type}:{session_id}",
+            chat_id=f"chat-{session_id}",
+            chat_type=chat_type,
+            display_name=display_name,
+            origin_json=json.dumps(
+                {
+                    "platform": source,
+                    "chat_type": chat_type,
+                    "chat_id": f"chat-{session_id}",
+                }
+            ),
+        )
+        db.append_message(session_id=session_id, role="user", content="hi")
+    finally:
+        db.close()
+
+
 def _seed_project(home, name, folder):
     from hermes_cli import projects_db
 
@@ -96,6 +124,57 @@ def _slice_ids(payload, slice_name):
 
 
 class TestSidebarScope:
+
+    def test_recent_cron_and_messaging_rows_include_canonical_origins(
+        self, profiles_on_disk
+    ):
+        worker_home = profiles_on_disk["worker"]
+        _seed_gateway_session(
+            worker_home,
+            "worker-recent",
+            source="telegram",
+            chat_type="group",
+            display_name="Recent room",
+        )
+        _seed_gateway_session(
+            worker_home,
+            "worker-cron",
+            source="cron",
+            chat_type="job",
+            display_name="Nightly job",
+        )
+        _seed_gateway_session(
+            worker_home,
+            "worker-messaging",
+            source="discord",
+            chat_type="channel",
+            display_name="Release room",
+        )
+
+        from hermes_cli.web_routers.profiles import get_profiles_sessions_sidebar
+
+        payload = get_profiles_sessions_sidebar(
+            recents_profile="worker",
+            recents_exclude="cron,discord",
+            messaging_exclude="cron,telegram",
+        )
+
+        assert payload["errors"] == []
+        assert payload["recents"]["sessions"][0]["origin"] == {
+            "platform": "telegram",
+            "chat_type": "group",
+            "display_label": "Recent room",
+        }
+        assert payload["cron"]["sessions"][0]["origin"] == {
+            "platform": "cron",
+            "chat_type": "job",
+            "display_label": "Nightly job",
+        }
+        assert payload["messaging"]["sessions"][0]["origin"] == {
+            "platform": "discord",
+            "chat_type": "channel",
+            "display_label": "Release room",
+        }
 
     def test_concrete_profile_sees_only_its_own_slices(self, client, profiles_on_disk):
         _seed_session(profiles_on_disk["default"], "default-chat", source="cli")

@@ -22,6 +22,7 @@ from fastapi import APIRouter, HTTPException, Query, Request  # noqa: F401
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import StreamingResponse
 
+from hermes_cli.session_origins import enrich_sessions_with_origins
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     BulkDeleteSessions,
@@ -154,6 +155,7 @@ def get_sessions(
                 # SQLite stores the flag as 0/1; expose a real JSON boolean.
                 s["archived"] = bool(s.get("archived"))
                 s["pinned"] = bool(s.get("pinned"))
+            enrich_sessions_with_origins(sessions, db)
             if not full:
                 _strip_session_list_rows(sessions)
             return {"sessions": sessions, "total": total, "limit": limit, "offset": offset}
