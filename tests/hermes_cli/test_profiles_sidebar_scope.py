@@ -164,16 +164,22 @@ class TestSidebarScope:
             "platform": "telegram",
             "chat_type": "group",
             "display_label": "Recent room",
+            "target_ref": "worker-recent",
+            "conversation_ref": "worker-recent",
         }
         assert payload["cron"]["sessions"][0]["origin"] == {
             "platform": "cron",
             "chat_type": "job",
             "display_label": "Nightly job",
+            "target_ref": "worker-cron",
+            "conversation_ref": "worker-cron",
         }
         assert payload["messaging"]["sessions"][0]["origin"] == {
             "platform": "discord",
             "chat_type": "channel",
             "display_label": "Release room",
+            "target_ref": "worker-messaging",
+            "conversation_ref": "worker-messaging",
         }
 
     def test_concrete_profile_sees_only_its_own_slices(self, client, profiles_on_disk):

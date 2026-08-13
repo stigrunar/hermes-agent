@@ -4526,6 +4526,61 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             result.update((row["id"], dict(row)) for row in rows)
         return result
 
+    def resolve_gateway_target(self, target_ref: str) -> Optional[Dict[str, Any]]:
+        """Resolve an opaque session id to its canonical messaging target."""
+        if not target_ref:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT source, chat_id, thread_id
+                   FROM sessions
+                   WHERE id = ? AND session_key IS NOT NULL
+                     AND source IS NOT NULL AND chat_id IS NOT NULL""",
+                (str(target_ref),),
+            ).fetchone()
+        if row is None or not str(row["source"] or "").strip() or not str(row["chat_id"] or "").strip():
+            return None
+        return {
+            "platform": str(row["source"]).strip().lower(),
+            "chat_id": str(row["chat_id"]).strip(),
+            "thread_id": str(row["thread_id"]).strip() if row["thread_id"] not in (None, "") else None,
+        }
+
+    def gateway_target_ref(
+        self, *, platform: str, chat_id: str, thread_id: Optional[str] = None
+    ) -> Optional[str]:
+        """Return a deterministic opaque session id for a canonical target."""
+        platform = str(platform or "").strip().lower()
+        chat_id = str(chat_id or "").strip()
+        thread_id = str(thread_id).strip() if thread_id not in (None, "") else None
+        if not platform or not chat_id:
+            return None
+        sql = """SELECT MIN(id) AS target_ref FROM sessions
+                 WHERE session_key IS NOT NULL AND LOWER(source) = ? AND chat_id = ?"""
+        params: list[Any] = [platform, chat_id]
+        if thread_id is None:
+            sql += " AND (thread_id IS NULL OR thread_id = '')"
+        else:
+            sql += " AND thread_id = ?"
+            params.append(thread_id)
+        with self._lock:
+            row = self._conn.execute(sql, params).fetchone()
+        return str(row["target_ref"]) if row and row["target_ref"] else None
+
+    def gateway_conversation_ref(self, *, platform: str, chat_id: str) -> Optional[str]:
+        """Return a deterministic opaque session id shared by all chat topics."""
+        platform = str(platform or "").strip().lower()
+        chat_id = str(chat_id or "").strip()
+        if not platform or not chat_id:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """SELECT MIN(id) AS target_ref FROM sessions
+                   WHERE session_key IS NOT NULL AND LOWER(source) = ? AND chat_id = ?""",
+                (platform, chat_id),
+            ).fetchone()
+        return str(row["target_ref"]) if row and row["target_ref"] else None
+
     def find_session_by_origin(
         self,
         *,

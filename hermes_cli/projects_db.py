@@ -80,6 +80,22 @@ CREATE TABLE IF NOT EXISTS project_folders (
 CREATE INDEX IF NOT EXISTS idx_project_folders_path
     ON project_folders(path);
 
+CREATE TABLE IF NOT EXISTS project_conversation_bindings (
+    project_id  TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+    platform    TEXT NOT NULL,
+    chat_id     TEXT NOT NULL,
+    thread_id   TEXT,
+    alias       TEXT,
+    created_at  INTEGER NOT NULL,
+    updated_at  INTEGER NOT NULL,
+    PRIMARY KEY (project_id, platform, chat_id, thread_id),
+    UNIQUE (platform, chat_id, thread_id)
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_project_conversation_bindings_threadless
+    ON project_conversation_bindings(platform, chat_id)
+    WHERE thread_id IS NULL;
+
 CREATE TABLE IF NOT EXISTS project_meta (
     key    TEXT PRIMARY KEY,
     value  TEXT
@@ -233,6 +249,28 @@ class ProjectFolder:
 
 
 @dataclass
+class ConversationBinding:
+    project_id: str
+    platform: str
+    chat_id: str
+    thread_id: Optional[str] = None
+    alias: Optional[str] = None
+    created_at: int = 0
+    updated_at: int = 0
+
+    def to_private_dict(self) -> dict:
+        return {
+            "project_id": self.project_id,
+            "platform": self.platform,
+            "chat_id": self.chat_id,
+            "thread_id": self.thread_id,
+            "alias": self.alias,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+        }
+
+
+@dataclass
 class Project:
     id: str
     slug: str
@@ -245,6 +283,7 @@ class Project:
     primary_path: Optional[str] = None
     archived: bool = False
     folders: List[ProjectFolder] = field(default_factory=list)
+    conversation_bindings: List[ConversationBinding] = field(default_factory=list)
 
     def to_dict(self) -> dict:
         return {
@@ -260,6 +299,13 @@ class Project:
             "created_at": self.created_at,
             "folders": [f.to_dict() for f in self.folders],
         }
+
+    def to_private_dict(self) -> dict:
+        payload = self.to_dict()
+        payload["conversation_bindings"] = [
+            binding.to_private_dict() for binding in self.conversation_bindings
+        ]
+        return payload
 
 
 def _project_from_row(row: sqlite3.Row) -> Project:
@@ -297,7 +343,44 @@ def _load_folders(conn: sqlite3.Connection, project_id: str) -> List[ProjectFold
 
 def _attach_folders(conn: sqlite3.Connection, project: Project) -> Project:
     project.folders = _load_folders(conn, project.id)
+    project.conversation_bindings = _load_conversation_bindings(conn, project.id)
     return project
+
+
+def _binding_from_row(row: sqlite3.Row) -> ConversationBinding:
+    return ConversationBinding(
+        project_id=row["project_id"],
+        platform=row["platform"],
+        chat_id=row["chat_id"],
+        thread_id=row["thread_id"],
+        alias=row["alias"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
+    )
+
+
+def _load_conversation_bindings(
+    conn: sqlite3.Connection, project_id: str
+) -> List[ConversationBinding]:
+    return list_conversation_bindings(conn, project_id=project_id)
+
+
+def normalize_thread_id(thread_id: Optional[str]) -> Optional[str]:
+    value = str(thread_id).strip() if thread_id is not None else ""
+    return value or None
+
+
+def normalize_conversation_target(
+    platform: str, chat_id: str, thread_id: Optional[str] = None
+) -> tuple[str, str, Optional[str]]:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_chat = str(chat_id or "").strip()
+    normalized_thread = normalize_thread_id(thread_id)
+    if not normalized_platform:
+        raise ValueError("platform required")
+    if not normalized_chat:
+        raise ValueError("chat_id required")
+    return normalized_platform, normalized_chat, normalized_thread
 
 
 # ---------------------------------------------------------------------------
@@ -572,6 +655,10 @@ def archive_project(conn: sqlite3.Connection, project_id: str) -> bool:
         cur = conn.execute(
             "UPDATE projects SET archived = 1 WHERE id = ?", (project_id,)
         )
+        conn.execute(
+            "DELETE FROM project_conversation_bindings WHERE project_id = ?",
+            (project_id,),
+        )
     return cur.rowcount > 0
 
 
@@ -584,10 +671,142 @@ def restore_project(conn: sqlite3.Connection, project_id: str) -> bool:
 
 
 def delete_project(conn: sqlite3.Connection, project_id: str) -> bool:
-    """Hard-delete a project and its folders (cascade)."""
+    """Hard-delete a project, its folders, and conversation bindings."""
     with write_txn(conn):
         cur = conn.execute("DELETE FROM projects WHERE id = ?", (project_id,))
     return cur.rowcount > 0
+
+
+# ---------------------------------------------------------------------------
+# Messaging conversation bindings
+# ---------------------------------------------------------------------------
+
+
+def bind_conversation(
+    conn: sqlite3.Connection,
+    project_id: str,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    alias: Optional[str] = None,
+) -> ConversationBinding:
+    """Bind one canonical messaging target to exactly one active project.
+
+    Rebinding the target moves it deterministically. Rebinding to the current
+    project updates the optional local alias while preserving ``created_at``.
+    """
+    project = get_project(conn, project_id)
+    if project is None:
+        raise ValueError(f"no such project: {project_id}")
+    if project.archived:
+        raise ValueError(f"cannot bind conversation to archived project: {project_id}")
+
+    platform, chat_id, thread_id = normalize_conversation_target(
+        platform, chat_id, thread_id
+    )
+    clean_alias = str(alias).strip() if alias is not None else None
+    clean_alias = clean_alias or None
+    now = _now()
+    existing = get_conversation_binding(
+        conn, platform=platform, chat_id=chat_id, thread_id=thread_id
+    )
+    created_at = existing.created_at if existing else now
+
+    with write_txn(conn):
+        if thread_id is None:
+            conn.execute(
+                "DELETE FROM project_conversation_bindings "
+                "WHERE platform = ? AND chat_id = ? AND thread_id IS NULL",
+                (platform, chat_id),
+            )
+        else:
+            conn.execute(
+                "DELETE FROM project_conversation_bindings "
+                "WHERE platform = ? AND chat_id = ? AND thread_id = ?",
+                (platform, chat_id, thread_id),
+            )
+        conn.execute(
+            "INSERT INTO project_conversation_bindings "
+            "(project_id, platform, chat_id, thread_id, alias, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (project_id, platform, chat_id, thread_id, clean_alias, created_at, now),
+        )
+
+    binding = get_conversation_binding(
+        conn, platform=platform, chat_id=chat_id, thread_id=thread_id
+    )
+    assert binding is not None
+    return binding
+
+
+def unbind_conversation(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+    project_id: Optional[str] = None,
+) -> bool:
+    platform, chat_id, thread_id = normalize_conversation_target(
+        platform, chat_id, thread_id
+    )
+    params: list[object] = [platform, chat_id]
+    sql = (
+        "DELETE FROM project_conversation_bindings "
+        "WHERE platform = ? AND chat_id = ?"
+    )
+    if thread_id is None:
+        sql += " AND thread_id IS NULL"
+    else:
+        sql += " AND thread_id = ?"
+        params.append(thread_id)
+    if project_id:
+        sql += " AND project_id = ?"
+        params.append(project_id)
+    with write_txn(conn):
+        cur = conn.execute(sql, params)
+    return cur.rowcount > 0
+
+
+def get_conversation_binding(
+    conn: sqlite3.Connection,
+    *,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str] = None,
+) -> Optional[ConversationBinding]:
+    platform, chat_id, thread_id = normalize_conversation_target(
+        platform, chat_id, thread_id
+    )
+    sql = (
+        "SELECT project_id, platform, chat_id, thread_id, alias, created_at, updated_at "
+        "FROM project_conversation_bindings "
+        "WHERE platform = ? AND chat_id = ?"
+    )
+    params: list[object] = [platform, chat_id]
+    if thread_id is None:
+        sql += " AND thread_id IS NULL"
+    else:
+        sql += " AND thread_id = ?"
+        params.append(thread_id)
+    row = conn.execute(sql, params).fetchone()
+    return _binding_from_row(row) if row else None
+
+
+def list_conversation_bindings(
+    conn: sqlite3.Connection, *, project_id: Optional[str] = None
+) -> List[ConversationBinding]:
+    sql = (
+        "SELECT project_id, platform, chat_id, thread_id, alias, created_at, updated_at "
+        "FROM project_conversation_bindings"
+    )
+    params: list[object] = []
+    if project_id:
+        sql += " WHERE project_id = ?"
+        params.append(project_id)
+    sql += " ORDER BY platform ASC, chat_id ASC, COALESCE(thread_id, '') ASC"
+    return [_binding_from_row(row) for row in conn.execute(sql, params).fetchall()]
 
 
 # ---------------------------------------------------------------------------

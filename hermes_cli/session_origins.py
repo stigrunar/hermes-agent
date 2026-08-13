@@ -62,7 +62,14 @@ def session_origin_metadata(row: Dict[str, Any]) -> Optional[Dict[str, str]]:
                 display_label = label
                 break
 
-    return {"platform": platform, "chat_type": chat_type, "display_label": display_label}
+    topic_label = ""
+    if not is_dm and row.get("thread_id") not in (None, ""):
+        topic_label = _session_origin_text(origin.get("chat_topic")) or "Topic"
+
+    result = {"platform": platform, "chat_type": chat_type, "display_label": display_label}
+    if topic_label:
+        result["topic_label"] = topic_label
+    return result
 
 
 def enrich_sessions_with_origins(sessions: List[Dict[str, Any]], db: Any) -> None:
@@ -75,6 +82,18 @@ def enrich_sessions_with_origins(sessions: List[Dict[str, Any]], db: Any) -> Non
         session_id = str(row.get("id") or "")
         metadata = session_origin_metadata(row)
         if metadata:
+            target_ref = db.gateway_target_ref(
+                platform=row.get("source"),
+                chat_id=row.get("chat_id"),
+                thread_id=row.get("thread_id"),
+            )
+            conversation_ref = db.gateway_conversation_ref(
+                platform=row.get("source"), chat_id=row.get("chat_id")
+            ) or target_ref
+            if target_ref:
+                metadata["target_ref"] = target_ref
+            if conversation_ref:
+                metadata["conversation_ref"] = conversation_ref
             origins[session_id] = metadata
     for session in sessions:
         origin = origins.get(str(session.get("id") or ""))

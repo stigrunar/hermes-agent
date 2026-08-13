@@ -66,7 +66,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   const leadingIcon = (
     <Codicon
       className="shrink-0 text-(--ui-text-tertiary)"
-      name={group.isKanban ? 'checklist' : group.isHome ? 'home' : 'git-branch'}
+      name={group.isConversation ? 'comment' : group.isKanban ? 'checklist' : group.isHome ? 'home' : 'git-branch'}
       size="0.75rem"
     />
   )
@@ -106,7 +106,7 @@ export function SidebarWorkspaceGroup({ group, renderRows, onNewSession, onRemov
   // Profile groups start a fresh session in that profile but keep the
   // all-profiles browse view; workspace groups seed the new session's cwd.
   // Main checkout lanes are branch-targeted.
-  const addButton = (onNewSession || isProfileGroup) && (
+  const addButton = !group.isConversation && (onNewSession || isProfileGroup) && (
     <WorkspaceAddButton label={s.newSessionIn(group.label)} onClick={() => void handleNewSession()} />
   )
 

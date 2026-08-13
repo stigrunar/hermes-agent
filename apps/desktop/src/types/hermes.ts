@@ -463,6 +463,16 @@ export interface SessionCreateResponse {
 
 export interface SessionInfo {
   archived?: boolean
+  /** Privacy-safe messaging identity produced by the session-origin seam in
+   *  #85601. Optional for older backends and local-only sessions. */
+  origin?: null | {
+    platform?: null | string
+    chat_type?: null | string
+    display_label?: null | string
+    topic_label?: null | string
+    target_ref?: null | string
+    conversation_ref?: null | string
+  }
   cwd?: null | string
   /** Git branch checked out in {@link cwd} when the session started/resumed.
    *  The sidebar groups main-checkout sessions by this so feature-branch work
@@ -920,6 +930,14 @@ export interface ProjectFolder {
   added_at: number
 }
 
+export interface ConversationBindingInfo {
+  project_id: string
+  target_ref: string
+  alias: null | string
+  created_at: number
+  updated_at: number
+}
+
 export interface ProjectInfo {
   id: string
   slug: string
@@ -932,6 +950,7 @@ export interface ProjectInfo {
   archived: boolean
   created_at: number
   folders: ProjectFolder[]
+  conversation_bindings?: ConversationBindingInfo[]
 }
 
 export interface ProjectsPayload {

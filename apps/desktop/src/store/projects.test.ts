@@ -8,6 +8,7 @@ import { $currentCwd, $selectedStoredSessionId, $sessions, applyConfiguredDefaul
 
 import {
   $activeProjectId,
+  $projects,
   $projectScope,
   $projectsRpcAvailable,
   $projectTree,
@@ -16,6 +17,7 @@ import {
   $worktreeRefreshToken,
   ALL_PROJECTS,
   beginSessionMutation,
+  bindConversationToProject,
   createProject,
   endSessionMutation,
   enterProject,
@@ -29,7 +31,8 @@ import {
   refreshWorktrees,
   resolveNewSessionCwd,
   scanAndRecordRepos,
-  tombstoneSessions
+  tombstoneSessions,
+  unbindConversationFromProject
 } from './projects'
 
 vi.mock('@/i18n', () => ({
@@ -551,5 +554,94 @@ describe('tombstone pruning', () => {
     await refreshProjectTree()
 
     expect($removedSessionIds.get().has('sess-1')).toBe(false)
+  })
+})
+
+describe('conversation binding mutations', () => {
+  const projects = [
+    {
+      archived: false,
+      board_slug: null,
+      color: null,
+      conversation_bindings: [],
+      created_at: 0,
+      description: null,
+      folders: [],
+      icon: null,
+      id: 'p_first',
+      name: 'First',
+      primary_path: null,
+      slug: 'first'
+    },
+    {
+      archived: false,
+      board_slug: null,
+      color: null,
+      conversation_bindings: [],
+      created_at: 0,
+      description: null,
+      folders: [],
+      icon: null,
+      id: 'p_second',
+      name: 'Second',
+      primary_path: null,
+      slug: 'second'
+    }
+  ]
+
+  beforeEach(() => {
+    vi.clearAllMocks()
+    $projects.set(projects)
+  })
+
+  it('moves a canonical target to exactly one project optimistically', async () => {
+    const request = vi.fn(async (method: string) =>
+      method === 'projects.bind_messaging_target'
+        ? { binding: {} }
+        : { active_id: null, projects: $projects.get(), scoped_session_ids: [] }
+    )
+
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await bindConversationToProject({
+      alias: 'Alias',
+      projectId: 'p_second',
+      targetRef: 'opaque-topic'
+    })
+
+    expect($projects.get().find(project => project.id === 'p_first')?.conversation_bindings).toEqual([])
+    expect($projects.get().find(project => project.id === 'p_second')?.conversation_bindings).toEqual([
+      expect.objectContaining({ alias: 'Alias', target_ref: 'opaque-topic' })
+    ])
+    expect(request).toHaveBeenCalledWith(
+      'projects.bind_messaging_target',
+      expect.objectContaining({ id: 'p_second', target_ref: 'opaque-topic' })
+    )
+  })
+
+  it('removes the local binding after explicit unbind', async () => {
+    $projects.set([
+      {
+        ...projects[0],
+        conversation_bindings: [
+          {
+            alias: null,
+            created_at: 0,
+            project_id: 'p_first',
+            target_ref: 'opaque-topic',
+            updated_at: 0
+          }
+        ]
+      }
+    ])
+    const request = vi.fn(async () => ({ removed: true }))
+    activeGateway.mockReturnValue({ connectionState: 'open', request } as never)
+
+    await unbindConversationFromProject({
+      projectId: 'p_first',
+      targetRef: 'opaque-topic'
+    })
+
+    expect($projects.get()[0].conversation_bindings).toEqual([])
   })
 })

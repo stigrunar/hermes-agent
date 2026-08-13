@@ -2148,7 +2148,15 @@ export const zh: Translations = {
       enter: label => `打开 ${label}`,
       reorder: label => `重新排序 ${label}`,
       toggle: (label, open) => `${open ? '展开' : '收起'} ${label} 会话`,
-      back: '全部项目'
+      back: '全部项目',
+      topicBindAction: '绑定到项目',
+      topicManageAction: '管理项目绑定',
+      topicProjectDescription: '将此消息主题及其 Desktop 或 TUI 延续会话归入同一项目。',
+      topicProjectPlaceholder: '选择项目',
+      topicAliasPlaceholder: '可选本地别名',
+      topicBind: '绑定到项目',
+      topicSave: '保存绑定',
+      topicUnbind: '解除绑定'
     },
     newSessionIn: label => `在 ${label} 中新建会话`,
     showMoreIn: (count, label) => `在 ${label} 中再显示 ${count} 个`,

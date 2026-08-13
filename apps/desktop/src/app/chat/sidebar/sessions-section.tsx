@@ -1,13 +1,26 @@
 import type { useSensors } from '@dnd-kit/core'
 import { useStore } from '@nanostores/react'
 import type * as React from 'react'
-import { useCallback, useMemo } from 'react'
+import { useCallback, useId, useMemo, useState } from 'react'
 
 import { SidebarPanelLabel } from '@/app/shell/sidebar-label'
+import { Button } from '@/components/ui/button'
+import { Codicon } from '@/components/ui/codicon'
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle
+} from '@/components/ui/dialog'
 import { DisclosureCaret } from '@/components/ui/disclosure-caret'
+import { Input } from '@/components/ui/input'
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
 import { SidebarGroup, SidebarGroupContent } from '@/components/ui/sidebar'
+import { Tip } from '@/components/ui/tooltip'
 import type { HermesGitWorktree } from '@/global'
-import type { SessionInfo } from '@/hermes'
+import type { ProjectInfo, SessionInfo } from '@/hermes'
 import { useI18n } from '@/i18n'
 import { flattenSessionsWithBranches } from '@/lib/session-branch-tree'
 import {
@@ -18,10 +31,12 @@ import {
 } from '@/lib/session-date-groups'
 import { sessionBucketLabel } from '@/lib/time'
 import { cn } from '@/lib/utils'
+import { bindConversationToProject, unbindConversationFromProject } from '@/store/projects'
 import { sessionPinId } from '@/store/session'
 import { $sessionDotStateById, hasLiveTurn } from '@/store/session-dot-state'
 
 import { SidebarDateDivider, SidebarSectionMeta } from './chrome'
+import type { MessagingConversationGroup, MessagingTopicGroup } from './messaging-groups'
 import { orderRowsWithinGroups, reorderableRowIds } from './order'
 import {
   EnteredProjectContent,
@@ -113,6 +128,8 @@ interface SidebarSessionsSectionProps {
   headerAction?: React.ReactNode
   footer?: React.ReactNode
   groups?: SidebarSessionGroup[]
+  messagingConversations?: MessagingConversationGroup[]
+  projects?: ProjectInfo[]
   tree?: SidebarWorkspaceTree[]
   // Project overview: when present, render a drill-in list of project rows
   // instead of sessions. Clicking a row enters that project (onEnterProject),
@@ -190,6 +207,8 @@ export function SidebarSessionsSection({
   headerAction,
   footer,
   groups,
+  messagingConversations,
+  projects = [],
   projectOverview,
   projectOverviewPreviews,
   projectsLoading = false,
@@ -218,6 +237,11 @@ export function SidebarSessionsSection({
   const dotStates = useStore($sessionDotStateById)
   const sectionOpen = collapsible ? open : true
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
+
+  const hasMessagingConversations = Boolean(
+    messagingConversations?.some(conversation => conversation.topics.some(topic => topic.sessions.length > 0))
+  )
+
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
   const hasProjectOverview = Boolean(projectOverview?.length)
@@ -231,7 +255,12 @@ export function SidebarSessionsSection({
   )
 
   const showEmptyState =
-    forceEmptyState || (!hasGroupedSessions && !hasProjectOverview && !hasProjectContent && sessions.length === 0)
+    forceEmptyState ||
+    (!hasGroupedSessions &&
+      !hasMessagingConversations &&
+      !hasProjectOverview &&
+      !hasProjectContent &&
+      sessions.length === 0)
 
   // The flat recents/pinned list is the only place sessions reorder by hand;
   // grouped/tree views always sort by creation date and never drag.
@@ -360,6 +389,7 @@ export function SidebarSessionsSection({
     !pinned &&
     !showEmptyState &&
     !groups?.length &&
+    !messagingConversations?.length &&
     !projectOverview?.length &&
     !projectContent &&
     sessions.length >= VIRTUALIZE_THRESHOLD
@@ -369,7 +399,12 @@ export function SidebarSessionsSection({
   // flashing the flat session list until the overview/content/groups resolve. A
   // background refresh keeps the prior tree, so this only fires when empty.
   const showProjectsSkeleton =
-    projectsLoading && !hasProjectOverview && !hasProjectContent && !projectContent && !groups?.length
+    projectsLoading &&
+    !hasProjectOverview &&
+    !hasProjectContent &&
+    !projectContent &&
+    !groups?.length &&
+    !messagingConversations?.length
 
   let inner: React.ReactNode
 
@@ -436,6 +471,20 @@ export function SidebarSessionsSection({
         ) : (
           rows
         )}
+      </>
+    )
+  } else if (messagingConversations?.length) {
+    inner = (
+      <>
+        {messagingConversations.map(conversation => (
+          <MessagingConversationTree
+            conversation={conversation}
+            key={conversation.id}
+            projects={projects}
+            renderRows={renderRows}
+          />
+        ))}
+        {renderRows(sessions)}
       </>
     )
   } else if (groups?.length) {
@@ -509,6 +558,190 @@ export function SidebarSessionsSection({
         </SidebarGroupContent>
       )}
     </SidebarGroup>
+  )
+}
+
+interface MessagingConversationTreeProps {
+  conversation: MessagingConversationGroup
+  projects: ProjectInfo[]
+  renderRows: (sessions: SessionInfo[]) => React.ReactNode
+}
+
+function MessagingConversationTree({ conversation, projects, renderRows }: MessagingConversationTreeProps) {
+  const [open, setOpen] = useState(true)
+  const contentId = useId()
+
+  return (
+    <div className="grid gap-px">
+      <button
+        aria-controls={contentId}
+        aria-expanded={open}
+        className="group/conversation flex min-h-[1.625rem] min-w-0 items-center gap-1.5 rounded-md bg-transparent pl-2 pr-1 text-left"
+        onClick={() => setOpen(value => !value)}
+        type="button"
+      >
+        <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment-discussion" size="0.75rem" />
+        <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
+          {conversation.label}
+        </span>
+        <DisclosureCaret
+          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/conversation:opacity-100"
+          open={open}
+        />
+      </button>
+      {open ? (
+        <div className="grid gap-px pl-3" id={contentId}>
+          {conversation.topics.map(topic => (
+            <MessagingTopicTree key={topic.id} projects={projects} renderRows={renderRows} topic={topic} />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+interface MessagingTopicTreeProps {
+  projects: ProjectInfo[]
+  renderRows: (sessions: SessionInfo[]) => React.ReactNode
+  topic: MessagingTopicGroup
+}
+
+function MessagingTopicTree({ projects, renderRows, topic }: MessagingTopicTreeProps) {
+  const { t } = useI18n()
+  const strings = t.sidebar.projects
+  const [open, setOpen] = useState(true)
+  const contentId = useId()
+  const [dialogOpen, setDialogOpen] = useState(false)
+  const firstActiveProject = projects.find(project => !project.archived)?.id ?? ''
+  const [projectId, setProjectId] = useState(topic.binding?.project_id ?? firstActiveProject)
+  const [alias, setAlias] = useState(topic.binding?.alias ?? topic.label)
+  const [saving, setSaving] = useState(false)
+  const projectName = projects.find(project => project.id === topic.binding?.project_id)?.name
+  const actionLabel = topic.binding ? strings.topicManageAction : strings.topicBindAction
+
+  const openDialog = () => {
+    setProjectId(topic.binding?.project_id ?? firstActiveProject)
+    setAlias(topic.binding?.alias ?? topic.label)
+    setDialogOpen(true)
+  }
+
+  const save = async () => {
+    if (!projectId) {
+      return
+    }
+
+    setSaving(true)
+
+    try {
+      await bindConversationToProject({
+        alias,
+        projectId,
+        targetRef: topic.identity.targetRef
+      })
+      setDialogOpen(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const unlink = async () => {
+    setSaving(true)
+
+    try {
+      await unbindConversationFromProject({
+        projectId: topic.binding?.project_id,
+        targetRef: topic.identity.targetRef
+      })
+      setDialogOpen(false)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <div className="grid gap-px">
+      <div className="group/topic grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md">
+        <button
+          aria-controls={contentId}
+          aria-expanded={open}
+          className="flex h-full min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
+          onClick={() => setOpen(value => !value)}
+          type="button"
+        >
+          <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment" size="0.75rem" />
+          <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
+            {topic.label}
+          </span>
+          {projectName ? (
+            <span className="max-w-20 truncate text-[0.6875rem] font-medium text-(--ui-text-quaternary)">
+              {projectName}
+            </span>
+          ) : null}
+          <DisclosureCaret
+            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/topic:opacity-100"
+            open={open}
+          />
+        </button>
+        {topic.canManageBinding ? (
+          <Tip label={actionLabel}>
+            <Button
+              aria-label={actionLabel}
+              className="self-center"
+              onClick={openDialog}
+              size="icon-xs"
+              variant="ghost"
+            >
+              <Codicon name={topic.binding ? 'link' : 'link-external'} />
+            </Button>
+          </Tip>
+        ) : null}
+      </div>
+      {open ? (
+        <div className="grid gap-px pl-3" id={contentId}>
+          {renderRows(topic.sessions)}
+        </div>
+      ) : null}
+      <Dialog onOpenChange={setDialogOpen} open={topic.canManageBinding && dialogOpen}>
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>{actionLabel}</DialogTitle>
+            <DialogDescription>{strings.topicProjectDescription}</DialogDescription>
+          </DialogHeader>
+          <div className="grid gap-3">
+            <Select onValueChange={setProjectId} value={projectId}>
+              <SelectTrigger aria-label={strings.topicProjectPlaceholder}>
+                <SelectValue placeholder={strings.topicProjectPlaceholder} />
+              </SelectTrigger>
+              <SelectContent>
+                {projects
+                  .filter(project => !project.archived)
+                  .map(project => (
+                    <SelectItem key={project.id} value={project.id}>
+                      {project.name}
+                    </SelectItem>
+                  ))}
+              </SelectContent>
+            </Select>
+            <Input
+              aria-label={strings.topicAliasPlaceholder}
+              onChange={event => setAlias(event.target.value)}
+              placeholder={strings.topicAliasPlaceholder}
+              value={alias}
+            />
+          </div>
+          <DialogFooter>
+            {topic.binding ? (
+              <Button disabled={saving} onClick={() => void unlink()} type="button" variant="text">
+                {strings.topicUnbind}
+              </Button>
+            ) : null}
+            <Button disabled={!projectId || saving} onClick={() => void save()} type="button">
+              {topic.binding ? strings.topicSave : strings.topicBind}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+    </div>
   )
 }
 
