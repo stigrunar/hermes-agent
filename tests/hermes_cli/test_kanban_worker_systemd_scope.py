@@ -298,6 +298,131 @@ def test_scoped_terminal_waits_for_exact_scope_reap(
     assert stopped == [(unit, target)]
 
 
+def test_scoped_iteration_exhaustion_waits_for_exact_scope_reap(
+    kanban_home, all_assignees_spawnable, monkeypatch
+):
+    target = kb._SystemdUserManagerTarget(
+        os.getuid(),
+        Path("/run/user") / str(os.getuid()),
+        Path("/run/user") / str(os.getuid()) / "bus",
+    )
+    monkeypatch.setattr(kb, "_systemd_user_manager_target_for_uid", lambda uid: target)
+    monkeypatch.setattr(kb, "_systemd_scope_state", lambda *args, **kwargs: "active")
+    stopped = []
+    monkeypatch.setattr(
+        kb,
+        "_stop_systemd_scope",
+        lambda unit, manager: stopped.append((unit, manager)) or True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="exhausted", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        unit = kb._systemd_scope_unit_name(task_id, run_id)
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._WorkerLaunchPid(
+                7654,
+                launch_mode="systemd-user-scope",
+                scope_unit=unit,
+                verification_status="verified",
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid(),
+                launch_acknowledged=True,
+            ),
+        )
+
+        assert kb._record_iteration_exhaustion(
+            conn, task_id, budget_used=12, budget_max=12,
+        ) == run_id
+
+        pending = conn.execute(
+            "SELECT status, claim_lock, current_run_id FROM tasks WHERE id=?",
+            (task_id,),
+        ).fetchone()
+        run = kb.get_run(conn, run_id)
+        assert pending is not None
+        assert pending["status"] == "running"
+        assert pending["claim_lock"] is not None
+        assert pending["current_run_id"] == run_id
+        assert run is not None
+        assert run.ended_at is None
+        assert run.terminal_action == "iteration_exhausted"
+        assert run.reap_state == "terminal_requested"
+        assert kb._record_iteration_exhaustion(
+            conn, task_id, budget_used=12, budget_max=12,
+        ) == run_id
+        assert kb._record_iteration_exhaustion(
+            conn, task_id, budget_used=11, budget_max=12,
+        ) is None
+        terminal_requests = [
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "terminal_requested"
+        ]
+        assert len(terminal_requests) == 1
+        assert terminal_requests[0].payload["action"] == "iteration_exhausted"
+
+        assert kb.reconcile_worker_scope_terminals(conn) == [task_id]
+
+        final = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert final is not None
+        assert final.status == "blocked"
+        assert final.block_kind == "iteration_exhausted"
+        assert final.claim_lock is None
+        assert final.current_run_id is None
+        assert final.consecutive_failures == 1
+        assert run is not None
+        assert run.ended_at is not None
+        assert run.outcome == "iteration_exhausted"
+        assert run.metadata == {
+            "budget_used": 12,
+            "budget_max": 12,
+            "checkpoint_required": True,
+            "workspace_path": "",
+            "retryable": False,
+            "resume_policy": "never",
+        }
+        event = next(
+            event for event in kb.list_events(conn, task_id)
+            if event.kind == "iteration_exhausted"
+        )
+        assert event.run_id == run_id
+        assert event.payload["terminal_run_id"] == run_id
+        assert event.payload["retryable"] is False
+
+    assert stopped == [(unit, target)]
+
+
+def test_untracked_iteration_exhaustion_remains_immediate(
+    kanban_home, all_assignees_spawnable
+):
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title="direct exhaustion", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+
+        assert kb._record_iteration_exhaustion(
+            conn, task_id, budget_used=4, budget_max=4,
+        ) == claimed.current_run_id
+
+        task = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, claimed.current_run_id)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.block_kind == "iteration_exhausted"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        assert run is not None
+        assert run.ended_at is not None
+        assert run.outcome == "iteration_exhausted"
+        assert run.terminal_action is None
+        assert run.reap_state is None
+
+
 @pytest.mark.parametrize("terminal", ["timeout", "crash", "cancel"])
 def test_dispatcher_terminal_paths_stop_persisted_scope(
     kanban_home, all_assignees_spawnable, monkeypatch, terminal

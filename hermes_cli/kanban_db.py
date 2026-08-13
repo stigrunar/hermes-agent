@@ -9067,11 +9067,14 @@ def _record_iteration_exhaustion(
     budget_max: int,
     error: Optional[str] = None,
 ) -> Optional[int]:
-    """Terminalize one exhausted worker run without entering retry routing.
+    """Request or finalize one exhausted run without entering retry routing.
 
     The iteration ceiling is an emergency stop, not a retry trigger. Preserve
     the workspace/diff, close the exact run as ``iteration_exhausted``, and
     park the task so only an owner-created replacement revision can continue.
+    Scoped workers first persist terminal intent so the dispatcher can reap
+    the exact scope before releasing the claim; direct/untracked runs retain
+    the legacy immediate transition.
     """
     used = max(0, int(budget_used))
     maximum = max(0, int(budget_max))
@@ -9081,6 +9084,48 @@ def _record_iteration_exhaustion(
             or f"Iteration budget exhausted ({used}/{maximum}) — task could not complete within the allowed iterations"
         )
     )[:500]
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+    if row["status"] == "running" and run_id is not None:
+        deferred = _request_scoped_terminal_transition(
+            conn,
+            task_id,
+            action="iteration_exhausted",
+            payload={
+                "budget_used": used,
+                "budget_max": maximum,
+                "error": message,
+            },
+            expected_run_id=run_id,
+        )
+        if deferred is True:
+            return run_id
+        if deferred is False:
+            return None
+    return _finalize_iteration_exhaustion_immediately(
+        conn,
+        task_id,
+        budget_used=used,
+        budget_max=maximum,
+        error=message,
+    )
+
+
+def _finalize_iteration_exhaustion_immediately(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    error: str,
+    expected_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """Apply the non-retryable blocked transition after any required reap."""
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, current_run_id, consecutive_failures, workspace_path "
@@ -9091,6 +9136,10 @@ def _record_iteration_exhaustion(
             return None
 
         run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+        if expected_run_id is not None and (
+            row["status"] != "running" or run_id != int(expected_run_id)
+        ):
+            return None
         if row["status"] == "blocked" and run_id is None:
             latest = conn.execute(
                 "SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
@@ -9105,7 +9154,7 @@ def _record_iteration_exhaustion(
             "UPDATE tasks SET status='blocked', block_kind='iteration_exhausted', "
             "max_retries=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
             "consecutive_failures=?, last_failure_error=? WHERE id=?",
-            (failures, message, task_id),
+            (failures, error, task_id),
         )
         closed_run_id = None
         if run_id is not None:
@@ -9114,10 +9163,10 @@ def _record_iteration_exhaustion(
                 task_id,
                 outcome="iteration_exhausted",
                 status="iteration_exhausted",
-                error=message,
+                error=error,
                 metadata={
-                    "budget_used": used,
-                    "budget_max": maximum,
+                    "budget_used": budget_used,
+                    "budget_max": budget_max,
                     "checkpoint_required": True,
                     "workspace_path": workspace_path,
                     "retryable": False,
@@ -9125,9 +9174,9 @@ def _record_iteration_exhaustion(
                 },
             )
         payload = {
-            "error": message,
-            "budget_used": used,
-            "budget_max": maximum,
+            "error": error,
+            "budget_used": budget_used,
+            "budget_max": budget_max,
             "blocker_type": "iteration_exhausted",
             "resume_policy": "never",
             "retryable": False,
@@ -10999,6 +11048,15 @@ def reconcile_worker_scope_terminals(conn: sqlite3.Connection) -> list[str]:
                     kind=payload.get("kind"),
                     expected_run_id=run_id,
                 )
+            elif row["terminal_action"] == "iteration_exhausted":
+                ok = _finalize_iteration_exhaustion_immediately(
+                    conn,
+                    task_id,
+                    budget_used=payload.get("budget_used", 0),
+                    budget_max=payload.get("budget_max", 0),
+                    error=str(payload.get("error") or "Iteration budget exhausted")[:500],
+                    expected_run_id=run_id,
+                ) == run_id
             else:
                 ok = False
         except Exception as exc:
