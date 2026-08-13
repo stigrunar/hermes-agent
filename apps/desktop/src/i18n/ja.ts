@@ -1776,7 +1776,15 @@ export const ja = defineLocale({
       removeWorktreeDirty:
         'このワークツリーにはコミットされていない変更があります。強制削除（変更を破棄）するか、レーンを隠してディスク上に残します。',
       forceRemove: '強制削除',
-      enter: label => `${label} を開く`
+      enter: label => `${label} を開く`,
+      topicBindAction: 'プロジェクトに関連付ける',
+      topicManageAction: 'プロジェクトの関連付けを管理',
+      topicProjectDescription: 'このメッセージトピックと Desktop/TUI の続きの会話を同じプロジェクトにまとめます。',
+      topicProjectPlaceholder: 'プロジェクトを選択',
+      topicAliasPlaceholder: '任意のローカル別名',
+      topicBind: 'プロジェクトに関連付ける',
+      topicSave: '関連付けを保存',
+      topicUnbind: '関連付けを解除'
     },
     newSessionIn: label => `${label} で新しいセッション`,
     showMoreIn: (count, label) => `${label} でさらに ${count} 件を表示`,

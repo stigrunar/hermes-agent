@@ -1959,7 +1959,15 @@ export const en: Translations = {
       enter: label => `Open ${label}`,
       reorder: label => `Reorder ${label}`,
       toggle: (label, open) => `${open ? 'Show' : 'Hide'} ${label} sessions`,
-      back: 'All projects'
+      back: 'All projects',
+      topicBindAction: 'Bind to Project',
+      topicManageAction: 'Manage Project binding',
+      topicProjectDescription: 'Keep this messaging topic and its Desktop or TUI continuations in one Project.',
+      topicProjectPlaceholder: 'Choose a Project',
+      topicAliasPlaceholder: 'Optional local alias',
+      topicBind: 'Bind to Project',
+      topicSave: 'Save binding',
+      topicUnbind: 'Unbind'
     },
     newSessionIn: label => `New session in ${label}`,
     showMoreIn: (count, label) => `Show ${count} more in ${label}`,

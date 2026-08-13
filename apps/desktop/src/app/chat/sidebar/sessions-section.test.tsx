@@ -1,8 +1,19 @@
-import { cleanup, render } from '@testing-library/react'
+import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import type * as React from 'react'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
-import type { SessionInfo } from '@/hermes'
+import type { ProjectInfo, SessionInfo } from '@/hermes'
+
+const { bindConversationToProject, unbindConversationFromProject } = vi.hoisted(() => ({
+  bindConversationToProject: vi.fn(async () => undefined),
+  unbindConversationFromProject: vi.fn(async () => undefined)
+}))
+
+vi.mock('@/store/projects', async importOriginal => ({
+  ...((await importOriginal()) as object),
+  bindConversationToProject,
+  unbindConversationFromProject
+}))
 
 import { SidebarSessionsSection, VIRTUALIZE_THRESHOLD } from './sessions-section'
 import type { VirtualSessionListProps } from './virtual-session-list'
@@ -12,6 +23,7 @@ afterEach(cleanup)
 vi.mock('@/i18n', () => ({
   useI18n: () => ({
     t: {
+      common: { close: 'Close' },
       sidebar: {
         dateDivider: {
           earlierThisMonth: 'Earlier this month',
@@ -20,6 +32,16 @@ vi.mock('@/i18n', () => ({
           older: 'Older',
           today: 'Today',
           yesterday: 'Yesterday'
+        },
+        projects: {
+          topicBindAction: 'Bind to Project',
+          topicManageAction: 'Manage Project binding',
+          topicProjectDescription: 'Keep this topic in one Project.',
+          topicProjectPlaceholder: 'Choose a Project',
+          topicAliasPlaceholder: 'Optional local alias',
+          topicBind: 'Bind to Project',
+          topicSave: 'Save binding',
+          topicUnbind: 'Unbind'
         }
       }
     }
@@ -175,5 +197,80 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
 
     const thirdRowsRef = mockVirtualListPropsHistory[2].rows
     expect(thirdRowsRef).not.toBe(secondRowsRef)
+  })
+
+  it('opens the inline topic binding dialog and binds the canonical identity', async () => {
+    bindConversationToProject.mockClear()
+    const topicSession = makeSession('topic-session')
+
+    const projects = [
+      {
+        archived: false,
+        board_slug: null,
+        color: null,
+        created_at: 0,
+        description: null,
+        folders: [],
+        icon: null,
+        id: 'p_project',
+        name: 'Operations',
+        primary_path: null,
+        slug: 'operations'
+      } as ProjectInfo
+    ]
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Telegram"
+        messagingConversations={[
+          {
+            id: 'telegram:chat',
+            label: 'Engineering',
+            topics: [
+              {
+                binding: null,
+                canManageBinding: true,
+                id: 'telegram:chat:topic',
+                identity: {
+                  conversationLabel: 'Engineering',
+                  conversationRef: 'opaque-chat',
+                  platform: 'telegram',
+                  profile: 'default',
+                  targetRef: 'opaque-topic',
+                  topicLabel: 'Deployments'
+                },
+                label: 'Deployments',
+                sessions: [topicSession]
+              }
+            ]
+          }
+        ]}
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        open={true}
+        pinned={false}
+        projects={projects}
+        sessions={[]}
+      />
+    )
+
+    fireEvent.click(screen.getByRole('button', { name: 'Bind to Project' }))
+    fireEvent.change(screen.getByRole('textbox', { name: 'Optional local alias' }), {
+      target: { value: 'Deploys' }
+    })
+    fireEvent.click(screen.getAllByRole('button', { name: 'Bind to Project' }).at(-1)!)
+
+    await waitFor(() =>
+      expect(bindConversationToProject).toHaveBeenCalledWith({
+        alias: 'Deploys',
+        projectId: 'p_project',
+        targetRef: 'opaque-topic'
+      })
+    )
   })
 })

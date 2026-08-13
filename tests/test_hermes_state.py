@@ -1819,6 +1819,34 @@ class TestListSessionsRich:
     def test_get_gateway_session_metadata_empty_request(self, db):
         assert db.get_gateway_session_metadata([]) == {}
 
+    def test_opaque_gateway_target_resolution_is_canonical_and_fails_closed(self, db):
+        for session_id, thread_id in (
+            ("later", "topic"),
+            ("earlier", "topic"),
+            ("other", "other"),
+        ):
+            db.create_session(session_id, source="telegram")
+            db.record_gateway_session_peer(
+                session_id,
+                source="telegram",
+                session_key=f"private:{session_id}",
+                chat_id="secret-chat",
+                thread_id=thread_id,
+            )
+
+        assert db.resolve_gateway_target("earlier") == {
+            "platform": "telegram",
+            "chat_id": "secret-chat",
+            "thread_id": "topic",
+        }
+        assert db.resolve_gateway_target("missing") is None
+        assert db.gateway_target_ref(
+            platform="telegram", chat_id="secret-chat", thread_id="topic"
+        ) == "earlier"
+        assert db.gateway_conversation_ref(
+            platform="telegram", chat_id="secret-chat"
+        ) == "earlier"
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")
