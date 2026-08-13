@@ -24,6 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401
 
 from fastapi import APIRouter, HTTPException, Query  # noqa: F401
 
+from hermes_cli.session_origins import enrich_sessions_with_origins
 from hermes_cli.web_deps import late
 from hermes_cli.web_models import (
     ProfileCreate,
@@ -193,6 +194,7 @@ def get_profiles_sessions(
             )
             total += profile_total
             profile_totals[name] = profile_total
+            enrich_sessions_with_origins(rows, db)
             for s in rows:
                 s["profile"] = name
                 s["is_default_profile"] = name == "default"
@@ -334,6 +336,7 @@ def get_profiles_sessions_sidebar(
             continue
         try:
             profile_rows = _slice(db, exclude=recents_exclude_list, cap=recents_cap)
+            enrich_sessions_with_origins(profile_rows, db)
             # A full window means more rows remain on disk. That is all the
             # sidebar's "load more" needs, and unlike an exact COUNT(*) per
             # profile per refresh it costs nothing beyond the rows already
@@ -346,10 +349,12 @@ def get_profiles_sessions_sidebar(
             # a page, and a total that shrank when you scrolled would be worse
             # than no total at all.
             profile_totals[name] = db.usage_totals()
-            cron_rows.extend(_tag(_slice(db, source="cron", cap=cron_cap), name))
-            messaging_rows.extend(
-                _tag(_slice(db, exclude=messaging_exclude_list, cap=messaging_cap), name)
-            )
+            profile_rows = _slice(db, source="cron", cap=cron_cap)
+            enrich_sessions_with_origins(profile_rows, db)
+            cron_rows.extend(_tag(profile_rows, name))
+            profile_rows = _slice(db, exclude=messaging_exclude_list, cap=messaging_cap)
+            enrich_sessions_with_origins(profile_rows, db)
+            messaging_rows.extend(_tag(profile_rows, name))
         except Exception as exc:
             _warn_profile_read_error(name, exc)
             errors.append({"profile": name, "error": str(exc)})

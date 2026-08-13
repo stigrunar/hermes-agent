@@ -1779,6 +1779,46 @@ class TestListSessionsRich:
         activity = db.get_session_activity("gw-1")
         assert activity["last_activity_description"] == "compressing context"
 
+    def test_get_gateway_session_metadata_preserves_same_key_history(self, db):
+        shared_key = "agent:main:telegram:dm:c1"
+        for session_id, display_name in (
+            ("gw-history-old", "Earlier chat"),
+            ("gw-history-new", "Latest chat"),
+        ):
+            db.create_session(session_id, "telegram")
+            db.record_gateway_session_peer(
+                session_id,
+                source="telegram",
+                session_key=shared_key,
+                chat_id="private-chat-id",
+                chat_type="dm",
+                display_name=display_name,
+                origin_json=json.dumps({"platform": "telegram", "chat_type": "dm"}),
+            )
+        db.create_session("not-gateway", "cli")
+
+        rows = db.get_gateway_session_metadata(
+            ["gw-history-old", "missing", "gw-history-new", "gw-history-old", "not-gateway"]
+        )
+
+        assert set(rows) == {"gw-history-old", "gw-history-new"}
+        assert rows["gw-history-old"]["display_name"] == "Earlier chat"
+        assert rows["gw-history-new"]["display_name"] == "Latest chat"
+        assert set(rows["gw-history-old"]) == {
+            "id",
+            "source",
+            "chat_type",
+            "display_name",
+            "origin_json",
+            "session_key",
+            "chat_id",
+            "user_id",
+            "thread_id",
+        }
+
+    def test_get_gateway_session_metadata_empty_request(self, db):
+        assert db.get_gateway_session_metadata([]) == {}
+
     def test_order_by_last_active_surfaces_recently_touched_older_session_first(self, db):
         t0 = 1709500000.0
         db.create_session("old", "cli")
