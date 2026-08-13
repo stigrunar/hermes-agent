@@ -5245,8 +5245,8 @@ def complete_task(
         },
         expected_run_id=expected_run_id,
     )
-    if deferred:
-        return True
+    if deferred is not None:
+        return deferred
 
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
@@ -6031,8 +6031,8 @@ def block_task(
         payload={"reason": reason, "kind": kind},
         expected_run_id=expected_run_id,
     )
-    if deferred:
-        return True
+    if deferred is not None:
+        return deferred
     recurrences = 0
     with write_txn(conn):
         cur_row = conn.execute(

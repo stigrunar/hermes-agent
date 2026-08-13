@@ -298,6 +298,78 @@ def test_scoped_terminal_waits_for_exact_scope_reap(
     assert stopped == [(unit, target)]
 
 
+@pytest.mark.parametrize("terminal", ["complete", "block"])
+def test_conflicting_scoped_terminal_request_does_not_finalize_before_reap(
+    kanban_home, all_assignees_spawnable, monkeypatch, terminal
+):
+    target = kb._SystemdUserManagerTarget(
+        os.getuid(),
+        Path("/run/user") / str(os.getuid()),
+        Path("/run/user") / str(os.getuid()) / "bus",
+    )
+    monkeypatch.setattr(kb, "_systemd_user_manager_target_for_uid", lambda uid: target)
+    monkeypatch.setattr(kb, "_systemd_scope_state", lambda *args, **kwargs: "active")
+    stopped = []
+    monkeypatch.setattr(
+        kb,
+        "_stop_systemd_scope",
+        lambda unit, manager: stopped.append((unit, manager)) or True,
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=terminal, assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = claimed.current_run_id
+        unit = kb._systemd_scope_unit_name(task_id, run_id)
+        kb._set_worker_pid(
+            conn,
+            task_id,
+            kb._WorkerLaunchPid(
+                4321,
+                launch_mode="systemd-user-scope",
+                scope_unit=unit,
+                verification_status="verified",
+                manager_kind=kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=os.getuid(),
+                launch_acknowledged=True,
+            ),
+        )
+
+        if terminal == "complete":
+            assert kb.complete_task(
+                conn, task_id, result="first", expected_run_id=run_id,
+            )
+            assert not kb.complete_task(
+                conn, task_id, result="second", expected_run_id=run_id,
+            )
+        else:
+            assert kb.block_task(
+                conn, task_id, reason="first", expected_run_id=run_id,
+            )
+            assert not kb.block_task(
+                conn, task_id, reason="second", expected_run_id=run_id,
+            )
+
+        pending = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert pending is not None and pending.status == "running"
+        assert pending.current_run_id == run_id
+        assert run is not None and run.ended_at is None
+        assert run.reap_state == "terminal_requested"
+        assert kb.reconcile_worker_scope_terminals(conn) == [task_id]
+
+        final = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+        assert final is not None
+        assert final.status == ("done" if terminal == "complete" else "blocked")
+        assert run is not None and run.ended_at is not None
+        assert run.reap_state == "reaped"
+        assert run.reap_completed_at is not None
+
+    assert stopped == [(unit, target)]
+
+
 def test_scoped_iteration_exhaustion_waits_for_exact_scope_reap(
     kanban_home, all_assignees_spawnable, monkeypatch
 ):
