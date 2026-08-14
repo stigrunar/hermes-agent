@@ -1757,12 +1757,13 @@ export function ChatSidebar({
                 const shownConversations = group.conversations
                   .map(conversation => ({
                     ...conversation,
-                    topics: conversation.topics
-                      .map(topic => ({
-                        ...topic,
-                        sessions: topic.sessions.filter(session => shownSessionIds.has(session.id))
-                      }))
-                      .filter(topic => topic.sessions.length > 0)
+                    topics: conversation.topics.flatMap(topic => {
+                      const [mainSession, ...historySessions] = [topic.mainSession, ...topic.historySessions].filter(
+                        session => shownSessionIds.has(session.id)
+                      )
+
+                      return mainSession ? [{ ...topic, historySessions, mainSession }] : []
+                    })
                   }))
                   .filter(conversation => conversation.topics.length > 0)
 

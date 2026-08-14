@@ -16,12 +16,14 @@ export interface MessagingTopicGroup {
   label: string
   binding: ConversationBindingInfo | null
   canManageBinding: boolean
-  sessions: SessionInfo[]
+  mainSession: SessionInfo
+  historySessions: SessionInfo[]
 }
 
 export interface MessagingConversationGroup {
   id: string
   label: string
+  profile: string
   topics: MessagingTopicGroup[]
 }
 
@@ -44,7 +46,9 @@ export function sessionConversationIdentity(session: SessionInfo): null | Sessio
   const targetRef = text(origin?.target_ref)
   const conversationRef = text(origin?.conversation_ref) || targetRef
 
-  if (!platform || !targetRef || !conversationRef) {return null}
+  if (!platform || !targetRef || !conversationRef) {
+    return null
+  }
 
   return {
     profile: profileKey(session),
@@ -60,7 +64,9 @@ function bindingMap(projects: readonly ProjectInfo[]): Map<string, ConversationB
   const bindings = new Map<string, ConversationBindingInfo>()
 
   for (const project of projects) {
-    for (const binding of project.conversation_bindings ?? []) {bindings.set(binding.target_ref, binding)}
+    for (const binding of project.conversation_bindings ?? []) {
+      bindings.set(binding.target_ref, binding)
+    }
   }
 
   return bindings
@@ -68,8 +74,7 @@ function bindingMap(projects: readonly ProjectInfo[]): Map<string, ConversationB
 
 const sessionTime = (session: SessionInfo): number => session.last_active || session.started_at || 0
 
-const topicTime = (topic: MessagingTopicGroup | undefined): number =>
-  topic?.sessions[0] ? sessionTime(topic.sessions[0]) : 0
+const topicTime = (topic: MessagingTopicGroup | undefined): number => (topic ? sessionTime(topic.mainSession) : 0)
 
 export function buildMessagingGroups(params: {
   sessions: readonly SessionInfo[]
@@ -85,7 +90,10 @@ export function buildMessagingGroups(params: {
     const identity = sessionConversationIdentity(session)
     const sourceId = identity?.platform ?? normalizeSessionSource(session.source)
 
-    if (!sourceId) {continue}
+    if (!sourceId) {
+      continue
+    }
+
     const bucket = byPlatform.get(sourceId) ?? { identified: [], flat: [] }
     bucket[identity ? 'identified' : 'flat'].push(session)
     byPlatform.set(sourceId, bucket)
@@ -98,13 +106,17 @@ export function buildMessagingGroups(params: {
       for (const session of bucket.identified) {
         const identity = sessionConversationIdentity(session)
 
-        if (!identity) {continue}
+        if (!identity) {
+          continue
+        }
+
         const conversationId = `${identity.profile}:${identity.conversationRef}`
         const topicId = `${identity.profile}:${identity.targetRef}`
 
         const conversation = conversations.get(conversationId) ?? {
           id: conversationId,
           label: identity.conversationLabel,
+          profile: identity.profile,
           topics: []
         }
 
@@ -118,19 +130,26 @@ export function buildMessagingGroups(params: {
             identity,
             binding,
             canManageBinding,
+            historySessions: [],
             label: binding?.alias || identity.topicLabel || identity.conversationLabel,
-            sessions: []
+            mainSession: session
           }
           conversation.topics.push(topic)
+        } else {
+          topic.historySessions.push(session)
         }
 
-        topic.sessions.push(session)
         conversations.set(conversationId, conversation)
       }
 
       for (const conversation of conversations.values()) {
         for (const topic of conversation.topics) {
-          topic.sessions.sort((a, b) => sessionTime(b) - sessionTime(a) || a.id.localeCompare(b.id))
+          const ordered = [topic.mainSession, ...topic.historySessions].sort(
+            (a, b) => sessionTime(b) - sessionTime(a) || a.id.localeCompare(b.id)
+          )
+
+          topic.mainSession = ordered[0]
+          topic.historySessions = ordered.slice(1)
         }
 
         conversation.topics.sort((a, b) => topicTime(b) - topicTime(a) || a.label.localeCompare(b.label))
@@ -140,14 +159,17 @@ export function buildMessagingGroups(params: {
         (a, b) => topicTime(b.topics[0]) - topicTime(a.topics[0]) || a.label.localeCompare(b.label)
       )
 
-      const sessions = [...bucket.identified, ...bucket.flat].sort((a, b) => sessionTime(b) - sessionTime(a))
+      const sessions = [...bucket.identified, ...bucket.flat].sort(
+        (a, b) => sessionTime(b) - sessionTime(a) || a.id.localeCompare(b.id)
+      )
+
       const known = params.platformTotals[sourceId]
 
       return {
         sourceId,
         label: sessionSourceLabel(sourceId) ?? sourceId,
         conversations: nested,
-        flatSessions: bucket.flat.sort((a, b) => sessionTime(b) - sessionTime(a)),
+        flatSessions: bucket.flat.sort((a, b) => sessionTime(b) - sessionTime(a) || a.id.localeCompare(b.id)),
         sessions,
         total: Math.max(sessions.length, known ?? 0),
         hasMore: known != null ? known > sessions.length : params.truncated

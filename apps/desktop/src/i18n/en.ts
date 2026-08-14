@@ -1961,6 +1961,8 @@ export const en: Translations = {
       toggle: (label, open) => `${open ? 'Show' : 'Hide'} ${label} sessions`,
       back: 'All projects',
       topicBindAction: 'Bind to Project',
+      topicHistory: 'History',
+      topicMain: 'Main',
       topicManageAction: 'Manage Project binding',
       topicProjectDescription: 'Keep this messaging topic and its Desktop or TUI continuations in one Project.',
       topicProjectPlaceholder: 'Choose a Project',

@@ -1648,6 +1648,8 @@ export interface Translations {
       toggle: (label: string, open: boolean) => string
       back: string
       topicBindAction: string
+      topicHistory: string
+      topicMain: string
       topicManageAction: string
       topicProjectDescription: string
       topicProjectPlaceholder: string

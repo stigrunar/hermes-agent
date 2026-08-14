@@ -1778,6 +1778,8 @@ export const ja = defineLocale({
       forceRemove: '強制削除',
       enter: label => `${label} を開く`,
       topicBindAction: 'プロジェクトに関連付ける',
+      topicHistory: '履歴',
+      topicMain: 'メイン',
       topicManageAction: 'プロジェクトの関連付けを管理',
       topicProjectDescription: 'このメッセージトピックと Desktop/TUI の続きの会話を同じプロジェクトにまとめます。',
       topicProjectPlaceholder: 'プロジェクトを選択',
