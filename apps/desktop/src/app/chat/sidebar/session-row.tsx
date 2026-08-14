@@ -47,6 +47,8 @@ import { useProfilePrewarm } from './use-profile-prewarm'
 
 interface SidebarSessionRowProps extends React.ComponentProps<'div'> {
   session: SessionInfo
+  /** Presentation-only title for canonical hierarchy rows such as Main. */
+  displayTitle?: string
   /** TUI-style tree stem for branched sessions (`└─ ` / `├─ `). */
   branchStem?: string
   isPinned: boolean
@@ -112,6 +114,7 @@ function formatAge(seconds: number, r: Translations['sidebar']['row']): string {
 
 function SidebarSessionRowImpl({
   session,
+  displayTitle,
   branchStem,
   isPinned,
   isSelected,
@@ -133,7 +136,7 @@ function SidebarSessionRowImpl({
   const { t } = useI18n()
   const r = t.sidebar.row
   const { cancelPrewarm, startPrewarm } = useProfilePrewarm(session.profile)
-  const title = sessionTitle(session)
+  const title = displayTitle ?? sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
   // Opt-in row metadata from the sidebar's filter menu. Read from the store

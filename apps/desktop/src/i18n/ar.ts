@@ -1631,6 +1631,8 @@ export const ar = defineLocale({
       toggle: (label, open) => `${open ? 'إظهار' : 'إخفاء'} جلسات ${label}`,
       back: 'كل المشاريع',
       topicBindAction: 'ربط بالمشروع',
+      topicHistory: 'السجل',
+      topicMain: 'الرئيسية',
       topicManageAction: 'إدارة ربط المشروع',
       topicProjectDescription: 'احتفظ بموضوع المراسلة ومتابعات سطح المكتب أو TUI في مشروع واحد.',
       topicProjectPlaceholder: 'اختر مشروعًا',
