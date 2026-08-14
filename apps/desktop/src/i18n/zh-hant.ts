@@ -1720,6 +1720,8 @@ export const zhHant = defineLocale({
       forceRemove: '強制移除',
       enter: label => `開啟 ${label}`,
       topicBindAction: '綁定到專案',
+      topicHistory: '歷史記錄',
+      topicMain: '主要對話',
       topicManageAction: '管理專案綁定',
       topicProjectDescription: '將此訊息主題及其 Desktop 或 TUI 延續工作階段歸入同一專案。',
       topicProjectPlaceholder: '選擇專案',

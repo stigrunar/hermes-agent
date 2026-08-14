@@ -239,8 +239,21 @@ export function SidebarSessionsSection({
   const hasGroupedSessions = Boolean(groups?.some(group => group.sessions.length > 0))
 
   const hasMessagingConversations = Boolean(
-    messagingConversations?.some(conversation => conversation.topics.some(topic => topic.sessions.length > 0))
+    messagingConversations?.some(conversation => conversation.topics.length > 0)
   )
+
+  const messagingProfileGroups = useMemo(() => {
+    const byProfile = new Map<string, MessagingConversationGroup[]>()
+
+    for (const conversation of messagingConversations ?? []) {
+      const conversations = byProfile.get(conversation.profile) ?? []
+
+      conversations.push(conversation)
+      byProfile.set(conversation.profile, conversations)
+    }
+
+    return [...byProfile.entries()].map(([profile, conversations]) => ({ conversations, profile }))
+  }, [messagingConversations])
 
   // A defined project list is itself content (even an empty project should
   // render as a drill-in row so the user can see it exists).
@@ -275,10 +288,11 @@ export function SidebarSessionsSection({
   )
 
   const renderRow = useCallback(
-    (session: SessionInfo, draggable: boolean, branchStem?: string) => {
+    (session: SessionInfo, draggable: boolean, branchStem?: string, displayTitle?: string) => {
       const rowProps = {
         branchStem,
         card,
+        displayTitle,
         isPinned: pinned,
         isSelected: session.id === activeSessionId,
         onArchive: () => onArchiveSession(session.id),
@@ -338,8 +352,10 @@ export function SidebarSessionsSection({
 
   // Sessions inside repos/worktrees are date-ordered and static.
   const renderRows = useCallback(
-    (items: SessionInfo[]) =>
-      flattenSessionsWithBranches(items).map(({ branchStem, session }) => renderRow(session, false, branchStem)),
+    (items: SessionInfo[], displayTitle?: string) =>
+      flattenSessionsWithBranches(items).map(({ branchStem, session }) =>
+        renderRow(session, false, branchStem, displayTitle)
+      ),
     [renderRow]
   )
 
@@ -476,14 +492,24 @@ export function SidebarSessionsSection({
   } else if (messagingConversations?.length) {
     inner = (
       <>
-        {messagingConversations.map(conversation => (
-          <MessagingConversationTree
-            conversation={conversation}
-            key={conversation.id}
-            projects={projects}
-            renderRows={renderRows}
-          />
-        ))}
+        {messagingProfileGroups.length > 1
+          ? messagingProfileGroups.map(group => (
+              <MessagingProfileTree
+                conversations={group.conversations}
+                key={group.profile}
+                profile={group.profile}
+                projects={projects}
+                renderRows={renderRows}
+              />
+            ))
+          : messagingConversations.map(conversation => (
+              <MessagingConversationTree
+                conversation={conversation}
+                key={conversation.id}
+                projects={projects}
+                renderRows={renderRows}
+              />
+            ))}
         {renderRows(sessions)}
       </>
     )
@@ -561,38 +587,96 @@ export function SidebarSessionsSection({
   )
 }
 
-interface MessagingConversationTreeProps {
-  conversation: MessagingConversationGroup
+interface MessagingProfileTreeProps {
+  conversations: MessagingConversationGroup[]
+  profile: string
   projects: ProjectInfo[]
-  renderRows: (sessions: SessionInfo[]) => React.ReactNode
+  renderRows: (sessions: SessionInfo[], displayTitle?: string) => React.ReactNode
 }
 
-function MessagingConversationTree({ conversation, projects, renderRows }: MessagingConversationTreeProps) {
+function MessagingProfileTree({ conversations, profile, projects, renderRows }: MessagingProfileTreeProps) {
+  const { t } = useI18n()
   const [open, setOpen] = useState(true)
   const contentId = useId()
+  const label = profile === 'default' ? t.profiles.defaultBadge : profile
 
   return (
     <div className="grid gap-px">
       <button
         aria-controls={contentId}
         aria-expanded={open}
-        className="group/conversation flex min-h-[1.625rem] min-w-0 items-center gap-1.5 rounded-md bg-transparent pl-2 pr-1 text-left"
+        className="group/profile flex min-h-[1.625rem] min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
         onClick={() => setOpen(value => !value)}
         type="button"
       >
-        <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment-discussion" size="0.75rem" />
-        <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
-          {conversation.label}
-        </span>
+        <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="account" size="0.75rem" />
+        <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-medium text-(--ui-text-secondary)">{label}</span>
         <DisclosureCaret
-          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/conversation:opacity-100"
+          className="text-(--ui-text-tertiary) opacity-0 transition group-hover/profile:opacity-100"
           open={open}
         />
       </button>
       {open ? (
         <div className="grid gap-px pl-3" id={contentId}>
+          {conversations.map(conversation => (
+            <MessagingConversationTree
+              conversation={conversation}
+              key={conversation.id}
+              projects={projects}
+              renderRows={renderRows}
+            />
+          ))}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+interface MessagingConversationTreeProps {
+  conversation: MessagingConversationGroup
+  projects: ProjectInfo[]
+  renderRows: (sessions: SessionInfo[], displayTitle?: string) => React.ReactNode
+}
+
+function MessagingConversationTree({ conversation, projects, renderRows }: MessagingConversationTreeProps) {
+  const [open, setOpen] = useState(true)
+  const contentId = useId()
+
+  const directTopic =
+    conversation.topics.length === 1 &&
+    conversation.topics[0].identity.targetRef === conversation.topics[0].identity.conversationRef
+
+  return (
+    <div className="grid gap-px">
+      <div className="group/conversation grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md">
+        <button
+          aria-controls={contentId}
+          aria-expanded={open}
+          className="flex min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
+          onClick={() => setOpen(value => !value)}
+          type="button"
+        >
+          <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment-discussion" size="0.75rem" />
+          <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
+            {conversation.label}
+          </span>
+          <DisclosureCaret
+            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/conversation:opacity-100"
+            open={open}
+          />
+        </button>
+        {directTopic ? <MessagingTopicBindingControl projects={projects} topic={conversation.topics[0]} /> : null}
+      </div>
+      {open ? (
+        <div className="grid gap-px pl-3" id={contentId}>
           {conversation.topics.map(topic => (
-            <MessagingTopicTree key={topic.id} projects={projects} renderRows={renderRows} topic={topic} />
+            <MessagingTopicTree
+              hideHeader={directTopic}
+              key={topic.id}
+              projects={projects}
+              renderRows={renderRows}
+              topic={topic}
+            />
           ))}
         </div>
       ) : null}
@@ -601,23 +685,92 @@ function MessagingConversationTree({ conversation, projects, renderRows }: Messa
 }
 
 interface MessagingTopicTreeProps {
+  hideHeader?: boolean
   projects: ProjectInfo[]
-  renderRows: (sessions: SessionInfo[]) => React.ReactNode
+  renderRows: (sessions: SessionInfo[], displayTitle?: string) => React.ReactNode
   topic: MessagingTopicGroup
 }
 
-function MessagingTopicTree({ projects, renderRows, topic }: MessagingTopicTreeProps) {
+function MessagingTopicTree({ hideHeader = false, projects, renderRows, topic }: MessagingTopicTreeProps) {
   const { t } = useI18n()
   const strings = t.sidebar.projects
   const [open, setOpen] = useState(true)
   const contentId = useId()
+  const historyId = useId()
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const projectName = projects.find(project => project.id === topic.binding?.project_id)?.name
+
+  return (
+    <div className="grid gap-px">
+      {!hideHeader ? (
+        <div className="group/topic grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md">
+          <button
+            aria-controls={contentId}
+            aria-expanded={open}
+            className="flex h-full min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
+            onClick={() => setOpen(value => !value)}
+            type="button"
+          >
+            <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment" size="0.75rem" />
+            <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
+              {topic.label}
+            </span>
+            {projectName ? (
+              <span className="max-w-20 truncate text-[0.6875rem] font-medium text-(--ui-text-quaternary)">
+                {projectName}
+              </span>
+            ) : null}
+            <DisclosureCaret
+              className="text-(--ui-text-tertiary) opacity-0 transition group-hover/topic:opacity-100"
+              open={open}
+            />
+          </button>
+          <MessagingTopicBindingControl projects={projects} topic={topic} />
+        </div>
+      ) : null}
+      {hideHeader || open ? (
+        <div className="grid gap-px pl-3" id={contentId}>
+          {renderRows([topic.mainSession], strings.topicMain)}
+          {topic.historySessions.length > 0 ? (
+            <>
+              <button
+                aria-controls={historyId}
+                aria-expanded={historyOpen}
+                aria-label={strings.topicHistory}
+                className="group/history flex min-h-[1.625rem] min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left text-[0.75rem] text-(--ui-text-tertiary)"
+                onClick={() => setHistoryOpen(value => !value)}
+                type="button"
+              >
+                <DisclosureCaret className="shrink-0" open={historyOpen} />
+                <span>{strings.topicHistory}</span>
+                <span className="text-(--ui-text-quaternary)">{topic.historySessions.length}</span>
+              </button>
+              {historyOpen ? (
+                <div className="grid gap-px pl-3" id={historyId}>
+                  {renderRows(topic.historySessions)}
+                </div>
+              ) : null}
+            </>
+          ) : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function MessagingTopicBindingControl({ projects, topic }: { projects: ProjectInfo[]; topic: MessagingTopicGroup }) {
+  const { t } = useI18n()
+  const strings = t.sidebar.projects
   const [dialogOpen, setDialogOpen] = useState(false)
   const firstActiveProject = projects.find(project => !project.archived)?.id ?? ''
   const [projectId, setProjectId] = useState(topic.binding?.project_id ?? firstActiveProject)
   const [alias, setAlias] = useState(topic.binding?.alias ?? topic.label)
   const [saving, setSaving] = useState(false)
-  const projectName = projects.find(project => project.id === topic.binding?.project_id)?.name
   const actionLabel = topic.binding ? strings.topicManageAction : strings.topicBindAction
+
+  if (!topic.canManageBinding) {
+    return null
+  }
 
   const openDialog = () => {
     setProjectId(topic.binding?.project_id ?? firstActiveProject)
@@ -633,11 +786,7 @@ function MessagingTopicTree({ projects, renderRows, topic }: MessagingTopicTreeP
     setSaving(true)
 
     try {
-      await bindConversationToProject({
-        alias,
-        projectId,
-        targetRef: topic.identity.targetRef
-      })
+      await bindConversationToProject({ alias, projectId, targetRef: topic.identity.targetRef })
       setDialogOpen(false)
     } finally {
       setSaving(false)
@@ -659,49 +808,13 @@ function MessagingTopicTree({ projects, renderRows, topic }: MessagingTopicTreeP
   }
 
   return (
-    <div className="grid gap-px">
-      <div className="group/topic grid min-h-[1.625rem] grid-cols-[minmax(0,1fr)_auto] items-stretch rounded-md">
-        <button
-          aria-controls={contentId}
-          aria-expanded={open}
-          className="flex h-full min-w-0 items-center gap-1.5 bg-transparent pl-2 pr-1 text-left"
-          onClick={() => setOpen(value => !value)}
-          type="button"
-        >
-          <Codicon className="shrink-0 text-(--ui-text-tertiary)" name="comment" size="0.75rem" />
-          <span className="min-w-0 flex-1 truncate text-[0.8125rem] leading-none text-(--ui-text-secondary)">
-            {topic.label}
-          </span>
-          {projectName ? (
-            <span className="max-w-20 truncate text-[0.6875rem] font-medium text-(--ui-text-quaternary)">
-              {projectName}
-            </span>
-          ) : null}
-          <DisclosureCaret
-            className="text-(--ui-text-tertiary) opacity-0 transition group-hover/topic:opacity-100"
-            open={open}
-          />
-        </button>
-        {topic.canManageBinding ? (
-          <Tip label={actionLabel}>
-            <Button
-              aria-label={actionLabel}
-              className="self-center"
-              onClick={openDialog}
-              size="icon-xs"
-              variant="ghost"
-            >
-              <Codicon name={topic.binding ? 'link' : 'link-external'} />
-            </Button>
-          </Tip>
-        ) : null}
-      </div>
-      {open ? (
-        <div className="grid gap-px pl-3" id={contentId}>
-          {renderRows(topic.sessions)}
-        </div>
-      ) : null}
-      <Dialog onOpenChange={setDialogOpen} open={topic.canManageBinding && dialogOpen}>
+    <>
+      <Tip label={actionLabel}>
+        <Button aria-label={actionLabel} className="self-center" onClick={openDialog} size="icon-xs" variant="ghost">
+          <Codicon name={topic.binding ? 'link' : 'link-external'} />
+        </Button>
+      </Tip>
+      <Dialog onOpenChange={setDialogOpen} open={dialogOpen}>
         <DialogContent>
           <DialogHeader>
             <DialogTitle>{actionLabel}</DialogTitle>
@@ -741,7 +854,7 @@ function MessagingTopicTree({ projects, renderRows, topic }: MessagingTopicTreeP
           </DialogFooter>
         </DialogContent>
       </Dialog>
-    </div>
+    </>
   )
 }
 

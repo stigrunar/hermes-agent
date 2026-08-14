@@ -34,6 +34,8 @@ vi.mock('@/i18n', () => ({
           yesterday: 'Yesterday'
         },
         projects: {
+          topicHistory: 'History',
+          topicMain: 'Main',
           topicBindAction: 'Bind to Project',
           topicManageAction: 'Manage Project binding',
           topicProjectDescription: 'Keep this topic in one Project.',
@@ -59,8 +61,18 @@ vi.mock('./virtual-session-list', () => ({
 }))
 
 vi.mock('./session-row', () => ({
-  SidebarSessionRow: ({ session }: { session: SessionInfo }) => (
-    <div data-testid={`session-row-${session.id}`}>{session.id}</div>
+  SidebarSessionRow: ({
+    displayTitle,
+    onResume,
+    session
+  }: {
+    displayTitle?: string
+    onResume: () => void
+    session: SessionInfo
+  }) => (
+    <button data-testid={`session-row-${session.id}`} onClick={onResume} type="button">
+      {displayTitle ?? session.id}
+    </button>
   )
 }))
 
@@ -228,6 +240,7 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
           {
             id: 'telegram:chat',
             label: 'Engineering',
+            profile: 'default',
             topics: [
               {
                 binding: null,
@@ -242,7 +255,8 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
                   topicLabel: 'Deployments'
                 },
                 label: 'Deployments',
-                sessions: [topicSession]
+                mainSession: topicSession,
+                historySessions: []
               }
             ]
           }
@@ -272,5 +286,114 @@ describe('SidebarSessionsSection memoization & virtualizer stability', () => {
         targetRef: 'opaque-topic'
       })
     )
+  })
+
+  it('shows only Main by default and reveals older topic history on demand', () => {
+    const main = makeSession('main', 3000)
+    const older = makeSession('older', 2000)
+    const oldest = makeSession('oldest', 1000)
+
+    const onResumeSession = vi.fn()
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Telegram"
+        messagingConversations={[
+          {
+            id: 'default:opaque-chat',
+            label: 'Engineering',
+            profile: 'default',
+            topics: [
+              {
+                binding: null,
+                canManageBinding: false,
+                historySessions: [older, oldest],
+                id: 'default:opaque-topic',
+                identity: {
+                  conversationLabel: 'Engineering',
+                  conversationRef: 'opaque-chat',
+                  platform: 'telegram',
+                  profile: 'default',
+                  targetRef: 'opaque-topic',
+                  topicLabel: 'Deployments'
+                },
+                label: 'Deployments',
+                mainSession: main
+              }
+            ]
+          }
+        ]}
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={onResumeSession}
+        onToggle={noop}
+        onTogglePin={noop}
+        open={true}
+        pinned={false}
+        sessions={[]}
+      />
+    )
+
+    expect(screen.getByTestId('session-row-main').textContent).toBe('Main')
+    expect(screen.queryByTestId('session-row-older')).toBeNull()
+    expect(screen.queryByTestId('session-row-oldest')).toBeNull()
+
+    fireEvent.click(screen.getByTestId('session-row-main'))
+    expect(onResumeSession).toHaveBeenCalledWith('main')
+
+    fireEvent.click(screen.getByRole('button', { name: 'History' }))
+
+    expect(screen.getByTestId('session-row-older')).not.toBeNull()
+    expect(screen.getByTestId('session-row-oldest')).not.toBeNull()
+  })
+
+  it('collapses a direct conversation without a duplicate topic row', () => {
+    const direct = makeSession('direct', 1000)
+
+    render(
+      <SidebarSessionsSection
+        activeSessionId={null}
+        emptyState={<div>Empty</div>}
+        label="Telegram"
+        messagingConversations={[
+          {
+            id: 'default:opaque-dm',
+            label: 'Stig',
+            profile: 'default',
+            topics: [
+              {
+                binding: null,
+                canManageBinding: false,
+                historySessions: [],
+                id: 'default:opaque-dm',
+                identity: {
+                  conversationLabel: 'Stig',
+                  conversationRef: 'opaque-dm',
+                  platform: 'telegram',
+                  profile: 'default',
+                  targetRef: 'opaque-dm',
+                  topicLabel: null
+                },
+                label: 'Stig',
+                mainSession: direct
+              }
+            ]
+          }
+        ]}
+        onArchiveSession={noop}
+        onDeleteSession={noop}
+        onResumeSession={noop}
+        onToggle={noop}
+        onTogglePin={noop}
+        open={true}
+        pinned={false}
+        sessions={[]}
+      />
+    )
+
+    expect(screen.getAllByText('Stig')).toHaveLength(1)
+    expect(screen.getByTestId('session-row-direct').textContent).toBe('Main')
   })
 })

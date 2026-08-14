@@ -2150,6 +2150,8 @@ export const zh: Translations = {
       toggle: (label, open) => `${open ? '展开' : '收起'} ${label} 会话`,
       back: '全部项目',
       topicBindAction: '绑定到项目',
+      topicHistory: '历史记录',
+      topicMain: '主会话',
       topicManageAction: '管理项目绑定',
       topicProjectDescription: '将此消息主题及其 Desktop 或 TUI 延续会话归入同一项目。',
       topicProjectPlaceholder: '选择项目',
