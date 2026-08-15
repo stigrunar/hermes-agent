@@ -9760,6 +9760,79 @@ def _plan_goal_compression_recovery(
     )
 
 
+def _start_authoritative_delivery(sid: str, session: dict, response: str) -> None:
+    """Deliver a resumed response off the turn-completion path.
+
+    Telegram delivery is an external I/O boundary.  It must not hold the
+    terminal ``message.complete`` frame (or the session turn cleanup) hostage
+    when the platform sender is slow or unavailable.  Snapshot the ownership
+    fields before starting the daemon so the worker does not retain or race the
+    live session dictionary after the turn settles.
+    """
+    if not session.get("explicitly_resumed_from_authoritative_ui"):
+        return
+
+    delivery_session = {
+        "session_key": str(session.get("session_key") or ""),
+        "profile_home": session.get("profile_home"),
+    }
+    explicitly_resumed = bool(
+        session.get("explicitly_resumed_from_authoritative_ui")
+    )
+    profile_home = delivery_session.get("profile_home")
+
+    def _deliver() -> None:
+        result: dict[str, Any] | None = None
+        try:
+            from tui_gateway.authoritative_delivery import (
+                deliver_resumed_telegram_response,
+            )
+
+            with _session_db(delivery_session) as delivery_db:
+                receipt = deliver_resumed_telegram_response(
+                    db=delivery_db,
+                    session_key=delivery_session["session_key"],
+                    response=response,
+                    explicitly_resumed_from_authoritative_ui=explicitly_resumed,
+                    profile_home=profile_home,
+                )
+            if receipt is not None:
+                result = {"delivery": receipt}
+                if receipt.get("status") != "delivered":
+                    result["warning"] = (
+                        "The response was saved, but Telegram delivery failed."
+                    )
+        except Exception:
+            logger.warning("Authoritative Telegram delivery failed after completion")
+            result = {
+                "delivery": {
+                    "platform": "telegram",
+                    "status": "failed",
+                    "error": "delivery_failed",
+                },
+                "warning": "The response was saved, but Telegram delivery failed.",
+            }
+
+        if result is not None:
+            # The terminal response is already complete.  Keep the receipt and
+            # failure warning observable without reopening the completed turn.
+            if result.get("warning"):
+                _emit(
+                    "notification.show",
+                    sid,
+                    {
+                        "key": f"authoritative-telegram-delivery:{sid}",
+                        "kind": "ttl",
+                        "level": "warn",
+                        "text": result["warning"],
+                        "ttl_ms": 10000,
+                    },
+                )
+            _emit("message.delivery", sid, result)
+
+    threading.Thread(target=_deliver, daemon=True).start()
+
+
 def _run_prompt_submit(
     rid,
     sid: str,
@@ -10254,48 +10327,6 @@ def _run_prompt_submit(
                 payload["reasoning"] = last_reasoning
             if status_note:
                 payload["warning"] = status_note
-            if status == "complete" and isinstance(raw, str) and raw.strip():
-                try:
-                    from tui_gateway.authoritative_delivery import (
-                        deliver_resumed_telegram_response,
-                    )
-
-                    with _session_db(session) as delivery_db:
-                        delivery_receipt = deliver_resumed_telegram_response(
-                            db=delivery_db,
-                            session_key=str(session.get("session_key") or ""),
-                            response=raw,
-                            explicitly_resumed_from_authoritative_ui=bool(
-                                session.get("explicitly_resumed_from_authoritative_ui")
-                            ),
-                            profile_home=session.get("profile_home"),
-                        )
-                    if delivery_receipt is not None:
-                        payload["delivery"] = delivery_receipt
-                        if delivery_receipt.get("status") != "delivered":
-                            delivery_warning = (
-                                "The response was saved, but Telegram delivery failed."
-                            )
-                            payload["warning"] = " ".join(
-                                part
-                                for part in (payload.get("warning"), delivery_warning)
-                                if part
-                            )
-                except Exception:
-                    logger.warning("Authoritative Telegram delivery failed before receipt")
-                    payload["delivery"] = {
-                        "platform": "telegram",
-                        "status": "failed",
-                        "error": "delivery_failed",
-                    }
-                    payload["warning"] = " ".join(
-                        part
-                        for part in (
-                            payload.get("warning"),
-                            "The response was saved, but Telegram delivery failed.",
-                        )
-                        if part
-                    )
             if result.get("response_previewed"):
                 payload["response_previewed"] = True
             # Forward the structured billing-wall descriptor (provider,
@@ -10328,6 +10359,8 @@ def _run_prompt_submit(
                 payload["recoverable"] = True
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
+            if status == "complete" and isinstance(raw, str) and raw.strip():
+                _start_authoritative_delivery(sid, session, raw)
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

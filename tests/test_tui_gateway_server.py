@@ -5404,6 +5404,63 @@ class _RecordingAgent:
         return {"final_response": "", "messages": []}
 
 
+def test_run_prompt_submit_emits_completion_before_authoritative_delivery_finishes(
+    monkeypatch, tmp_path
+):
+    """A slow Telegram send must not hold the Desktop terminal frame hostage."""
+    from tui_gateway import authoritative_delivery
+
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    real_thread_class = threading.Thread
+    threads = []
+    delivery_started = threading.Event()
+    release_delivery = threading.Event()
+    events = []
+
+    def _recording_thread(*args, **kwargs):
+        thread = real_thread_class(*args, **kwargs)
+        threads.append(thread)
+        return thread
+
+    def _slow_delivery(**_kwargs):
+        delivery_started.set()
+        assert release_delivery.wait(timeout=5)
+        return {"platform": "telegram", "status": "delivered"}
+
+    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+    monkeypatch.setattr(
+        authoritative_delivery,
+        "deliver_resumed_telegram_response",
+        _slow_delivery,
+    )
+
+    class _ResponseAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            self._turns.append(prompt)
+            return {"final_response": "answer", "messages": []}
+
+    session = _session(
+        session_key="telegram-session",
+        agent=_ResponseAgent([]),
+        running=True,
+        explicitly_resumed_from_authoritative_ui=True,
+    )
+    server._sessions["sid-delivery"] = session
+    try:
+        server._run_prompt_submit("rid", "sid-delivery", session, "continue")
+
+        assert delivery_started.wait(timeout=2)
+        assert any(event[0] == "message.complete" for event in events)
+    finally:
+        release_delivery.set()
+        for thread in threads:
+            thread.join(timeout=5)
+        server._sessions.pop("sid-delivery", None)
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code
