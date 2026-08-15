@@ -319,7 +319,17 @@ def _(rid, params: dict) -> dict:
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
-    omit_messages = is_truthy_value(params.get("omit_messages", False))
+    if "omit_messages" in params:
+        omit_messages = is_truthy_value(params.get("omit_messages"))
+    else:
+        dashboard_cfg = _load_cfg().get("dashboard", {}) or {}
+        omit_messages = (
+            str(params.get("source") or "").strip().lower() == "desktop"
+            and isinstance(dashboard_cfg, dict)
+            and is_truthy_value(
+                dashboard_cfg.get("desktop_resume_omit_messages_default", False)
+            )
+        )
 
     # In a profile scope this opens a DEDICATED handle we own until the agent
     # takes it (see the ownership transfer at _init_session below); every path

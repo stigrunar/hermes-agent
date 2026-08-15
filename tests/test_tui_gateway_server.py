@@ -2545,10 +2545,15 @@ def test_history_to_messages_keeps_real_user_bracket_text():
     ]
 
 
-@pytest.mark.parametrize("omit_messages", [False, True])
-def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messages):
+@pytest.mark.parametrize(
+    ("omit_messages", "expected_omit"),
+    [(False, False), (True, True), (None, True)],
+)
+def test_session_resume_uses_parent_lineage_for_display(
+    monkeypatch, omit_messages, expected_omit
+):
     captured = {}
-    target = "tip-omit" if omit_messages else "tip-full"
+    target = "tip-omit" if expected_omit else "tip-full"
 
     class FakeDB:
         def get_session(self, target):
@@ -2599,20 +2604,27 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch, omit_messag
     # returned display history.
 
     params = {"session_id": target}
-    if omit_messages:
-        params["omit_messages"] = True
+    if omit_messages is None:
+        params["source"] = "desktop"
+        monkeypatch.setattr(
+            server,
+            "_load_cfg",
+            lambda: {"dashboard": {"desktop_resume_omit_messages_default": True}},
+        )
+    else:
+        params["omit_messages"] = omit_messages
     resp = server.handle_request(
         {"id": "1", "method": "session.resume", "params": params}
     )
 
-    expected = [] if omit_messages else [
+    expected = [] if expected_omit else [
         {"role": "user", "text": "root prompt"},
         {"role": "assistant", "text": "root answer"},
     ]
     assert resp["result"]["messages"] == expected
-    assert resp["result"]["message_count"] == (1 if omit_messages else 2)
-    assert resp["result"]["messages_omitted"] is omit_messages
-    expected_calls = [(target, False)] if omit_messages else [
+    assert resp["result"]["message_count"] == (1 if expected_omit else 2)
+    assert resp["result"]["messages_omitted"] is expected_omit
+    expected_calls = [(target, False)] if expected_omit else [
         (target, False),
         (target, True),
     ]
