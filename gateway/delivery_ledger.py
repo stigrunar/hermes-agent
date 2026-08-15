@@ -211,6 +211,52 @@ def record_obligation(
     _prune()
 
 
+def reserve_obligation(
+    *,
+    obligation_id: str,
+    session_key: str,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    content: str,
+) -> tuple[bool, str]:
+    """Atomically reserve an obligation without resetting an existing row.
+
+    Returns ``(created, state)``.  This is the idempotent variant used by
+    completed-turn continuation paths: replaying the same server-owned turn
+    must observe its earlier ``delivered`` row rather than replacing it with a
+    fresh ``pending`` row and sending the response twice.
+    """
+    now = time.time()
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """INSERT OR IGNORE INTO delivery_obligations
+               (obligation_id, session_key, platform, chat_id, thread_id,
+                content, state, attempts, created_at, updated_at,
+                owner_pid, owner_started_at)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?)""",
+            (
+                obligation_id,
+                session_key,
+                platform,
+                str(chat_id),
+                str(thread_id) if thread_id else None,
+                content,
+                now,
+                now,
+                pid,
+                started,
+            ),
+        )
+        row = conn.execute(
+            "SELECT state FROM delivery_obligations WHERE obligation_id = ?",
+            (obligation_id,),
+        ).fetchone()
+    _prune()
+    return bool(cursor.rowcount), str(row[0] if row else "")
+
+
 def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 

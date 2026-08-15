@@ -93,6 +93,21 @@ class TestStateMachine:
         _record()
         assert _row("ob-1")["state"] == "pending"
 
+    def test_reserve_does_not_reset_a_delivered_obligation(self):
+        kwargs = {
+            "obligation_id": "ob-1",
+            "session_key": "stored-session",
+            "platform": "telegram",
+            "chat_id": "private-chat",
+            "thread_id": "private-topic",
+            "content": "final response",
+        }
+        assert dl.reserve_obligation(**kwargs) == (True, "pending")
+        dl.mark_delivered("ob-1")
+
+        assert dl.reserve_obligation(**kwargs) == (False, "delivered")
+        assert _row("ob-1")["state"] == "delivered"
+
 
 class TestObligationId:
     def test_stable_and_distinct(self):
@@ -296,4 +311,3 @@ class TestUnconnectedPlatformKeepsItsBudget:
             "the obligation was abandoned without a single send being attempted"
         )
         assert _row("ob-1")["attempts"] == 0
-
