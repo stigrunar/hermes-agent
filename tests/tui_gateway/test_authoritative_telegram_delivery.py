@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 from types import SimpleNamespace
 
-from tui_gateway.authoritative_delivery import deliver_resumed_telegram_response
+from tui_gateway.authoritative_delivery import (
+    deliver_resumed_telegram_response,
+    reserve_resumed_telegram_delivery,
+)
 
 
 class FakeDB:
@@ -368,3 +371,27 @@ def test_profile_scope_wraps_config_load_and_send_and_restores_in_reverse_order(
         ("reset_secrets", "secret-token"),
         ("reset_home", "home-token"),
     ]
+
+
+def test_profile_scoped_reservation_uses_profile_ledger(tmp_path, monkeypatch):
+    """The durable row is created in the stored profile before any send."""
+    from gateway import delivery_ledger
+
+    launch_home = tmp_path / "launch"
+    profile_home = tmp_path / "profiles" / "work"
+    launch_home.mkdir()
+    profile_home.mkdir(parents=True)
+    monkeypatch.setenv("HERMES_HOME", str(launch_home))
+
+    reservation = reserve_resumed_telegram_delivery(
+        db=FakeDB(telegram_dm_row()),
+        session_key="stored-session",
+        response="profile-owned response",
+        explicitly_resumed_from_authoritative_ui=True,
+        profile_home=str(profile_home),
+        ledger=delivery_ledger,
+    )
+
+    assert reservation and reservation.get("obligation_id")
+    assert (profile_home / "state.db").exists()
+    assert not (launch_home / "state.db").exists()

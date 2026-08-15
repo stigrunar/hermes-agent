@@ -119,23 +119,27 @@ def _load_telegram_sender(
     return platform_config, sender
 
 
-def deliver_resumed_telegram_response(
+def _resolve_ledger(ledger: Any) -> Any:
+    if ledger is not None:
+        return ledger
+    from gateway import delivery_ledger
+
+    return delivery_ledger
+
+
+def _failure_receipt(error: str) -> dict[str, str]:
+    return {"platform": "telegram", "status": "failed", "error": error}
+
+
+def _reserve_resumed_telegram_delivery(
     *,
     db: Any,
     session_key: str,
     response: str,
     explicitly_resumed_from_authoritative_ui: bool,
-    profile_home: Optional[str] = None,
-    ledger: Any = None,
-    sender_loader: Optional[
-        Callable[[Optional[str]], tuple[Any, Callable[..., Any]]]
-    ] = None,
-) -> Optional[dict[str, str]]:
-    """Deliver one persisted Desktop continuation response to its Telegram origin.
-
-    Ineligible and legacy sessions return ``None``.  Eligible sessions return
-    a renderer-safe receipt containing no routing identifiers or credentials.
-    """
+    ledger: Any,
+) -> Optional[dict[str, Any]]:
+    """Reserve a durable obligation without performing network I/O."""
     if (
         not explicitly_resumed_from_authoritative_ui
         or not isinstance(response, str)
@@ -148,22 +152,12 @@ def deliver_resumed_telegram_response(
         return None
     assistant_row_id = db.latest_message_row_id(session_key, role="assistant")
     if assistant_row_id is None:
-        return {
-            "platform": "telegram",
-            "status": "failed",
-            "error": "delivery_not_tracked",
-        }
+        return {"receipt": _failure_receipt("delivery_not_tracked")}
     message_ref = f"assistant-row:{int(assistant_row_id)}"
 
-    if ledger is None:
-        from gateway import delivery_ledger as ledger
     try:
         if not ledger.ledger_enabled():
-            return {
-                "platform": "telegram",
-                "status": "failed",
-                "error": "delivery_not_tracked",
-            }
+            return {"receipt": _failure_receipt("delivery_not_tracked")}
         obligation_id = ledger.compute_obligation_id(session_key, message_ref, response)
         created, state = ledger.reserve_obligation(
             obligation_id=obligation_id,
@@ -175,31 +169,90 @@ def deliver_resumed_telegram_response(
         )
     except Exception:
         logger.warning("Authoritative Telegram delivery could not reserve obligation")
-        return {
-            "platform": "telegram",
-            "status": "failed",
-            "error": "delivery_not_tracked",
-        }
+        return {"receipt": _failure_receipt("delivery_not_tracked")}
 
     if not created:
         if state == "delivered":
-            return {"platform": "telegram", "status": "delivered"}
-        return {"platform": "telegram", "status": "failed", "error": "delivery_pending"}
+            return {"receipt": {"platform": "telegram", "status": "delivered"}}
+        return {"receipt": _failure_receipt("delivery_pending")}
+    return {"obligation_id": obligation_id}
+
+
+def reserve_resumed_telegram_delivery(
+    *,
+    db: Any,
+    session_key: str,
+    response: str,
+    explicitly_resumed_from_authoritative_ui: bool,
+    profile_home: Optional[str] = None,
+    ledger: Any = None,
+) -> Optional[dict[str, Any]]:
+    """Create the durable delivery obligation before terminal completion.
+
+    The profile scope deliberately wraps the ledger reservation. The ledger
+    resolves its state database through ``get_hermes_home()`` at call time, so
+    reserving outside this scope silently writes a remote session's obligation
+    to the launch profile.
+    """
+    with _profile_scope(profile_home):
+        return _reserve_resumed_telegram_delivery(
+            db=db,
+            session_key=session_key,
+            response=response,
+            explicitly_resumed_from_authoritative_ui=explicitly_resumed_from_authoritative_ui,
+            ledger=_resolve_ledger(ledger),
+        )
+
+
+def _deliver_resumed_telegram_response(
+    *,
+    db: Any,
+    session_key: str,
+    response: str,
+    explicitly_resumed_from_authoritative_ui: bool,
+    profile_home: Optional[str],
+    ledger: Any,
+    sender_loader: Optional[
+        Callable[[Optional[str]], tuple[Any, Callable[..., Any]]]
+    ],
+    reservation: Optional[dict[str, Any]],
+) -> Optional[dict[str, str]]:
+    """Send a previously reserved response, or reserve it for direct callers."""
+    if reservation is None:
+        reservation = _reserve_resumed_telegram_delivery(
+            db=db,
+            session_key=session_key,
+            response=response,
+            explicitly_resumed_from_authoritative_ui=explicitly_resumed_from_authoritative_ui,
+            ledger=ledger,
+        )
+    if reservation is None:
+        return None
+    if "receipt" in reservation:
+        return reservation["receipt"]
+    obligation_id = reservation.get("obligation_id")
+    if not obligation_id:
+        return _failure_receipt("delivery_not_tracked")
+
+    origin = _telegram_origin(db, session_key)
+    if origin is None:
+        try:
+            ledger.mark_failed(obligation_id, "standalone telegram delivery failed")
+        except Exception:
+            logger.warning("Authoritative Telegram delivery could not record failure")
+        return _failure_receipt("delivery_not_tracked")
 
     try:
         ledger.mark_attempting(obligation_id)
-        with _profile_scope(profile_home):
-            platform_config, sender = (sender_loader or _load_telegram_sender)(
-                profile_home
+        platform_config, sender = (sender_loader or _load_telegram_sender)(profile_home)
+        result = asyncio.run(
+            sender(
+                platform_config,
+                origin["chat_id"],
+                response,
+                thread_id=origin["thread_id"],
             )
-            result = asyncio.run(
-                sender(
-                    platform_config,
-                    origin["chat_id"],
-                    response,
-                    thread_id=origin["thread_id"],
-                )
-            )
+        )
         success = bool(
             result.get("success")
             if isinstance(result, Mapping)
@@ -228,4 +281,38 @@ def deliver_resumed_telegram_response(
 
     if success:
         return {"platform": "telegram", "status": "delivered"}
-    return {"platform": "telegram", "status": "failed", "error": "delivery_failed"}
+    return _failure_receipt("delivery_failed")
+
+
+def deliver_resumed_telegram_response(
+    *,
+    db: Any,
+    session_key: str,
+    response: str,
+    explicitly_resumed_from_authoritative_ui: bool,
+    profile_home: Optional[str] = None,
+    ledger: Any = None,
+    sender_loader: Optional[
+        Callable[[Optional[str]], tuple[Any, Callable[..., Any]]]
+    ] = None,
+    reservation: Optional[dict[str, Any]] = None,
+) -> Optional[dict[str, str]]:
+    """Deliver one persisted Desktop continuation response to its Telegram origin.
+
+    Ineligible and legacy sessions return ``None``. Eligible sessions return a
+    renderer-safe receipt containing no routing identifiers or credentials.
+    The profile scope covers reservation, sender lookup, send, and ledger
+    updates so every profile-owned side effect uses the stored profile home.
+    """
+    with _profile_scope(profile_home):
+        resolved_ledger = _resolve_ledger(ledger)
+        return _deliver_resumed_telegram_response(
+            db=db,
+            session_key=session_key,
+            response=response,
+            explicitly_resumed_from_authoritative_ui=explicitly_resumed_from_authoritative_ui,
+            profile_home=profile_home,
+            ledger=resolved_ledger,
+            sender_loader=sender_loader,
+            reservation=reservation,
+        )

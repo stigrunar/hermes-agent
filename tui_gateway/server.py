@@ -9760,7 +9760,78 @@ def _plan_goal_compression_recovery(
     )
 
 
-def _start_authoritative_delivery(sid: str, session: dict, response: str) -> None:
+def _authoritative_delivery_failure() -> dict[str, Any]:
+    return {
+        "delivery": {
+            "platform": "telegram",
+            "status": "failed",
+            "error": "delivery_failed",
+        },
+        "warning": "The response was saved, but Telegram delivery failed.",
+    }
+
+
+def _publish_authoritative_delivery_result(
+    sid: str, result: dict[str, Any] | None
+) -> None:
+    """Surface a post-completion delivery receipt without touching the turn."""
+    if result is None:
+        return
+    try:
+        if result.get("warning"):
+            _emit(
+                "notification.show",
+                sid,
+                {
+                    "key": f"authoritative-telegram-delivery:{sid}",
+                    "kind": "ttl",
+                    "level": "warn",
+                    "text": result["warning"],
+                    "ttl_ms": 10000,
+                },
+            )
+        _emit("message.delivery", sid, result)
+    except Exception:
+        # Delivery receipts are best-effort UI telemetry. Never let a broken
+        # transport callback reopen or otherwise mutate a completed turn.
+        logger.warning("Could not surface authoritative Telegram delivery receipt")
+
+
+def _prepare_authoritative_delivery(
+    session: dict, response: str
+) -> dict[str, Any] | None:
+    """Reserve the delivery obligation before the completion frame is emitted."""
+    if not session.get("explicitly_resumed_from_authoritative_ui"):
+        return None
+    delivery_session = {
+        "session_key": str(session.get("session_key") or ""),
+        "profile_home": session.get("profile_home"),
+    }
+    profile_home = delivery_session.get("profile_home")
+    try:
+        from tui_gateway.authoritative_delivery import (
+            reserve_resumed_telegram_delivery,
+        )
+
+        with _session_db(delivery_session) as delivery_db:
+            return reserve_resumed_telegram_delivery(
+                db=delivery_db,
+                session_key=delivery_session["session_key"],
+                response=response,
+                explicitly_resumed_from_authoritative_ui=True,
+                profile_home=profile_home,
+            )
+    except Exception:
+        logger.warning("Authoritative Telegram delivery reservation failed")
+        return {"receipt": _authoritative_delivery_failure()["delivery"]}
+
+
+def _start_authoritative_delivery(
+    sid: str,
+    session: dict,
+    response: str,
+    reservation: dict[str, Any] | None = None,
+) -> None:
     """Deliver a resumed response off the turn-completion path.
 
     Telegram delivery is an external I/O boundary.  It must not hold the
@@ -9795,6 +9866,7 @@ def _start_authoritative_delivery(sid: str, session: dict, response: str) -> Non
                     response=response,
                     explicitly_resumed_from_authoritative_ui=explicitly_resumed,
                     profile_home=profile_home,
+                    reservation=reservation,
                 )
             if receipt is not None:
                 result = {"delivery": receipt}
@@ -9804,33 +9876,33 @@ def _start_authoritative_delivery(sid: str, session: dict, response: str) -> Non
                     )
         except Exception:
             logger.warning("Authoritative Telegram delivery failed after completion")
-            result = {
-                "delivery": {
-                    "platform": "telegram",
-                    "status": "failed",
-                    "error": "delivery_failed",
-                },
-                "warning": "The response was saved, but Telegram delivery failed.",
-            }
+            result = _authoritative_delivery_failure()
 
-        if result is not None:
-            # The terminal response is already complete.  Keep the receipt and
-            # failure warning observable without reopening the completed turn.
-            if result.get("warning"):
-                _emit(
-                    "notification.show",
-                    sid,
-                    {
-                        "key": f"authoritative-telegram-delivery:{sid}",
-                        "kind": "ttl",
-                        "level": "warn",
-                        "text": result["warning"],
-                        "ttl_ms": 10000,
-                    },
-                )
-            _emit("message.delivery", sid, result)
+        _publish_authoritative_delivery_result(sid, result)
 
-    threading.Thread(target=_deliver, daemon=True).start()
+    if reservation is not None and "receipt" in reservation:
+        _publish_authoritative_delivery_result(
+            sid,
+            {
+                "delivery": reservation["receipt"],
+                "warning": (
+                    "The response was saved, but Telegram delivery failed."
+                    if reservation["receipt"].get("status") != "delivered"
+                    else None
+                ),
+            },
+        )
+        return
+
+    try:
+        worker = threading.Thread(target=_deliver, daemon=True)
+        worker.start()
+    except Exception:
+        # Thread.start() can fail after the turn has already been completed
+        # (notably during interpreter/thread exhaustion). This is a delivery
+        # failure only; it must never escape into terminal-error handling.
+        logger.warning("Authoritative Telegram delivery worker could not start")
+        _publish_authoritative_delivery_result(sid, _authoritative_delivery_failure())
 
 
 def _run_prompt_submit(
@@ -10339,6 +10411,12 @@ def _run_prompt_submit(
             rendered = render_message(raw, cols)
             if rendered:
                 payload["rendered"] = rendered
+            # Reserve the profile-scoped delivery obligation before the
+            # terminal frame. The actual Telegram I/O remains in the daemon
+            # worker started after message.complete.
+            delivery_reservation = None
+            if status == "complete" and isinstance(raw, str) and raw.strip():
+                delivery_reservation = _prepare_authoritative_delivery(session, raw)
             with session["history_lock"]:
                 if status == "error":
                     # Returned-error result (provider 4xx, budget, etc.): retain
@@ -10360,7 +10438,12 @@ def _run_prompt_submit(
             _retire_turn_marker(session, marker_key)
             _emit("message.complete", sid, payload)
             if status == "complete" and isinstance(raw, str) and raw.strip():
-                _start_authoritative_delivery(sid, session, raw)
+                _start_authoritative_delivery(
+                    sid,
+                    session,
+                    raw,
+                    delivery_reservation,
+                )
 
             # ── /goal continuation (Ralph-style loop) ─────────────────
             # After every TUI turn, if a /goal is active, ask the judge

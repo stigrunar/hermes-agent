@@ -5461,6 +5461,113 @@ def test_run_prompt_submit_emits_completion_before_authoritative_delivery_finish
         server._sessions.pop("sid-delivery", None)
 
 
+def test_authoritative_reservation_precedes_completion_and_worker_start(
+    monkeypatch, tmp_path
+):
+    """The shutdown-safe reservation is made before the terminal frame."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path)
+    order = []
+
+    monkeypatch.setattr(
+        server,
+        "_prepare_authoritative_delivery",
+        lambda *_args: order.append("reserve") or {"obligation_id": "ob-1"},
+    )
+    monkeypatch.setattr(
+        server,
+        "_start_authoritative_delivery",
+        lambda *_args: order.append("worker"),
+    )
+    monkeypatch.setattr(server, "_emit", lambda event, *_args: order.append(event))
+
+    class _ResponseAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            self._turns.append(prompt)
+            return {"final_response": "answer", "messages": []}
+
+    session = _session(
+        session_key="telegram-session",
+        agent=_ResponseAgent([]),
+        running=True,
+        explicitly_resumed_from_authoritative_ui=True,
+    )
+    server._sessions["sid-order"] = session
+    try:
+        server._run_prompt_submit("rid", "sid-order", session, "continue")
+    finally:
+        server._sessions.pop("sid-order", None)
+
+    assert order.index("reserve") < order.index("message.complete") < order.index("worker")
+
+
+def test_authoritative_worker_start_failure_does_not_reopen_completed_turn(
+    monkeypatch, tmp_path
+):
+    """Thread.start failure is a receipt, not a second terminal turn error."""
+    _configure_immediate_prompt_run(monkeypatch, tmp_path, immediate_threads=False)
+    events = []
+    real_thread = threading.Thread
+    run_threads = []
+
+    class _BrokenThread:
+        def __init__(self, **_kwargs):
+            pass
+
+        def start(self):
+            raise RuntimeError("thread resources exhausted")
+
+    def _thread_factory(*args, **kwargs):
+        if not run_threads:
+            thread = real_thread(*args, **kwargs)
+            run_threads.append(thread)
+            return thread
+        return _BrokenThread()
+
+    monkeypatch.setattr(server.threading, "Thread", _thread_factory)
+    monkeypatch.setattr(
+        server,
+        "_prepare_authoritative_delivery",
+        lambda *_args: {"obligation_id": "ob-1"},
+    )
+    monkeypatch.setattr(server, "_emit", lambda *args: events.append(args))
+
+    class _ResponseAgent(_RecordingAgent):
+        def run_conversation(
+            self, prompt, conversation_history=None, stream_callback=None, **_kwargs
+        ):
+            self._turns.append(prompt)
+            return {"final_response": "answer", "messages": []}
+
+    session = _session(
+        session_key="telegram-session",
+        agent=_ResponseAgent([]),
+        running=True,
+        explicitly_resumed_from_authoritative_ui=True,
+    )
+    server._sessions["sid-start-failure"] = session
+    try:
+        server._run_prompt_submit("rid", "sid-start-failure", session, "continue")
+        run_threads[0].join(timeout=5)
+    finally:
+        server._sessions.pop("sid-start-failure", None)
+
+    completions = [event for event in events if event[0] == "message.complete"]
+    deliveries = [event for event in events if event[0] == "message.delivery"]
+    assert len(completions) == 1
+    assert completions[0][2]["status"] == "complete"
+    assert len(deliveries) == 1
+    assert deliveries[0][2] == {
+        "delivery": {
+            "platform": "telegram",
+            "status": "failed",
+            "error": "delivery_failed",
+        },
+        "warning": "The response was saved, but Telegram delivery failed.",
+    }
+
+
 @pytest.mark.parametrize("exit_code", [0, 7])
 def test_run_prompt_submit_requeues_foreign_completion(
     monkeypatch, tmp_path, exit_code
