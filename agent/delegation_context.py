@@ -42,6 +42,9 @@ DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 #     that must NOT inherit the parent worker's dispatcher identity, but are
 #     NOT delegated children: strip without the marker (#81508).
 
+# Historical keys remain public for callers/tests that need to enumerate the
+# current contract. Enforcement below is deliberately prefix-based so a newly
+# introduced dispatcher capability cannot leak before this tuple is updated.
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK",
     "HERMES_KANBAN_RUN_ID",
@@ -146,10 +149,11 @@ def strip_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     tool, execute_code) that must simply not inherit the parent worker's
     Kanban identity — they are not delegate_task children.
     """
-    cleaned = dict(env)
-    for key in KANBAN_ENV_KEYS:
-        cleaned.pop(key, None)
-    return cleaned
+    return {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("HERMES_KANBAN_")
+    }
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
