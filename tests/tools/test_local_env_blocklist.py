@@ -1532,6 +1532,13 @@ class TestKanbanNestedSpawnScrub:
         "HERMES_KANBAN_BOARD": "default",
         "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
         "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+        "HERMES_KANBAN_BRANCH": "wt/t_6229de04",
+        "HERMES_KANBAN_GOAL_MODE": "1",
+        "HERMES_KANBAN_GOAL_MAX_TURNS": "12",
+        "HERMES_KANBAN_WORKER_SCOPE": "lifecycle-only",
+        # Drift oracle: a future dispatcher key must be stripped without first
+        # being added to a hand-maintained allow/deny list.
+        "HERMES_KANBAN_FUTURE_CAPABILITY": "must-not-leak",
     }
 
     def test_worker_terminal_foreground_spawn_strips_kanban_env(self):
