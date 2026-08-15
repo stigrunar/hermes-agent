@@ -1668,6 +1668,7 @@ def create_job(
     attach_to_session: Optional[bool] = None,
     monitor_script: Optional[str] = None,
     monitor_url: Optional[str] = None,
+    enabled: bool = True,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -1725,10 +1726,15 @@ def create_job(
         monitor_url: Optional http(s) URL used as the monitor source instead
                 of a script — fetched with a bounded GET each tick. Same
                 hash-suppression semantics as ``monitor_script``.
+        enabled: Whether the new job is runnable immediately. ``False`` stores
+                the job paused in the first persisted record.
 
     Returns:
         The created job dict
     """
+    if not isinstance(enabled, bool):
+        raise ValueError("enabled must be a boolean")
+
     parsed_schedule = parse_schedule(schedule)
 
     # Normalize repeat: treat 0 or negative values as None (infinite)
@@ -1802,8 +1808,8 @@ def create_job(
         no_agent=normalized_no_agent,
     )
 
-    next_run_at = compute_next_run(parsed_schedule)
-    if parsed_schedule.get("kind") == "once" and next_run_at is None:
+    next_run_at = compute_next_run(parsed_schedule) if enabled else None
+    if enabled and parsed_schedule.get("kind") == "once" and next_run_at is None:
         run_at = parsed_schedule.get("run_at") or schedule
         logger.warning(
             "Rejecting one-shot cron job '%s': run_at %s is outside the %ss grace window",
@@ -1844,9 +1850,9 @@ def create_job(
             "times": repeat,  # None = forever
             "completed": 0
         },
-        "enabled": True,
-        "state": "scheduled",
-        "paused_at": None,
+        "enabled": enabled,
+        "state": "scheduled" if enabled else "paused",
+        "paused_at": None if enabled else now,
         "paused_reason": None,
         "created_at": now,
         "next_run_at": next_run_at,

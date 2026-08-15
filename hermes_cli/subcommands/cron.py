@@ -67,6 +67,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
         ),
     )
     cron_create.add_argument(
+        "--disabled",
+        action="store_true",
+        default=False,
+        help="Create the job paused/disabled without making it temporarily runnable.",
+    )
+    cron_create.add_argument(
         "--monitor-script",
         dest="monitor_script",
         help=(

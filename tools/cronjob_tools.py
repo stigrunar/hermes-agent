@@ -1166,6 +1166,7 @@ def cronjob(
     monitor_url: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    enabled: Optional[bool] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1254,6 +1255,7 @@ def cronjob(
                     attach_to_session=attach_to_session,
                     monitor_script=_normalize_optional_job_value(monitor_script),
                     monitor_url=_normalize_optional_job_value(monitor_url),
+                    enabled=True if enabled is None else enabled,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -1642,6 +1644,14 @@ Scheduling from cron-run sessions is disabled by default and enabled via cron.al
                     "WHEN TO USE False (default): anything that needs reasoning — summarize a feed, draft a daily briefing, pick interesting items, rephrase data for a human, follow conditional logic based on content."
                 ),
             },
+            "enabled": {
+                "type": "boolean",
+                "description": (
+                    "Optional create-time state. Defaults to True. Set False "
+                    "to persist the job paused/disabled atomically, without "
+                    "ever making it eligible for scheduling."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -1727,6 +1737,7 @@ registry.register(
         no_agent=args.get("no_agent"),
         monitor_script=args.get("monitor_script"),
         monitor_url=args.get("monitor_url"),
+        enabled=args.get("enabled"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
     ),

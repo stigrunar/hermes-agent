@@ -71,6 +71,30 @@ def test_create_registers_first_trigger_with_active_provider(
     assert registered == [job]
 
 
+def test_disabled_create_skips_external_provider_registration(
+    temp_home, monkeypatch, make_cron_provider
+):
+    """A paused first record must never be armed by an external provider."""
+    import cron.scheduler_provider as sp
+    import cron.scheduler as sched
+
+    registered = []
+    provider = make_cron_provider(register_job=registered.append)
+    monkeypatch.setattr(sp, "resolve_cron_scheduler", lambda: provider)
+
+    job = sched.create_job_with_scheduler_registration(
+        prompt="echo hi",
+        schedule="every 5m",
+        name="w",
+        enabled=False,
+    )
+
+    assert job["enabled"] is False
+    assert job["state"] == "paused"
+    assert job["next_run_at"] is None
+    assert registered == []
+
+
 def test_create_failure_preserves_job_and_hides_provider_details(
     temp_home, monkeypatch, make_cron_provider
 ):

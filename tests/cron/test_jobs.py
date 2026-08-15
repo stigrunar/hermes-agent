@@ -190,6 +190,43 @@ def tmp_cron_dir(tmp_path, monkeypatch):
 
 
 class TestJobCRUD:
+    def test_disabled_create_is_persisted_paused_before_first_save(self, tmp_cron_dir, monkeypatch):
+        """A disabled create never persists a runnable intermediate record."""
+        captured = []
+
+        def capture_save(jobs, **kwargs):
+            captured.append([dict(job) for job in jobs])
+
+        monkeypatch.setattr("cron.jobs.save_jobs", capture_save)
+
+        job = create_job(prompt="Later", schedule="every 1h", enabled=False)
+
+        assert len(captured) == 1
+        first = captured[0][0]
+        assert first == job
+        assert first["enabled"] is False
+        assert first["state"] == "paused"
+        assert first["paused_at"]
+        assert first["paused_reason"] is None
+        assert first["next_run_at"] is None
+
+    def test_disabled_create_is_excluded_from_due_jobs_and_resumes(self, tmp_cron_dir):
+        job = create_job(prompt="Later", schedule="every 1h", enabled=False)
+
+        assert get_due_jobs() == []
+        assert list_jobs() == []
+        assert [item["id"] for item in list_jobs(include_disabled=True)] == [job["id"]]
+
+        resumed = resume_job(job["id"])
+        assert resumed["enabled"] is True
+        assert resumed["state"] == "scheduled"
+        assert resumed["paused_at"] is None
+        assert resumed["next_run_at"]
+
+    def test_create_rejects_non_boolean_enabled(self, tmp_cron_dir):
+        with pytest.raises(ValueError, match="enabled must be a boolean"):
+            create_job(prompt="Later", schedule="every 1h", enabled="false")
+
     def test_cjk_and_emoji_round_trip_readable_in_jobs_json(self, tmp_cron_dir):
         """CJK/emoji job text must round-trip AND stay human-readable on disk.
 
