@@ -196,6 +196,44 @@ def test_resume_closes_profile_db_on_deferred_cold_resume(profile_dbs, monkeypat
     assert profile_dbs[0].closed == 1
 
 
+@pytest.mark.parametrize(
+    ("source", "dashboard", "authorized"),
+    (("desktop", False, True), (None, True, True), (None, False, False)),
+)
+def test_resume_keeps_exact_scope_and_marks_only_authoritative_ui(
+    profile_dbs, monkeypatch, source, dashboard, authorized
+):
+    """Main selection authorizes continuation without copying raw origin data."""
+
+    def _factory(db_path=None, **kwargs):
+        db = _RecordingDB(db_path=db_path, **kwargs)
+        db.rows["s1"] = {"id": "s1", "cwd": ""}
+        profile_dbs.append(db)
+        return db
+
+    monkeypatch.setattr("hermes_state.SessionDB", _factory)
+    monkeypatch.setattr(server, "_stored_session_runtime_overrides", lambda _found: {})
+    if dashboard:
+        monkeypatch.setenv("HERMES_TUI_DASHBOARD", "1")
+
+    params = {"session_id": "s1", "profile": "work"}
+    if source:
+        params["source"] = source
+    resp = _resume(**params)
+
+    runtime_id = resp["result"]["session_id"]
+    live = server._sessions[runtime_id]
+    assert resp["result"]["session_key"] == "s1"
+    assert resp["result"]["resumed"] == "s1"
+    assert live["resume_session_id"] == "s1"
+    assert live["session_key"] == "s1"
+    assert live["profile_home"] == str(profile_dbs[0].db_path.parent)
+    assert bool(live.get("explicitly_resumed_from_authoritative_ui")) is authorized
+    assert "chat_id" not in live
+    assert "thread_id" not in live
+    assert "origin" not in live
+
+
 def test_resume_keeps_profile_db_open_after_ownership_transfer(profile_dbs, monkeypatch):
     """A COMPLETED resume transfers the handle to the agent — do not close it.
 

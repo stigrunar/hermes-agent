@@ -7956,6 +7956,7 @@ def _deferred_session_record(
     lazy: bool = False,
     model_override=None,
     resume_runtime_overrides: dict | None = None,
+    explicitly_resumed_from_authoritative_ui: bool = False,
 ) -> dict:
     """A live-session record whose AIAgent is built later (lazy watch / cold
     resume) — _init_session's shape minus the agent."""
@@ -7985,6 +7986,7 @@ def _deferred_session_record(
         "profile_home": str(profile_home) if profile_home is not None else None,
         "resume_runtime_overrides": resume_runtime_overrides,
         "resume_session_id": session_key,
+        "explicitly_resumed_from_authoritative_ui": explicitly_resumed_from_authoritative_ui,
         "running": False,
         "session_key": session_key,
         "show_reasoning": _load_show_reasoning(),
@@ -10252,6 +10254,48 @@ def _run_prompt_submit(
                 payload["reasoning"] = last_reasoning
             if status_note:
                 payload["warning"] = status_note
+            if status == "complete" and isinstance(raw, str) and raw.strip():
+                try:
+                    from tui_gateway.authoritative_delivery import (
+                        deliver_resumed_telegram_response,
+                    )
+
+                    with _session_db(session) as delivery_db:
+                        delivery_receipt = deliver_resumed_telegram_response(
+                            db=delivery_db,
+                            session_key=str(session.get("session_key") or ""),
+                            response=raw,
+                            explicitly_resumed_from_authoritative_ui=bool(
+                                session.get("explicitly_resumed_from_authoritative_ui")
+                            ),
+                            profile_home=session.get("profile_home"),
+                        )
+                    if delivery_receipt is not None:
+                        payload["delivery"] = delivery_receipt
+                        if delivery_receipt.get("status") != "delivered":
+                            delivery_warning = (
+                                "The response was saved, but Telegram delivery failed."
+                            )
+                            payload["warning"] = " ".join(
+                                part
+                                for part in (payload.get("warning"), delivery_warning)
+                                if part
+                            )
+                except Exception:
+                    logger.warning("Authoritative Telegram delivery failed before receipt")
+                    payload["delivery"] = {
+                        "platform": "telegram",
+                        "status": "failed",
+                        "error": "delivery_failed",
+                    }
+                    payload["warning"] = " ".join(
+                        part
+                        for part in (
+                            payload.get("warning"),
+                            "The response was saved, but Telegram delivery failed.",
+                        )
+                        if part
+                    )
             if result.get("response_previewed"):
                 payload["response_previewed"] = True
             # Forward the structured billing-wall descriptor (provider,

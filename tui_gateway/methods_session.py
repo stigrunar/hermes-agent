@@ -316,6 +316,13 @@ def _(rid, params: dict) -> dict:
     # local profile's state.db. None/own profile → the launch profile (unchanged).
     profile = (params.get("profile") or "").strip() or None
     profile_home = _profile_home(profile)
+    resume_source = _resolve_session_source(
+        str(params.get("source") or "").strip() or None
+    )
+    authoritative_ui_resume = not is_truthy_value(params.get("lazy", False)) and (
+        resume_source == "desktop"
+        or is_truthy_value(os.environ.get("HERMES_TUI_DASHBOARD"))
+    )
     # Desktop hydrates persisted transcripts through the authenticated REST
     # route in parallel. Suppress the duplicate WebSocket transcript only when
     # the caller explicitly requests it; other clients keep upstream behavior.
@@ -414,6 +421,8 @@ def _(rid, params: dict) -> dict:
         )
 
         def _reuse_live_payload(sid: str, session: dict) -> dict:
+            if authoritative_ui_resume:
+                session["explicitly_resumed_from_authoritative_ui"] = True
             payload = _live_session_payload(
                 sid,
                 session,
@@ -446,7 +455,7 @@ def _(rid, params: dict) -> dict:
         # (resume_session_id keeps the upgrade on the stored conversation).
         if is_truthy_value(params.get("lazy", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = resume_source
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             try:
                 db.reopen_session(target)
@@ -526,7 +535,7 @@ def _(rid, params: dict) -> dict:
         # session's persisted runtime identity, and is a real (upgradable) session.
         if not is_truthy_value(params.get("eager_build", False)):
             sid = uuid.uuid4().hex[:8]
-            source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+            source = resume_source
             lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
             # Interactive resume routes approvals/clarify through gateway prompts;
             # the deferred build wires the remaining per-session callbacks.
@@ -572,6 +581,7 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 model_override=overrides.get("model_override"),
                 resume_runtime_overrides=overrides or None,
+                explicitly_resumed_from_authoritative_ui=authoritative_ui_resume,
             )
             if (live := _claim_or_reuse_live(sid, target, record, lease)) is not None:
                 return _ok(rid, _reuse_live_payload(*live))
@@ -608,7 +618,7 @@ def _(rid, params: dict) -> dict:
         # _session_resume_lock across it would stall session.close on the main
         # dispatch thread (it's not a _LONG_HANDLER), blocking fast-path RPCs.
         sid = uuid.uuid4().hex[:8]
-        source = _resolve_session_source(str(params.get("source") or "").strip() or None)
+        source = resume_source
         lease = None  # claimed lazily on the first turn (_ensure_active_session_slot)
         _enable_gateway_prompts()
         home_token = (
@@ -756,6 +766,8 @@ def _(rid, params: dict) -> dict:
                     # skills — must resolve to the resumed profile too).
                     if profile_home is not None:
                         _sessions[sid]["profile_home"] = str(profile_home)
+                    if authoritative_ui_resume:
+                        _sessions[sid]["explicitly_resumed_from_authoritative_ui"] = True
                     _sessions[sid]["active_session_lease"] = lease
             except Exception as e:
                 # _init_session registers _sessions[sid] BEFORE its first read
