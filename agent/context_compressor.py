@@ -858,6 +858,15 @@ _REPLAY_BUDGET_KEYS = (
     "codex_message_items",
 )
 
+# Replay keys that can be safely pruned from stale assistant messages during
+# compaction. ``codex_reasoning_items`` carries encrypted reasoning blobs that
+# are only needed for the current turn's replay; prior-turn items are pure
+# re-billed weight. Native compaction checkpoints are retained by the prune
+# helper below.
+_STALE_REPLAY_PRUNE_KEYS = (
+    "codex_reasoning_items",
+)
+
 
 def _reasoning_details_text_chars(value: Any) -> int:
     """Textual thinking chars inside a ``reasoning_details`` envelope.
@@ -6891,6 +6900,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         # are positional; this single terminal sweep makes it structural so a
         # future copy site cannot re-leak the marker into the child-session flush.
         _strip_persistence_markers(compressed)
+        # Prune stale codex_reasoning_items from retained assistant messages
+        # older than the active turn. Native compaction checkpoints are exempt
+        # inside _prune_stale_reasoning_replay because they carry cumulative
+        # already-pruned history rather than per-turn reasoning.
+        _pruned_replay = _prune_stale_reasoning_replay(compressed)
+        if _pruned_replay and not self.quiet_mode:
+            logger.info(
+                "Pruned stale replay items from %d assistant message(s) during compaction",
+                _pruned_replay,
+            )
         self._last_compression_made_progress = True
 
         # A successful compaction just freed the largest allocation a long
