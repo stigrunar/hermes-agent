@@ -1511,6 +1511,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    baseline_event_id INTEGER,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
@@ -2763,6 +2764,13 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             _add_column_if_missing(
                 conn, "kanban_notify_subs", "delivery_metadata", "delivery_metadata TEXT"
             )
+        if "baseline_event_id" not in notify_cols:
+            _add_column_if_missing(
+                conn,
+                "kanban_notify_subs",
+                "baseline_event_id",
+                "baseline_event_id INTEGER",
+            )
 
     # One-shot backfill: any task that is 'running' before runs existed
     # had its claim_lock / claim_expires / worker_pid on the task row.
@@ -2835,6 +2843,7 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         )
 
     _rebuild_drifted_tables(conn)
+    _baseline_legacy_notify_subs(conn)
 
 
 # Legacy DBs defined these tables with a ``TEXT PRIMARY KEY`` id (or, for
@@ -2889,7 +2898,7 @@ _REBUILD_SPECS = {
         " chat_type TEXT,"
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
-        " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " last_event_id INTEGER NOT NULL DEFAULT 0, baseline_event_id INTEGER,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),
     ),
@@ -2969,6 +2978,55 @@ def _rebuild_drifted_tables(conn: sqlite3.Connection) -> None:
         except sqlite3.OperationalError:
             pass
         raise
+
+
+def _baseline_legacy_notify_subs(conn: sqlite3.Connection) -> None:
+    """Apply the one-time from-now baseline to pre-marker subscriptions.
+
+    ``baseline_event_id IS NULL`` is the durable upgrade marker. Existing
+    nonzero cursors are preserved; zero cursors advance to the task's current
+    event maximum. A task with no events records marker value 0, preventing a
+    later event from being mistaken for pre-upgrade history on restart.
+    """
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type='table' AND name='kanban_notify_subs'"
+    ).fetchone()
+    if table_exists is None:
+        return
+
+    def _apply_baseline() -> None:
+        conn.execute(
+            """
+            UPDATE kanban_notify_subs
+               SET last_event_id = CASE
+                       WHEN last_event_id = 0 THEN COALESCE(
+                           (SELECT MAX(e.id)
+                              FROM task_events AS e
+                             WHERE e.task_id = kanban_notify_subs.task_id),
+                           0
+                       )
+                       ELSE last_event_id
+                   END,
+                   baseline_event_id = COALESCE(
+                       (SELECT MAX(e.id)
+                          FROM task_events AS e
+                         WHERE e.task_id = kanban_notify_subs.task_id),
+                       0
+                   )
+             WHERE baseline_event_id IS NULL
+            """
+        )
+
+    # ``connect()`` uses an autocommit connection, but migration helpers are
+    # also called directly with ordinary sqlite connections in tests and by
+    # embedders. Join an existing transaction instead of trying to nest
+    # ``BEGIN IMMEDIATE``; otherwise retain the normal serialized write path.
+    if conn.in_transaction:
+        _apply_baseline()
+    else:
+        with write_txn(conn):
+            _apply_baseline()
 
 
 def _check_file_length_invariant(conn: sqlite3.Connection) -> None:
@@ -3612,16 +3670,17 @@ def _inherit_notify_subs(
         INSERT OR IGNORE INTO kanban_notify_subs
             (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
              chat_type, notifier_profile, delivery_mode, delivery_metadata,
-             created_at, last_event_id)
+             created_at, last_event_id, baseline_event_id)
         SELECT ?, platform, chat_id, thread_id, user_id, user_id_alt,
                COALESCE(chat_type, 'dm'), notifier_profile,
-               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?
+               COALESCE(delivery_mode, 'notify'), delivery_metadata, ?, ?, ?
           FROM kanban_notify_subs
          WHERE task_id IN ({placeholders})
         """,
         (
             child_id,
             int(created_at if created_at is not None else time.time()),
+            cursor,
             cursor,
             *parent_ids,
         ),
@@ -11443,9 +11502,11 @@ def add_notify_sub(
             INSERT OR IGNORE INTO kanban_notify_subs
                 (task_id, platform, chat_id, thread_id, user_id, user_id_alt,
                  chat_type, notifier_profile, delivery_mode, delivery_metadata,
-                 created_at, last_event_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                    COALESCE((SELECT MAX(id) FROM task_events WHERE task_id = ?), 0))
+                 created_at, last_event_id, baseline_event_id)
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                   COALESCE(MAX(id), 0), COALESCE(MAX(id), 0)
+              FROM task_events
+             WHERE task_id = ?
             """,
             (
                 task_id,
@@ -11725,18 +11786,22 @@ def unseen_events_for_sub(
 ) -> tuple[int, list[Event]]:
     """Return ``(new_cursor, events)`` for a given subscription.
 
-    Only events with ``id > last_event_id`` are returned. The subscription's
-    cursor is NOT advanced here; call :func:`advance_notify_cursor` after
-    the gateway has successfully delivered the notifications.
+    Only events with ``id > max(last_event_id, baseline_event_id)`` are
+    returned. ``baseline_event_id`` is the durable from-now migration boundary:
+    it suppresses pre-upgrade history without rewriting a nonzero delivery
+    cursor. The subscription's stored cursor is NOT advanced here; call
+    :func:`advance_notify_cursor` after successful delivery.
     """
     row = conn.execute(
-        "SELECT last_event_id FROM kanban_notify_subs "
+        "SELECT last_event_id, baseline_event_id FROM kanban_notify_subs "
         "WHERE task_id = ? AND platform = ? AND chat_id = ? AND thread_id = ?",
         (task_id, platform, chat_id, thread_id or ""),
     ).fetchone()
     if row is None:
         return 0, []
-    cursor = int(row["last_event_id"])
+    stored_cursor = int(row["last_event_id"])
+    baseline_cursor = int(row["baseline_event_id"] or 0)
+    cursor = max(stored_cursor, baseline_cursor)
     kind_list = list(kinds) if kinds else None
     q = (
         "SELECT * FROM task_events WHERE task_id = ? AND id > ? "
