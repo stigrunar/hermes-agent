@@ -4,6 +4,7 @@ When browser.backend is "browser-use", the model gets ``browser_exec`` tool
 instead of default browser tools
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -398,6 +399,75 @@ def _workspace_dir(task_id: Optional[str]) -> Optional[str]:
         return None
 
 
+def _task_browser_session_name(task_id: Optional[str]) -> str:
+    """Stable, collision-resistant harness session for one task worker."""
+    raw = str(task_id or "").strip()
+    if not raw:
+        return ""
+    safe = re.sub(r"[^A-Za-z0-9_-]+", "-", raw).strip("-_") or "task"
+    digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:10]
+    # 5 ("task-") + 48 + 1 + 10 = the BU_NAME maximum of 64 chars.
+    return f"task-{safe[:48]}-{digest}"
+
+
+def _browser_harness_runtime_dir(env: dict) -> Path:
+    raw = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
+    if raw:
+        return Path(raw).expanduser().resolve()
+    harness_home = env.get("BH_HOME") or env.get("BROWSER_HARNESS_HOME")
+    if harness_home:
+        return (Path(harness_home).expanduser().resolve() / "runtime").resolve()
+    xdg = env.get("XDG_CONFIG_HOME") or os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return (Path(xdg).expanduser().resolve() / "browser-harness" / "runtime").resolve()
+    process_home = Path(env.get("HOME") or Path.home()).expanduser().resolve()
+    return (process_home / ".config" / "browser-harness" / "runtime").resolve()
+
+
+def _browser_session_lease_path(env: dict, session_name: str) -> Path:
+    runtime = _browser_harness_runtime_dir(env)
+    isolated_runtime = bool(env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR"))
+    shared_runtime = env.get("BH_RUNTIME_DIR_SHARED") == "1"
+    stem = "bu" if isolated_runtime and not shared_runtime else f"bu-{session_name}"
+    return runtime / f"{stem}.lease"
+
+
+def _process_start_ticks(pid: int) -> Optional[int]:
+    try:
+        # /proc/<pid>/stat field 22 (index 21) is process start time in ticks.
+        return int(Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _touch_browser_session_lease(
+    env: dict, session_name: str, task_id: Optional[str]
+) -> None:
+    """Record live ownership so the external reaper never kills active work."""
+    try:
+        path = _browser_session_lease_path(env, session_name)
+        existed = path.parent.exists()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not existed and os.name == "posix":
+            os.chmod(path.parent, 0o700)
+        payload = {
+            "session": session_name,
+            "task_id": str(task_id or ""),
+            "owner_pid": os.getpid(),
+            "owner_start_ticks": _process_start_ticks(os.getpid()),
+            "touched_at": time.time(),
+        }
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(payload, sort_keys=True) + "\n", encoding="utf-8")
+        if os.name == "posix":
+            os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except Exception as e:
+        # A cleanup lease is defensive infrastructure; browser work must remain
+        # available if the local state directory is temporarily unwritable.
+        logger.debug("browser session lease update failed: %s", e)
+
+
 def _find_screenshot(stdout: str, since: float) -> Optional[str]:
     """Return the last screenshot path printed during this exec, or None.
 
@@ -572,13 +642,18 @@ def browser_exec(
         )
 
     env = _base_subprocess_env()
-    if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(
-                f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                "dashes, or underscores (e.g. 'r7k2')."
-            )
-        env["BU_NAME"] = session
+    requested_session = session
+    if requested_session and not _SESSION_RE.match(requested_session):
+        return tool_error(
+            f"Invalid session name {requested_session!r}: use 1-64 letters, digits, "
+            "dashes, or underscores (e.g. 'r7k2')."
+        )
+    # Kanban/worker calls that omit `session` are isolated automatically by
+    # task id. This keeps their tabs out of the long-lived default daemon while
+    # preserving state across every browser_exec call inside the same task.
+    effective_session = requested_session or _task_browser_session_name(task_id)
+    if effective_session:
+        env["BU_NAME"] = effective_session
     # Route through the configured browser backend (Browserbase, Firecrawl,
     # Nous gateway, CDP override, local Chrome, …). Named sessions compose
     # with the backend: BU_NAME namespaces the harness daemon (its IPC
@@ -587,7 +662,7 @@ def browser_exec(
     # each other's daemon (#86894). Browser Use direct-API cloud configs
     # are the one exception: the CLI manages named cloud browsers natively,
     # and _resolve_backend_cdp skips provider resolution for them.
-    backend_err = _resolve_backend_cdp(env, task_id, session_name=session)
+    backend_err = _resolve_backend_cdp(env, task_id, session_name=effective_session)
     if backend_err:
         return tool_error(backend_err)
 
@@ -597,7 +672,7 @@ def browser_exec(
     # the model's code. Private per-name browsers (provider-keyed or BU
     # cloud) skip this: no one to collide with, and the extra tab would leak.
     private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)
-    if session and not private_browser:
+    if effective_session and not private_browser:
         code = _OWN_TAB_PREAMBLE + code
 
     workspace = _workspace_dir(task_id)
@@ -627,27 +702,35 @@ def browser_exec(
         except Exception as e:
             logger.debug("Windows hide-flags unavailable: %s", e)
 
+    lease_session = effective_session or "default"
+    _touch_browser_session_lease(env, lease_session, task_id)
     started = time.time()
     try:
-        proc = subprocess.run(
-            cmd,
-            input=code,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            env=env,
-            **popen_extra,
-        )
-    except subprocess.TimeoutExpired:
-        return tool_error(
-            f"browser-use exec timed out after {timeout}s. The daemon may "
-            "still be working; retry with a larger timeout_s (max "
-            f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
-            "append to workspace files — anything already written to the "
-            "workspace is preserved."
-        )
-    except OSError as e:
-        return tool_error(f"Failed to launch browser-use CLI: {e}")
+        try:
+            proc = subprocess.run(
+                cmd,
+                input=code,
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                env=env,
+                **popen_extra,
+            )
+        except subprocess.TimeoutExpired:
+            return tool_error(
+                f"browser-use exec timed out after {timeout}s. The daemon may "
+                "still be working; retry with a larger timeout_s (max "
+                f"{_MAX_TIMEOUT_S}), or split the work into several calls that "
+                "append to workspace files — anything already written to the "
+                "workspace is preserved."
+            )
+        except OSError as e:
+            return tool_error(f"Failed to launch browser-use CLI: {e}")
+    finally:
+        # The timestamp marks the end of the latest call. Task-owned sessions
+        # are protected while their worker PID is alive; interactive sessions
+        # become eligible for idle cleanup after this point.
+        _touch_browser_session_lease(env, lease_session, task_id)
 
     result = {
         "success": proc.returncode == 0,
@@ -656,8 +739,10 @@ def browser_exec(
     }
     if workspace:
         result["workspace"] = workspace
-    if session:
-        result["session"] = session
+    if effective_session:
+        result["session"] = effective_session
+        if not requested_session:
+            result["session_scope"] = "task"
     stderr = (proc.stderr or "").strip()
     if stderr:
         if len(stderr) > _STDERR_CAP_CHARS:
