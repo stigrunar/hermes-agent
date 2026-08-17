@@ -486,6 +486,49 @@ class TestToolHandlers:
         second_client.arecall.assert_called_once()
 
 
+def test_local_embedded_tools_mode_defers_eager_daemon_start(tmp_path, monkeypatch):
+    """Tools-only memory must not load the embedded model stack at init."""
+    config = {
+        "mode": "local_embedded",
+        "profile": "test-tools-only",
+        "bank_id": "test-tools-only",
+        "memory_mode": "tools",
+        "auto_recall": False,
+        "auto_retain": False,
+    }
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._check_local_runtime", lambda: (True, "")
+    )
+
+    started_threads = []
+
+    class _ThreadShouldNotStart:
+        def __init__(self, *args, **kwargs):
+            started_threads.append((args, kwargs))
+
+        def start(self):
+            raise AssertionError("tools-only initialization must stay lazy")
+
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.threading.Thread", _ThreadShouldNotStart
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize(session_id="test-session", platform="cli")
+
+    assert provider._mode == "local_embedded"
+    assert provider._memory_mode == "tools"
+    assert provider._client is None
+    assert started_threads == []
+
+
 # ---------------------------------------------------------------------------
 # Prefetch tests
 # ---------------------------------------------------------------------------
