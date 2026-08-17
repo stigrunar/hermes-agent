@@ -28,19 +28,18 @@ def isolated_kanban(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
 
 def _active_review(conn):
     source = kb.create_task(conn, title="delivery source", assignee="builder")
-    review = kb.create_task(
-        conn, title="exact candidate QA", assignee="qa", parents=[source]
-    )
-    kb.register_review_handoff(conn, source, review)
     claimed = kb.claim_task(conn, source, claimer="builder:1")
     assert claimed is not None
-    assert kb.block_task(
+    assert kb.request_review(
         conn,
         source,
-        reason="review-required: exact candidate ready",
+        summary="exact candidate ready",
+        reviewer="qa",
         expected_run_id=claimed.current_run_id,
     )
-    return source, review
+    review_claim = kb.claim_review_task(conn, source, claimer="qa:1")
+    assert review_claim is not None
+    return source, source
 
 
 def _graph_snapshot(conn):
@@ -53,13 +52,6 @@ def _graph_snapshot(conn):
             tuple(row)
             for row in conn.execute(
                 "SELECT parent_id, child_id FROM task_links ORDER BY parent_id, child_id"
-            )
-        ],
-        "handoffs": [
-            tuple(row)
-            for row in conn.execute(
-                "SELECT source_task_id, review_task_id, state, verdict "
-                "FROM review_handoffs ORDER BY source_task_id"
             )
         ],
     }
@@ -107,14 +99,13 @@ def test_malformed_blocker_is_rejected_without_graph_mutation(isolated_kanban, p
         before = _graph_snapshot(conn)
         blocker = {**_valid_blocker(), **patch}
 
-        with pytest.raises(ValueError):
-            kb.submit_review_verdict(
-                conn,
-                review,
-                verdict="changes_requested",
-                summary="prose must not control state",
-                findings=[blocker],
-            )
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict="changes_requested",
+            summary="prose must not control state",
+            findings=[blocker],
+        ) is False
 
         assert _graph_snapshot(conn) == before
 
@@ -219,19 +210,21 @@ def test_only_canonical_default_can_reopen_scope_or_authorize_extra_review(
         )
         claimed = kb.claim_task(conn, source, claimer="builder:remediation")
         assert claimed is not None
-        assert kb.block_task(
+        assert kb.request_review(
             conn,
             source,
-            reason="review-required: targeted recheck",
+            summary="targeted recheck",
+            reviewer="qa",
             expected_run_id=claimed.current_run_id,
         )
-        with pytest.raises(ValueError, match="standard review budget exhausted"):
-            kb.submit_review_verdict(
-                conn,
-                review,
-                verdict="changes_requested",
-                findings=[_valid_blocker()],
-            )
+        review_claim = kb.claim_review_task(conn, source, claimer="qa:2")
+        assert review_claim is not None
+        assert kb.submit_review_verdict(
+            conn,
+            review,
+            verdict="changes_requested",
+            findings=[_valid_blocker()],
+        ) is False
         kb.apply_outcome_review_decision(
             conn,
             source,

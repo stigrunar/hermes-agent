@@ -7103,10 +7103,30 @@ def submit_review_verdict(
         return False
     with write_txn(conn):
         prior = _latest_review_verdict(conn, review_task_id)
+        prior_row = conn.execute(
+            "SELECT run_id FROM task_events "
+            "WHERE task_id = ? AND kind = 'review_verdict' "
+            "ORDER BY id DESC LIMIT 1",
+            (review_task_id,),
+        ).fetchone()
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id = ?",
+            (review_task_id,),
+        ).fetchone()
         payload = _review_verdict_payload(
             verdict=verdict, findings=serialized_findings, summary=summary,
         )
-        if prior == payload:
+        same_active_run = (
+            task_row is not None
+            and task_row["status"] == "running"
+            and prior_row is not None
+            and prior_row["run_id"] is not None
+            and task_row["current_run_id"] == prior_row["run_id"]
+        )
+        if prior == payload and (
+            (task_row is not None and task_row["status"] == "done")
+            or same_active_run
+        ):
             return True
         if not _review_budget_allows(
             conn, review_task_id, verdict=verdict, budget=budget,
@@ -7212,6 +7232,8 @@ def apply_outcome_review_decision(
             "targeted_recheck": STANDARD_REVIEW_BUDGET.targeted_recheck,
         },
     }
+    if mandatory_criterion_id:
+        result["mandatory_criterion_id"] = payload["mandatory_criterion_id"]
     if decision_value in {
         OutcomeReviewDecision.MUTATE_FROZEN_SCOPE.value,
         OutcomeReviewDecision.REOPEN_SCOPE.value,
