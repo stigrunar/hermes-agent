@@ -122,7 +122,13 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``BLOCK_RECURRENCE_LIMIT``) escalates them to ``triage`` if a cron keeps
 # unblocking them only to have the worker re-block for the same reason.
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
-VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
+VALID_BLOCK_KINDS = {
+    "dependency", "needs_input", "capability", "transient",
+    # A worker that consumed its bounded turn budget is terminal and must not
+    # be sent through the ordinary unblock/retry circuit.  The preserved
+    # artifact is handed to the durable owner-replan control plane instead.
+    "iteration_exhausted",
+}
 
 # After a task has been blocked, unblocked, and re-blocked this many times for
 # the same (truly-blocked) reason, the unblock-loop breaker stops trusting the
@@ -4059,6 +4065,13 @@ def add_comment(
             (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        # An exact default-owner receipt permanently closes a pending
+        # owner-replan intent.  This stays inside the same transaction as the
+        # comment, so a visible acknowledgement can never outrun its ledger
+        # receipt (or vice versa).
+        _acknowledge_owner_replan_in_txn(
+            conn, task_id, author=author.strip(), body=body.strip(),
+        )
         return int(cur.lastrowid or 0)
 
 
@@ -6766,12 +6779,14 @@ def promote_task(
     promotion would succeed without mutating state.
     """
     row = conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,)
     ).fetchone()
     if row is None:
         return False, f"task {task_id} not found"
 
     cur_status = row["status"]
+    if cur_status == "blocked" and row["block_kind"] == "iteration_exhausted":
+        return False, "iteration-exhausted task requires owner replan; promotion is disabled"
     if cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
@@ -6878,9 +6893,14 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     now = int(time.time())
     with write_txn(conn):
         current = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT status, block_kind FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
+        # Iteration exhaustion is a terminal control-plane handoff, not a
+        # resumable worker block. Only the default owner may materialize a new
+        # revision/manual blocker; a generic unblock must never retry it.
+        if current and current["status"] == "blocked" and current["block_kind"] == "iteration_exhausted":
+            return False
         resume_status = (
             _resume_status_from_events(conn, task_id)
             if current and current["status"] == "blocked"
@@ -9172,6 +9192,27 @@ def _record_task_failure(
     ``max_retries`` override against the violation streak itself. The
     failure is still counted into ``consecutive_failures``.
     """
+    # ``agent.turn_finalizer`` historically routes iteration-budget exhaustion
+    # through this general failure hook as ``timed_out`` while attaching the
+    # exact budget counters.  That call shape is a distinct semantic outcome:
+    # it is terminal, non-retryable, and must preserve the artifact for the
+    # default owner instead of entering the ordinary timeout retry circuit.
+    if (
+        outcome == "timed_out"
+        and isinstance(event_payload_extra, dict)
+        and "budget_used" in event_payload_extra
+        and "budget_max" in event_payload_extra
+    ):
+        return bool(
+            _record_iteration_exhaustion(
+                conn,
+                task_id,
+                budget_used=int(event_payload_extra["budget_used"]),
+                budget_max=int(event_payload_extra["budget_max"]),
+                error=error,
+            )
+            is not None
+        )
     if failure_limit is None:
         failure_limit = DEFAULT_FAILURE_LIMIT
     blocked = False
@@ -9309,6 +9350,482 @@ def _record_spawn_failure(
         release_claim=True,
         end_run=True,
     )
+
+
+# ---------------------------------------------------------------------------
+# Terminal owner-replan control plane
+# ---------------------------------------------------------------------------
+
+_OWNER_REPLAN_EVENT_KIND = "needs_owner_replan"
+_OWNER_REPLAN_ACK_RE = re.compile(
+    r"(?mi)^\s*owner_replan_ack\s*:\s*([0-9a-f]{64})\s*$"
+)
+_OWNER_REPLAN_CONTINUATION_RE = re.compile(
+    r"(?mi)^\s*(?:continuation_of|replaces_task_id|replacement_for)\s*[:=]\s*([A-Za-z0-9_.:-]+)\s*$"
+)
+
+
+def _row_value(row: Mapping[str, Any], key: str, default: Any = None) -> Any:
+    """Read a mapping/SQLite row without requiring one concrete row type."""
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _owner_replan_body_fields(task: Mapping[str, Any]) -> dict[str, str]:
+    """Extract the small explicit identity seam from task body metadata."""
+    body = str(_row_value(task, "body", "") or "")
+    fields: dict[str, str] = {}
+    for line in body.splitlines():
+        match = re.match(
+            r"^\s*(contract_id|revision|canon_path|project|project_id|"
+            r"hygiene_class|superseded_by|resume_policy|end_reason|"
+            r"needs_user_decision|manual_only|owner_replan_suppressed|status)\s*[:=]\s*(.*?)\s*$",
+            line,
+            re.IGNORECASE,
+        )
+        if match and match.group(2):
+            fields[match.group(1).lower()] = match.group(2).strip()
+    return fields
+
+
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = Path(str(row[2])).expanduser() if row and row[2] else None
+    except Exception:
+        path = None
+    if path is not None and path.name == "kanban.db":
+        if path.parent.parent.name == "boards" and path.parent.name:
+            return str(path.parent.name)
+    return DEFAULT_BOARD
+
+
+def _owner_replan_route(
+    conn: sqlite3.Connection, task_id: str,
+) -> Optional[dict[str, str]]:
+    """Resolve the durable default-owner route from notify provenance."""
+    row = conn.execute(
+        "SELECT platform, chat_id, chat_type, thread_id, user_id, "
+        "delivery_metadata FROM kanban_notify_subs WHERE task_id=? "
+        "AND notifier_profile='default' ORDER BY created_at DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    platform = str(row["platform"] or "").strip().lower()
+    chat_id = str(row["chat_id"] or "").strip()
+    if not platform or not chat_id:
+        return None
+    thread_id = str(row["thread_id"] or "").strip()
+    metadata: dict[str, Any] = {}
+    try:
+        metadata = json.loads(row["delivery_metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    session_key = str(
+        metadata.get("session_key") or metadata.get("session_id") or ""
+    ).strip()
+    topic = f"{platform}:{chat_id}" + (f":{thread_id}" if thread_id else "")
+    return {
+        "platform": platform,
+        "chat_id": chat_id,
+        "chat_type": str(row["chat_type"] or "").strip(),
+        "thread_id": thread_id,
+        "user_id": str(row["user_id"] or "").strip(),
+        "notifier_profile": "default",
+        "session_key": session_key,
+        "topic": topic,
+    }
+
+
+def _owner_replan_project_identity(
+    task: Mapping[str, Any], board: str,
+) -> tuple[str, str]:
+    fields = _owner_replan_body_fields(task)
+    project_id = str(
+        _row_value(task, "project_id") or fields.get("project_id") or ""
+    ).strip()
+    if project_id:
+        return project_id, "project_id"
+    tenant = str(_row_value(task, "tenant") or fields.get("project") or "").strip()
+    return (tenant, "tenant") if tenant else (board, "board")
+
+
+def _owner_replan_identity(task: Mapping[str, Any]) -> tuple[str, str, dict[str, str]]:
+    fields = _owner_replan_body_fields(task)
+    task_id = str(_row_value(task, "id") or "")
+    contract = fields.get("contract_id") or f"task:{task_id}"
+    revision = fields.get("revision") or "r1"
+    return contract, revision, fields
+
+
+def _owner_replan_repo_suppression(task: Mapping[str, Any]) -> Optional[str]:
+    fields = _owner_replan_body_fields(task)
+    canon = str(_row_value(task, "canon_path") or fields.get("canon_path") or "").strip()
+    if not canon:
+        return None
+    contract_id, revision, _ = _owner_replan_identity(task)
+    try:
+        text = Path(canon).expanduser().read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    for match in re.finditer(r"HERMES_EXECUTION_STATE\s+(\{.*?\})\s*-->", text):
+        try:
+            state = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(state, dict) or str(state.get("contract_id") or "") != contract_id:
+            continue
+        repo_revision = str(state.get("revision") or "").strip()
+        repo_status = str(state.get("status") or "").strip().casefold()
+        if repo_revision and repo_revision != revision:
+            return "repo_canon_noncurrent"
+        if repo_revision == revision and repo_status in {
+            "done", "superseded", "cancelled", "archived",
+        }:
+            return "repo_canon_complete_or_closed"
+    return None
+
+
+def _owner_replan_active_successor(
+    conn: sqlite3.Connection, task: Mapping[str, Any],
+) -> Optional[str]:
+    task_id = str(_row_value(task, "id") or "")
+    contract_id, revision, _ = _owner_replan_identity(task)
+    # Explicit continuation links are authoritative.  Contract identity is a
+    # secondary seam for current revisions; task-local legacy ids never join by
+    # title or prose similarity.
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE id<>? AND status IN ('ready','running','review') "
+        "ORDER BY created_at DESC",
+        (task_id,),
+    ).fetchall()
+    for row in rows:
+        candidate = dict(row)
+        candidate_fields = _owner_replan_body_fields(candidate)
+        if str(candidate.get("hygiene_class") or candidate_fields.get("hygiene_class") or "").casefold() in {
+            "obsolete", "superseded",
+        } or str(candidate.get("superseded_by") or candidate_fields.get("superseded_by") or "").strip():
+            continue
+        continuation = _OWNER_REPLAN_CONTINUATION_RE.search(
+            str(candidate.get("body") or "")
+        )
+        if continuation and continuation.group(1).strip() == task_id:
+            return str(row["id"])
+        if not contract_id.startswith("task:"):
+            other_contract, other_revision, _ = _owner_replan_identity(candidate)
+            if other_contract == contract_id and other_revision != revision:
+                return str(row["id"])
+    return None
+
+
+def _owner_replan_fingerprint(payload: Mapping[str, Any]) -> str:
+    identity = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND,
+        "project": str(payload.get("project") or ""),
+        "task_id": str(payload.get("task_id") or ""),
+        "contract_id": str(payload.get("contract_id") or ""),
+        "revision": str(payload.get("revision") or ""),
+        "terminal_run_id": int(payload.get("terminal_run_id") or 0),
+        "end_reason": str(payload.get("end_reason") or ""),
+    }
+    return hashlib.sha256(
+        json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def _owner_replan_control(
+    conn: sqlite3.Connection, task_id: str, fingerprint: str,
+) -> Optional[str]:
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN "
+        "(?,?,?,?,?) ORDER BY id DESC",
+        (
+            task_id, "owner_replan_wake_claimed", "owner_replan_delivered",
+            "owner_replan_acknowledged", "owner_replan_failed",
+            "owner_replan_suppressed",
+        ),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict) and payload.get("fingerprint") == fingerprint:
+            return str(row["kind"])
+    return None
+
+
+def _ensure_owner_replan_event(
+    conn: sqlite3.Connection,
+    task_snapshot: Mapping[str, Any],
+    *,
+    terminal_run_id: Optional[int],
+    end_reason: str,
+) -> Optional[str]:
+    """Append one durable owner intent without making the task runnable."""
+    task_id = str(_row_value(task_snapshot, "id") or "")
+    if not task_id or terminal_run_id is None:
+        return None
+    if str(_row_value(task_snapshot, "status") or "") != "running":
+        return None
+    if int(_row_value(task_snapshot, "current_run_id") or 0) != int(terminal_run_id):
+        return None
+    fields = _owner_replan_body_fields(task_snapshot)
+    hygiene = str(_row_value(task_snapshot, "hygiene_class") or fields.get("hygiene_class") or "").casefold()
+    if hygiene in {"obsolete", "superseded"} or str(_row_value(task_snapshot, "superseded_by") or fields.get("superseded_by") or "").strip():
+        return None
+    if str(end_reason or "").casefold() in {"needs_user_decision", "user_decision", "manual"}:
+        return None
+    if str(fields.get("resume_policy") or "").casefold() == "manual":
+        return None
+    if any(
+        str(fields.get(name) or "").strip().casefold()
+        in {"1", "true", "yes", "on", "needs_user_decision", "manual"}
+        for name in ("needs_user_decision", "manual_only", "owner_replan_suppressed")
+    ):
+        return None
+    if str(fields.get("status") or "").casefold() in {
+        "superseded", "obsolete", "cancelled", "archived",
+    }:
+        return None
+    if _owner_replan_repo_suppression(task_snapshot) or _owner_replan_active_successor(conn, task_snapshot):
+        return None
+    route = _owner_replan_route(conn, task_id)
+    if route is None:
+        return None
+    board = _board_slug_for_connection(conn)
+    project, project_source = _owner_replan_project_identity(task_snapshot, board)
+    contract_id, revision, _ = _owner_replan_identity(task_snapshot)
+    payload: dict[str, Any] = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND,
+        "owner": "default",
+        "project": project,
+        "project_source": project_source,
+        "board": board,
+        "topic": route["topic"],
+        "task_id": task_id,
+        "terminal_run_id": int(terminal_run_id),
+        "contract_id": contract_id,
+        "revision": revision,
+        "end_reason": str(end_reason),
+        "worktree": str(_row_value(task_snapshot, "workspace_path") or ""),
+        "branch": str(_row_value(task_snapshot, "branch_name") or ""),
+        "artifact_state": "unknown",
+        "resume_policy": "never",
+        "retryable": False,
+        "route": route,
+    }
+    payload["fingerprint"] = _owner_replan_fingerprint(payload)
+    fingerprint = str(payload["fingerprint"])
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+        (task_id, _OWNER_REPLAN_EVENT_KIND),
+    ).fetchall():
+        try:
+            existing = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
+            return fingerprint
+    _append_event(conn, task_id, _OWNER_REPLAN_EVENT_KIND, payload, run_id=int(terminal_run_id))
+    return fingerprint
+
+
+def claim_owner_replan_for_route(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, claim: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Peek or atomically claim the one exact default-owner route."""
+    txn = write_txn(conn) if claim else contextlib.nullcontext(conn)
+    with txn:
+        rows = conn.execute(
+            "SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
+            (task_id, _OWNER_REPLAN_EVENT_KIND),
+        ).fetchall()
+        for row in rows:
+            try:
+                payload = json.loads(row["payload"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(payload, dict):
+                continue
+            route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+            if (
+                str(route.get("platform") or "").casefold() != str(platform or "").casefold()
+                or str(route.get("chat_id") or "") != str(chat_id or "")
+                or str(route.get("thread_id") or "") != str(thread_id or "")
+            ):
+                continue
+            fingerprint = str(payload.get("fingerprint") or "")
+            if not fingerprint:
+                continue
+            control = _owner_replan_control(conn, task_id, fingerprint)
+            if control:
+                if not claim and control == "owner_replan_wake_claimed":
+                    interrupted = dict(payload)
+                    interrupted["replan_event_id"] = int(row["id"])
+                    interrupted["interrupted_claim"] = True
+                    return interrupted
+                continue
+            task = get_task(conn, task_id)
+            if task is None:
+                return None
+            task_map = task.__dict__
+            fields = _owner_replan_body_fields(task_map)
+            hygiene = str(task_map.get("hygiene_class") or fields.get("hygiene_class") or "").casefold()
+            reason = None
+            if hygiene in {"obsolete", "superseded"} or task_map.get("superseded_by"):
+                reason = "superseded_or_obsolete"
+            elif _owner_replan_repo_suppression(task_map):
+                reason = _owner_replan_repo_suppression(task_map)
+            else:
+                successor = _owner_replan_active_successor(conn, task_map)
+                if successor:
+                    reason = f"active_successor:{successor}"
+            if reason:
+                if claim:
+                    _append_event(conn, task_id, "owner_replan_suppressed", {
+                        "fingerprint": fingerprint, "replan_event_id": int(row["id"]), "reason": reason,
+                    }, run_id=payload.get("terminal_run_id"))
+                return None
+            claimed = dict(payload)
+            claimed["replan_event_id"] = int(row["id"])
+            if not claim:
+                return claimed
+            _append_event(conn, task_id, "owner_replan_wake_claimed", {
+                "fingerprint": fingerprint, "replan_event_id": int(row["id"]), "owner": "default",
+            }, run_id=payload.get("terminal_run_id"))
+            return claimed
+    return None
+
+
+def mark_owner_replan_delivered(
+    conn: sqlite3.Connection, task_id: str, *, fingerprint: str, replan_event_id: int,
+) -> bool:
+    with write_txn(conn):
+        if _owner_replan_control(conn, task_id, fingerprint) in {
+            "owner_replan_delivered", "owner_replan_acknowledged", "owner_replan_failed",
+        }:
+            return False
+        _append_event(conn, task_id, "owner_replan_delivered", {
+            "fingerprint": fingerprint, "replan_event_id": int(replan_event_id), "owner": "default",
+        })
+    return True
+
+
+def mark_owner_replan_failed(
+    conn: sqlite3.Connection, task_id: str, *, fingerprint: str,
+    replan_event_id: int, error: str,
+) -> bool:
+    with write_txn(conn):
+        if _owner_replan_control(conn, task_id, fingerprint) in {
+            "owner_replan_failed", "owner_replan_delivered", "owner_replan_acknowledged",
+        }:
+            return False
+        _append_event(conn, task_id, "owner_replan_failed", {
+            "fingerprint": fingerprint, "replan_event_id": int(replan_event_id),
+            "owner": "default", "resume_policy": "manual", "retryable": False,
+            "error": str(error)[:500],
+        })
+    return True
+
+
+def _acknowledge_owner_replan_in_txn(
+    conn: sqlite3.Connection, task_id: str, *, author: str, body: str,
+) -> bool:
+    if str(author or "").strip().casefold() != "default":
+        return False
+    match = _OWNER_REPLAN_ACK_RE.search(str(body or ""))
+    if not match:
+        return False
+    fingerprint = match.group(1)
+    rows = conn.execute(
+        "SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC",
+        (task_id, _OWNER_REPLAN_EVENT_KIND),
+    ).fetchall()
+    for row in rows:
+        try:
+            payload = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(payload, dict) or payload.get("fingerprint") != fingerprint:
+            continue
+        if _owner_replan_control(conn, task_id, fingerprint) == "owner_replan_acknowledged":
+            return False
+        _append_event(conn, task_id, "owner_replan_acknowledged", {
+            "fingerprint": fingerprint, "replan_event_id": int(row["id"]), "owner": "default",
+        }, run_id=payload.get("terminal_run_id"))
+        return True
+    return False
+
+
+def acknowledge_owner_replan_from_comment(
+    conn: sqlite3.Connection, task_id: str, *, author: str, body: str,
+) -> bool:
+    """Persist a matching default-owner acknowledgement comment."""
+    with write_txn(conn):
+        return _acknowledge_owner_replan_in_txn(
+            conn, task_id, author=author, body=body,
+        )
+
+
+def _record_iteration_exhaustion(
+    conn: sqlite3.Connection, task_id: str, *, budget_used: int,
+    budget_max: int, error: Optional[str] = None,
+) -> Optional[int]:
+    """Terminalize a bounded worker run and emit one owner-replan intent."""
+    used = max(0, int(budget_used))
+    maximum = max(0, int(budget_max))
+    message = str(error or f"Iteration budget exhausted ({used}/{maximum}) — task could not complete within the allowed iterations")[:500]
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+        if run_id is None:
+            latest = conn.execute(
+                "SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                (task_id,),
+            ).fetchone()
+            if latest and latest["outcome"] == "iteration_exhausted":
+                return int(latest["id"])
+        failures = int(row["consecutive_failures"] or 0) + 1
+        workspace_path = str(row["workspace_path"] or "")
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='iteration_exhausted', "
+            "max_retries=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=?, last_failure_error=? WHERE id=?",
+            (failures, message, task_id),
+        )
+        closed_run_id = _end_run(
+            conn, task_id, outcome="iteration_exhausted", status="iteration_exhausted",
+            error=message, metadata={
+                "budget_used": used, "budget_max": maximum,
+                "checkpoint_required": True, "workspace_path": workspace_path,
+                "retryable": False, "resume_policy": "never",
+            },
+        ) if run_id is not None else None
+        if closed_run_id is None and run_id is None:
+            # No open run means there is no terminal attempt to own.  Keep the
+            # task idempotent and avoid fabricating a second owner wake.
+            return None
+        payload = {
+            "error": message, "budget_used": used, "budget_max": maximum,
+            "blocker_type": "iteration_exhausted", "resume_policy": "never",
+            "retryable": False, "checkpoint_required": True,
+            "workspace_path": workspace_path, "terminal_run_id": closed_run_id,
+        }
+        _append_event(conn, task_id, "iteration_exhausted", payload, run_id=closed_run_id)
+        _ensure_owner_replan_event(
+            conn, dict(row), terminal_run_id=closed_run_id,
+            end_reason="iteration_exhausted",
+        )
+        return closed_run_id
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:

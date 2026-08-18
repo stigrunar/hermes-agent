@@ -170,6 +170,27 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
+    """Build one bounded, artifact-grounded continuation for Dolly/default."""
+    task_id = str(replan.get("task_id") or getattr(task, "id", ""))
+    fingerprint = str(replan.get("fingerprint") or "")
+    return (
+        "[HERMES OWNER REPLAN — one shot]\n"
+        f"Project: {replan.get('project') or 'unknown'} · board: {replan.get('board') or 'unknown'}\n"
+        f"Terminal task: {task_id} · run: {replan.get('terminal_run_id')} · reason: {replan.get('end_reason')}\n"
+        f"Contract/revision: {replan.get('contract_id')} / {replan.get('revision')}\n"
+        f"Preserved artifact: {replan.get('worktree') or 'unknown'} · branch: {replan.get('branch') or 'unknown'} · state: {replan.get('artifact_state') or 'unknown'}\n\n"
+        "Inspect the terminal run, preserved worktree/diff, tests, commit and push evidence. "
+        "Classify exactly one of: complete_candidate, useful_incomplete_patch, "
+        "new_blocker_or_unusable. Materialize exactly one current revision and one next "
+        "action or manual blocker in repo canon, preserving current dependencies and review gates. "
+        "Do not unblock or retry the terminal revision; do not spawn the same worker, Architect, "
+        "detached QA, a new root graph, merge, or deploy.\n"
+        f"After the current-revision/next-action receipt is durable, add one Kanban comment to {task_id} "
+        f"with this exact line: owner_replan_ack: {fingerprint}"
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -259,7 +280,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "iteration_exhausted", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -482,9 +507,20 @@ class GatewayKanbanWatchersMixin:
                                         thread_id=sub.get("thread_id") or "",
                                         kinds=TERMINAL_KINDS,
                                     )
-                                    if not events:
-                                        continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Peek only: the durable wake claim is made
+                                    # immediately before delivery, after the
+                                    # ordinary notification cursor succeeds.
+                                    owner_replan = _kb.claim_owner_replan_for_route(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        claim=False,
+                                    )
+                                    if not events and owner_replan is None:
+                                        continue
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -496,6 +532,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "owner_replan": owner_replan,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -514,6 +551,7 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    owner_replan = d.get("owner_replan")
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -622,6 +660,19 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "iteration_exhausted":
+                            payload = ev.payload if isinstance(ev.payload, dict) else {}
+                            used = payload.get("budget_used")
+                            maximum = payload.get("budget_max")
+                            budget = (
+                                f" ({used}/{maximum} iterations)"
+                                if used is not None and maximum is not None
+                                else ""
+                            )
+                            msg = (
+                                f"⏹ {board_tag}{tag}Kanban {sub['task_id']} exhausted its "
+                                f"bounded iteration budget{budget}; owner replan required"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -1019,6 +1070,109 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
+
+                        # A terminal iteration exhaustion is deliberately not
+                        # sent through the generic creator-session wake list.
+                        # Claim and deliver the durable default-owner intent
+                        # once, after the authoritative event cursor has been
+                        # advanced. A prior interrupted claim is terminalized
+                        # as manual-only; it is never reclaimed into a second
+                        # wake attempt.
+                        if owner_replan is not None:
+                            _fingerprint = str(owner_replan.get("fingerprint") or "")
+                            _replan_event_id = int(owner_replan.get("replan_event_id") or 0)
+                            if owner_replan.get("interrupted_claim"):
+                                await asyncio.to_thread(
+                                    self._kanban_owner_replan_outcome,
+                                    board_slug,
+                                    sub["task_id"],
+                                    _fingerprint,
+                                    _replan_event_id,
+                                    "owner wake claim was interrupted before a delivery receipt",
+                                )
+                                logger.warning(
+                                    "kanban notifier: recovered interrupted owner replan for %s as manual-only",
+                                    sub["task_id"],
+                                )
+                            else:
+                                owner_replan = await asyncio.to_thread(
+                                    self._kanban_claim_owner_replan,
+                                    board_slug,
+                                    sub,
+                                )
+                                if owner_replan is not None:
+                                    _fingerprint = str(owner_replan.get("fingerprint") or "")
+                                    _replan_event_id = int(owner_replan.get("replan_event_id") or 0)
+                                    try:
+                                        from gateway.session import SessionSource
+                                        from gateway.wake import deliver_wake
+
+                                        _route = owner_replan.get("route") or {}
+                                        _owner_prompt = _owner_replan_prompt(task, owner_replan)
+                                        if _is_push_adapter:
+                                            _chat_type = str(
+                                                _route.get("chat_type")
+                                                or sub.get("chat_type")
+                                                or ""
+                                            ).strip() or "group"
+                                            _source = SessionSource(
+                                                platform=plat,
+                                                chat_id=str(_route.get("chat_id") or sub["chat_id"]),
+                                                chat_type=_chat_type,
+                                                thread_id=str(_route.get("thread_id") or "") or None,
+                                                user_id=str(_route.get("user_id") or "") or None,
+                                                profile="default",
+                                                scope_id=_wake_scope_id(adapter, sub),
+                                            )
+                                            _resolver = getattr(self, "_session_key_for_source", None)
+                                            _owner_session_key = (
+                                                _resolver(_source)
+                                                if callable(_resolver)
+                                                else str(getattr(task, "session_id", None) or "")
+                                            )
+                                            await deliver_wake(
+                                                adapter,
+                                                text=_owner_prompt,
+                                                session_id=_owner_session_key,
+                                                source=_source,
+                                            )
+                                        else:
+                                            _owner_session_key = str(
+                                                _route.get("session_key")
+                                                or getattr(task, "session_id", None)
+                                                or _route.get("chat_id")
+                                                or ""
+                                            ).strip()
+                                            await deliver_wake(
+                                                adapter,
+                                                text=_owner_prompt,
+                                                session_id=_owner_session_key,
+                                            )
+                                        await asyncio.to_thread(
+                                            self._kanban_owner_replan_outcome,
+                                            board_slug,
+                                            sub["task_id"],
+                                            _fingerprint,
+                                            _replan_event_id,
+                                            None,
+                                        )
+                                        logger.info(
+                                            "kanban notifier: delivered one-shot owner replan for %s run=%s",
+                                            sub["task_id"], owner_replan.get("terminal_run_id"),
+                                        )
+                                    except Exception as _owner_err:
+                                        await asyncio.to_thread(
+                                            self._kanban_owner_replan_outcome,
+                                            board_slug,
+                                            sub["task_id"],
+                                            _fingerprint,
+                                            _replan_event_id,
+                                            str(_owner_err),
+                                        )
+                                        logger.warning(
+                                            "kanban notifier: owner replan failed once for %s; manual-only: %s",
+                                            sub["task_id"], _owner_err,
+                                        )
                         # Unsubscribe only on archive. Completion (``done``)
                         # remains reversible: controllers reopen completed
                         # work for review corrections and continuation. The
@@ -1052,6 +1206,54 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_claim_owner_replan(
+        self, board: Optional[str], sub: dict,
+    ) -> Optional[dict[str, Any]]:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.claim_owner_replan_for_route(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claim=True,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_owner_replan_outcome(
+        self,
+        board: Optional[str],
+        task_id: str,
+        fingerprint: str,
+        replan_event_id: int,
+        error: Optional[str],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            if error is None:
+                _kb.mark_owner_replan_delivered(
+                    conn,
+                    task_id,
+                    fingerprint=fingerprint,
+                    replan_event_id=replan_event_id,
+                )
+            else:
+                _kb.mark_owner_replan_failed(
+                    conn,
+                    task_id,
+                    fingerprint=fingerprint,
+                    replan_event_id=replan_event_id,
+                    error=error,
+                )
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,

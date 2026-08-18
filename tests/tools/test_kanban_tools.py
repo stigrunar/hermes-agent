@@ -371,6 +371,33 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_prefers_session_scoped_profile(worker_env):
+    """Owner comments retain the session profile over process-global env."""
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    set_session_vars(profile="default")
+    try:
+        out = kt._handle_comment({
+            "task_id": worker_env,
+            "body": "owner scoped comment",
+        })
+    finally:
+        # Restore a fresh/unbound test context.  clear_session_vars() is the
+        # production handler-exit contract and intentionally masks env fallback,
+        # which would contaminate later env-based tools tests in this process.
+        reset_session_vars()
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        assert comments[0].author == "default"
+    finally:
+        conn.close()
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment

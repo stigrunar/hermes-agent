@@ -1,0 +1,203 @@
+"""Focused canaries for terminal owner-replan durability."""
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import pytest
+
+from hermes_cli import kanban_db as kb
+
+
+@pytest.fixture
+def isolated_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_PROFILE", "default")
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    kb._INITIALIZED_PATHS.clear()
+    kb.init_db()
+
+
+def _terminal_task(conn, *, body_extra: str = "") -> tuple[str, int]:
+    tid = kb.create_task(
+        conn,
+        title="owner replan fixture",
+        body=("contract_id: owner-replan\nrevision: r1\n" + body_extra).strip(),
+        assignee="dollycode",
+        tenant="fixture-project",
+        workspace_kind="dir",
+        workspace_path="/tmp/owner-replan-fixture",
+        max_retries=0,
+    )
+    claimed = kb.claim_task(conn, tid, claimer="fixture-worker")
+    assert claimed is not None and claimed.current_run_id is not None
+    kb.add_notify_sub(
+        conn,
+        task_id=tid,
+        platform="telegram",
+        chat_id="-1001",
+        chat_type="group",
+        thread_id="87",
+        notifier_profile="default",
+    )
+    return tid, int(claimed.current_run_id)
+
+
+def _events(conn, tid: str, kind: str) -> list[dict]:
+    rows = conn.execute(
+        "SELECT id, run_id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
+        (tid, kind),
+    ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "run_id": row["run_id"],
+            "payload": json.loads(row["payload"] or "{}"),
+        }
+        for row in rows
+    ]
+
+
+def test_iteration_exhaustion_is_terminal_and_one_shot(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _terminal_task(conn)
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            error="budget exhausted",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"budget_used": 60, "budget_max": 60},
+        )
+        assert kb._record_task_failure(
+            conn,
+            tid,
+            error="budget exhausted",
+            outcome="timed_out",
+            release_claim=True,
+            end_run=True,
+            event_payload_extra={"budget_used": 60, "budget_max": 60},
+        )
+        task = kb.get_task(conn, tid)
+        assert task.status == "blocked"
+        assert task.block_kind == "iteration_exhausted"
+        assert task.max_retries == 0
+        assert task.current_run_id is None
+        assert kb.claim_task(conn, tid, claimer="must-not-retry") is None
+        assert kb.unblock_task(conn, tid) is False
+        assert kb.promote_task(conn, tid, actor="operator")[0] is False
+        assert len(_events(conn, tid, "iteration_exhausted")) == 1
+        [intent] = _events(conn, tid, "needs_owner_replan")
+        assert intent["run_id"] == run_id
+        assert intent["payload"]["resume_policy"] == "never"
+        assert intent["payload"]["retryable"] is False
+        first = kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        )
+        second = kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        )
+        assert first is not None
+        assert second is None
+        assert len(_events(conn, tid, "owner_replan_wake_claimed")) == 1
+
+
+def test_successor_and_superseded_metadata_suppress_intent(isolated_home):
+    with kb.connect() as conn:
+        old, _ = _terminal_task(conn)
+        replacement = kb.create_task(
+            conn,
+            title="replacement",
+            body="contract_id: owner-replan\nrevision: r2",
+            assignee="default",
+            tenant="fixture-project",
+        )
+        assert kb.claim_task(conn, replacement, claimer="owner") is not None
+        # The successor is present before terminalization, so no intent is
+        # created for the obsolete revision.
+        assert kb._record_iteration_exhaustion(conn, old, budget_used=60, budget_max=60)
+        assert _events(conn, old, "needs_owner_replan") == []
+
+        stale, _ = _terminal_task(
+            conn, body_extra=f"hygiene_class: superseded\nsuperseded_by: {replacement}",
+        )
+        assert kb._record_iteration_exhaustion(conn, stale, budget_used=60, budget_max=60)
+        assert _events(conn, stale, "needs_owner_replan") == []
+
+        obsolete, _ = _terminal_task(
+            conn, body_extra="hygiene_class: obsolete\nhygiene_reason: old revision",
+        )
+        assert kb._record_iteration_exhaustion(conn, obsolete, budget_used=60, budget_max=60)
+        assert _events(conn, obsolete, "needs_owner_replan") == []
+
+
+def test_needs_user_decision_is_manual_without_owner_intent(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _terminal_task(conn)
+        snapshot = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+        with kb.write_txn(conn):
+            assert kb._ensure_owner_replan_event(
+                conn,
+                snapshot,
+                terminal_run_id=run_id,
+                end_reason="needs_user_decision",
+            ) is None
+        assert _events(conn, tid, "needs_owner_replan") == []
+
+
+def test_default_ack_is_durable_and_failure_is_manual_only(isolated_home):
+    with kb.connect() as conn:
+        tid, _ = _terminal_task(conn)
+        kb._record_iteration_exhaustion(conn, tid, budget_used=60, budget_max=60)
+        [intent] = _events(conn, tid, "needs_owner_replan")
+        claimed = kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        )
+        assert claimed is not None
+        assert kb.mark_owner_replan_failed(
+            conn,
+            tid,
+            fingerprint=intent["payload"]["fingerprint"],
+            replan_event_id=intent["id"],
+            error="wake failed",
+        )
+        assert kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        ) is None
+        [failure] = _events(conn, tid, "owner_replan_failed")
+        assert failure["payload"]["resume_policy"] == "manual"
+        assert failure["payload"]["retryable"] is False
+
+    with kb.connect() as conn:
+        tid, _ = _terminal_task(conn)
+        kb._record_iteration_exhaustion(conn, tid, budget_used=60, budget_max=60)
+        [intent] = _events(conn, tid, "needs_owner_replan")
+        fingerprint = intent["payload"]["fingerprint"]
+        kb.add_comment(conn, tid, author="worker", body=f"owner_replan_ack: {fingerprint}")
+        assert _events(conn, tid, "owner_replan_acknowledged") == []
+        kb.add_comment(conn, tid, author="default", body=f"owner_replan_ack: {fingerprint}")
+        assert len(_events(conn, tid, "owner_replan_acknowledged")) == 1
+        assert kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        ) is None
+
+
+def test_successor_created_after_intent_suppresses_claim(isolated_home):
+    with kb.connect() as conn:
+        tid, _ = _terminal_task(conn)
+        kb._record_iteration_exhaustion(conn, tid, budget_used=60, budget_max=60)
+        replacement = kb.create_task(
+            conn,
+            title="replacement after terminal event",
+            body="contract_id: owner-replan\nrevision: r2",
+            assignee="default",
+            tenant="fixture-project",
+        )
+        assert kb.claim_task(conn, replacement, claimer="owner") is not None
+        assert kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        ) is None
+        assert len(_events(conn, tid, "owner_replan_suppressed")) == 1
