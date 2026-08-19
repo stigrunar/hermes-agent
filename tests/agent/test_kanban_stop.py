@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from agent.kanban_stop import (
+    build_kanban_budget_reserve_nudge,
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
     session_called_kanban_terminal,
@@ -74,8 +75,58 @@ def test_no_nudge_after_kanban_complete(clear_kanban_env):
     assert build_kanban_stop_nudge(messages=messages) is None
 
 
+def test_request_review_counts_as_terminal(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_review")
+    messages = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "1",
+                    "type": "function",
+                    "function": {"name": "kanban_request_review", "arguments": "{}"},
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "name": "kanban_request_review",
+            "tool_call_id": "1",
+            "content": "review",
+        },
+    ]
+    assert session_called_kanban_terminal(messages) is True
+    assert build_kanban_stop_nudge(messages=messages) is None
+    assert build_kanban_budget_reserve_nudge(
+        messages=messages, api_call_count=54, max_iterations=60
+    ) is None
 
 
+def test_budget_reserve_nudges_before_hard_limit(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_budget")
+    assert build_kanban_budget_reserve_nudge(
+        messages=[], api_call_count=53, max_iterations=60
+    ) is None
+    nudge = build_kanban_budget_reserve_nudge(
+        messages=[], api_call_count=54, max_iterations=60
+    )
+    assert nudge is not None
+    assert "6 model-call slot" in nudge
+    assert "kanban_complete" in nudge
+    assert "kanban_request_review" in nudge
+    assert "kanban_block" in nudge
+    assert "new broad suite" in nudge
+
+
+def test_budget_reserve_is_one_shot_and_not_for_tiny_budgets(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_budget")
+    assert build_kanban_budget_reserve_nudge(
+        messages=[], api_call_count=54, max_iterations=60, already_nudged=True
+    ) is None
+    assert build_kanban_budget_reserve_nudge(
+        messages=[], api_call_count=1, max_iterations=1
+    ) is None
 
 
 # ── Integration: agent nudge + dispatcher bounded retry ──────────────
