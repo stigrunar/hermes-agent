@@ -17,9 +17,14 @@ import os
 from typing import Any, Iterable, Optional
 
 
-_TERMINAL_KANBAN_TOOLS = frozenset({"kanban_complete", "kanban_block"})
+_TERMINAL_KANBAN_TOOLS = frozenset({
+    "kanban_complete",
+    "kanban_block",
+    "kanban_request_review",
+})
 
 _DEFAULT_MAX_ATTEMPTS = 2
+_DEFAULT_BUDGET_RESERVE = 6
 
 
 def kanban_stop_nudge_enabled() -> bool:
@@ -90,18 +95,64 @@ def build_kanban_stop_nudge(
         "[System: You are a Hermes kanban worker. A plain-text reply is NOT a "
         "terminal state for the board.\n\n"
         f"Task `{tid}` is still `running`. Ending now without a board tool "
-        "causes a protocol violation (clean exit with no "
-        "`kanban_complete` / `kanban_block`).\n\n"
+        "causes a protocol violation (clean exit with no terminal lifecycle call).\n\n"
         "Do this immediately in your next response — do not narrate intent:\n"
-        "1. Finish any remaining deliverable (write the required file(s) now).\n"
-        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the work "
-        "is done, OR `kanban_block(reason=...)` if you are blocked.\n\n"
+        "1. Finish any remaining deliverable only if it is required for the current acceptance.\n"
+        "2. Call `kanban_complete(summary=..., artifacts=[...])` if the implementation phase "
+        "is done and downstream review/QA is already represented by child cards; call "
+        "`kanban_request_review(summary=..., metadata=...)` if this same card is ready for "
+        "review; otherwise call `kanban_block(reason=...)` with the exact remaining blocker.\n\n"
         "Never end a turn with only a promise of future action. Repeated "
         "protocol violations will block this task and require manual intervention.]"
     )
 
 
+def build_kanban_budget_reserve_nudge(
+    *,
+    messages: Iterable[dict] | None = None,
+    api_call_count: int,
+    max_iterations: int,
+    already_nudged: bool = False,
+    reserve: int = _DEFAULT_BUDGET_RESERVE,
+    task_id: Optional[str] = None,
+) -> Optional[str]:
+    """Return a one-shot nudge before a kanban worker consumes its final calls.
+
+    The normal stop guard only fires after the model attempts a text response. A
+    tool-hungry worker can therefore spend every iteration on reads/tests and hit
+    the hard budget with no opportunity to write the terminal board receipt. This
+    guard reserves a small tail of the budget for acceptance-linked closeout.
+    """
+    if not kanban_stop_nudge_enabled() or already_nudged:
+        return None
+    if session_called_kanban_terminal(messages):
+        return None
+    try:
+        used = max(0, int(api_call_count))
+        maximum = max(1, int(max_iterations))
+        tail = max(1, int(reserve))
+    except (TypeError, ValueError):
+        return None
+    if maximum < 10 or used < max(1, maximum - tail):
+        return None
+
+    tid = (task_id or os.environ.get("HERMES_KANBAN_TASK") or "").strip() or "this task"
+    remaining = max(0, maximum - used)
+    return (
+        "[System: Kanban iteration budget reserve is active. "
+        f"Task `{tid}` has {remaining} model-call slot(s) left before the hard limit.\n\n"
+        "Stop expanding scope now. Do not start a new broad suite, repeated browser matrix, "
+        "new refactor, extra proof family, or fresh exploratory pass. Use the remaining calls "
+        "only to decide the current acceptance from evidence already gathered, run at most one "
+        "directly affected check if a decisive check is still missing, preserve the current "
+        "candidate/checkpoint, and then immediately make exactly one lifecycle transition: "
+        "`kanban_complete`, `kanban_request_review`, or `kanban_block`. A partial but preserved "
+        "candidate with an exact blocker is better than consuming the budget without a receipt.]"
+    )
+
+
 __all__ = [
+    "build_kanban_budget_reserve_nudge",
     "build_kanban_stop_nudge",
     "kanban_stop_nudge_enabled",
     "session_called_kanban_terminal",

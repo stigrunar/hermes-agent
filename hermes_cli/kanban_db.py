@@ -3066,6 +3066,33 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    if goal_mode and (assignee or "").lower() == "dollycode":
+        body_lower = str(body or "").lower()
+        required_markers = ("goal_mode_reason:", "outcome:", "stop_when:")
+        missing_markers = [marker[:-1] for marker in required_markers if marker not in body_lower]
+        if missing_markers:
+            raise ValueError(
+                "dollycode goal_mode requires explicit durable-mission fields: "
+                + ", ".join(missing_markers)
+                + "; ordinary implementation should be one-shot with Codex as the writer"
+            )
+        if goal_max_turns is None:
+            goal_max_turns = 20
+        try:
+            resolved_goal_turns = int(goal_max_turns)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("goal_max_turns must be an integer") from exc
+        if resolved_goal_turns < 1 or resolved_goal_turns > 40:
+            raise ValueError("dollycode goal_max_turns must be between 1 and 40")
+        if resolved_goal_turns > 20 and not any(
+            marker in body_lower
+            for marker in ("unattended", "overnight", "multi-hour", "section-level")
+        ):
+            raise ValueError(
+                "dollycode goal_max_turns above 20 requires an explicit unattended, "
+                "overnight, multi-hour, or section-level goal_mode_reason"
+            )
+        goal_max_turns = resolved_goal_turns
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -11789,10 +11816,17 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    #
+    # DollyCode is a durable implementation *owner*, not the default code
+    # author. Always load the canonical Codex routing contract so older or
+    # minimally-specified cards cannot silently fall back to spending the
+    # entire Hermes model loop on direct repo implementation. Task-local
+    # skills still compose normally and can add specialist constraints.
+    effective_skills = [sk for sk in (task.skills or ()) if sk]
+    if profile_arg == "dollycode" and "codex-first" not in effective_skills:
+        effective_skills.insert(0, "codex-first")
+    for sk in effective_skills:
+        cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker

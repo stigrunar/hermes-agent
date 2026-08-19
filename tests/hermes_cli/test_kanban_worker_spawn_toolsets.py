@@ -89,6 +89,41 @@ agent:
         assert required in pinned
 
 
+def test_default_spawn_force_loads_codex_first_for_dollycode(monkeypatch, tmp_path):
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "dollycode"
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    root.joinpath("config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+
+    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    captured = {}
+
+    class FakeProc:
+        pid = 4243
+
+    def fake_popen(cmd, *args, **kwargs):
+        captured["cmd"] = list(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    task = _make_task(kb, assignee="dollycode")
+    task.skills = ["surface-acceptance-contract"]
+    kb._default_spawn(task, str(workspace))
+
+    cmd = captured["cmd"]
+    skill_values = [cmd[i + 1] for i, value in enumerate(cmd[:-1]) if value == "--skills"]
+    assert skill_values[0] == "codex-first"
+    assert skill_values.count("codex-first") == 1
+    assert "surface-acceptance-contract" in skill_values
+
+
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.
 

@@ -36,7 +36,57 @@ def kanban_home(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+def test_dollycode_goal_mode_requires_explicit_durable_mission(kanban_home):
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="goal_mode requires explicit durable-mission fields"):
+            kb.create_task(
+                conn,
+                title="ordinary feature",
+                body="Implement this feature and run tests.",
+                assignee="dollycode",
+                goal_mode=True,
+            )
 
+
+def test_dollycode_goal_mode_defaults_to_20_turns(kanban_home):
+    body = """goal_mode_reason: explicit durable mission\noutcome: ship one coherent section\nstop_when: acceptance is green\n"""
+    with kb.connect() as conn:
+        tid = kb.create_task(
+            conn,
+            title="durable mission",
+            body=body,
+            assignee="dollycode",
+            goal_mode=True,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.goal_mode is True
+    assert task.goal_max_turns == 20
+
+
+def test_dollycode_goal_mode_above_20_requires_unattended_reason(kanban_home):
+    base = "outcome: ship one coherent section\nstop_when: acceptance is green\n"
+    with kb.connect() as conn:
+        with pytest.raises(ValueError, match="above 20 requires"):
+            kb.create_task(
+                conn,
+                title="too broad",
+                body="goal_mode_reason: ordinary feature\n" + base,
+                assignee="dollycode",
+                goal_mode=True,
+                goal_max_turns=30,
+            )
+        tid = kb.create_task(
+            conn,
+            title="overnight mission",
+            body="goal_mode_reason: explicit unattended multi-hour mission\n" + base,
+            assignee="dollycode",
+            goal_mode=True,
+            goal_max_turns=40,
+        )
+        task = kb.get_task(conn, tid)
+    assert task is not None
+    assert task.goal_max_turns == 40
 
 
 def test_legacy_db_migrates_goal_columns(tmp_path, monkeypatch):
