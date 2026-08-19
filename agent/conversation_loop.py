@@ -1419,6 +1419,50 @@ def _notify_context_engine_turn_complete(
         )
 
 
+def _append_kanban_budget_reserve_nudge(
+    *,
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    api_call_count: int,
+) -> bool:
+    """Append the one-shot Kanban closeout nudge before the final calls."""
+    try:
+        from agent.kanban_stop import build_kanban_budget_reserve_nudge
+
+        nudge = build_kanban_budget_reserve_nudge(
+            messages=messages,
+            api_call_count=api_call_count,
+            max_iterations=agent.max_iterations,
+            already_nudged=getattr(agent, "_kanban_budget_reserve_nudged", False),
+        )
+    except Exception:
+        logger.debug("kanban budget-reserve check failed", exc_info=True)
+        return False
+
+    if not nudge:
+        return False
+
+    agent._kanban_budget_reserve_nudged = True
+    messages.append(
+        {
+            "role": "user",
+            "content": nudge,
+            "_kanban_budget_reserve_synthetic": True,
+        }
+    )
+    agent._session_messages = messages
+    logger.info(
+        "kanban budget-reserve nudge issued at %d/%d task=%s",
+        api_call_count,
+        agent.max_iterations,
+        os.environ.get("HERMES_KANBAN_TASK", ""),
+    )
+    agent._emit_status(
+        f"⚠️ Kanban closeout reserve active ({api_call_count}/{agent.max_iterations})"
+    )
+    return True
+
+
 def run_conversation(
     agent,
     user_message: Any,
@@ -1658,36 +1702,11 @@ def run_conversation(
         # model attempts a text response; workers that keep calling tools can
         # otherwise consume the entire hard budget without ever getting a chance
         # to call kanban_complete / kanban_request_review / kanban_block.
-        try:
-            from agent.kanban_stop import build_kanban_budget_reserve_nudge
-
-            _kanban_budget_nudge = build_kanban_budget_reserve_nudge(
-                messages=messages,
-                api_call_count=api_call_count,
-                max_iterations=agent.max_iterations,
-                already_nudged=getattr(agent, "_kanban_budget_reserve_nudged", False),
-            )
-        except Exception:
-            logger.debug("kanban budget-reserve check failed", exc_info=True)
-            _kanban_budget_nudge = None
-
-        if _kanban_budget_nudge:
-            agent._kanban_budget_reserve_nudged = True
-            append_message(messages, {
-                "role": "user",
-                "content": _kanban_budget_nudge,
-                "_kanban_budget_reserve_synthetic": True,
-            })
-            agent._session_messages = messages
-            logger.info(
-                "kanban budget-reserve nudge issued at %d/%d task=%s",
-                api_call_count,
-                agent.max_iterations,
-                os.environ.get("HERMES_KANBAN_TASK", ""),
-            )
-            agent._emit_status(
-                f"⚠️ Kanban closeout reserve active ({api_call_count}/{agent.max_iterations})"
-            )
+        _append_kanban_budget_reserve_nudge(
+            agent=agent,
+            messages=messages,
+            api_call_count=api_call_count,
+        )
 
         api_call_count += 1
         agent._api_call_count = api_call_count

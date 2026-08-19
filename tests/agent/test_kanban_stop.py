@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
+from agent.conversation_loop import _append_kanban_budget_reserve_nudge
 from agent.kanban_stop import (
     build_kanban_budget_reserve_nudge,
     build_kanban_stop_nudge,
@@ -117,6 +120,33 @@ def test_budget_reserve_nudges_before_hard_limit(clear_kanban_env):
     assert "kanban_request_review" in nudge
     assert "kanban_block" in nudge
     assert "new broad suite" in nudge
+
+
+def test_conversation_loop_appends_reserve_nudge_at_54_of_60(clear_kanban_env):
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_budget")
+    statuses = []
+    agent = SimpleNamespace(
+        max_iterations=60,
+        _kanban_budget_reserve_nudged=False,
+        _session_messages=None,
+        _emit_status=statuses.append,
+    )
+    messages = []
+
+    assert _append_kanban_budget_reserve_nudge(
+        agent=agent, messages=messages, api_call_count=53
+    ) is False
+    assert messages == []
+
+    assert _append_kanban_budget_reserve_nudge(
+        agent=agent, messages=messages, api_call_count=54
+    ) is True
+    assert agent._kanban_budget_reserve_nudged is True
+    assert agent._session_messages is messages
+    assert messages[-1]["role"] == "user"
+    assert messages[-1]["_kanban_budget_reserve_synthetic"] is True
+    assert "6 model-call slot" in messages[-1]["content"]
+    assert statuses == ["⚠️ Kanban closeout reserve active (54/60)"]
 
 
 def test_budget_reserve_is_one_shot_and_not_for_tiny_budgets(clear_kanban_env):
