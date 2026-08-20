@@ -66,8 +66,12 @@ The body MUST include these sections, each prefixed with a bold markdown
 heading, in this order:
 
   **Goal** — one sentence, user-facing outcome.
-  **Approach** — 2-5 bullets on how a worker should tackle it.
+  **Current truth / constraints** — only facts already present in the task or
+      safe facts the worker must verify before acting; do not invent architecture.
   **Acceptance criteria** — checklist of concrete, verifiable conditions.
+  **Execution guidance** — state the smallest useful next decision or execution
+      slice. Preserve a proposed framework/service/transport/scheduler/database/UI
+      pattern as a hypothesis unless the source task explicitly froze it.
   **Out of scope** — short list of things NOT to touch (omit if nothing
       obvious; never invent scope creep).
 
@@ -77,6 +81,14 @@ Rules:
   - If the original idea is already detailed, preserve its substance and
     just reformat into the sections above.
   - Never add invented requirements the user didn't hint at.
+  - Separate outcome from mechanism. Before naming a new framework, service,
+    transport, scheduler, database, agent hop, or UI pattern, preserve the
+    nearest existing/native/reuse option as the first thing the owner should
+    inspect. Do not turn the first plausible implementation idea into frozen
+    acceptance.
+  - Do not decide architecture or information architecture on behalf of the
+    owner. If that decision is genuinely open, say what must be inspected or
+    compared before implementation instead of fabricating certainty.
   - No preamble, no closing remarks, no code fences around the JSON.
   - Output only the JSON object and nothing else.
 """

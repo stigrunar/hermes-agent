@@ -2166,9 +2166,11 @@ KANBAN_CREATE_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": (
-                    "Opening post: full spec, acceptance criteria, "
-                    "links. The assigned worker reads this as part of "
-                    "its context."
+                    "Opening execution contract. Before assigning code, classify "
+                    "execution_shape. Agent-created DollyCode work must be "
+                    "execution_shape: leaf and include mutation_scope, "
+                    "acceptance_commands, and qa_boundary. Controller-sized work "
+                    "stays with default/Sol and uses execution_shape: controller."
                 ),
             },
             "parents": {

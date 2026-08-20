@@ -3293,6 +3293,45 @@ def create_task(
     if provider_override and not model_override:
         raise ValueError("provider_override requires a model_override")
     assignee = _canonical_assignee(assignee)
+    assignee_norm = (assignee or "").lower()
+    body_lower = str(body or "").lower()
+    creator_norm = str(created_by or "").strip().lower()
+    if assignee_norm == "dollycode":
+        # DollyCode is the cheap bounded implementation leaf. Durable mission
+        # ownership does not make a controller-sized feature a Luna task: the
+        # durable card stays with default/Sol and uses the native Codex v2
+        # writer route. Enforce the distinction for agent-created cards while
+        # preserving low-level/legacy fixtures whose creator is intentionally
+        # unset.
+        if goal_mode:
+            raise ValueError(
+                "dollycode is leaf-only and cannot own goal_mode; route the durable "
+                "mission to assignee=default with execution_shape: controller and "
+                "use Codex Sol -> Luna v2 for bounded implementation packages"
+            )
+        if "execution_shape: controller" in body_lower:
+            raise ValueError(
+                "controller-sized work cannot be assigned to dollycode; use "
+                "assignee=default and keep the durable outcome with the Sol owner"
+            )
+        if creator_norm not in {"", "user", "human"}:
+            required_leaf_markers = (
+                "execution_shape: leaf",
+                "mutation_scope:",
+                "acceptance_commands:",
+                "qa_boundary:",
+            )
+            missing_markers = [
+                marker[:-1] if marker.endswith(":") else marker
+                for marker in required_leaf_markers
+                if marker not in body_lower
+            ]
+            if missing_markers:
+                raise ValueError(
+                    "agent-created dollycode cards require a leaf execution contract: "
+                    + ", ".join(missing_markers)
+                    + "; controller-sized or multi-phase work belongs to default/Sol"
+                )
     if not title or not title.strip():
         raise ValueError("title is required")
     if initial_status not in VALID_INITIAL_STATUSES:
@@ -11061,10 +11100,22 @@ def _default_spawn(
     # accepts both forms (action='append' + comma-split), but
     # per-name pairs are easier to read in `ps` output and avoid any
     # quoting ambiguity if a skill name ever contains unusual chars.
-    if task.skills:
-        for sk in task.skills:
-            if sk:
-                cmd.extend(["--skills", sk])
+    #
+    # Execution-shape routing is explicit. DollyCode is already the Luna/xhigh
+    # leaf and should normally implement its bounded packet directly; forcing
+    # codex-first there creates an unnecessary Luna -> Sol -> Luna wrapper.
+    # Controller-sized durable cards stay with default/Sol and automatically
+    # load the canonical Codex v2 routing contract.
+    effective_skills = [sk for sk in (task.skills or ()) if sk]
+    task_body_lower = str(task.body or "").lower()
+    if (
+        profile_arg == "default"
+        and "execution_shape: controller" in task_body_lower
+        and "codex-first" not in effective_skills
+    ):
+        effective_skills.insert(0, "codex-first")
+    for sk in effective_skills:
+        cmd.extend(["--skills", sk])
     if task.model_override:
         cmd.extend(["-m", task.model_override])
         # Pin the provider too when the override names one, so the worker

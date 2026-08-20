@@ -606,6 +606,18 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_routes_leaf_vs_controller_and_splits_proof():
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert "execution_shape: leaf" in KANBAN_GUIDANCE
+    assert "execution_shape: controller" in KANBAN_GUIDANCE
+    assert "mutation_scope" in KANBAN_GUIDANCE
+    assert "qa_boundary" in KANBAN_GUIDANCE
+    assert "whole mission to DollyCode" in KANBAN_GUIDANCE
+    assert "at most one representative local browser smoke" in KANBAN_GUIDANCE
+    assert "actual-target" in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------

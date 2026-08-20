@@ -257,10 +257,12 @@ _MEMORY_REVIEW_PROMPT = (
 )
 
 _SKILL_REVIEW_PROMPT = (
-    "Review the conversation above and update the skill library. Be "
-    "ACTIVE — most sessions produce at least one skill update, even if "
-    "small. A pass that does nothing is a missed learning opportunity, "
-    "not a neutral outcome.\n\n"
+    "Review the conversation above for durable class-level learning. Mutate "
+    "the skill library only when there is concrete evidence that a future "
+    "session would otherwise repeat a verified workflow mistake, user "
+    "correction, or reusable technique. Smooth sessions and one-off task "
+    "details normally require no skill mutation; 'Nothing to save.' is a "
+    "correct outcome when no durable signal fired.\n\n"
     "Target shape of the library: CLASS-LEVEL skills, each with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries. This "
@@ -375,10 +377,10 @@ _SKILL_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "'Nothing to save.' is a real option but should NOT be the "
-    "default. If the session ran smoothly with no corrections and "
-    "produced no new technique, just say 'Nothing to save.' and stop. "
-    "Otherwise, act."
+    "If the session ran smoothly with no durable correction or reusable "
+    "technique, say 'Nothing to save.' and stop. When a durable signal is "
+    "present, prefer the smallest update to an existing class-level skill "
+    "over creating a new skill."
 )
 
 _COMBINED_REVIEW_PROMPT = (
@@ -387,9 +389,11 @@ _COMBINED_REVIEW_PROMPT = (
     "desires, preferences, personal details, or expectations about "
     "how you should behave? Save facts about the user and durable "
     "preferences with the memory tool.\n\n"
-    "**Skills**: how to do this class of task. Be ACTIVE — most "
-    "sessions produce at least one skill update. A pass that does "
-    "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
+    "**Skills**: how to do this class of task. Mutate skills only when a "
+    "durable class-level signal is present: a verified reusable technique, "
+    "a user correction that would otherwise recur, or a loaded skill proven "
+    "wrong/incomplete. Smooth sessions and one-off task details normally "
+    "require no skill mutation.\n\n"
     "Target shape of the skill library: CLASS-LEVEL skills with a rich "
     "SKILL.md and a `references/` directory for session-specific detail. "
     "Not a long flat list of narrow one-session-one-skill entries.\n\n"
@@ -477,9 +481,10 @@ _COMBINED_REVIEW_PROMPT = (
     "command, config step, env var to set) under an existing setup or "
     "troubleshooting skill — never 'this tool does not work' as a "
     "standalone constraint.\n\n"
-    "Act on whichever of the two dimensions has real signal. If "
-    "genuinely nothing stands out on either, say 'Nothing to save.' "
-    "and stop — but don't reach for that conclusion as a default."
+    "Act on whichever dimension has durable evidence. If neither memory nor "
+    "skill learning has a concrete durable signal, say 'Nothing to save.' "
+    "and stop. Prefer the smallest existing-skill update over new skill "
+    "creation whenever possible."
 )
 
 
