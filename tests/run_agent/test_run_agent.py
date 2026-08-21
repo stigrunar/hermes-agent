@@ -27,6 +27,7 @@ from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.memory_manager import MemoryManager
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
+from agent.conversation_loop import KANBAN_CLOSEOUT_RESERVE_NOTICE
 
 
 # ---------------------------------------------------------------------------
@@ -2961,6 +2962,60 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_kanban_closeout_reserve_does_not_continue_a_text_response(
+        self, agent, monkeypatch
+    ):
+        """The reserve is request guidance, not a post-text continuation loop."""
+        self._setup_agent(agent)
+        agent.max_iterations = 10
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "task-closeout")
+        tool_responses = [
+            _mock_response(
+                content="",
+                finish_reason="tool_calls",
+                tool_calls=[_mock_tool_call(call_id=f"c{i}")],
+            )
+            for i in range(4)
+        ]
+        agent.client.chat.completions.create.side_effect = [
+            *tool_responses,
+            _mock_response(content="Done", finish_reason="stop"),
+        ]
+
+        with (
+            patch("run_agent.handle_function_call", return_value="ok"),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("finish the task")
+
+        assert result["final_response"] == "Done"
+        assert result["completed"] is True
+        assert agent.client.chat.completions.create.call_count == 5
+        sent_messages = agent.client.chat.completions.create.call_args_list[4].kwargs[
+            "messages"
+        ]
+        sent_tool = [
+            message for message in sent_messages if message.get("role") == "tool"
+        ][-1]
+        assert "ok" in sent_tool["content"]
+        assert KANBAN_CLOSEOUT_RESERVE_NOTICE in sent_tool["content"]
+        assert sum(
+            message.get("role") == "user"
+            for message in result["messages"]
+            if isinstance(message, dict)
+        ) == 1
+        for message in result["messages"]:
+            if not isinstance(message, dict):
+                continue
+            assert "_kanban_stop_synthetic" not in message
+            assert "_kanban_budget_reserve_synthetic" not in message
+            assert "_kanban_stop_synthetic" not in repr(message.get("content"))
+            assert "_kanban_budget_reserve_synthetic" not in repr(
+                message.get("content")
+            )
 
     def test_prompt_cache_marks_static_system_prefix_on_wire(self, agent):
         self._setup_agent(agent)
