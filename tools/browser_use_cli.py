@@ -410,6 +410,29 @@ def _task_browser_session_name(task_id: Optional[str]) -> str:
     return f"task-{safe[:48]}-{digest}"
 
 
+def _dispatcher_owned_task_session(task_id: Optional[str]) -> str:
+    """Return an isolated name only for the worker that owns ``task_id``.
+
+    Tool handlers may receive a task id for workspace/lease bookkeeping even
+    in ordinary sessions and in delegated/cron child contexts. Those callers
+    must keep Browser Use's native shared default; only the dispatcher-owned
+    Kanban worker may derive a task-scoped harness name.
+    """
+    raw_task_id = str(task_id or "").strip()
+    if not raw_task_id or os.environ.get("HERMES_KANBAN_TASK") != raw_task_id:
+        return ""
+    try:
+        from agent.delegation_context import is_dispatcher_owned_worker_context
+
+        if not is_dispatcher_owned_worker_context():
+            return ""
+    except Exception:
+        # An ownership probe failure must not turn an ordinary caller's task
+        # metadata into a private browser session.
+        return ""
+    return _task_browser_session_name(raw_task_id)
+
+
 def _browser_harness_runtime_dir(env: dict) -> Path:
     raw = env.get("BH_RUNTIME_DIR") or env.get("BH_TMP_DIR")
     if raw:
@@ -648,10 +671,10 @@ def browser_exec(
             f"Invalid session name {requested_session!r}: use 1-64 letters, digits, "
             "dashes, or underscores (e.g. 'r7k2')."
         )
-    # Kanban/worker calls that omit `session` are isolated automatically by
-    # task id. This keeps their tabs out of the long-lived default daemon while
-    # preserving state across every browser_exec call inside the same task.
-    effective_session = requested_session or _task_browser_session_name(task_id)
+    # Dispatcher-owned Kanban workers that omit `session` are isolated by task
+    # id. Ordinary sessions may still carry a task id for workspace/lease
+    # bookkeeping; they retain Browser Use's native shared default.
+    effective_session = requested_session or _dispatcher_owned_task_session(task_id)
     if effective_session:
         env["BU_NAME"] = effective_session
     # Route through the configured browser backend (Browserbase, Firecrawl,

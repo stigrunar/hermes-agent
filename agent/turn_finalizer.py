@@ -74,9 +74,7 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
-            _kb._record_task_failure(
-                _conn,
-                kanban_task,
+            failure_kwargs = dict(
                 error=(
                     f"Iteration budget exhausted "
                     f"({api_call_count}/{max_iterations}) — "
@@ -90,6 +88,20 @@ def _record_kanban_budget_exhausted(
                     "budget_used": api_call_count,
                     "budget_max": max_iterations,
                 },
+            )
+            # Dispatcher workers carry the run identity in their environment.
+            # Binding the finalizer to it prevents a stale worker from closing
+            # a successor run after its claim has been reclaimed.
+            raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+            try:
+                if raw_run_id:
+                    failure_kwargs["expected_run_id"] = int(raw_run_id)
+            except (TypeError, ValueError):
+                pass
+            _kb._record_task_failure(
+                _conn,
+                kanban_task,
+                **failure_kwargs,
             )
         finally:
             try:

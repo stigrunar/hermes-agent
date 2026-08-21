@@ -27,6 +27,7 @@ def _clean_env(monkeypatch, tmp_path):
     monkeypatch.delenv("BU_NAME", raising=False)
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.delenv("BROWSER_USE_API_KEY", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     monkeypatch.delenv("BH_RUNTIME_DIR", raising=False)
     monkeypatch.delenv("BH_TMP_DIR", raising=False)
     monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
@@ -820,6 +821,7 @@ class TestBrowserExec:
     def test_task_id_gets_isolated_session_and_lease(self, tmp_path, monkeypatch):
         cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:$BU_NAME"\n')
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_00169a29")
 
         result = json.loads(
             bu_cli.browser_exec("print(1)", task_id="t_00169a29")
@@ -839,6 +841,36 @@ class TestBrowserExec:
         assert payload["owner_pid"] == os.getpid()
         assert isinstance(payload["owner_start_ticks"], int)
         assert payload["touched_at"] > 0
+
+    def test_ordinary_task_metadata_keeps_native_shared_session(self, tmp_path, monkeypatch):
+        """A task id alone must not opt ordinary sessions into isolation."""
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:${BU_NAME-default}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+
+        result = json.loads(
+            bu_cli.browser_exec("print(1)", task_id="t_ordinary_metadata")
+        )
+
+        assert "bu:default" in result["output"]
+        assert "session" not in result
+
+    def test_non_dispatcher_worker_keeps_native_shared_session(
+        self, tmp_path, monkeypatch,
+    ):
+        """Inherited Kanban env in a delegated/cron context must not isolate."""
+        from agent.delegation_context import non_dispatcher_owned_context
+
+        cli = _fake_cli(tmp_path, 'cat > /dev/null\necho "bu:${BU_NAME-default}"\n')
+        monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_child")
+
+        with non_dispatcher_owned_context():
+            result = json.loads(
+                bu_cli.browser_exec("print(1)", task_id="t_child")
+            )
+
+        assert "bu:default" in result["output"]
+        assert "session" not in result
 
     def test_task_session_name_is_stable_and_collision_resistant(self):
         task_id = "task/with spaces/" + "x" * 120

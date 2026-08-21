@@ -9239,6 +9239,7 @@ def _record_task_failure(
     release_claim: bool = False,
     end_run: bool = False,
     event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
 ) -> bool:
     """Record a non-success outcome (spawn_failed / crashed / timed_out)
     and maybe trip the circuit breaker.
@@ -9301,6 +9302,7 @@ def _record_task_failure(
                 budget_used=int(event_payload_extra["budget_used"]),
                 budget_max=int(event_payload_extra["budget_max"]),
                 error=error,
+                expected_run_id=expected_run_id,
             )
             is not None
         )
@@ -9868,6 +9870,7 @@ def acknowledge_owner_replan_from_comment(
 def _record_iteration_exhaustion(
     conn: sqlite3.Connection, task_id: str, *, budget_used: int,
     budget_max: int, error: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
 ) -> Optional[int]:
     """Terminalize a bounded worker run and emit one owner-replan intent."""
     used = max(0, int(budget_used))
@@ -9878,21 +9881,36 @@ def _record_iteration_exhaustion(
         if row is None:
             return None
         run_id = int(row["current_run_id"]) if row["current_run_id"] else None
-        if run_id is None:
-            latest = conn.execute(
-                "SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
-                (task_id,),
-            ).fetchone()
-            if latest and latest["outcome"] == "iteration_exhausted":
-                return int(latest["id"])
+        # A finalizer belongs to the dispatcher run that spawned it.  Never
+        # let a completed task, or a stale worker whose claim was replaced,
+        # rewrite the task or close the successor's run.
+        if expected_run_id is not None:
+            try:
+                expected_run_id = int(expected_run_id)
+            except (TypeError, ValueError):
+                return None
+            if run_id != expected_run_id:
+                return None
+        if row["status"] != "running" or run_id is None:
+            if run_id is None:
+                latest = conn.execute(
+                    "SELECT id, outcome FROM task_runs WHERE task_id=? ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest and latest["outcome"] == "iteration_exhausted":
+                    return int(latest["id"])
+            return None
         failures = int(row["consecutive_failures"] or 0) + 1
         workspace_path = str(row["workspace_path"] or "")
-        conn.execute(
+        cur = conn.execute(
             "UPDATE tasks SET status='blocked', block_kind='iteration_exhausted', "
             "max_retries=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
-            "consecutive_failures=?, last_failure_error=? WHERE id=?",
-            (failures, message, task_id),
+            "consecutive_failures=?, last_failure_error=? "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (failures, message, task_id, run_id),
         )
+        if cur.rowcount != 1:
+            return None
         closed_run_id = _end_run(
             conn, task_id, outcome="iteration_exhausted", status="iteration_exhausted",
             error=message, metadata={

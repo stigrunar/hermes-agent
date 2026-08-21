@@ -105,6 +105,59 @@ def test_iteration_exhaustion_is_terminal_and_one_shot(isolated_home):
         assert len(_events(conn, tid, "owner_replan_wake_claimed")) == 1
 
 
+def test_iteration_exhaustion_does_not_rewrite_completed_task(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _terminal_task(conn)
+        assert kb.complete_task(conn, tid, expected_run_id=run_id, result="done")
+
+        assert kb._record_iteration_exhaustion(
+            conn,
+            tid,
+            budget_used=60,
+            budget_max=60,
+            expected_run_id=run_id,
+        ) is None
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "done"
+        run = conn.execute(
+            "SELECT outcome FROM task_runs WHERE id=?", (run_id,)
+        ).fetchone()
+        assert run["outcome"] == "completed"
+        assert _events(conn, tid, "iteration_exhausted") == []
+
+
+def test_stale_iteration_finalizer_cannot_close_successor_run(isolated_home):
+    with kb.connect() as conn:
+        tid, first_run_id = _terminal_task(conn)
+        assert kb.reclaim_task(
+            conn, tid, reason="replace worker", signal_fn=lambda *_args: None,
+        )
+        successor = kb.claim_task(conn, tid, claimer="successor-worker")
+        assert successor is not None and successor.current_run_id is not None
+        second_run_id = int(successor.current_run_id)
+        assert second_run_id != first_run_id
+
+        assert kb._record_iteration_exhaustion(
+            conn,
+            tid,
+            budget_used=60,
+            budget_max=60,
+            expected_run_id=first_run_id,
+        ) is None
+
+        task = kb.get_task(conn, tid)
+        assert task.status == "running"
+        assert task.current_run_id == second_run_id
+        runs = conn.execute(
+            "SELECT id, status FROM task_runs WHERE id IN (?, ?)",
+            (first_run_id, second_run_id),
+        ).fetchall()
+        statuses = {int(row["id"]): row["status"] for row in runs}
+        assert statuses[first_run_id] == "reclaimed"
+        assert statuses[second_run_id] == "running"
+
+
 def test_successor_and_superseded_metadata_suppress_intent(isolated_home):
     with kb.connect() as conn:
         old, _ = _terminal_task(conn)

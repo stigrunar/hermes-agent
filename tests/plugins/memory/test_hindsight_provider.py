@@ -520,6 +520,7 @@ def test_local_embedded_tools_mode_defers_eager_daemon_start(tmp_path, monkeypat
     monkeypatch.setattr(
         "plugins.memory.hindsight._check_local_runtime", lambda: (True, "")
     )
+    monkeypatch.setattr("plugins.memory.hindsight.os.geteuid", lambda: 1000)
 
     started_threads = []
 
@@ -541,6 +542,60 @@ def test_local_embedded_tools_mode_defers_eager_daemon_start(tmp_path, monkeypat
     assert provider._memory_mode == "tools"
     assert provider._client is None
     assert started_threads == []
+
+
+def test_tools_mode_default_retain_stays_lazy_until_explicit_tool_use(
+    tmp_path, monkeypatch,
+):
+    """Shipped tools-mode defaults must not auto-retain a conversation turn."""
+    config = {
+        "mode": "cloud",
+        "apiKey": "test-key",
+        "api_url": "http://localhost:9999",
+        "bank_id": "test-tools-only",
+        "memory_mode": "tools",
+    }
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+
+    provider = HindsightMemoryProvider()
+    provider.initialize(session_id="test-session", platform="cli")
+    assert provider._auto_retain is False
+    assert provider._client is None
+
+    provider.sync_turn("hello", "world")
+
+    assert provider._client is None
+    assert provider._writer_thread is None
+    assert provider._session_turns == []
+
+
+def test_local_embedded_tools_mode_keeps_root_safety_guard(tmp_path, monkeypatch):
+    """Tools-only mode must still reject embedded Hindsight under root."""
+    config = {
+        "mode": "local_embedded",
+        "memory_mode": "tools",
+    }
+    config_path = tmp_path / "hindsight" / "config.json"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text(json.dumps(config))
+    monkeypatch.setattr(
+        "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+    )
+    monkeypatch.setattr(
+        "plugins.memory.hindsight._check_local_runtime", lambda: (True, "")
+    )
+    monkeypatch.setattr("plugins.memory.hindsight.os.geteuid", lambda: 0)
+
+    provider = HindsightMemoryProvider()
+
+    provider.initialize(session_id="test-session", platform="cli")
+
+    assert provider._mode == "disabled"
 
 
 # ---------------------------------------------------------------------------
