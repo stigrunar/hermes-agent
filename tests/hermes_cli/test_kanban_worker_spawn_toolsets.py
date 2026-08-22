@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import subprocess
 
+import pytest
+
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -161,3 +163,104 @@ toolsets:
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
+
+
+@pytest.mark.parametrize(
+    ("profile_name", "profile_toolsets", "expected_bundle_tools"),
+    [
+        (
+            "dollyresearch",
+            ("file_readonly", "skills_readonly"),
+            {
+                "file_readonly": {"read_file", "search_files"},
+                "skills_readonly": {"skills_list", "skill_view"},
+            },
+        ),
+        (
+            "dollyqa",
+            ("file_readonly", "skills_readonly"),
+            {
+                "file_readonly": {"read_file", "search_files"},
+                "skills_readonly": {"skills_list", "skill_view"},
+            },
+        ),
+        (
+            "dollycode",
+            ("file", "skills_readonly"),
+            {
+                "file": {"read_file", "write_file", "patch", "search_files"},
+                "skills_readonly": {"skills_list", "skill_view"},
+            },
+        ),
+        (
+            "dollyops",
+            ("file", "skills_readonly"),
+            {
+                "file": {"read_file", "write_file", "patch", "search_files"},
+                "skills_readonly": {"skills_list", "skill_view"},
+            },
+        ),
+    ],
+)
+def test_readonly_worker_profiles_resolve_only_intended_bundles(
+    monkeypatch,
+    tmp_path,
+    profile_name,
+    profile_toolsets,
+    expected_bundle_tools,
+):
+    """Profile-scoped CLI resolution keeps the approved worker bundles narrow."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / profile_name
+    profile.mkdir(parents=True)
+    profile.joinpath("config.yaml").write_text(
+        (
+            "platform_toolsets:\n"
+            "  cli:\n"
+            + "".join(f"    - {toolset}\n" for toolset in profile_toolsets)
+            + "agent:\n"
+            "  disabled_toolsets:\n"
+            "    - bfl\n"
+        ),
+        encoding="utf-8",
+    )
+    # Keep the fixture hermetic and prove the profile config wins over its
+    # parent, which intentionally has an unrelated worker surface.
+    root.joinpath("config.yaml").write_text(
+        "platform_toolsets:\n  cli:\n    - terminal\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HERMES_HOME", str(root))
+
+    from hermes_cli import kanban_db as kb
+    from toolsets import resolve_toolset
+
+    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+
+    assert resolved is not None
+    # ``kanban`` is the dispatcher-owned worker lifecycle surface; it must be
+    # separate from the profile bundles under test.
+    assert set(resolved) == set(expected_bundle_tools) | {"kanban"}
+
+    resolved_tools = set()
+    for bundle_name, expected_tools in expected_bundle_tools.items():
+        bundle_tools = set(resolve_toolset(bundle_name, include_registry=False))
+        assert bundle_tools == expected_tools
+        resolved_tools.update(bundle_tools)
+
+    forbidden = {
+        "skill_manage",
+        "terminal",
+        "process",
+        "execute_code",
+        "delegate_task",
+        "cronjob",
+        "send_message",
+        "discord",
+        "discord_admin",
+        "kanban_show",
+        "kanban_list",
+        "kanban_complete",
+    }
+    if "file_readonly" in expected_bundle_tools:
+        forbidden.update({"write_file", "patch"})
+    assert resolved_tools.isdisjoint(forbidden)

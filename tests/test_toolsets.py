@@ -41,6 +41,22 @@ class TestGetToolset:
         assert "xurl" in description
         assert "authenticated" in description
 
+    def test_readonly_file_toolset_has_no_mutators(self):
+        assert set(resolve_toolset("file_readonly")) == {"read_file", "search_files"}
+        assert set(resolve_toolset("file_readonly", include_registry=False)) == {
+            "read_file",
+            "search_files",
+        }
+        assert set(resolve_toolset("file_readonly")) & {"write_file", "patch"} == set()
+
+    def test_readonly_skills_toolset_has_no_manager(self):
+        assert set(resolve_toolset("skills_readonly")) == {"skills_list", "skill_view"}
+        assert set(resolve_toolset("skills_readonly", include_registry=False)) == {
+            "skills_list",
+            "skill_view",
+        }
+        assert "skill_manage" not in resolve_toolset("skills_readonly")
+
     def test_merges_registry_tools_into_builtin_toolset(self, monkeypatch):
         reg = ToolRegistry()
         reg.register(
