@@ -4686,6 +4686,70 @@ def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     ).fetchone() is None
 
 
+def _reap_dead_handoff_claim(
+    conn: sqlite3.Connection,
+    task_id: str,
+) -> bool:
+    """Release a fenced review handoff after its host-local worker exits.
+
+    ``request_changes`` routes a review task back to ``ready``/``todo`` while
+    its reviewer process may still be unwinding.  Keeping the old claim lock
+    and PID prevents a replacement worker from being admitted beside that
+    process, but ordinary running-task reapers intentionally do not inspect
+    non-running rows.  This small bridge reuses the existing host/PID
+    liveness authority and releases only a completed handoff-style row
+    (``current_run_id IS NULL``), so malformed or live claims remain fenced.
+
+    The caller may be a dispatcher or a direct ``claim_task`` caller.  The
+    compare-and-set update keeps a concurrent claimant from clearing a newer
+    lock and makes the operation idempotent.
+    """
+    row = conn.execute(
+        "SELECT status, claim_lock, claim_expires, worker_pid, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if row is None or row["status"] not in ("ready", "todo"):
+        return False
+    if row["current_run_id"] is not None:
+        return False
+    claim_lock = row["claim_lock"]
+    worker_pid = row["worker_pid"]
+    if not claim_lock or not worker_pid:
+        return False
+    host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+    if not str(claim_lock).startswith(host_prefix):
+        return False
+    if _pid_alive(worker_pid):
+        return False
+
+    now = int(time.time())
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET claim_lock = NULL, claim_expires = NULL, "
+            "worker_pid = NULL "
+            "WHERE id = ? AND status IN ('ready', 'todo') "
+            "AND current_run_id IS NULL AND claim_lock IS ? "
+            "AND worker_pid = ?",
+            (task_id, claim_lock, int(worker_pid)),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn,
+            task_id,
+            "reclaimed",
+            {
+                "reason": "review_handoff_worker_exited",
+                "claim_lock": claim_lock,
+                "worker_pid": int(worker_pid),
+                "retry_status": row["status"],
+                "now": now,
+            },
+        )
+    return True
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -4698,6 +4762,12 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    # ``request_changes`` keeps a host-local review claim fenced while the
+    # reviewer process is still unwinding.  A direct terminal/CLI claimant
+    # must use the same reap seam as the dispatcher before attempting the
+    # ready -> running CAS; otherwise a dead predecessor would leave the task
+    # permanently unclaimable until the next dispatcher tick.
+    _reap_dead_handoff_claim(conn, task_id)
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -5047,7 +5117,19 @@ def release_stale_claims(
     extensions don't count). Safe to call often.
     """
     now = int(time.time())
-    reclaimed = 0
+    # Review handoffs intentionally retain a host-local claim while the
+    # reviewer process unwinds, even though the task is already back in the
+    # ready/todo lane. Reap those completed handoff fences before enumerating
+    # ordinary running stale claims so this tick can admit the replacement.
+    reclaimed = sum(
+        1
+        for row in conn.execute(
+            "SELECT id FROM tasks WHERE status IN ('ready', 'todo') "
+            "AND claim_lock IS NOT NULL AND worker_pid IS NOT NULL "
+            "AND current_run_id IS NULL"
+        ).fetchall()
+        if _reap_dead_handoff_claim(conn, row["id"])
+    )
     host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
@@ -6742,7 +6824,8 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?",
+            "SELECT status, assignee, current_run_id, claim_lock, "
+            "claim_expires, worker_pid FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         if task_row is None:
@@ -6800,6 +6883,34 @@ def request_changes(
             reviewer = None
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # The review worker can still be unwinding after it records the
+        # changes request.  Keep its host-local claim as a short-lived fence
+        # only while the recorded PID is alive; the dispatcher/direct claim
+        # seam reaps this fence once the predecessor exits.  Non-local, absent,
+        # or already-dead workers retain the historical immediate release.
+        claim_lock = task_row["claim_lock"]
+        worker_pid = task_row["worker_pid"]
+        host_prefix = f"{_claimer_id().split(':', 1)[0]}:"
+        retain_worker_claim = bool(
+            claim_lock
+            and str(claim_lock).startswith(host_prefix)
+            and worker_pid
+            and _pid_alive(worker_pid)
+        )
+        if retain_worker_claim:
+            claim_sql = (
+                "claim_lock = ?, claim_expires = ?, worker_pid = ?"
+            )
+            claim_params: tuple[Any, ...] = (
+                claim_lock,
+                task_row["claim_expires"],
+                int(worker_pid),
+            )
+        else:
+            claim_sql = (
+                "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL"
+            )
+            claim_params = ()
         # NOTE: consecutive_failures is deliberately PRESERVED (neither
         # reset nor incremented). Review transitions are not evidence the
         # pathology cleared — only complete_task's success path resets the
@@ -6809,12 +6920,16 @@ def request_changes(
             UPDATE tasks
                SET status = ?,
                    assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL
+                   """ + claim_sql + """
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
-            (new_status, implementer, task_id, int(current_run_id)),
+            (
+                new_status,
+                implementer,
+                *claim_params,
+                task_id,
+                int(current_run_id),
+            ),
         )
         if cur.rowcount != 1:
             return False, "task changed during review handoff"
