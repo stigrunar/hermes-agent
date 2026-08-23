@@ -229,6 +229,10 @@ kanban:
   review_dispatch: true            # default: spawn the assigned profile with
                                    # the bundled sdlc-review skill. Set false
                                    # for human-only review boards.
+  max_in_progress: 2               # host-wide running-worker cap
+  max_in_progress_per_profile: 1   # host-wide cap for each profile
+  safe_dispatch_admission:
+    allowed_worker_profiles: [researcher, builder]
 ```
 
 Override the config flag at runtime via `HERMES_KANBAN_DISPATCH_IN_GATEWAY=0`
@@ -764,7 +768,9 @@ hermes kanban watch [--assignee P] [--tenant T]        # live stream ALL events 
 hermes kanban heartbeat <id> [--note "..."]            # worker liveness signal for long ops
 hermes kanban runs <id> [--json]                       # attempt history (one row per run)
 hermes kanban assignees [--json]                       # profiles on disk + per-assignee task counts
-hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass
+hermes kanban dispatch [--dry-run] [--max N]           # one-shot pass; --max
+        [--spawn-budget N]                             # narrows per-board live cap
+                                                        # and new starts separately
         [--failure-limit N] [--json]
 hermes kanban daemon --force                           # DEPRECATED — standalone dispatcher (use `hermes gateway start` instead)
         [--failure-limit N] [--pidfile PATH] [-v]
@@ -791,17 +797,29 @@ All commands are also available as a slash command in the interactive CLI and in
 
 | Config key | Default | What it does |
 |------------|---------|--------------|
-| `kanban.max_in_progress` | unset (unlimited) | Caps the number of simultaneously running tasks. When the board already has N running, the dispatcher skips spawning more — useful for slow workers (local LLMs, resource-constrained hosts) so they finish what they have before more pile up and time out. Invalid or below-1 values log a warning and behave as unlimited. |
-| `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
+| `kanban.max_spawn` | unset | Per-board live-concurrency cap. Running workers on other boards do not consume this cap. |
+| `kanban.max_in_progress` | memory-derived when unset | Host-wide running-worker cap across every active board and dispatcher entry point. Values must be positive integers. A cap above one requires the canonical shared-root admission allowlist below. |
+| `kanban.max_in_progress_per_profile` | unset | Host-wide per-profile cap across every board. Useful when one profile is slow or rate-limited but other admitted profiles should keep flowing. |
+| `kanban.safe_dispatch_admission.allowed_worker_profiles` | unset | Enables adaptive global admission and names the only profiles it may start. The value must be a non-empty list of canonical profiles that already exist. Caller flags, dashboard queries, and profile-local config may narrow this list and the caps, but cannot widen the shared-root policy. Adaptive dispatch starts at most one new worker per invocation. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
 
 ```yaml
 kanban:
   max_in_progress: 2
+  max_in_progress_per_profile: 1
+  safe_dispatch_admission:
+    allowed_worker_profiles: [researcher, builder]
   auto_promote_children: false
   default_workdir: ~/work/active-project
 ```
+
+`hermes kanban dispatch --spawn-budget N` limits new starts for that one
+invocation without changing `max_spawn`, which remains a live per-board cap.
+Adaptive policy always narrows the invocation budget to at most one. A
+`--dry-run` uses a private read-only SQLite snapshot: it does not create lock
+files, reconcile or reclaim tasks, checkpoint WAL, fire hooks, or alter the
+board database and sidecars.
 
 ### Scheduled task starts (`scheduled_at`)
 

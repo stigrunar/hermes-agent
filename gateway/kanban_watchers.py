@@ -1469,6 +1469,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(kanban_cfg, dict):
+            logger.error("kanban dispatcher: kanban config must be a mapping")
+            return
         if not kanban_cfg.get("dispatch_in_gateway", True):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
@@ -1479,6 +1482,34 @@ class GatewayKanbanWatchersMixin:
             from hermes_cli import kanban_db as _kb
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            return
+
+        # Resolve the immutable shared-root admission snapshot before the
+        # gateway singleton lock. Configuration failure must be side-effect
+        # free, and every board in this watcher must receive the same policy.
+        try:
+            requested_spawn, requested_progress = _kb.resolve_dispatch_caps(cfg)
+            requested_progress = _kb.resolve_max_in_progress(requested_progress)
+            admission_config = _kb.prepare_dispatch_admission(
+                cfg,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+                max_in_progress_per_profile=kanban_cfg.get(
+                    "max_in_progress_per_profile"
+                ),
+            )
+            max_spawn, max_in_progress = _kb.resolve_dispatch_caps(
+                admission_config,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+            )
+            allowed_worker_profiles = _kb.resolve_worker_profile_admission(
+                admission_config,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error("kanban dispatcher: admission policy invalid: %s", exc)
             return
 
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
@@ -1516,49 +1547,10 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
-
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
-            try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
-                )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
-                        raw_max_in_progress,
-                    )
-                    max_in_progress = None
-                else:
-                    logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
-        # When the operator never set kanban.max_in_progress, fall back to a
-        # memory-derived default (OOF-30/OOF-77): unbounded fan-out on small
-        # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
-        # config always wins; None stays None on hosts where total memory
-        # can't be read (macOS/Windows dev machines).
-        effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
-        if max_in_progress is None and effective_max_in_progress is not None:
-            logger.info(
-                "kanban dispatcher: kanban.max_in_progress unset; using "
-                "memory-derived default max_in_progress=%d "
-                "(set kanban.max_in_progress in config.yaml to override)",
-                effective_max_in_progress,
-            )
-        max_in_progress = effective_max_in_progress
+        if max_in_progress is not None:
+            logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -1732,6 +1724,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    allowed_worker_profiles=allowed_worker_profiles,
+                    effective_config=admission_config,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:

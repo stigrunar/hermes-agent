@@ -803,7 +803,7 @@ def test_dry_run_orphan_reconciliation_preserves_scoped_identity(
 def test_dry_run_recomputes_ready_before_enumeration_and_matches_live_spawn(
     isolated_scope_home, all_assignees_spawnable, monkeypatch
 ):
-    """Dry-run promotion is visible without claiming or resolving a workspace."""
+    """Dry-run models promotion privately and leaves the source unchanged."""
     monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "unknown")
     spawn_calls = []
 
@@ -836,10 +836,12 @@ def test_dry_run_recomputes_ready_before_enumeration_and_matches_live_spawn(
 
         child = kb.get_task(conn, child_id)
         assert dry_result.promoted == 1
-        assert dry_result.spawned == [(child_id, "worker", "")]
+        assert [task_id for task_id, _assignee, _workspace in dry_result.spawned] == [
+            child_id
+        ]
         assert spawn_calls == []
         assert child is not None
-        assert child.status == "ready"
+        assert child.status == "todo"
         assert child.current_run_id is None
         assert child.worker_pid is None
         assert child.claim_lock is None
@@ -855,6 +857,7 @@ def test_dry_run_recomputes_ready_before_enumeration_and_matches_live_spawn(
         assert [task_id for task_id, _assignee, _workspace in live_result.spawned] == [
             child_id
         ]
+        assert live_result.promoted == 1
         assert spawn_calls and spawn_calls[0][0] == child_id
         assert live_child is not None
         assert live_child.status == "running"
@@ -2312,6 +2315,9 @@ def test_cross_board_host_occupancy_requires_scope_before_claim(
             second_conn, title="other-board-running", assignee="worker"
         )
         assert kb.claim_task(second_conn, other_task) is not None
+        assert second_conn.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()[0] == 0
     finally:
         second_conn.close()
 

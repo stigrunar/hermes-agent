@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -2300,22 +2301,45 @@ def get_task_log(
 @router.post("/dispatch")
 def dispatch(
     dry_run: bool = Query(False),
-    max_n: int = Query(8, alias="max"),
+    max_n: Optional[int] = Query(None, alias="max", ge=1),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
     try:
-        result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        if not isinstance(cfg, dict):
+            raise ValueError("effective Hermes config must be a mapping")
+        admission_config = kanban_db.prepare_dispatch_admission(
+            cfg,
+            max_spawn=max_n,
         )
-        # DispatchResult is a dataclass.
-        try:
-            return asdict(result)
-        except TypeError:
-            return {"result": str(result)}
-    finally:
-        conn.close()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)[:512]) from exc
+    connection_scope = (
+        kanban_db.connect_readonly_closing(board=board)
+        if dry_run
+        else contextlib.closing(_conn(board=board))
+    )
+    try:
+        with connection_scope as conn:
+            result = kanban_db.dispatch_once(
+                conn,
+                dry_run=dry_run,
+                max_spawn=max_n,
+                effective_config=admission_config,
+                board=board,
+            )
+            try:
+                return asdict(result)
+            except TypeError:
+                return {"result": str(result)}
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"kanban board is unavailable for read-only preview: {exc}")[:512],
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

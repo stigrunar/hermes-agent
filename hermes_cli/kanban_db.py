@@ -71,6 +71,7 @@ new locking.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -84,7 +85,9 @@ import sys
 import threading
 import logging
 import stat
+import tempfile
 import time
+from types import MappingProxyType
 from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from enum import Enum
@@ -1955,6 +1958,213 @@ def _native_admission_lock():
             _NATIVE_ADMISSION_THREAD_LOCK.release()
 
 
+_ALLOCATION_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _allocation_lock(*, required: bool = False):
+    """Acquire the host-wide worker allocation lock without blocking.
+
+    Parallel dispatch must serialize the occupancy snapshot and the claim
+    transition across boards and dispatcher entry points.  The lock is
+    deliberately fail-closed when required, and uses the same path/FD
+    identity checks as native scope admission so a replaced or symlinked lock
+    file cannot silently move the lock domain.
+    """
+    if not _ALLOCATION_THREAD_LOCK.acquire(blocking=False):
+        yield False
+        return
+    lock_path = kanban_home() / "kanban" / ".allocation.lock"
+    handle = None
+    acquired = False
+    admissible = False
+    try:
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            if _native_admission_lock_path_is_usable(lock_path):
+                handle = lock_path.open("a+b")
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                admissible = _native_admission_lock_identity_matches(
+                    lock_path, handle
+                )
+        except (OSError, AttributeError, ValueError):
+            acquired = False
+            admissible = False
+        yield bool(acquired and admissible) if required else True
+    finally:
+        try:
+            if acquired and handle is not None:
+                if _IS_WINDOWS:
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, AttributeError, ValueError):
+            pass
+        finally:
+            if handle is not None:
+                handle.close()
+            _ALLOCATION_THREAD_LOCK.release()
+
+
+def _allocation_boards(
+    selected_boards: Optional[Iterable[str]] = None,
+) -> list[str]:
+    """Return every live board plus any explicitly selected board."""
+    result = [str(item["slug"]) for item in list_boards(include_archived=False)]
+    seen = set(result)
+    if selected_boards is None:
+        raw = os.environ.get("HERMES_KANBAN_SELECTED_BOARDS", "").strip()
+        if raw:
+            selected_boards = raw.split(",")
+    if selected_boards is not None:
+        for value in selected_boards:
+            slug = _normalize_board_slug(value)
+            if slug and slug not in seen:
+                result.append(slug)
+                seen.add(slug)
+    return result
+
+
+def _global_running_occupancy(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    selected_boards: Optional[Iterable[str]] = None,
+) -> tuple[int, dict[str, int]]:
+    """Count current-board rows plus strict immutable foreign-board evidence."""
+    rows = conn.execute(
+        "SELECT assignee, COUNT(*) FROM tasks "
+        "WHERE status = 'running' GROUP BY assignee"
+    ).fetchall()
+    total = 0
+    by_profile: dict[str, int] = {}
+    for row in rows:
+        if row is None or len(row) < 2:
+            raise ValueError("current-board occupancy row is malformed")
+        assignee, raw_count = row[0], row[1]
+        if type(raw_count) is not int or raw_count < 0:
+            raise ValueError("current-board occupancy count is malformed")
+        if assignee is not None and (
+            type(assignee) is not str or not assignee.strip()
+        ):
+            raise ValueError("current-board occupancy profile is malformed")
+        total += raw_count
+        if assignee is not None:
+            by_profile[assignee] = by_profile.get(assignee, 0) + raw_count
+
+    foreign = observe_running_tasks_other_boards(board)
+    if foreign is None:
+        raise ValueError("foreign-board occupancy evidence is unknown")
+    total += foreign.running_count
+    for profile, count in foreign.per_profile_running.items():
+        if type(profile) is not str or not profile or type(count) is not int or count < 0:
+            raise ValueError("foreign-board profile occupancy is malformed")
+        by_profile[profile] = by_profile.get(profile, 0) + count
+    return total, by_profile
+
+
+def _global_running_count(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    selected_boards: Optional[Iterable[str]] = None,
+) -> int:
+    """Compatibility helper returning only host-wide running count."""
+    return _global_running_occupancy(
+        conn, board=board, selected_boards=selected_boards
+    )[0]
+
+
+def _read_live_worker_scopes() -> dict[str, int]:
+    """Read strict systemd worker-scope occupancy for parallel admission."""
+    states = ("active", "activating", "deactivating")
+    proc = subprocess.run(
+        [
+            "systemctl", "--user", "list-units", "hermes-kanban-worker-*.scope",
+            "--type=scope", f"--state={','.join(states)}", "--plain",
+            "--no-legend", "--no-pager",
+        ],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=3,
+        check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("could not list live worker scopes")
+    counts = {state: 0 for state in states}
+    for line in (proc.stdout or "").splitlines():
+        if not line.strip():
+            continue
+        fields = line.split()
+        if (
+            len(fields) < 4
+            or not _SYSTEMD_WORKER_SCOPE_RE.fullmatch(fields[0])
+            or fields[2] not in counts
+        ):
+            raise RuntimeError("live worker scope telemetry was malformed")
+        counts[fields[2]] += 1
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+class _ParallelAdmissionBlocked(RuntimeError):
+    """Internal fail-closed signal carrying bounded occupancy evidence."""
+
+    def __init__(self, reason: str, metrics: Optional[Mapping[str, Any]] = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.metrics = dict(metrics or {})
+
+
+def _parallel_occupancy(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str],
+    selected_boards: Optional[Iterable[str]],
+) -> dict[str, Any]:
+    """Return conservative DB/scope occupancy or fail closed."""
+    try:
+        db_running, per_profile_running = _global_running_occupancy(
+            conn, board=board, selected_boards=selected_boards
+        )
+        scopes = _read_live_worker_scopes()
+    except Exception as exc:
+        raise _ParallelAdmissionBlocked(
+            "scope_telemetry_unavailable",
+            {"error": f"{type(exc).__name__}: {exc}"[:512]},
+        ) from exc
+    live_running = scopes.get("total")
+    if type(live_running) is not int or live_running < 0:
+        raise _ParallelAdmissionBlocked(
+            "scope_telemetry_malformed", {"scope_states": dict(scopes)}
+        )
+    metrics = {
+        "db_running": db_running,
+        "per_profile_running": per_profile_running,
+        "live_scopes": live_running,
+        "scope_states": dict(scopes),
+    }
+    if db_running != live_running:
+        raise _ParallelAdmissionBlocked("scope_count_transition", metrics)
+    metrics["conservative_running"] = max(db_running, live_running)
+    return metrics
+
+
 # Periodic WAL checkpoint state for the dispatcher tick path. The kanban
 # connections run with ``wal_autocheckpoint=100``, but a passive
 # autocheckpoint can be starved on a busy multi-process board (any reader
@@ -2686,6 +2896,105 @@ def connect_closing(
             conn.close()
         except Exception:
             pass
+
+
+@contextlib.contextmanager
+def _private_db_snapshot(db_path: Optional[Path]):
+    """Copy a disk-backed DB/WAL into a private directory without SQLite IO.
+
+    This boundary deliberately uses raw file copies only. In particular, it
+    never calls ``backup`` or executes a query on the live source connection,
+    because SQLite may update WAL shared-memory lock bytes while inspecting a
+    live WAL database. The returned path is private and may be opened
+    read/write by a preview.
+    """
+    if db_path is None:
+        yield None
+        return
+    resolved = db_path.expanduser().resolve()
+    if not resolved.is_file():
+        yield None
+        return
+
+    def source_signature() -> tuple[tuple[str, int, int] | None, ...]:
+        signature: list[tuple[str, int, int] | None] = []
+        for source in (resolved, Path(f"{resolved}-wal")):
+            try:
+                info = source.stat()
+            except FileNotFoundError:
+                signature.append(None)
+            else:
+                signature.append((source.name, info.st_size, info.st_mtime_ns))
+        return tuple(signature)
+
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-preview-") as temp_dir:
+        snapshot = Path(temp_dir) / resolved.name
+        for attempt in range(3):
+            before = source_signature()
+            shutil.copyfile(resolved, snapshot)
+            source_wal = Path(f"{resolved}-wal")
+            snapshot_wal = Path(f"{snapshot}-wal")
+            if source_wal.is_file():
+                shutil.copyfile(source_wal, snapshot_wal)
+            else:
+                snapshot_wal.unlink(missing_ok=True)
+            after = source_signature()
+            if before == after:
+                break
+            if attempt == 2:
+                raise RuntimeError(
+                    "kanban database changed while creating read-only preview snapshot"
+                )
+        yield snapshot
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(
+    db_path: Optional[Path] = None,
+    *,
+    board: Optional[str] = None,
+):
+    """Open a private read-only snapshot without touching DB sidecars.
+
+    Dry-run dispatch must not create a missing board, initialize a schema, or
+    checkpoint a WAL. Copying the database and its WAL into a temporary
+    directory gives the preview a stable SQLite read-only view while keeping
+    the requested board untouched.
+    """
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    with _private_db_snapshot(path) as snapshot:
+        if snapshot is None:
+            conn = sqlite3.connect(":memory:", isolation_level=None)
+            conn.executescript(SCHEMA_SQL)
+            conn.row_factory = sqlite3.Row
+            try:
+                yield conn
+            finally:
+                conn.close()
+            return
+
+        conn = sqlite3.connect(
+            snapshot.as_uri() + "?mode=ro", uri=True, isolation_level=None, timeout=5
+        )
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
+def _connection_database_path(conn: sqlite3.Connection) -> Optional[Path]:
+    """Return a live connection's main path without reading database pages."""
+    tracked = getattr(conn, "_hermes_tracked_path", None)
+    if tracked:
+        return Path(tracked)
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+    except sqlite3.Error:
+        return None
+    if not row or len(row) < 3 or not row[2]:
+        return None
+    return Path(str(row[2])).expanduser().resolve()
 
 
 def init_db(
@@ -8765,6 +9074,14 @@ class DispatchResult:
     subsequent tick when the assignee has capacity. Separate bucket so
     telemetry / dashboards can show "this profile is busy" vs
     "task is genuinely stuck"."""
+    skipped_worker_profile_not_allowed: list[tuple[str, str]] = field(
+        default_factory=list
+    )
+    """Bounded ``(task_id, assignee)`` details for policy exclusions."""
+    skipped_worker_profile_not_allowed_total: int = 0
+    """Exact count of tasks excluded by the profile admission policy."""
+    skipped_worker_profile_not_allowed_truncated: bool = False
+    """True when policy-skip details exceeded the bounded projection."""
     crashed: list[str] = field(default_factory=list)
     """Task ids reclaimed because their worker PID disappeared."""
     auto_blocked: list[str] = field(default_factory=list)
@@ -8798,6 +9115,23 @@ class DispatchResult:
     spawned. ``None`` when memory was fine/unknown and the guard imposed
     no restriction. Reclaim/promotion bookkeeping still ran either way;
     deferred tasks stay queued for the next tick."""
+    admission_blocked: bool = False
+    """True when conservative parallel admission refused this tick."""
+    admission_reason: Optional[str] = None
+    """Stable reason for an admission block, when one occurred."""
+    admission_metrics: dict[str, Any] = field(default_factory=dict)
+    """Bounded occupancy telemetry attached to an admission block."""
+
+
+def _record_worker_profile_admission_skip(
+    result: DispatchResult, task_id: str, assignee: str,
+) -> None:
+    """Record one allowlist exclusion with bounded deterministic detail."""
+    result.skipped_worker_profile_not_allowed_total += 1
+    if len(result.skipped_worker_profile_not_allowed) < MAX_ADMISSION_SKIP_DETAILS:
+        result.skipped_worker_profile_not_allowed.append((task_id, assignee))
+    else:
+        result.skipped_worker_profile_not_allowed_truncated = True
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -11471,6 +11805,521 @@ def review_dispatch_enabled() -> bool:
         return True
 
 
+_ADMISSION_ARGUMENT_MISSING = object()
+_CANONICAL_PARALLEL_DISPATCH_KEY = "_canonical_parallel_dispatch"
+MAX_ADMISSION_SKIP_DETAILS = 32
+
+
+def effective_max_spawn(
+    max_spawn: Any = None, max_in_progress: Any = None,
+) -> Optional[int]:
+    """Return the tightest positive concurrency cap."""
+    caps = [
+        value for value in (max_spawn, max_in_progress)
+        if type(value) is int and value > 0
+    ]
+    return min(caps) if caps else None
+
+
+def _positive_dispatch_cap(value: Any, name: str) -> Optional[int]:
+    """Validate a configured admission cap without lossy coercion."""
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def resolve_dispatch_caps(
+    config: Optional[Mapping[str, Any]] = None,
+    *,
+    max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> tuple[Optional[int], Optional[int]]:
+    """Resolve the canonical global and per-tick caps for every frontend."""
+    configured_spawn = configured_progress = None
+    if config is not None:
+        if not isinstance(config, Mapping):
+            raise ValueError("effective Hermes config must be a mapping")
+        kanban = config.get("kanban", {})
+        if kanban is None:
+            kanban = {}
+        if not isinstance(kanban, Mapping):
+            raise ValueError("kanban config must be a mapping")
+        configured_spawn = _positive_dispatch_cap(
+            kanban.get("max_spawn"), "kanban.max_spawn"
+        )
+        configured_progress = _positive_dispatch_cap(
+            kanban.get("max_in_progress"), "kanban.max_in_progress"
+        )
+    explicit_spawn = (
+        _positive_dispatch_cap(max_spawn, "max_spawn")
+        if max_spawn is not None else None
+    )
+    explicit_progress = (
+        _positive_dispatch_cap(max_in_progress, "max_in_progress")
+        if max_in_progress is not None else None
+    )
+    resolved_spawn = (
+        min(configured_spawn, explicit_spawn)
+        if configured_spawn is not None and explicit_spawn is not None
+        else explicit_spawn if explicit_spawn is not None else configured_spawn
+    )
+    resolved_progress = (
+        min(configured_progress, explicit_progress)
+        if configured_progress is not None and explicit_progress is not None
+        else explicit_progress if explicit_progress is not None else configured_progress
+    )
+    return resolved_spawn, resolved_progress
+
+
+def _parallel_dispatch_required(
+    config: Optional[Mapping[str, Any]] = None,
+    *,
+    max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> bool:
+    """Return whether host-wide fail-closed admission is required."""
+    canonical_parallel = False
+    if isinstance(config, Mapping):
+        kanban = config.get("kanban", {})
+        canonical_parallel = bool(
+            isinstance(kanban, Mapping)
+            and kanban.get(_CANONICAL_PARALLEL_DISPATCH_KEY) is True
+        )
+    configured_progress = resolve_dispatch_caps(config)[1]
+    explicit_progress = (
+        _positive_dispatch_cap(max_in_progress, "max_in_progress")
+        if max_in_progress is not None else None
+    )
+    return bool(
+        canonical_parallel
+        or (configured_progress is not None and configured_progress > 1)
+        or (explicit_progress is not None and explicit_progress > 1)
+    )
+
+
+def validate_allowed_worker_profiles(value: Any) -> Optional[list[str]]:
+    """Validate the strict profile allowlist used by parallel admission."""
+    if value is None:
+        return None
+    if type(value) is not list or not value:
+        raise ValueError(
+            "kanban.safe_dispatch_admission.allowed_worker_profiles "
+            "must be a non-empty list"
+        )
+    try:
+        from hermes_cli.profiles import profile_exists, validate_profile_name
+    except Exception as exc:
+        raise ValueError("could not validate allowed worker profiles") from exc
+    profiles: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if type(item) is not str or not item or item != item.strip():
+            raise ValueError(
+                "kanban.safe_dispatch_admission.allowed_worker_profiles "
+                f"[{index}] must be a canonical profile name"
+            )
+        try:
+            validate_profile_name(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(
+                "kanban.safe_dispatch_admission.allowed_worker_profiles "
+                f"[{index}] is invalid: {exc}"
+            ) from exc
+        if item in seen:
+            raise ValueError(
+                "kanban.safe_dispatch_admission.allowed_worker_profiles "
+                f"must not contain duplicates: {item!r}"
+            )
+        try:
+            exists = profile_exists(item)
+        except Exception as exc:
+            raise ValueError(f"could not check worker profile {item!r}") from exc
+        if not exists:
+            raise ValueError(
+                "kanban.safe_dispatch_admission.allowed_worker_profiles "
+                f"names missing profile {item!r}"
+            )
+        seen.add(item)
+        profiles.append(item)
+    return profiles
+
+
+def _admission_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    section = config.get("kanban", {})
+    if section is None:
+        return {}
+    if not isinstance(section, Mapping):
+        raise ValueError("kanban config must be a mapping")
+    return section
+
+
+def _admission_allowlist(config: Mapping[str, Any]) -> Any:
+    section = _admission_section(config)
+    if "safe_dispatch_admission" not in section:
+        return _ADMISSION_ARGUMENT_MISSING
+    policy = section["safe_dispatch_admission"]
+    if not isinstance(policy, Mapping):
+        raise ValueError("kanban.safe_dispatch_admission must be a mapping")
+    return policy.get("allowed_worker_profiles", _ADMISSION_ARGUMENT_MISSING)
+
+
+def _admission_snapshot(config: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy only the resolved config fields admission is allowed to inspect."""
+    section = _admission_section(config)
+    snapshot: dict[str, Any] = {}
+    for key in (
+        "max_spawn", "max_in_progress", "max_in_progress_per_profile",
+        _CANONICAL_PARALLEL_DISPATCH_KEY,
+    ):
+        if key in section:
+            snapshot[key] = copy.deepcopy(section[key])
+    policy = section.get("safe_dispatch_admission", _ADMISSION_ARGUMENT_MISSING)
+    if policy is not _ADMISSION_ARGUMENT_MISSING:
+        if not isinstance(policy, Mapping):
+            raise ValueError("kanban.safe_dispatch_admission must be a mapping")
+        snapshot["safe_dispatch_admission"] = {}
+        if "allowed_worker_profiles" in policy:
+            snapshot["safe_dispatch_admission"]["allowed_worker_profiles"] = (
+                copy.deepcopy(policy["allowed_worker_profiles"])
+            )
+    return {"kanban": snapshot}
+
+
+@dataclass(frozen=True)
+class _CanonicalAdmissionSnapshot(Mapping[str, Any]):
+    """Trusted, immutable policy resolved from the shared Hermes root once."""
+
+    _config: Mapping[str, Any]
+
+    def __getitem__(self, key: str) -> Any:
+        return self._config[key]
+
+    def __iter__(self):
+        return iter(self._config)
+
+    def __len__(self) -> int:
+        return len(self._config)
+
+
+def _freeze_admission_config(config: Mapping[str, Any]) -> _CanonicalAdmissionSnapshot:
+    section = _admission_section(config)
+    frozen_section: dict[str, Any] = dict(section)
+    policy = frozen_section.get("safe_dispatch_admission")
+    if isinstance(policy, Mapping):
+        frozen_policy = dict(policy)
+        profiles = frozen_policy.get("allowed_worker_profiles")
+        if isinstance(profiles, list):
+            frozen_policy["allowed_worker_profiles"] = tuple(profiles)
+        frozen_section["safe_dispatch_admission"] = MappingProxyType(frozen_policy)
+    return _CanonicalAdmissionSnapshot(
+        MappingProxyType({"kanban": MappingProxyType(frozen_section)})
+    )
+
+
+def _canonical_dispatch_config(
+    effective_config: Optional[Mapping[str, Any]],
+    *,
+    max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> Optional[Mapping[str, Any]]:
+    """Resolve canonical shared-root admission policy before DB work.
+
+    ``load_config_readonly`` is context-scoped to the shared Kanban home.  It
+    returns a cached mutable object, so this function snapshots only the
+    admission fields and never mutates that object.  A caller config can
+    narrow canonical values but cannot widen caps or profile admission.
+    """
+    if isinstance(effective_config, _CanonicalAdmissionSnapshot):
+        return effective_config
+    if effective_config is not None and not isinstance(effective_config, Mapping):
+        raise ValueError("effective Hermes config must be a mapping")
+    explicit_arg_spawn = _positive_dispatch_cap(max_spawn, "max_spawn")
+    explicit_arg_progress = _positive_dispatch_cap(
+        max_in_progress, "max_in_progress"
+    )
+
+    config_path = kanban_home() / "config.yaml"
+    try:
+        info = config_path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise ValueError("could not access canonical Hermes config") from exc
+    if info is not None:
+        if not stat.S_ISREG(info.st_mode) or config_path.is_symlink():
+            raise ValueError("canonical Hermes config is not a regular file")
+        if not os.access(config_path, os.R_OK):
+            raise ValueError("canonical Hermes config is not readable")
+
+    def _config_fingerprint(value: os.stat_result) -> tuple[int, int, int, int, int]:
+        return (
+            int(value.st_dev), int(value.st_ino), int(value.st_mode),
+            int(value.st_size), int(value.st_mtime_ns),
+        )
+
+    if info is None:
+        explicit = (
+            _admission_snapshot(effective_config)
+            if effective_config is not None else None
+        )
+        explicit_spawn, explicit_progress = resolve_dispatch_caps(explicit)
+        if (
+            (explicit_arg_progress is not None and explicit_arg_progress > 1)
+            or (explicit_progress is not None and explicit_progress > 1)
+            or (
+                explicit is not None
+                and _admission_allowlist(explicit) is not _ADMISSION_ARGUMENT_MISSING
+            )
+        ):
+            raise ValueError(
+                "canonical Hermes config is required for adaptive or "
+                "parallel-capable Kanban dispatch"
+            )
+        return _freeze_admission_config(explicit) if explicit is not None else None
+
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+
+        token = set_hermes_home_override(kanban_home())
+        try:
+            canonical_raw = load_config_readonly()
+            if info is not None:
+                parse_marker = (str(config_path), info.st_mtime_ns, info.st_size)
+                import hermes_cli.config as config_module
+                if parse_marker in getattr(config_module, "_CONFIG_PARSE_WARNED", set()):
+                    raise ValueError("canonical Hermes config could not be parsed")
+        finally:
+            reset_hermes_home_override(token)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("could not load canonical Hermes config") from exc
+    try:
+        post_info = config_path.lstat()
+    except OSError as exc:
+        raise ValueError("canonical Hermes config changed while loading") from exc
+    if (
+        info is None
+        or _config_fingerprint(post_info) != _config_fingerprint(info)
+        or not stat.S_ISREG(post_info.st_mode)
+        or config_path.is_symlink()
+    ):
+        raise ValueError("canonical Hermes config changed while loading")
+    if not isinstance(canonical_raw, Mapping):
+        raise ValueError("effective Hermes config must be a mapping")
+    canonical = _admission_snapshot(canonical_raw)
+    canonical_spawn, canonical_progress = resolve_dispatch_caps(canonical)
+    canonical_section = dict(_admission_section(canonical))
+    canonical_per_profile = _positive_dispatch_cap(
+        canonical_section.get("max_in_progress_per_profile"),
+        "kanban.max_in_progress_per_profile",
+    )
+    canonical_allowed_value = _admission_allowlist(canonical)
+    canonical_allowed = (
+        validate_allowed_worker_profiles(canonical_allowed_value)
+        if canonical_allowed_value is not _ADMISSION_ARGUMENT_MISSING else None
+    )
+    canonical_policy_present = "safe_dispatch_admission" in canonical_section
+    if canonical_policy_present and canonical_progress is None:
+        canonical_progress = resolve_max_in_progress(None)
+        if canonical_progress is not None:
+            canonical_section["max_in_progress"] = canonical_progress
+    canonical_parallel_authorized = bool(
+        canonical_policy_present
+        or (canonical_progress is not None and canonical_progress > 1)
+    )
+    if canonical_parallel_authorized and canonical_allowed is None:
+        # A caller-supplied allowlist cannot repair a canonical policy that is
+        # itself incomplete.  Reject before any resolved snapshot can expose
+        # the caller's profiles as authoritative.
+        raise ValueError(
+            "canonical kanban.safe_dispatch_admission.allowed_worker_profiles "
+            "is required when parallel dispatch safety is active"
+        )
+    canonical_section[_CANONICAL_PARALLEL_DISPATCH_KEY] = bool(
+        canonical_parallel_authorized
+    )
+    canonical["kanban"] = canonical_section
+    if effective_config is None:
+        if (
+            not canonical_parallel_authorized
+            and explicit_arg_progress is not None
+            and explicit_arg_progress > 1
+        ):
+            raise ValueError(
+                "effective_config cannot enable adaptive or parallel-capable "
+                "Kanban dispatch without canonical shared-root policy"
+            )
+        return _freeze_admission_config(canonical)
+
+    explicit = _admission_snapshot(effective_config)
+    explicit_spawn, explicit_progress = resolve_dispatch_caps(explicit)
+    explicit_section = _admission_section(explicit)
+    explicit_per_profile = _positive_dispatch_cap(
+        explicit_section.get("max_in_progress_per_profile"),
+        "kanban.max_in_progress_per_profile",
+    )
+    explicit_allowed_value = _admission_allowlist(explicit)
+    if not canonical_parallel_authorized and (
+        (explicit_arg_progress is not None and explicit_arg_progress > 1)
+        or (explicit_progress is not None and explicit_progress > 1)
+        or "safe_dispatch_admission" in explicit_section
+    ):
+        # The effective/profile config is a narrowing request only.  It must
+        # not turn a serial or legacy canonical config into an adaptive one.
+        raise ValueError(
+            "effective_config cannot enable adaptive or parallel-capable "
+            "Kanban dispatch without canonical shared-root policy"
+        )
+    explicit_allowed = (
+        validate_allowed_worker_profiles(explicit_allowed_value)
+        if explicit_allowed_value is not _ADMISSION_ARGUMENT_MISSING else None
+    )
+    if canonical_allowed is not None and explicit_allowed is not None:
+        widened = sorted(set(explicit_allowed) - set(canonical_allowed))
+        if widened:
+            raise ValueError(
+                "effective_config cannot widen canonical "
+                f"kanban.safe_dispatch_admission policy: {widened}"
+            )
+    resolved = {"kanban": dict(canonical_section)}
+    for key, canonical_value, explicit_value in (
+        ("max_spawn", canonical_spawn, explicit_spawn),
+        ("max_in_progress", canonical_progress, explicit_progress),
+        ("max_in_progress_per_profile", canonical_per_profile, explicit_per_profile),
+    ):
+        value = (
+            min(canonical_value, explicit_value)
+            if canonical_value is not None and explicit_value is not None
+            else explicit_value if explicit_value is not None else canonical_value
+        )
+        if value is not None:
+            resolved["kanban"][key] = value
+    if canonical_allowed is not None or explicit_allowed is not None:
+        resolved["kanban"]["safe_dispatch_admission"] = {
+            "allowed_worker_profiles": (
+                explicit_allowed
+                if explicit_allowed is not None
+                else canonical_allowed
+            )
+        }
+    resolved["kanban"][_CANONICAL_PARALLEL_DISPATCH_KEY] = canonical_section[
+        _CANONICAL_PARALLEL_DISPATCH_KEY
+    ]
+    return _freeze_admission_config(resolved)
+
+
+def resolve_worker_profile_admission(
+    config: Optional[Mapping[str, Any]] = None,
+    *,
+    max_spawn: Any = None,
+    max_in_progress: Any = None,
+    allowed_worker_profiles: Any = _ADMISSION_ARGUMENT_MISSING,
+) -> Optional[list[str]]:
+    """Resolve explicit or configured worker-profile admission policy."""
+    configured_value = (
+        _admission_allowlist(config)
+        if isinstance(config, Mapping) else _ADMISSION_ARGUMENT_MISSING
+    )
+    canonical_snapshot = (
+        isinstance(config, _CanonicalAdmissionSnapshot)
+        and _admission_section(config).get(_CANONICAL_PARALLEL_DISPATCH_KEY) is True
+    )
+    if (
+        configured_value is not _ADMISSION_ARGUMENT_MISSING
+        and not canonical_snapshot
+    ) or (
+        allowed_worker_profiles is not _ADMISSION_ARGUMENT_MISSING
+        and allowed_worker_profiles is not None
+        and not canonical_snapshot
+    ):
+        raise ValueError(
+            "worker-profile admission cannot enable adaptive or "
+            "parallel-capable Kanban dispatch without canonical policy"
+        )
+    configured_profiles = (
+        validate_allowed_worker_profiles(
+            list(configured_value)
+            if isinstance(config, _CanonicalAdmissionSnapshot)
+            and isinstance(configured_value, tuple)
+            else configured_value
+        )
+        if configured_value is not _ADMISSION_ARGUMENT_MISSING else None
+    )
+    explicit_profiles = (
+        validate_allowed_worker_profiles(allowed_worker_profiles)
+        if allowed_worker_profiles is not _ADMISSION_ARGUMENT_MISSING
+        and allowed_worker_profiles is not None else None
+    )
+    if configured_profiles is not None and explicit_profiles is not None:
+        widened = sorted(set(explicit_profiles) - set(configured_profiles))
+        if widened:
+            raise ValueError(
+                "explicit allowed_worker_profiles cannot widen configured "
+                f"kanban.safe_dispatch_admission policy: {widened}"
+            )
+        profiles = explicit_profiles
+    else:
+        profiles = explicit_profiles or configured_profiles
+    if _parallel_dispatch_required(
+        config, max_spawn=max_spawn, max_in_progress=max_in_progress
+    ) and configured_profiles is None:
+        raise ValueError(
+            "canonical kanban.safe_dispatch_admission.allowed_worker_profiles "
+            "is required when parallel dispatch safety is active"
+        )
+    return profiles
+
+
+def prepare_dispatch_admission(
+    effective_config: Optional[Mapping[str, Any]] = None,
+    *,
+    max_spawn: Any = None,
+    max_in_progress: Any = None,
+    max_in_progress_per_profile: Any = None,
+    allowed_worker_profiles: Any = _ADMISSION_ARGUMENT_MISSING,
+) -> Optional[Mapping[str, Any]]:
+    """Prepare the immutable admission snapshot before opening a Kanban DB.
+
+    Supported dispatch wrappers call this boundary before constructing a
+    connection scope.  It deliberately resolves only config/profile policy:
+    no SQLite path, schema, WAL/SHM, board, dispatcher, allocation, or worker
+    lifecycle operation is touched here.  ``dispatch_once`` repeats the
+    defense-in-depth checks and reuses the returned snapshot by identity.
+    """
+    snapshot = _canonical_dispatch_config(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+    )
+    if effective_config is not None:
+        _positive_dispatch_cap(
+            _admission_section(effective_config).get(
+                "max_in_progress_per_profile"
+            ),
+            "kanban.max_in_progress_per_profile",
+        )
+    _positive_dispatch_cap(
+        max_in_progress_per_profile,
+        "max_in_progress_per_profile",
+    )
+    resolved_spawn, resolved_progress = resolve_dispatch_caps(
+        snapshot,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+    )
+    resolve_worker_profile_admission(
+        snapshot,
+        max_spawn=resolved_spawn,
+        max_in_progress=resolved_progress,
+        allowed_worker_profiles=allowed_worker_profiles,
+    )
+    return snapshot
+
+
 # ---------------------------------------------------------------------------
 # Memory-aware dispatch guard (OOF-30 / OOF-77)
 #
@@ -11648,6 +12497,7 @@ def count_running_tasks_other_boards(board: Optional[str] = None) -> int:
 class _OtherBoardsRunningObservation:
     running_count: int
     has_independent_db: bool
+    per_profile_running: Mapping[str, int] = field(default_factory=dict, compare=False)
 
 
 def observe_running_tasks_other_boards(
@@ -11728,6 +12578,7 @@ def observe_running_tasks_other_boards(
         return None
 
     total = 0
+    per_profile_running: dict[str, int] = {}
     foreign_paths: set[Path] = set()
     foreign_identities: set[tuple[int, int]] = set()
     observations: list[
@@ -11759,12 +12610,27 @@ def observe_running_tasks_other_boards(
             immutable_uri = resolved.as_uri() + "?immutable=1"
             other = sqlite3.connect(immutable_uri, uri=True, timeout=0.5)
             try:
-                row = other.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-                ).fetchone()
-                if row is None or row[0] is None:
-                    return None
-                total += int(row[0])
+                rows = other.execute(
+                    "SELECT assignee, COUNT(*) FROM tasks "
+                    "WHERE status = 'running' GROUP BY assignee"
+                ).fetchall()
+                board_total = 0
+                for row in rows:
+                    if row is None or len(row) < 2:
+                        return None
+                    assignee, raw_count = row[0], row[1]
+                    if type(raw_count) is not int or raw_count < 0:
+                        return None
+                    if assignee is not None and (
+                        type(assignee) is not str or not assignee.strip()
+                    ):
+                        return None
+                    board_total += raw_count
+                    if assignee is not None:
+                        per_profile_running[assignee] = (
+                            per_profile_running.get(assignee, 0) + raw_count
+                        )
+                total += board_total
             finally:
                 other.close()
             if not _same_snapshot(raw_path, resolved, db_snapshot, wal_snapshot):
@@ -11786,6 +12652,7 @@ def observe_running_tasks_other_boards(
     return _OtherBoardsRunningObservation(
         running_count=total,
         has_independent_db=bool(foreign_paths),
+        per_profile_running=MappingProxyType(dict(per_profile_running)),
     )
 
 
@@ -11811,6 +12678,166 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+def _dispatch_preview(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: int,
+    max_spawn: Optional[int],
+    max_new_spawns: Optional[int],
+    max_in_progress: Optional[int],
+    default_assignee: Optional[str],
+    max_in_progress_per_profile: Optional[int],
+    allowed_worker_profiles: Optional[Iterable[str]],
+) -> DispatchResult:
+    """Build a read-only dispatch preview from a private SQLite snapshot.
+
+    Dependency promotion is part of the preview model, but
+    :func:`recompute_ready` is intentionally a write-oriented helper.  Copy
+    the caller's connection into an in-memory database first, then perform
+    promotion and enumeration there.  The source connection (including its
+    WAL/SHM and surrounding files) is never written or locked for mutation.
+    """
+    result = DispatchResult()
+    source_path = _connection_database_path(conn)
+    if source_path is None:
+        # A genuinely in-memory connection has no source files or WAL/SHM
+        # sidecars, so SQLite backup is safe and is the only way to preserve
+        # arbitrary caller-created in-memory schemas.
+        preview_conn = sqlite3.connect(":memory:", isolation_level=None)
+        preview_conn.row_factory = sqlite3.Row
+        try:
+            conn.backup(preview_conn)
+            result.promoted = recompute_ready(
+                preview_conn, failure_limit=failure_limit
+            )
+            if max_new_spawns == 0:
+                return result
+            _populate_dispatch_preview(
+                preview_conn,
+                result,
+                max_spawn=max_spawn,
+                max_new_spawns=max_new_spawns,
+                max_in_progress=max_in_progress,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                allowed_worker_profiles=allowed_worker_profiles,
+            )
+            return result
+        finally:
+            preview_conn.close()
+
+    with _private_db_snapshot(source_path) as snapshot:
+        if snapshot is None:
+            raise RuntimeError(
+                "kanban dry-run source database disappeared before snapshot"
+            )
+        preview_conn = sqlite3.connect(snapshot, isolation_level=None)
+        preview_conn.row_factory = sqlite3.Row
+        try:
+            result.promoted = recompute_ready(
+                preview_conn, failure_limit=failure_limit
+            )
+            if max_new_spawns == 0:
+                return result
+            _populate_dispatch_preview(
+                preview_conn,
+                result,
+                max_spawn=max_spawn,
+                max_new_spawns=max_new_spawns,
+                max_in_progress=max_in_progress,
+                default_assignee=default_assignee,
+                max_in_progress_per_profile=max_in_progress_per_profile,
+                allowed_worker_profiles=allowed_worker_profiles,
+            )
+            return result
+        finally:
+            preview_conn.close()
+
+
+def _populate_dispatch_preview(
+    conn: sqlite3.Connection,
+    result: DispatchResult,
+    *,
+    max_spawn: Optional[int],
+    max_new_spawns: Optional[int],
+    max_in_progress: Optional[int],
+    default_assignee: Optional[str],
+    max_in_progress_per_profile: Optional[int],
+    allowed_worker_profiles: Optional[Iterable[str]],
+) -> None:
+    """Enumerate would-be starts from an already-promoted preview database."""
+    if max_in_progress is not None and (
+        max_spawn is None or max_in_progress < max_spawn
+    ):
+        max_spawn = max_in_progress
+    running = int(
+        conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
+        ).fetchone()[0]
+    )
+    budget = max_new_spawns if max_new_spawns is not None else None
+    allowed = (
+        frozenset(allowed_worker_profiles)
+        if allowed_worker_profiles is not None else None
+    )
+    rows = conn.execute(
+        "SELECT id, assignee, status FROM tasks "
+        "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
+        "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, "
+        "priority DESC, created_at ASC"
+    ).fetchall()
+    per_profile_cap = (
+        max_in_progress_per_profile
+        if type(max_in_progress_per_profile) is int
+        and max_in_progress_per_profile > 0 else None
+    )
+    per_profile_running: dict[str, int] = {}
+    if per_profile_cap is not None:
+        for row in conn.execute(
+            "SELECT assignee, COUNT(*) AS n FROM tasks "
+            "WHERE status = 'running' AND assignee IS NOT NULL "
+            "GROUP BY assignee"
+        ):
+            per_profile_running[row["assignee"]] = int(row["n"])
+    for row in rows:
+        if budget is not None and len(result.spawned) >= budget:
+            break
+        if max_spawn is not None and running + len(result.spawned) >= max_spawn:
+            break
+        if row["status"] == "review" and not review_dispatch_enabled():
+            continue
+        assignee = row["assignee"]
+        if not assignee and default_assignee:
+            assignee = default_assignee.strip() or None
+            if assignee:
+                result.auto_assigned_default.append(row["id"])
+        if not assignee:
+            result.skipped_unassigned.append(row["id"])
+            continue
+        if allowed is not None and assignee not in allowed:
+            _record_worker_profile_admission_skip(
+                result, row["id"], assignee
+            )
+            continue
+        if per_profile_cap is not None:
+            current = per_profile_running.get(assignee, 0)
+            if current >= per_profile_cap:
+                result.skipped_per_profile_capped.append(
+                    (row["id"], assignee, current)
+                )
+                continue
+        guard_reason = check_respawn_guard(
+            conn, row["id"],
+            **({"lane": "review"} if row["status"] == "review" else {}),
+        )
+        if guard_reason is not None:
+            result.respawn_guarded.append((row["id"], guard_reason))
+            continue
+        result.spawned.append((row["id"], assignee, ""))
+        if per_profile_cap is not None:
+            per_profile_running[assignee] = per_profile_running.get(assignee, 0) + 1
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -11818,12 +12845,16 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
+    selected_boards: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -11841,56 +12872,158 @@ def dispatch_once(
     boards tick in parallel. See :func:`_dispatch_tick_lock` for the
     cross-process / cross-platform mechanics.
     """
-    try:
-        db_path = kanban_db_path(board=board)
-    except Exception:
-        # Path resolution should never fail, but if it somehow does we
-        # must not lose the tick — fall through to an unguarded dispatch
-        # rather than dropping work.
-        result = _dispatch_once_locked(
+    effective_config = _canonical_dispatch_config(
+        effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress
+    )
+    parallel_dispatch = _parallel_dispatch_required(
+        effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress
+    )
+    max_spawn, max_in_progress = resolve_dispatch_caps(
+        effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress
+    )
+    configured_per_profile = None
+    if effective_config is not None:
+        configured_per_profile = _positive_dispatch_cap(
+            _admission_section(effective_config).get("max_in_progress_per_profile"),
+            "kanban.max_in_progress_per_profile",
+        )
+    explicit_per_profile = _positive_dispatch_cap(
+        max_in_progress_per_profile, "max_in_progress_per_profile"
+    )
+    max_in_progress_per_profile = (
+        min(configured_per_profile, explicit_per_profile)
+        if configured_per_profile is not None and explicit_per_profile is not None
+        else explicit_per_profile if explicit_per_profile is not None
+        else configured_per_profile
+    )
+    allowed_worker_profiles = resolve_worker_profile_admission(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        allowed_worker_profiles=allowed_worker_profiles,
+    )
+    if max_new_spawns is not None:
+        if type(max_new_spawns) is not int or max_new_spawns < 0:
+            raise ValueError("max_new_spawns must be a non-negative integer or None")
+    if parallel_dispatch:
+        max_new_spawns = (
+            1 if max_new_spawns is None else min(max_new_spawns, 1)
+        )
+    if dry_run:
+        return _dispatch_preview(
             conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
             failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            max_spawn=max_spawn,
+            max_new_spawns=max_new_spawns,
+            max_in_progress=max_in_progress,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
-            reconcile_orphans=reconcile_orphans,
+            allowed_worker_profiles=allowed_worker_profiles,
         )
-        _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    with _dispatch_tick_lock(db_path) as held:
-        if not held:
-            result = DispatchResult(skipped_locked=True)
+
+    try:
+        db_path = kanban_db_path(board=board)
+    except Exception as exc:
+        if parallel_dispatch:
+            result = DispatchResult(
+                admission_blocked=True,
+                admission_reason="db_telemetry_unavailable",
+                admission_metrics={"error": f"{type(exc).__name__}: {exc}"},
+            )
         else:
             result = _dispatch_once_locked(
-                conn,
-                spawn_fn=spawn_fn,
-                ttl_seconds=ttl_seconds,
-                dry_run=dry_run,
-                max_spawn=max_spawn,
+                conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds,
+                max_spawn=max_spawn, max_new_spawns=max_new_spawns,
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
-                stale_timeout_seconds=stale_timeout_seconds,
-                board=board,
+                stale_timeout_seconds=stale_timeout_seconds, board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                allowed_worker_profiles=allowed_worker_profiles,
                 reconcile_orphans=reconcile_orphans,
             )
-            # Still under the dispatch lock: run the periodic PASSIVE WAL
-            # checkpoint (see _maybe_checkpoint_wal; the -wal file size is
-            # bounded by journal_size_limit on the writer's natural reset).
-            _maybe_checkpoint_wal(conn, db_path)
+        _fire_dispatch_tick_hook(result, board=board, dry_run=False)
+        return result
+
+    allocation_scope = (
+        _allocation_lock(required=True)
+        if parallel_dispatch else contextlib.nullcontext(True)
+    )
+    with allocation_scope as allocation_held:
+        if not allocation_held:
+            result = DispatchResult(skipped_locked=True)
+        else:
+            with _dispatch_tick_lock(db_path) as held:
+                if not held:
+                    result = DispatchResult(skipped_locked=True)
+                else:
+                    result = _dispatch_once_with_board_lock(
+                        conn,
+                        spawn_fn=spawn_fn,
+                        ttl_seconds=ttl_seconds,
+                        max_spawn=max_spawn,
+                        max_new_spawns=max_new_spawns,
+                        max_in_progress=max_in_progress,
+                        failure_limit=failure_limit,
+                        stale_timeout_seconds=stale_timeout_seconds,
+                        board=board,
+                        default_assignee=default_assignee,
+                        max_in_progress_per_profile=max_in_progress_per_profile,
+                        allowed_worker_profiles=allowed_worker_profiles,
+                        selected_boards=selected_boards,
+                        parallel_dispatch=parallel_dispatch,
+                        reconcile_orphans=reconcile_orphans,
+                    )
+                    _maybe_checkpoint_wal(conn, db_path)
     # The dispatch lock has been released here. Fire the tick observer
     # strictly OUTSIDE the single-writer critical section (#56066 sweeper
     # finding / #64231 disposition): a slow subscriber must never extend
     # the lock hold and stall a sibling dispatcher's tick.
     _fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
     return result
+
+
+def _dispatch_once_with_board_lock(
+    conn: sqlite3.Connection,
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
+    selected_boards: Optional[Iterable[str]] = None,
+    parallel_dispatch: bool = False,
+    reconcile_orphans: bool = True,
+) -> DispatchResult:
+    """Run board dispatch with an allocation snapshot held by the caller."""
+    native_scope_snapshot = (
+        _worker_scope_config()
+        if spawn_fn is None or spawn_fn is _default_spawn else None
+    )
+    return _dispatch_once_locked(
+        conn,
+        spawn_fn=spawn_fn,
+        ttl_seconds=ttl_seconds,
+        max_spawn=max_spawn,
+        max_new_spawns=max_new_spawns,
+        max_in_progress=max_in_progress,
+        failure_limit=failure_limit,
+        stale_timeout_seconds=stale_timeout_seconds,
+        board=board,
+        default_assignee=default_assignee,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        allowed_worker_profiles=allowed_worker_profiles,
+        selected_boards=selected_boards,
+        parallel_dispatch=parallel_dispatch,
+        reconcile_orphans=reconcile_orphans,
+        _native_scope_snapshot=native_scope_snapshot,
+    )
 
 
 def _dispatch_once_locked(
@@ -11900,12 +13033,17 @@ def _dispatch_once_locked(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
+    selected_boards: Optional[Iterable[str]] = None,
+    initial_occupancy: Optional[Mapping[str, Any]] = None,
+    parallel_dispatch: Optional[bool] = None,
     reconcile_orphans: bool = True,
     _native_admission_held: bool = False,
     _skip_maintenance: bool = False,
@@ -11948,6 +13086,14 @@ def _dispatch_once_locked(
     board. When omitted, the current-board resolution chain is used.
     """
     result = _dispatch_result if _dispatch_result is not None else DispatchResult()
+    if parallel_dispatch is None:
+        parallel_dispatch = _parallel_dispatch_required(
+            max_spawn=max_spawn, max_in_progress=max_in_progress
+        )
+    allowed_profiles = (
+        frozenset(allowed_worker_profiles)
+        if allowed_worker_profiles is not None else None
+    )
     # A required native scope is an admission prerequisite, not a spawn-time
     # best effort. Establish it before zombie/reclaim/reconciliation work so
     # an invalid host or malformed required config cannot mutate a task/run
@@ -12041,8 +13187,29 @@ def _dispatch_once_locked(
             "ORDER BY priority DESC, created_at ASC"
         ).fetchall()
 
-    if native_spawn and not dry_run and not ready_rows and not review_rows:
+    if (
+        not ready_rows
+        and not review_rows
+        and (native_spawn or parallel_dispatch)
+    ):
         return result
+
+    # Host occupancy is observed only after maintenance has settled this
+    # board.  A scope-count transition may be sampled once more, but the
+    # maintenance pass above is never repeated.
+    if parallel_dispatch and initial_occupancy is None:
+        for probe in range(2):
+            try:
+                initial_occupancy = _parallel_occupancy(
+                    conn, board=board, selected_boards=selected_boards
+                )
+                break
+            except _ParallelAdmissionBlocked as exc:
+                if exc.reason != "scope_count_transition" or probe:
+                    result.admission_blocked = True
+                    result.admission_reason = exc.reason
+                    result.admission_metrics = exc.metrics
+                    return result
 
     # Foreign-board occupancy and the native claim/launch transition form one
     # host-wide admission critical section.  The board dispatch locks above
@@ -12065,12 +13232,17 @@ def _dispatch_once_locked(
                 ttl_seconds=ttl_seconds,
                 dry_run=dry_run,
                 max_spawn=max_spawn,
+                max_new_spawns=max_new_spawns,
                 max_in_progress=max_in_progress,
                 failure_limit=failure_limit,
                 stale_timeout_seconds=stale_timeout_seconds,
                 board=board,
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
+                allowed_worker_profiles=allowed_worker_profiles,
+                selected_boards=selected_boards,
+                initial_occupancy=initial_occupancy,
+                parallel_dispatch=parallel_dispatch,
                 reconcile_orphans=reconcile_orphans,
                 _native_admission_held=True,
                 _skip_maintenance=True,
@@ -12090,6 +13262,19 @@ def _dispatch_once_locked(
     # deliberately do not interpret an unknown cap as parallel by itself, so
     # ordinary serial CLI use and unsupported hosts retain their direct path.
     running_count = count_running_tasks(conn)
+    conservative_running: Optional[int] = None
+    if parallel_dispatch and initial_occupancy is not None:
+        try:
+            conservative_running = int(
+                initial_occupancy["conservative_running"]
+            )
+            if conservative_running < running_count:
+                raise ValueError("global occupancy below board occupancy")
+        except (KeyError, TypeError, ValueError):
+            result.admission_blocked = True
+            result.admission_reason = "scope_telemetry_malformed"
+            result.admission_metrics = {"error": "missing conservative occupancy"}
+            return result
     spawn_budget: Optional[int] = None
     known_host_running_count: Optional[int] = None
 
@@ -12100,6 +13285,11 @@ def _dispatch_once_locked(
         if running_count >= max_spawn:
             return result
         spawn_budget = max_spawn - running_count
+    if max_new_spawns is not None:
+        if type(max_new_spawns) is not int or max_new_spawns < 0:
+            raise ValueError("max_new_spawns must be a non-negative integer or None")
+        if spawn_budget is None or spawn_budget > max_new_spawns:
+            spawn_budget = max_new_spawns
 
     if native_spawn and not dry_run:
         strict_other_boards = observe_running_tasks_other_boards(board)
@@ -12121,7 +13311,11 @@ def _dispatch_once_locked(
     # this, N active boards multiply the cap by N — exactly the fan-out
     # the memory-derived default exists to prevent.
     if max_in_progress is not None:
-        if native_spawn and not dry_run:
+        if parallel_dispatch and initial_occupancy is not None:
+            assert conservative_running is not None
+            known_host_running_count = conservative_running
+            other_running = max(conservative_running - running_count, 0)
+        elif native_spawn and not dry_run:
             assert strict_other_boards is not None
             other_running = strict_other_boards.running_count
         else:
@@ -12147,11 +13341,12 @@ def _dispatch_once_locked(
     # ran, so board bookkeeping stays live either way, and deferred tasks
     # simply wait for a later tick. "unknown" imposes no restriction.
     pressure = _memory_pressure_level()
-    if pressure == "critical":
+    if pressure == "critical" or (parallel_dispatch and pressure == "unknown"):
         result.memory_pressure = pressure
         _log.warning(
-            "kanban dispatch: system memory pressure is critical; "
-            "spawning no new workers this tick (deferred, not dropped)"
+            "kanban dispatch: system memory pressure is %s; "
+            "spawning no new workers this tick (deferred, not dropped)",
+            pressure,
         )
         return result
     if pressure == "elevated":
@@ -12167,33 +13362,6 @@ def _dispatch_once_locked(
         assert strict_other_boards is not None
         known_host_running_count = running_count + strict_other_boards.running_count
 
-    # Review-lane reservation (OOF-30 review finding): the ready loop runs
-    # first and used to consume the ENTIRE shared budget, so a sustained
-    # ready backlog permanently starved autonomous reviews — completed work
-    # sat in 'review' forever while new work kept spawning. When spawnable
-    # review work exists and the tick has any budget, hold one slot back
-    # from the ready loop so the review lane always gets a spawn
-    # opportunity. The reservation is per-tick and self-releasing: with no
-    # spawnable review work (or no cap at all) the ready loop keeps the
-    # full budget. "Spawnable" mirrors the review loop's own gate
-    # (assigned + real profile) so a review column full of human-pulled
-    # control-plane lanes doesn't permanently tax ready throughput.
-    def _any_spawnable_review() -> bool:
-        if not review_rows:
-            return False
-        try:
-            from hermes_cli.profiles import profile_exists as _rpe
-        except Exception:
-            # Profiles module unavailable (test stubs, exotic envs) —
-            # assume spawnable, matching the review loop's own fallback.
-            return any(row["assignee"] for row in review_rows)
-        return any(
-            row["assignee"] and _rpe(row["assignee"]) for row in review_rows
-        )
-
-    ready_budget = spawn_budget
-    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
-        ready_budget = max(spawn_budget - 1, 0)
     spawned = 0
     # Per-profile concurrency cap (#21582): when set, track how many
     # workers each assignee already has in flight, and refuse to spawn
@@ -12208,13 +13376,61 @@ def _dispatch_once_locked(
         and max_in_progress_per_profile > 0
     ) else None
     _per_profile_running: dict[str, int] = {}
-    if _per_profile_cap is not None:
+    if _per_profile_cap is not None and parallel_dispatch and initial_occupancy:
+        raw_per_profile = initial_occupancy.get("per_profile_running")
+        if not isinstance(raw_per_profile, Mapping):
+            result.admission_blocked = True
+            result.admission_reason = "scope_telemetry_malformed"
+            result.admission_metrics = {"error": "per-profile occupancy invalid"}
+            return result
+        _per_profile_running = {
+            str(profile): int(count)
+            for profile, count in raw_per_profile.items()
+            if type(profile) is str and type(count) is int and count >= 0
+        }
+        if len(_per_profile_running) != len(raw_per_profile):
+            result.admission_blocked = True
+            result.admission_reason = "scope_telemetry_malformed"
+            result.admission_metrics = {"error": "per-profile occupancy invalid"}
+            return result
+    elif _per_profile_cap is not None:
         for prow in conn.execute(
             "SELECT assignee, COUNT(*) AS n FROM tasks "
             "WHERE status = 'running' AND assignee IS NOT NULL "
             "GROUP BY assignee"
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
+
+    # Hold a ready slot only for review work that can actually consume it.
+    # These gates intentionally mirror the review loop so an excluded,
+    # profile-capped, or respawn-guarded review cannot starve eligible ready
+    # work under adaptive dispatch's one-start budget.
+    def _any_spawnable_review() -> bool:
+        try:
+            from hermes_cli.profiles import profile_exists as _rpe
+        except Exception:
+            _rpe = None
+        for review_row in review_rows:
+            assignee = review_row["assignee"]
+            if not assignee:
+                continue
+            if allowed_profiles is not None and assignee not in allowed_profiles:
+                continue
+            if _rpe is not None and not _rpe(assignee):
+                continue
+            if (
+                _per_profile_cap is not None
+                and _per_profile_running.get(assignee, 0) >= _per_profile_cap
+            ):
+                continue
+            if check_respawn_guard(conn, review_row["id"], lane="review") is not None:
+                continue
+            return True
+        return False
+
+    ready_budget = spawn_budget
+    if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review():
+        ready_budget = max(spawn_budget - 1, 0)
     # Normalize default_assignee once: empty/whitespace string → None so the
     # rest of the loop can use ``if default_assignee:`` as a single check.
     # We also resolve profile_exists once here for the same reason.
@@ -12260,6 +13476,8 @@ def _dispatch_once_locked(
                 if _default_assignee and _default_assignee_resolved:
                     assignee = _default_assignee
             if not assignee:
+                return None
+            if allowed_profiles is not None and assignee not in allowed_profiles:
                 return None
             if (
                 _admission_profile_exists is not None
@@ -12313,7 +13531,8 @@ def _dispatch_once_locked(
         effective_spawn_capacity = len(admission_ready) + len(admission_review)
         assert strict_other_boards is not None
         native_scope_required_for_tick = bool(
-            native_scope_config.required
+            parallel_dispatch
+            or native_scope_config.required
             or (
                 effective_spawn_capacity > 0
                 and (
@@ -12413,6 +13632,11 @@ def _dispatch_once_locked(
             else:
                 result.skipped_unassigned.append(row["id"])
                 continue
+        if allowed_profiles is not None and row_assignee not in allowed_profiles:
+            _record_worker_profile_admission_skip(
+                result, row["id"], row_assignee
+            )
+            continue
         # Skip ready tasks whose assignee is not a real Hermes profile.
         # `_default_spawn` invokes ``hermes -p <assignee>`` which fails
         # with "Profile 'X' does not exist" when the assignee names a
@@ -12526,7 +13750,7 @@ def _dispatch_once_locked(
                         _native_scope_admission_required()
                         if _spawn is _default_spawn
                         else bool(
-                            (max_spawn is not None and max_spawn > 1)
+                            parallel_dispatch
                             or running_count + spawned > 0
                         )
                     )
@@ -12617,6 +13841,11 @@ def _dispatch_once_locked(
         if not row["assignee"]:
             result.skipped_unassigned.append(row["id"])
             continue
+        if allowed_profiles is not None and row["assignee"] not in allowed_profiles:
+            _record_worker_profile_admission_skip(
+                result, row["id"], row["assignee"]
+            )
+            continue
         try:
             from hermes_cli.profiles import profile_exists
         except Exception:
@@ -12695,7 +13924,7 @@ def _dispatch_once_locked(
                         _native_scope_admission_required()
                         if _spawn is _default_spawn
                         else bool(
-                            (max_spawn is not None and max_spawn > 1)
+                            parallel_dispatch
                             or running_count + spawned > 0
                         )
                     )
@@ -14843,6 +16072,9 @@ def run_daemon(
     *,
     interval: float = 60.0,
     max_spawn: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
     failure_limit: int = DEFAULT_SPAWN_FAILURE_LIMIT,
     stop_event=None,
     on_tick=None,
@@ -14861,6 +16093,31 @@ def run_daemon(
     """
     import signal
     import threading
+
+    requested_progress = max_in_progress
+    if requested_progress is None:
+        requested_progress = resolve_dispatch_caps(effective_config)[1]
+    if requested_progress is None:
+        requested_progress = configured_max_in_progress()
+    effective_config = prepare_dispatch_admission(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=requested_progress,
+    )
+    max_spawn, resolved_progress = resolve_dispatch_caps(
+        effective_config, max_spawn=max_spawn, max_in_progress=requested_progress
+    )
+    max_in_progress = (
+        resolved_progress
+        if resolved_progress is not None
+        else resolve_max_in_progress(configured_max_in_progress())
+    )
+    allowed_worker_profiles = resolve_worker_profile_admission(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        allowed_worker_profiles=allowed_worker_profiles,
+    )
 
     if stop_event is None:
         stop_event = threading.Event()
@@ -14889,14 +16146,13 @@ def run_daemon(
             # entire backlog in one tick even with the derived default in
             # place everywhere else. Re-resolved every tick (config load is
             # mtime-cached) so operator edits apply without a restart.
-            max_in_progress = resolve_max_in_progress(
-                configured_max_in_progress()
-            )
             with contextlib.closing(connect()) as conn:
                 res = dispatch_once(
                     conn,
                     max_spawn=max_spawn,
                     max_in_progress=max_in_progress,
+                    allowed_worker_profiles=allowed_worker_profiles,
+                    effective_config=effective_config,
                     failure_limit=failure_limit,
                 )
             if on_tick is not None:
