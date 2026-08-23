@@ -1860,6 +1860,7 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
         focus: Optional[str] = None,
+        notify_completion: bool = False,
     ) -> None:
         """Spawn the background memory/skill review thread.
 
@@ -1872,6 +1873,10 @@ class AIAgent:
         ``focus`` is optional user-supplied steering (from ``/refine``)
         appended to the review prompt — e.g. "save the deploy workflow as a
         skill". The automatic post-turn triggers never set it.
+
+        ``notify_completion`` is set by explicit ``/refine`` callers so a
+        terminal receipt is delivered even when the review saves nothing.
+        Automatic post-turn reviews keep their existing quiet no-op behavior.
         """
         # A delegation subagent (``_delegate_depth > 0``) must not run the
         # automatic post-turn review. Subagents are ephemeral workers already
@@ -1913,6 +1918,7 @@ class AIAgent:
                 focus=focus,
                 task_cfg=task_cfg,
                 review_run=review_run,
+                notify_completion=notify_completion,
             )
             # Carry the active profile into the review thread so MEMORY.md /
             # skill review writes land in the right profile (#54937).
