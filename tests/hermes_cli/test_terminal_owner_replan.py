@@ -169,6 +169,56 @@ def test_legacy_semantic_bridge_requires_explicit_default_owner(isolated_home):
         assert intent["payload"]["semantic_outcome"] == "changes_requested"
 
 
+@pytest.mark.parametrize(
+    "outcome,next_step",
+    [
+        ("rolled_back", "Dolly/default: manual action required"),
+        ("changes_requested", "manual-only follow-up required"),
+    ],
+)
+def test_explicit_manual_next_step_stays_manual_without_intent_or_wake(
+    isolated_home, outcome, next_step,
+):
+    with kb.connect() as conn:
+        tid, run_id = _semantic_task(conn)
+        assert _complete_semantic(
+            conn,
+            tid,
+            run_id,
+            {
+                "outcome": outcome,
+                "next_step": next_step,
+                "next_owner": "default",
+            },
+        )
+        assert _events(conn, tid, "needs_owner_replan") == []
+        assert kb.claim_owner_replan_for_route(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-1001",
+            thread_id="87",
+        ) is None
+        assert _events(conn, tid, "owner_replan_wake_claimed") == []
+
+
+def test_autonomous_manual_noun_next_step_remains_intent_eligible(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _semantic_task(conn)
+        assert _complete_semantic(
+            conn,
+            tid,
+            run_id,
+            {
+                "outcome": "rolled_back",
+                "next_step": "update the operator manual and rerun checks",
+                "next_owner": "default",
+            },
+        )
+        [intent] = _events(conn, tid, "needs_owner_replan")
+        assert intent["payload"]["action"] == "update the operator manual and rerun checks"
+
+
 def test_missing_project_topic_or_owner_route_is_ineligible(isolated_home):
     with kb.connect() as conn:
         missing_project, run_id = _semantic_task(conn, project_id="")

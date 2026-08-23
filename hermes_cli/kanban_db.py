@@ -9580,6 +9580,10 @@ _OWNER_REPLAN_FORBIDDEN_GATE_RE = re.compile(
     r"financial|destructive|safety|external|production)\b",
     re.IGNORECASE,
 )
+_OWNER_REPLAN_MANUAL_NEXT_STEP_RE = re.compile(
+    r"\bmanual(?:[-_\s]+(?:only|action))\b",
+    re.IGNORECASE,
+)
 _OWNER_REPLAN_TOPIC_TARGET_RE = re.compile(
     r"^[A-Za-z][A-Za-z0-9_-]*:[^:\s]+(?::[^:\s]+)?$"
 )
@@ -9865,6 +9869,8 @@ def _normalize_completion_owner_replan(
     # two historical semantic outcomes receive this compatibility bridge.
     next_step = str(metadata.get("next_step") or "").strip()
     if raw_outcome not in _OWNER_REPLAN_LEGACY_OUTCOMES or not next_step:
+        return None
+    if _OWNER_REPLAN_MANUAL_NEXT_STEP_RE.search(next_step):
         return None
     next_owner = str(metadata.get("next_owner") or "").strip().casefold()
     anchored_default = bool(

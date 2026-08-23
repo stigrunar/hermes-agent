@@ -45,7 +45,11 @@ async def _one_tick(monkeypatch, runner):
         runner._running = False
         await real_sleep(0)
 
+    async def inline_to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(asyncio, "to_thread", inline_to_thread)
     await runner._kanban_notifier_owner_loop(interval=1)
 
 
