@@ -221,6 +221,44 @@ def test_background_review_shuts_down_memory_provider_before_close(monkeypatch):
     ]
 
 
+def test_explicit_refine_reports_terminal_no_change_receipt(monkeypatch):
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    receipts = []
+    agent = _bare_agent()
+    agent.background_review_callback = receipts.append
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+        notify_completion=True,
+    )
+
+    assert receipts == [
+        "💾 Self-improvement review complete: "
+        "No memory or skill changes were saved."
+    ]
+
+
+def test_automatic_no_change_review_remains_silent(monkeypatch):
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    receipts = []
+    agent = _bare_agent()
+    agent.background_review_callback = receipts.append
+
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{"role": "user", "content": "hello"}],
+        review_memory=True,
+    )
+
+    assert receipts == []
+
+
 def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     """The review fork shares the parent's live session_id, so it must set
     ``_end_session_on_close = False``. Otherwise close() (now finalizing owned

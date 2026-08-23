@@ -2987,6 +2987,7 @@ class GatewaySlashCommandsMixin:
                 review_memory=True,
                 review_skills=review_skills,
                 focus=args or None,
+                notify_completion=True,
             )
         except Exception as exc:
             return f"/refine failed to start: {exc}"
