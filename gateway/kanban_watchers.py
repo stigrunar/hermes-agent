@@ -176,9 +176,12 @@ def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
     fingerprint = str(replan.get("fingerprint") or "")
     return (
         "[HERMES OWNER REPLAN — one shot]\n"
-        f"Project: {replan.get('project') or 'unknown'} · board: {replan.get('board') or 'unknown'}\n"
+        f"Project: {replan.get('project_id') or replan.get('project') or 'unknown'} · board: {replan.get('board') or 'unknown'}\n"
         f"Terminal task: {task_id} · run: {replan.get('terminal_run_id')} · reason: {replan.get('end_reason')}\n"
         f"Contract/revision: {replan.get('contract_id')} / {replan.get('revision')}\n"
+        f"Semantic outcome: {replan.get('semantic_outcome') or replan.get('end_reason')} · action: {replan.get('action') or 'inspect preserved artifact'}\n"
+        f"Source topic target: {replan.get('topic_target') or 'unknown'}\n"
+        f"Required successor identity: continuation_of={task_id} · project_id={replan.get('project_id') or replan.get('project') or 'unknown'} · topic_target={replan.get('topic_target') or 'unknown'} · fingerprint={fingerprint}\n"
         f"Preserved artifact: {replan.get('worktree') or 'unknown'} · branch: {replan.get('branch') or 'unknown'} · state: {replan.get('artifact_state') or 'unknown'}\n\n"
         "Inspect the terminal run, preserved worktree/diff, tests, commit and push evidence. "
         "Classify exactly one of: complete_candidate, useful_incomplete_patch, "
@@ -853,9 +856,14 @@ class GatewayKanbanWatchersMixin:
                         #   next tick retries.
                         task_terminal = task and task.status == "archived"
                         _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked")
+                        # A durable owner-replan intent is the sole bounded
+                        # agent wake for this terminal completion. Keep the
+                        # passive event notification, but do not also wake the
+                        # creator session with the generic summary.
+                        _owner_replan_wake = owner_replan is not None
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
+                            if wake_agent and not _owner_replan_wake
                             else set()
                         )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok

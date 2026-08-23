@@ -5589,7 +5589,7 @@ def complete_task(
         if not _parents_satisfied(conn, task_id):
             return False
         prior = conn.execute(
-            "SELECT status FROM tasks WHERE id = ?",
+            "SELECT * FROM tasks WHERE id = ?",
             (task_id,),
         ).fetchone()
         prior_status = prior["status"] if prior else None
@@ -5702,6 +5702,15 @@ def complete_task(
             conn, task_id, "completed",
             completed_payload,
             run_id=run_id,
+        )
+        # A completed lifecycle run may carry a bounded semantic handoff for
+        # the default owner.  Keep this ledger append in the same transaction
+        # as the immutable closing run and completion event so a completed
+        # notification cannot outrun (or duplicate) the owner intent.
+        _ensure_semantic_owner_replan_event(
+            conn,
+            dict(prior) if prior is not None else {},
+            terminal_run_id=run_id,
         )
     # Prose-scan the summary + result for t_<hex> references that do
     # not resolve. Advisory — does not block the completion. Runs in
@@ -9565,6 +9574,19 @@ def _record_spawn_failure(
 # ---------------------------------------------------------------------------
 
 _OWNER_REPLAN_EVENT_KIND = "needs_owner_replan"
+_OWNER_REPLAN_LEGACY_OUTCOMES = frozenset({"rolled_back", "changes_requested"})
+_OWNER_REPLAN_FORBIDDEN_GATE_RE = re.compile(
+    r"\b(?:human|auth(?:entication|orization)?|live|customer|public|"
+    r"financial|destructive|safety|external|production)\b",
+    re.IGNORECASE,
+)
+_OWNER_REPLAN_MANUAL_NEXT_STEP_RE = re.compile(
+    r"\bmanual(?:[-_\s]+(?:only|action))\b",
+    re.IGNORECASE,
+)
+_OWNER_REPLAN_TOPIC_TARGET_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_-]*:[^:\s]+(?::[^:\s]+)?$"
+)
 _OWNER_REPLAN_ACK_RE = re.compile(
     r"(?mi)^\s*owner_replan_ack\s*:\s*([0-9a-f]{64})\s*$"
 )
@@ -9589,11 +9611,12 @@ def _owner_replan_body_fields(task: Mapping[str, Any]) -> dict[str, str]:
         match = re.match(
             r"^\s*(contract_id|revision|canon_path|project|project_id|"
             r"hygiene_class|superseded_by|resume_policy|end_reason|"
-            r"needs_user_decision|manual_only|owner_replan_suppressed|status)\s*[:=]\s*(.*?)\s*$",
+            r"needs_user_decision|manual_only|owner_replan_suppressed|"
+            r"continuation_of|topic_target|status)\s*[:=]\s*(.*?)\s*$",
             line,
             re.IGNORECASE,
         )
-        if match and match.group(2):
+        if match:
             fields[match.group(1).lower()] = match.group(2).strip()
     return fields
 
@@ -9651,14 +9674,20 @@ def _owner_replan_route(
 
 
 def _owner_replan_project_identity(
-    task: Mapping[str, Any], board: str,
+    task: Mapping[str, Any], board: str, *, require_explicit: bool = False,
 ) -> tuple[str, str]:
     fields = _owner_replan_body_fields(task)
-    project_id = str(
-        _row_value(task, "project_id") or fields.get("project_id") or ""
-    ).strip()
+    project_id = str(_row_value(task, "project_id") or "").strip()
     if project_id:
         return project_id, "project_id"
+    if require_explicit:
+        return "", "missing"
+    # Iteration exhaustion predates project adoption and must retain its
+    # existing tenant/board fallback. Semantic completion calls opt into the
+    # strict adopted-project path above.
+    body_project = str(fields.get("project_id") or "").strip()
+    if body_project:
+        return body_project, "project_id_body"
     tenant = str(_row_value(task, "tenant") or fields.get("project") or "").strip()
     return (tenant, "tenant") if tenant else (board, "board")
 
@@ -9708,7 +9737,7 @@ def _owner_replan_active_successor(
     # secondary seam for current revisions; task-local legacy ids never join by
     # title or prose similarity.
     rows = conn.execute(
-        "SELECT * FROM tasks WHERE id<>? AND status IN ('ready','running','review') "
+        "SELECT * FROM tasks WHERE id<>? AND status IN ('todo','ready','running','review') "
         "ORDER BY created_at DESC",
         (task_id,),
     ).fetchall()
@@ -9726,20 +9755,305 @@ def _owner_replan_active_successor(
             return str(row["id"])
         if not contract_id.startswith("task:"):
             other_contract, other_revision, _ = _owner_replan_identity(candidate)
-            if other_contract == contract_id and other_revision != revision:
+            current_match = re.search(r"(?:^|[-_.])r(\d+)$", revision, re.IGNORECASE)
+            other_match = re.search(r"(?:^|[-_.])r(\d+)$", other_revision, re.IGNORECASE)
+            if (
+                other_contract == contract_id
+                and current_match is not None
+                and other_match is not None
+                and int(other_match.group(1)) > int(current_match.group(1))
+            ):
                 return str(row["id"])
     return None
+
+
+def _owner_replan_gate_text(metadata: Mapping[str, Any]) -> str:
+    """Return only explicit handoff/gate text, never completion prose."""
+    values: list[str] = []
+    for key in (
+        "next_step", "next_owner", "authority", "action", "risk", "gate",
+        "approval", "safety_gate", "external_action", "auth_required",
+        "live_required", "requires_human", "scope",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            values.append(value)
+    envelope = metadata.get("owner_replan")
+    if isinstance(envelope, Mapping):
+        for key in (
+            "owner", "action", "authority", "risk", "gate", "approval",
+            "safety_gate", "external_action", "auth_required", "live_required",
+            "requires_human", "scope",
+        ):
+            value = envelope.get(key)
+            if isinstance(value, str):
+                values.append(value)
+    return "\n".join(values)
+
+
+def _owner_replan_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _owner_replan_has_gate_flag(metadata: Mapping[str, Any]) -> bool:
+    keys = (
+        "auth_required", "live_required", "requires_human", "external_action",
+        "safety_gate",
+    )
+    if any(_owner_replan_truthy(metadata.get(key)) for key in keys):
+        return True
+    envelope = metadata.get("owner_replan")
+    return isinstance(envelope, Mapping) and any(
+        _owner_replan_truthy(envelope.get(key)) for key in keys
+    )
+
+
+def _normalize_completion_owner_replan(
+    metadata: Any,
+) -> Optional[dict[str, Any]]:
+    """Normalize one explicitly safe completion handoff.
+
+    The nested envelope is the canonical contract.  The flat bridge is kept
+    deliberately narrow for historical ``rolled_back`` and
+    ``changes_requested`` completions; neither path reads summary prose.
+    """
+    if not isinstance(metadata, Mapping):
+        return None
+    envelope = metadata.get("owner_replan")
+    raw_outcome = str(metadata.get("outcome") or "").strip().casefold()
+    if isinstance(envelope, Mapping):
+        owner = str(envelope.get("owner") or "").strip().casefold()
+        authority = str(envelope.get("authority") or "").strip().casefold()
+        action = str(envelope.get("action") or "").strip()
+        if owner != "default" or authority != "agent_internal" or not action:
+            return None
+        if envelope.get("needs_user_decision") is not False:
+            return None
+        if (
+            "needs_user_decision" in metadata
+            and metadata.get("needs_user_decision") is not False
+        ):
+            return None
+        if "manual_only" in metadata and metadata.get("manual_only") is not False:
+            return None
+        if _owner_replan_truthy(metadata.get("owner_replan_suppressed")):
+            return None
+        if _owner_replan_has_gate_flag(metadata):
+            return None
+        if str(metadata.get("resume_policy") or "").strip().casefold() == "manual":
+            return None
+        semantic_outcome = raw_outcome or str(
+            envelope.get("outcome") or "completed"
+        ).strip().casefold()
+        if semantic_outcome not in {"completed", *_OWNER_REPLAN_LEGACY_OUTCOMES}:
+            return None
+        if _OWNER_REPLAN_FORBIDDEN_GATE_RE.search(_owner_replan_gate_text(metadata)):
+            return None
+        return {
+            "semantic_outcome": semantic_outcome,
+            "action": action,
+            "owner_replan": {
+                "owner": "default",
+                "action": action,
+                "authority": "agent_internal",
+                "needs_user_decision": False,
+            },
+            "topic_target": str(
+                metadata.get("topic_target") or envelope.get("topic_target") or ""
+            ).strip(),
+        }
+
+    # A generic completed + next_step is intentionally not enough.  Only the
+    # two historical semantic outcomes receive this compatibility bridge.
+    next_step = str(metadata.get("next_step") or "").strip()
+    if raw_outcome not in _OWNER_REPLAN_LEGACY_OUTCOMES or not next_step:
+        return None
+    if _OWNER_REPLAN_MANUAL_NEXT_STEP_RE.search(next_step):
+        return None
+    next_owner = str(metadata.get("next_owner") or "").strip().casefold()
+    anchored_default = bool(
+        re.search(r"\b(?:dolly\s*/\s*default|default\s+owner|dolly\s+owner)\b", next_step, re.IGNORECASE)
+    )
+    if next_owner and next_owner != "default":
+        return None
+    if not next_owner and not anchored_default:
+        return None
+    if (
+        "needs_user_decision" in metadata
+        and metadata.get("needs_user_decision") is not False
+    ):
+        return None
+    if "manual_only" in metadata and metadata.get("manual_only") is not False:
+        return None
+    if _owner_replan_truthy(metadata.get("owner_replan_suppressed")):
+        return None
+    if _owner_replan_has_gate_flag(metadata):
+        return None
+    if str(metadata.get("resume_policy") or "").strip().casefold() == "manual":
+        return None
+    if _OWNER_REPLAN_FORBIDDEN_GATE_RE.search(_owner_replan_gate_text(metadata)):
+        return None
+    return {
+        "semantic_outcome": raw_outcome,
+        "action": next_step,
+        "owner_replan": {
+            "owner": "default",
+            "action": next_step,
+            "authority": "agent_internal",
+            "needs_user_decision": False,
+        },
+        "topic_target": str(metadata.get("topic_target") or "").strip(),
+    }
+
+
+def _owner_replan_topic_target(
+    task: Mapping[str, Any], normalized: Mapping[str, Any],
+) -> Optional[str]:
+    fields = _owner_replan_body_fields(task)
+    candidates = [
+        str(fields.get("topic_target") or "").strip(),
+        str(normalized.get("topic_target") or "").strip(),
+    ]
+    candidates = [value for value in candidates if value]
+    if not candidates or len(set(candidates)) != 1:
+        return None
+    topic_target = candidates[0]
+    if not _OWNER_REPLAN_TOPIC_TARGET_RE.fullmatch(topic_target):
+        return None
+    return topic_target
+
+
+def _completion_owner_replan_from_run(
+    conn: sqlite3.Connection, terminal_run_id: Optional[int],
+) -> Optional[dict[str, Any]]:
+    if terminal_run_id is None:
+        return None
+    row = conn.execute(
+        "SELECT outcome, metadata FROM task_runs WHERE id=?", (int(terminal_run_id),)
+    ).fetchone()
+    if row is None or str(row["outcome"] or "").casefold() != "completed":
+        return None
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return _normalize_completion_owner_replan(metadata)
+
+
+def _ensure_semantic_owner_replan_event(
+    conn: sqlite3.Connection,
+    task_snapshot: Mapping[str, Any],
+    *,
+    terminal_run_id: Optional[int],
+) -> Optional[str]:
+    """Append one safe semantic completion intent in the close transaction."""
+    task_id = str(_row_value(task_snapshot, "id") or "").strip()
+    if not task_id or terminal_run_id is None:
+        return None
+    current_run_id = _row_value(task_snapshot, "current_run_id")
+    if current_run_id is not None and int(current_run_id) != int(terminal_run_id):
+        return None
+    if str(_row_value(task_snapshot, "status") or "").casefold() not in {
+        "running", "ready", "blocked", "review",
+    }:
+        return None
+    fields = _owner_replan_body_fields(task_snapshot)
+    hygiene = str(
+        _row_value(task_snapshot, "hygiene_class") or fields.get("hygiene_class") or ""
+    ).strip().casefold()
+    if hygiene in {"obsolete", "superseded", "cancelled", "archived"}:
+        return None
+    if str(
+        _row_value(task_snapshot, "superseded_by") or fields.get("superseded_by") or ""
+    ).strip():
+        return None
+    if str(fields.get("status") or "").strip().casefold() in {
+        "superseded", "obsolete", "cancelled", "archived",
+    }:
+        return None
+    if _owner_replan_repo_suppression(task_snapshot):
+        return None
+    normalized = _completion_owner_replan_from_run(conn, terminal_run_id)
+    if normalized is None:
+        return None
+    project_id, project_source = _owner_replan_project_identity(
+        task_snapshot, _board_slug_for_connection(conn), require_explicit=True,
+    )
+    if not project_id:
+        return None
+    topic_target = _owner_replan_topic_target(task_snapshot, normalized)
+    if topic_target is None:
+        return None
+    if _owner_replan_active_successor(conn, task_snapshot):
+        return None
+    route = _owner_replan_route(conn, task_id)
+    if route is None:
+        return None
+    board = _board_slug_for_connection(conn)
+    contract_id, revision, _ = _owner_replan_identity(task_snapshot)
+    semantic_outcome = str(normalized["semantic_outcome"])
+    action = str(normalized["action"])
+    payload: dict[str, Any] = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND,
+        "owner": "default",
+        "project": project_id,
+        "project_id": project_id,
+        "project_source": project_source,
+        "board": board,
+        "topic_target": topic_target,
+        "task_id": task_id,
+        "continuation_of": task_id,
+        "terminal_run_id": int(terminal_run_id),
+        "contract_id": contract_id,
+        "revision": revision,
+        "semantic_outcome": semantic_outcome,
+        "end_reason": semantic_outcome,
+        "action": action,
+        "owner_replan": normalized["owner_replan"],
+        "worktree": str(_row_value(task_snapshot, "workspace_path") or ""),
+        "branch": str(_row_value(task_snapshot, "branch_name") or ""),
+        "artifact_state": "unknown",
+        "resume_policy": "never",
+        "retryable": False,
+        "route": route,
+        "owner_route": route,
+    }
+    payload["fingerprint"] = _owner_replan_fingerprint(payload)
+    fingerprint = str(payload["fingerprint"])
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+        (task_id, _OWNER_REPLAN_EVENT_KIND),
+    ).fetchall():
+        try:
+            existing = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
+            return fingerprint
+    _append_event(
+        conn,
+        task_id,
+        _OWNER_REPLAN_EVENT_KIND,
+        payload,
+        run_id=int(terminal_run_id),
+    )
+    return fingerprint
 
 
 def _owner_replan_fingerprint(payload: Mapping[str, Any]) -> str:
     identity = {
         "event_type": _OWNER_REPLAN_EVENT_KIND,
-        "project": str(payload.get("project") or ""),
+        "board": str(payload.get("board") or ""),
+        "project_id": str(payload.get("project_id") or payload.get("project") or ""),
         "task_id": str(payload.get("task_id") or ""),
+        "terminal_run_id": int(payload.get("terminal_run_id") or 0),
         "contract_id": str(payload.get("contract_id") or ""),
         "revision": str(payload.get("revision") or ""),
-        "terminal_run_id": int(payload.get("terminal_run_id") or 0),
-        "end_reason": str(payload.get("end_reason") or ""),
+        "semantic_outcome": str(
+            payload.get("semantic_outcome") or payload.get("end_reason") or ""
+        ),
     }
     return hashlib.sha256(
         json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()
