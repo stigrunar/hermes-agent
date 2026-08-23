@@ -75,6 +75,50 @@ def _terminal_fixture(conn):
     return tid
 
 
+def _semantic_fixture(conn):
+    tid = kb.create_task(
+        conn,
+        title="semantic owner wake",
+        body="contract_id: semantic-owner\nrevision: r1\n"
+        "topic_target: telegram:-1001:87",
+        assignee="dollycode",
+        tenant="owner-project",
+        project_id="adopted-project",
+        workspace_kind="dir",
+        workspace_path="/tmp/semantic-owner-artifact",
+        max_retries=0,
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET project_id=? WHERE id=?", ("adopted-project", tid))
+    claimed = kb.claim_task(conn, tid, claimer="semantic-worker")
+    assert claimed is not None and claimed.current_run_id is not None
+    kb.add_notify_sub(
+        conn,
+        task_id=tid,
+        platform="telegram",
+        chat_id="owner-chat",
+        chat_type="group",
+        thread_id="17",
+        notifier_profile="default",
+        delivery_mode="notify+wake",
+    )
+    assert kb.complete_task(
+        conn,
+        tid,
+        expected_run_id=claimed.current_run_id,
+        summary="useful preserved patch",
+        metadata={
+            "owner_replan": {
+                "owner": "default",
+                "action": "inspect the preserved patch",
+                "authority": "agent_internal",
+                "needs_user_decision": False,
+            },
+        },
+    )
+    return tid
+
+
 def _control(conn, tid, kind):
     rows = conn.execute(
         "SELECT payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id",
@@ -106,6 +150,36 @@ def test_owner_replan_wakes_default_once_and_duplicate_tick_is_quiet(tmp_path, m
     try:
         assert len(_control(conn, tid, "owner_replan_wake_claimed")) == 1
         assert len(_control(conn, tid, "owner_replan_delivered")) == 1
+    finally:
+        conn.close()
+
+
+def test_semantic_completion_keeps_passive_notice_but_suppresses_generic_wake(
+    tmp_path, monkeypatch,
+):
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "semantic-owner.db"))
+    kb.init_db()
+    conn = kb.connect()
+    try:
+        tid = _semantic_fixture(conn)
+    finally:
+        conn.close()
+
+    adapter = RecordingAdapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    assert "action: inspect the preserved patch" in prompt
+    assert f"continuation_of={tid}" in prompt
+    assert "project_id=adopted-project" in prompt
+    assert "topic_target=telegram:-1001:87" in prompt
+    assert "Do not unblock or retry" in prompt
+
+    conn = kb.connect()
+    try:
+        assert len(_control(conn, tid, "owner_replan_delivered")) == 1
+        assert _control(conn, tid, "owner_replan_wake_claimed")
     finally:
         conn.close()
 

@@ -60,6 +60,169 @@ def _events(conn, tid: str, kind: str) -> list[dict]:
     ]
 
 
+def _semantic_task(
+    conn,
+    *,
+    body_extra: str = "",
+    project_id: str = "adopted-project",
+    add_route: bool = True,
+) -> tuple[str, int]:
+    tid, run_id = _terminal_task(
+        conn,
+        body_extra=(
+            "topic_target: telegram:-1001:87\n" + body_extra
+        ),
+    )
+    with kb.write_txn(conn):
+        conn.execute("UPDATE tasks SET project_id=? WHERE id=?", (project_id, tid))
+        if not add_route:
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id=?", (tid,)
+            )
+    return tid, run_id
+
+
+def _complete_semantic(conn, tid: str, run_id: int, metadata: dict) -> bool:
+    return kb.complete_task(
+        conn,
+        tid,
+        expected_run_id=run_id,
+        summary="terminal worker left a preserved artifact",
+        metadata=metadata,
+    )
+
+
+def test_completed_semantic_envelope_appends_one_owner_intent_in_close_txn(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _semantic_task(conn)
+        metadata = {
+            "owner_replan": {
+                "owner": "default",
+                "action": "inspect the preserved patch and materialize one current revision",
+                "authority": "agent_internal",
+                "needs_user_decision": False,
+            },
+            "topic_target": "telegram:-1001:87",
+        }
+        assert _complete_semantic(conn, tid, run_id, metadata)
+        [intent] = _events(conn, tid, "needs_owner_replan")
+        assert intent["run_id"] == run_id
+        payload = intent["payload"]
+        assert payload["semantic_outcome"] == "completed"
+        assert payload["project_id"] == "adopted-project"
+        assert payload["topic_target"] == "telegram:-1001:87"
+        assert payload["continuation_of"] == tid
+        assert payload["owner_route"]["platform"] == "telegram"
+        assert payload["owner_replan"]["authority"] == "agent_internal"
+        assert payload["owner_replan"]["needs_user_decision"] is False
+        assert len(_events(conn, tid, "completed")) == 1
+        assert len(_events(conn, tid, "needs_owner_replan")) == 1
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        {"outcome": "completed", "next_step": "Dolly/default: inspect patch"},
+        {"outcome": "changes_requested", "next_step": "inspect patch", "next_owner": "reviewer"},
+        {"outcome": "rolled_back", "next_step": "inspect patch"},
+        {"outcome": "completed", "owner_replan": {"owner": "default", "action": "inspect", "authority": "human", "needs_user_decision": False}},
+        {"owner_replan": {"owner": "default", "action": "inspect", "authority": "agent_internal", "needs_user_decision": True}},
+        {"owner_replan": {"owner": "default", "action": "wait for human approval", "authority": "agent_internal", "needs_user_decision": False}},
+    ],
+)
+def test_semantic_completion_fails_closed_without_explicit_safe_envelope(
+    isolated_home, metadata,
+):
+    with kb.connect() as conn:
+        tid, run_id = _semantic_task(conn)
+        assert _complete_semantic(conn, tid, run_id, metadata)
+        assert _events(conn, tid, "needs_owner_replan") == []
+
+
+def test_legacy_semantic_bridge_requires_explicit_default_owner(isolated_home):
+    with kb.connect() as conn:
+        accepted, accepted_run = _semantic_task(conn)
+        assert _complete_semantic(
+            conn,
+            accepted,
+            accepted_run,
+            {
+                "outcome": "rolled_back",
+                "next_step": "restore the preserved patch",
+                "next_owner": "default",
+            },
+        )
+        [intent] = _events(conn, accepted, "needs_owner_replan")
+        assert intent["payload"]["semantic_outcome"] == "rolled_back"
+
+        anchored, anchored_run = _semantic_task(conn)
+        assert _complete_semantic(
+            conn,
+            anchored,
+            anchored_run,
+            {
+                "outcome": "changes_requested",
+                "next_step": "Dolly/default: inspect the preserved patch",
+            },
+        )
+        [intent] = _events(conn, anchored, "needs_owner_replan")
+        assert intent["payload"]["semantic_outcome"] == "changes_requested"
+
+
+def test_missing_project_topic_or_owner_route_is_ineligible(isolated_home):
+    with kb.connect() as conn:
+        missing_project, run_id = _semantic_task(conn, project_id="")
+        assert _complete_semantic(
+            conn,
+            missing_project,
+            run_id,
+            {"owner_replan": {"owner": "default", "action": "inspect", "authority": "agent_internal", "needs_user_decision": False}},
+        )
+        assert _events(conn, missing_project, "needs_owner_replan") == []
+
+        missing_topic, run_id = _semantic_task(conn, body_extra="topic_target:")
+        assert _complete_semantic(
+            conn,
+            missing_topic,
+            run_id,
+            {"owner_replan": {"owner": "default", "action": "inspect", "authority": "agent_internal", "needs_user_decision": False}},
+        )
+        assert _events(conn, missing_topic, "needs_owner_replan") == []
+
+        missing_route, run_id = _semantic_task(conn, add_route=False)
+        assert _complete_semantic(
+            conn,
+            missing_route,
+            run_id,
+            {"owner_replan": {"owner": "default", "action": "inspect", "authority": "agent_internal", "needs_user_decision": False}},
+        )
+        assert _events(conn, missing_route, "needs_owner_replan") == []
+
+
+def test_semantic_owner_intent_is_not_retried_or_duplicated(isolated_home):
+    with kb.connect() as conn:
+        tid, run_id = _semantic_task(conn)
+        metadata = {
+            "owner_replan": {
+                "owner": "default",
+                "action": "inspect the preserved patch",
+                "authority": "agent_internal",
+                "needs_user_decision": False,
+            }
+        }
+        assert _complete_semantic(conn, tid, run_id, metadata)
+        assert kb.complete_task(conn, tid, metadata=metadata) is False
+        assert len(_events(conn, tid, "needs_owner_replan")) == 1
+        first = kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        )
+        second = kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        )
+        assert first is not None
+        assert second is None
+
+
 def test_iteration_exhaustion_is_terminal_and_one_shot(isolated_home):
     with kb.connect() as conn:
         tid, run_id = _terminal_task(conn)
