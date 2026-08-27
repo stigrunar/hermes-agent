@@ -601,11 +601,16 @@ def _resolve_cua_driver_app_path(driver_cmd: str) -> Optional[str]:
     chain never validated. If the resolved driver does not live inside an
     app bundle, the caller fails closed with install guidance.
     """
+    # The official installer exposes ~/.local/bin/cua-driver as a symlink into
+    # CuaDriver.app. Canonicalize it before enforcing bundle provenance so the
+    # validated install is not rejected merely because PATH selected the
+    # installer-managed symlink.
+    resolved_driver = os.path.realpath(driver_cmd)
     marker = ".app/Contents/MacOS/"
-    marker_index = driver_cmd.find(marker)
+    marker_index = resolved_driver.find(marker)
     if marker_index < 0:
         return None
-    candidate = driver_cmd[: marker_index + len(".app")]
+    candidate = resolved_driver[: marker_index + len(".app")]
     executable = os.path.join(candidate, "Contents", "MacOS", "cua-driver")
     if os.path.isfile(executable) and os.access(executable, os.X_OK):
         return candidate
@@ -617,7 +622,9 @@ def _resolve_cua_driver_app_path(driver_cmd: str) -> Optional[str]:
 # suffixed identifier ("com.trycua.driver.evil") or a different non-empty
 # team is an impostor bundle, not a variant.
 _CUA_DRIVER_BUNDLE_ID = "com.trycua.driver"
-_CUA_DRIVER_TEAM_ID = "4YEC26S9KF"
+# Official stable releases have used both signer identities. Keep exact-match
+# verification while accepting the currently notarized Cua AI, Inc. release.
+_CUA_DRIVER_TEAM_IDS = frozenset({"4YEC26S9KF", "YCK386LBJ7"})
 
 
 def _validate_cua_driver_app_signature(app_path: str) -> None:
@@ -664,13 +671,14 @@ def _validate_cua_driver_app_signature(app_path: str) -> None:
             f"CuaDriver.app at {app_path} has identifier {identifier!r}, "
             f"expected {_CUA_DRIVER_BUNDLE_ID!r}; refusing to launch it."
         )
-    if team == _CUA_DRIVER_TEAM_ID:
+    if team in _CUA_DRIVER_TEAM_IDS:
         return
     if team in ("", "not set") and _computer_use_cfg().get("allow_unsigned_driver") is True:
         return
+    expected_teams = ", ".join(sorted(_CUA_DRIVER_TEAM_IDS))
     raise RuntimeError(
-        f"CuaDriver.app at {app_path} is signed by team {team!r}, expected "
-        f"{_CUA_DRIVER_TEAM_ID!r}; refusing to launch it. (Set "
+        f"CuaDriver.app at {app_path} is signed by team {team!r}, expected one "
+        f"of {expected_teams}; refusing to launch it. (Set "
         "computer_use.allow_unsigned_driver: true in config.yaml only for "
         "local unsigned driver builds.)"
     )
