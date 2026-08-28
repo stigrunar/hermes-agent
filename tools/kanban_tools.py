@@ -503,6 +503,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "execution_preflight": task.execution_preflight,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +550,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "execution_preflight": t.execution_preflight,
                 }
 
             def _run_dict(r):
@@ -1413,6 +1415,21 @@ def _handle_create(args: dict, **kw) -> str:
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
+    execution = args.get("execution")
+    if execution is not None and not isinstance(execution, dict):
+        return tool_error(
+            f"execution must be an object, got {type(execution).__name__}"
+        )
+    if execution is not None:
+        missing_execution_fields = [
+            field
+            for field in ("environment", "action")
+            if not str(execution.get(field) or "").strip()
+        ]
+        if missing_execution_fields:
+            return tool_error(
+                "execution requires non-empty environment and action"
+            )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1461,6 +1478,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                execution=execution,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1470,6 +1488,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                execution_preflight=(
+                    new_task.execution_preflight if new_task else None
+                ),
                 subscribed=subscribed,
             )
         finally:
@@ -2302,6 +2323,34 @@ KANBAN_CREATE_SCHEMA = {
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
                 ),
+            },
+            "execution": {
+                "type": "object",
+                "description": (
+                    "Optional repository execution preflight. The resolver "
+                    "applies the named environment and action, then clamps "
+                    "quality/risk upward to the project's safety floor."
+                ),
+                "properties": {
+                    "environment": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "inspect", "test", "build", "restart",
+                            "deploy", "migrate", "write", "destructive",
+                        ],
+                    },
+                    "quality_mode": {
+                        "type": "string",
+                        "enum": ["SPIKE", "FEATURE", "RELEASE"],
+                    },
+                    "risk_tier": {
+                        "type": "string",
+                        "enum": ["R0", "R1", "R2", "R3"],
+                    },
+                },
+                "additionalProperties": False,
+                "required": ["environment", "action"],
             },
             "board": _board_schema_prop(),
         },

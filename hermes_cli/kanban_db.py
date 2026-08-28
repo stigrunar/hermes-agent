@@ -90,6 +90,11 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
+from hermes_cli.project_execution_policy import (
+    canonical_execution_preflight,
+    parse_execution_preflight,
+    resolve_project_execution_policy,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -1141,6 +1146,9 @@ class Task:
     # Unblock-loop counter. See the column comment in SCHEMA_SQL and
     # ``BLOCK_RECURRENCE_LIMIT``. Reset only on successful completion.
     block_recurrences: int = 0
+    # Canonical JSON object produced by the repository-local execution policy
+    # resolver. None preserves legacy tasks created before preflight support.
+    execution_preflight: Optional[dict] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -1234,6 +1242,10 @@ class Task:
                 int(row["block_recurrences"])
                 if "block_recurrences" in keys and row["block_recurrences"] is not None
                 else 0
+            ),
+            execution_preflight=(
+                parse_execution_preflight(row["execution_preflight"])
+                if "execution_preflight" in keys else None
             ),
         )
 
@@ -1422,7 +1434,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    -- Canonical, deterministic JSON policy snapshot captured at task create.
+    execution_preflight TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -2690,6 +2704,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             "block_recurrences INTEGER NOT NULL DEFAULT 0",
         )
 
+    if "execution_preflight" not in cols:
+        # Additive nullable column: legacy rows intentionally remain
+        # indistinguishable from pre-policy tasks (NULL passthrough).
+        _add_column_if_missing(
+            conn,
+            "tasks",
+            "execution_preflight",
+            "execution_preflight TEXT",
+        )
+
     # Indexes over additive ``tasks`` columns must be created after the
     # columns exist. Keeping them in SCHEMA_SQL breaks legacy boards: SQLite
     # parses each statement in ``executescript`` against the live schema, so a
@@ -3194,6 +3218,7 @@ def create_task(
     board: Optional[str] = None,
     project_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
+    execution: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a new task and optionally link it under parent tasks.
 
@@ -3346,6 +3371,10 @@ def create_task(
             # Canonicalise (a slug may have been passed) and anchor the
             # worktree under the project's primary repo.
             project_id = project_obj.id
+            # Policy resolution is anchored to the canonical Project repo,
+            # never to a generated task worktree or the ambient cwd.
+            if project_obj.primary_path:
+                project_repo = str(project_obj.primary_path)
             if workspace_kind == "scratch" and project_obj.primary_path:
                 workspace_kind = "worktree"
             if (
@@ -3441,6 +3470,12 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    # Resolve only after the project lookup above. An explicit execution
+    # request with no usable project/profile still gets a conservative
+    # persisted snapshot; only no profile + no request is legacy passthrough.
+    execution_preflight = resolve_project_execution_policy(project_repo, execution)
+    execution_preflight_json = canonical_execution_preflight(execution_preflight)
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -3508,8 +3543,8 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, execution_preflight
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -3535,6 +3570,7 @@ def create_task(
                         1 if goal_mode else 0,
                         int(goal_max_turns) if goal_max_turns is not None else None,
                         session_id,
+                        execution_preflight_json,
                     ),
                 )
                 for pid in parents:
@@ -3563,6 +3599,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "execution_preflight": execution_preflight,
                     },
                 )
                 _inherit_notify_subs(conn, task_id, parents, created_at=now)
@@ -11072,6 +11109,56 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+
+    # Execution preflight is intentionally the first structured guidance the
+    # worker sees, before the user-authored body. Keep it compact and explicit
+    # so policy cannot be mistaken for task prose.
+    if task.execution_preflight:
+        preflight = task.execution_preflight
+        resolved = preflight.get("resolved") or {}
+        floor = preflight.get("floor") or {}
+        ceiling = preflight.get("ceiling") or {}
+        proof = preflight.get("proof_policy") or {}
+        lines.append("## Execution preflight")
+        lines.append(
+            "Effective environment: "
+            f"{resolved.get('environment') or '(unspecified)'}"
+        )
+        lines.append(f"Mode: {resolved.get('quality_mode') or 'FEATURE'}")
+        lines.append(f"Risk: {resolved.get('risk_tier') or 'R3'}")
+        lines.append(
+            "Continuity proof: "
+            f"{resolved.get('continuity_proof') or 'rollback'}"
+        )
+        lines.append(
+            "Invariant floor: "
+            f"mode >= {floor.get('quality_mode') or 'FEATURE'}, "
+            f"risk >= {floor.get('risk_tier') or 'R3'}"
+        )
+        lines.append(
+            "Invariant ceiling: "
+            f"mode <= {ceiling.get('quality_mode') or 'RELEASE'}, "
+            f"risk <= {ceiling.get('risk_tier') or 'R3'}"
+        )
+        lines.append(
+            "Proof: "
+            f"{proof.get('scope') or 'conservative'}; "
+            "proportional to the resolved gate; escalation allowed."
+        )
+        lines.append(
+            "Reasons: "
+            + ", ".join(str(reason) for reason in (preflight.get("reasons") or []))
+        )
+        if preflight.get("diagnostics"):
+            lines.append(
+                "Diagnostics: "
+                + ", ".join(str(item) for item in preflight["diagnostics"])
+            )
+        lines.append(
+            "Verification discipline: this is a floor/ceiling contract for "
+            "proportional proof. Workers may escalate on concrete evidence, "
+            "but must not add detached QA or full release ceremony by habit."
+        )
     lines.append("")
 
     if task.body and task.body.strip():
