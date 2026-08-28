@@ -120,6 +120,26 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert d.detail.endswith("…") or len(d.detail) < 700
 
 
+@pytest.mark.parametrize(
+    ("status", "expected_count"),
+    [("cancelled", 0), ("blocked", 1), ("ready", 1), ("todo", 1)],
+)
+def test_repeated_failures_ignores_cancelled_but_not_active_statuses(
+    status, expected_count,
+):
+    task = _task(
+        status=status,
+        consecutive_failures=4,
+        last_failure_error="worker failed",
+    )
+
+    diagnostics = kd._rule_repeated_failures(
+        task, [], [], int(time.time()), {"failure_threshold": 2}
+    )
+
+    assert len(diagnostics) == expected_count
+
+
 # ---------------------------------------------------------------------------
 # Severity sorting
 # ---------------------------------------------------------------------------

@@ -531,8 +531,8 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     Accepts the legacy ``spawn_failure_threshold`` config key for
     back-compat.
 
-    Terminal statuses are exempt: a done/archived card has nothing left
-    to retry, so a lingering failure streak is history, not a signal.
+    Terminal statuses are exempt: a done/archived/cancelled card has nothing
+    left to retry, so a lingering failure streak is history, not a signal.
     (``complete_task`` resets the counter, but a manual done — e.g. a
     dashboard drag — ends no run and used to leave the flag stuck.)
 
@@ -542,7 +542,9 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     "failed Nx", which reads as a current failure. It re-fires if the new
     run fails too (status leaves ``running`` with a recorded outcome).
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in (
+        "done", "archived", "cancelled", "running",
+    ):
         return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
