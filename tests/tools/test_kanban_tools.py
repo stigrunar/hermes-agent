@@ -579,6 +579,18 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
 
 
+def test_kanban_guidance_routes_internal_owner_verdicts_to_review():
+    """Specialists must not consume the human block-loop for controller-owned
+    acceptance and risk decisions. Same-card review is the non-triage handoff.
+    """
+    from agent.prompt_builder import KANBAN_GUIDANCE
+
+    assert 'reviewer="default"' in KANBAN_GUIDANCE
+    assert "do **not** call `kanban_block`" in KANBAN_GUIDANCE
+    assert "avoids block-loop escalation to human triage" in KANBAN_GUIDANCE
+    assert '`kanban_block(kind="needs_input"' in KANBAN_GUIDANCE
+
+
 # ---------------------------------------------------------------------------
 # Worker task-ownership enforcement (regression tests for #19534)
 # ---------------------------------------------------------------------------
