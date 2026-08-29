@@ -2,10 +2,10 @@
 
 After sustained Bad Gateway / TimedOut reconnect cycles, the PTB httpx client
 can enter a wedged state where ``bot.send_message()`` returns a valid Message
-but nothing reaches the recipient.  ``_send_path_degraded`` short-circuits
+but nothing reaches the recipient. ``_send_path_degraded`` short-circuits
 ``send()`` so cron's live-adapter branch falls through to standalone HTTP.
 """
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -22,8 +22,7 @@ def _make_adapter() -> TelegramAdapter:
 
 @pytest.mark.asyncio
 async def test_send_short_circuits_when_path_degraded():
-    """Degraded adapter returns failure WITHOUT calling send_message,
-    so cron's live-adapter branch falls through to standalone HTTP."""
+    """Degraded adapter returns failure without calling send_message."""
     adapter = _make_adapter()
     adapter._send_path_degraded = True
 
@@ -50,12 +49,40 @@ async def test_send_long_flood_fails_closed_without_inline_sleep(monkeypatch):
     sleep = AsyncMock()
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
 
-    result = await adapter.send("123", "hello")
+    result = await adapter._send_with_retry("123", "hello")
 
     assert result.success is False
     assert result.error == "flood_control:5827.0"
     assert result.retry_after == 5827.0
     assert result.retryable is False
+    assert result.error_kind == "rate_limited"
+    assert result.raw_response == {"delivery_state": "deferred"}
+    assert adapter._bot.send_message.await_count == 1
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rich_send_long_flood_is_durable_without_inline_sleep(monkeypatch):
+    """sendRichMessage obeys the same long-flood cap as the legacy path."""
+    adapter = _make_adapter()
+    adapter._bot.do_api_request = AsyncMock(side_effect=_FloodError(5827.0))
+    monkeypatch.setattr(adapter, "_should_attempt_rich", lambda *_a, **_kw: True)
+    sleep = AsyncMock()
+    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
+
+    result = await adapter._send_with_retry(
+        "123",
+        "| Item | State |\n| --- | --- |\n| Queue | waiting |",
+    )
+
+    assert result.success is False
+    assert result.error == "flood_control:5827.0"
+    assert result.retry_after == 5827.0
+    assert result.retryable is False
+    assert result.error_kind == "rate_limited"
+    assert result.raw_response == {"delivery_state": "deferred"}
+    assert adapter._bot.do_api_request.await_count == 1
+    adapter._bot.send_message.assert_not_awaited()
     sleep.assert_not_awaited()
 
 
@@ -74,5 +101,3 @@ async def test_send_short_flood_still_retries_inline(monkeypatch):
     assert result.success is True
     assert result.message_id == "7"
     sleep.assert_awaited_once_with(2.0)
-
-

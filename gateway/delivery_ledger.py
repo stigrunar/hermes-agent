@@ -44,7 +44,9 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import math
 import os
+import random
 import sqlite3
 import threading
 import time
@@ -64,6 +66,7 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_DEFER_JITTER_SECONDS = 1.0
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -124,7 +127,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            retry_not_before REAL
         )"""
     )
     columns = {
@@ -134,6 +138,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         try:
             conn.execute(
                 "ALTER TABLE delivery_obligations ADD COLUMN adapter_profile TEXT"
+            )
+        except sqlite3.OperationalError as exc:
+            # Concurrent first-use connections can both observe the old schema.
+            if "duplicate column" not in str(exc).lower():
+                raise
+    if "retry_not_before" not in columns:
+        try:
+            conn.execute(
+                "ALTER TABLE delivery_obligations ADD COLUMN retry_not_before REAL"
             )
         except sqlite3.OperationalError as exc:
             # Concurrent first-use connections can both observe the old schema.
@@ -270,6 +283,56 @@ def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
 
 
+def mark_deferred(
+    obligation_id: str,
+    retry_after: float,
+    *,
+    now: Optional[float] = None,
+    error_kind: str = "flood_control",
+) -> float:
+    """Persist an explicit unsent Telegram flood rejection for later retry.
+
+    ``retry_after`` is server authority.  Invalid, negative, or non-finite
+    values are rejected rather than converted into an early retry.  A small
+    bounded positive jitter prevents a fleet from waking on the same instant.
+    Returns the persisted wall-clock due time for scheduling/tests.
+    """
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("retry_after must be finite and nonnegative") from exc
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError("retry_after must be finite and nonnegative")
+    current = time.time() if now is None else float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be finite")
+    jitter = random.uniform(0.0, _MAX_DEFER_JITTER_SECONDS)
+    due = current + delay + max(0.0, min(float(jitter), _MAX_DEFER_JITTER_SECONDS))
+    sanitized_error = str(error_kind or "deferred_retry")[:100]
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='deferred', retry_not_before=?, updated_at=?,
+                   last_error=?
+               WHERE obligation_id=? AND state != 'delivered'""",
+            (due, current, sanitized_error, obligation_id),
+        )
+    return due
+
+
+def mark_deferred_failed(obligation_id: str, error_kind: str) -> None:
+    """Make a claimed deferred retry terminal without exposing raw errors."""
+    sanitized = str(error_kind or "deferred_send_failed")[:100]
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state != 'delivered'
+                 AND retry_not_before IS NOT NULL""",
+            (time.time(), sanitized, obligation_id),
+        )
+
+
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
     """Return an unsent runtime claim to ``failed`` without spending an attempt.
 
@@ -300,10 +363,151 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   retry_not_before=CASE
+                       WHEN ? IN ('delivered', 'failed', 'abandoned') THEN NULL
+                       ELSE retry_not_before END
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id),
+            (state, time.time(), error[:500] if error else None,
+             state, obligation_id),
         )
+
+
+def _normalized_profile(profile: Optional[str]) -> str:
+    return "default" if not profile or profile == "default" else str(profile)
+
+
+def claim_due_deferred(
+    *,
+    profile: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the first due Telegram obligation for one bot.
+
+    Ordering is deterministic by due time, creation time, then id.  A claim is
+    also the point where one unit of the existing retry budget is spent.
+    Rows owned by another live process are never touched; dead-owner rows are
+    eligible so restart reconstructs the same durable queue.
+    """
+    current = time.time() if now is None else float(now)
+    expected_profile = _normalized_profile(profile)
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        in_flight = conn.execute(
+            """SELECT owner_pid, owner_started_at
+               FROM delivery_obligations
+               WHERE platform='telegram' AND adapter_profile=?
+                 AND retry_not_before IS NOT NULL AND state='attempting'""",
+            (expected_profile,),
+        ).fetchall()
+        if any(_owner_alive(owner_pid, owner_started_at)
+               for owner_pid, owner_started_at in in_flight):
+            return None
+        rows = conn.execute(
+            """SELECT obligation_id, session_key, chat_id, thread_id, content,
+                      attempts, created_at, owner_pid, owner_started_at,
+                      retry_not_before, state
+               FROM delivery_obligations
+               WHERE platform='telegram' AND adapter_profile=?
+                 AND retry_not_before IS NOT NULL
+                 AND retry_not_before <= ?
+                 AND state IN ('deferred', 'attempting')
+               ORDER BY retry_not_before, created_at, obligation_id""",
+            (expected_profile, current),
+        ).fetchall()
+        for (
+            oid, session_key, chat_id, thread_id, content, attempts, created_at,
+            owner_pid, owner_started_at, due, state,
+        ) in rows:
+            owner_is_current = owner_pid == pid and owner_started_at == started
+            owner_is_alive = _owner_alive(owner_pid, owner_started_at)
+            # A current-process attempting row already belongs to the active
+            # send.  It becomes dead-owner restart work if shutdown interrupts.
+            if state == "attempting" and owner_is_current:
+                continue
+            if owner_is_alive and not owner_is_current:
+                continue
+            if attempts >= MAX_ATTEMPTS or (current - created_at) > STALE_AFTER_SECONDS:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', retry_not_before=NULL, updated_at=?
+                       WHERE obligation_id=? AND state=?
+                         AND owner_pid IS ? AND owner_started_at IS ?""",
+                    (current, oid, state, owner_pid, owner_started_at),
+                )
+                continue
+            cursor = conn.execute(
+                """UPDATE delivery_obligations
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       attempts=attempts+1, updated_at=?
+                   WHERE obligation_id=? AND state=?
+                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                (pid, started, current, oid, state, owner_pid, owner_started_at),
+            )
+            if cursor.rowcount:
+                return {
+                    "obligation_id": oid,
+                    "session_key": session_key,
+                    "platform": "telegram",
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "content": content,
+                    "profile": expected_profile,
+                    "attempts": attempts + 1,
+                    "retry_not_before": due,
+                }
+    return None
+
+
+def next_deferred_due(
+    *,
+    profile: Optional[str] = None,
+    now: Optional[float] = None,
+) -> Optional[float]:
+    """Return the next schedulable due time for one Telegram bot scope."""
+    current = time.time() if now is None else float(now)
+    expected_profile = _normalized_profile(profile)
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            """SELECT retry_not_before, state, owner_pid, owner_started_at
+               FROM delivery_obligations
+               WHERE platform='telegram' AND adapter_profile=?
+                 AND retry_not_before IS NOT NULL
+                 AND state IN ('deferred', 'attempting')
+               ORDER BY retry_not_before, created_at, obligation_id""",
+            (expected_profile,),
+        ).fetchall()
+    for due, state, owner_pid, owner_started_at in rows:
+        owner_is_current = owner_pid == pid and owner_started_at == started
+        if state == "attempting" and owner_is_current:
+            continue
+        if _owner_alive(owner_pid, owner_started_at) and not owner_is_current:
+            continue
+        return max(current, float(due))
+    return None
+
+
+def release_deferred_claim(obligation_id: str) -> bool:
+    """Release a claimed row when no transport send was started.
+
+    The due time is preserved and the attempt increment is refunded.  This is
+    deliberately separate from :func:`mark_deferred`, whose only caller-side
+    meaning is an explicit Telegram flood rejection.
+    """
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='deferred', attempts=CASE
+                       WHEN attempts > 0 THEN attempts - 1 ELSE 0 END,
+                   updated_at=?
+               WHERE obligation_id=? AND state='attempting'
+                 AND retry_not_before IS NOT NULL
+                 AND owner_pid IS ? AND owner_started_at IS ?""",
+            (time.time(), obligation_id, pid, started),
+        )
+    return bool(cursor.rowcount)
 
 
 def sweep_recoverable(
@@ -341,7 +545,8 @@ def sweep_recoverable(
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+                 AND NOT (platform='telegram' AND retry_not_before IS NOT NULL)"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
@@ -501,7 +706,9 @@ def _prune(now: Optional[float] = None) -> None:
         with _transaction() as conn:
             conn.execute(
                 """DELETE FROM delivery_obligations
-                   WHERE state IN ('delivered', 'abandoned') AND updated_at < ?""",
+                   WHERE (state IN ('delivered', 'abandoned')
+                          OR (state='failed' AND retry_not_before IS NOT NULL))
+                     AND updated_at < ?""",
                 (cutoff,),
             )
             total = conn.execute(

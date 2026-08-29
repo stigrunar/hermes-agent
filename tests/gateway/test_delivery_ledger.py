@@ -45,7 +45,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content, last_error
+            """SELECT state, attempts, owner_pid, content, last_error,
+                      retry_not_before
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
@@ -55,6 +56,7 @@ def _row(oid):
         "owner_pid": r[2],
         "content": r[3],
         "last_error": r[4],
+        "retry_not_before": r[5],
     }
 
 
@@ -123,13 +125,166 @@ class TestSchemaMigration:
         finally:
             conn.close()
 
-        assert "adapter_profile" in columns
+        assert {"adapter_profile", "retry_not_before"} <= columns
 
 
 class TestStateMachine:
     def test_record_starts_pending(self):
         _record()
         assert _row("ob-1")["state"] == "pending"
+
+
+class TestDeferredTelegramQueue:
+    def test_mark_deferred_persists_authoritative_due_with_bounded_jitter(
+        self, monkeypatch
+    ):
+        _record(platform="telegram")
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.5)
+
+        due = dl.mark_deferred("ob-1", 10, now=100.0)
+
+        assert due == 110.5
+        row = _row("ob-1")
+        assert row["state"] == "deferred"
+        assert row["retry_not_before"] == 110.5
+        assert row["last_error"] == "flood_control"
+
+    @pytest.mark.parametrize("delay", [-1, float("inf"), float("nan"), "bad"])
+    def test_mark_deferred_rejects_invalid_server_delay(self, delay):
+        _record(platform="telegram")
+        with pytest.raises(ValueError):
+            dl.mark_deferred("ob-1", delay)
+        assert _row("ob-1")["state"] == "pending"
+
+    def test_due_time_is_not_claimed_early_and_profile_is_exact(self, monkeypatch):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 10, now=100.0)
+        _record(
+            oid="ob-2",
+            session_key="agent:reviewer:telegram:dm:C2",
+            platform="telegram",
+            chat_id="C2",
+            adapter_profile="reviewer",
+        )
+        dl.mark_deferred("ob-2", 0, now=100.0)
+
+        assert dl.claim_due_deferred(profile="default", now=109.999) is None
+        assert dl.claim_due_deferred(profile="default", now=110.0)[
+            "obligation_id"
+        ] == "ob-1"
+        assert _row("ob-2")["state"] == "deferred"
+
+    def test_fifo_is_due_then_creation_then_id(self, monkeypatch):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        for oid in ("ob-c", "ob-a", "ob-b"):
+            _record(
+                oid=oid,
+                session_key=f"agent:main:telegram:dm:{oid}",
+                platform="telegram",
+            )
+            dl.mark_deferred(oid, 0, now=100.0)
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=90 WHERE obligation_id='ob-c'"
+            )
+
+        order = []
+        for _ in range(3):
+            row = dl.claim_due_deferred(now=100.0)
+            order.append(row["obligation_id"])
+            dl.mark_delivered(row["obligation_id"])
+
+        assert order == ["ob-c", "ob-a", "ob-b"]
+
+    def test_concurrent_claim_is_single(self, monkeypatch):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        barrier = threading.Barrier(3)
+        claimed = []
+
+        def claim():
+            barrier.wait()
+            claimed.append(dl.claim_due_deferred(now=100.0))
+
+        threads = [threading.Thread(target=claim) for _ in range(2)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        assert sum(row is not None for row in claimed) == 1
+
+    def test_repeated_flood_reschedules_and_spends_one_attempt_per_send(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        first = dl.claim_due_deferred(now=100.0)
+        assert first["attempts"] == 1
+
+        dl.mark_deferred("ob-1", 5, now=100.0)
+
+        assert dl.claim_due_deferred(now=104.999) is None
+        second = dl.claim_due_deferred(now=105.0)
+        assert second["attempts"] == 2
+
+    def test_attempt_cap_and_stale_rows_abandon(self, monkeypatch):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (dl.MAX_ATTEMPTS, "ob-1"),
+            )
+        assert dl.claim_due_deferred(now=100.0) is None
+        assert _row("ob-1")["state"] == "abandoned"
+
+        _record(oid="ob-2", platform="telegram")
+        dl.mark_deferred("ob-2", 0, now=100.0)
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=? WHERE obligation_id=?",
+                (100.0 - dl.STALE_AFTER_SECONDS - 1, "ob-2"),
+            )
+        assert dl.claim_due_deferred(now=100.0) is None
+        assert _row("ob-2")["state"] == "abandoned"
+
+    def test_dead_owner_attempt_is_recovered_but_live_other_owner_is_untouched(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        assert dl.claim_due_deferred(now=100.0) is not None
+        _orphan("ob-1")
+
+        recovered = dl.claim_due_deferred(now=100.0)
+
+        assert recovered["obligation_id"] == "ob-1"
+        assert recovered["attempts"] == 2
+
+    def test_delivered_and_terminal_failed_rows_are_never_reclaimed(
+        self, monkeypatch
+    ):
+        monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        dl.mark_delivered("ob-1")
+        dl.mark_deferred("ob-1", 0, now=100.0)
+        assert _row("ob-1")["state"] == "delivered"
+
+        _record(oid="ob-2", platform="telegram")
+        dl.mark_deferred("ob-2", 0, now=100.0)
+        dl.mark_deferred_failed("ob-2", "forbidden")
+        _orphan("ob-2")
+        assert dl.claim_due_deferred(now=100.0) is None
+        assert dl.sweep_recoverable(now=100.0) == []
+        assert _row("ob-2")["state"] == "failed"
 
 
 class TestObligationId:

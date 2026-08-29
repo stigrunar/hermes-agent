@@ -12,6 +12,7 @@ import dataclasses
 import inspect
 import json
 import logging
+import math
 import os
 import html as _html
 import re
@@ -234,6 +235,8 @@ def _flood_cap_result(wait: float) -> "SendResult":
         success=False,
         error=f"flood_control:{wait}",
         retry_after=float(wait),
+        raw_response={"delivery_state": "deferred"},
+        error_kind="rate_limited",
     )
 
 
@@ -2301,6 +2304,20 @@ class TelegramAdapter(BasePlatformAdapter):
                 _m = _re.search(r"retry\s+(?:in\s+)?(\d+)", err_str, _re.IGNORECASE)
                 if _m:
                     _retry_after = float(_m.group(1))
+            # Rich sends bypass the legacy send() exception handler, so apply
+            # the same inline-wait cap here. A definitive, unsent long flood
+            # response must reach the durable delivery ledger rather than
+            # making BasePlatformAdapter sleep for the full server penalty.
+            try:
+                _retry_wait = float(_retry_after)
+            except (TypeError, ValueError):
+                _retry_wait = None
+            if (
+                _retry_wait is not None
+                and math.isfinite(_retry_wait)
+                and _retry_wait > _FLOOD_INLINE_WAIT_CAP_SECS
+            ):
+                return _flood_cap_result(_retry_wait)
             safe_error = _redact_telegram_error_text(exc)
             logger.warning(
                 "[%s] sendRichMessage transient failure (no legacy resend): %s",

@@ -5682,6 +5682,20 @@ class BasePlatformAdapter(ABC):
         if result.success:
             return result
 
+        # Telegram intentionally refuses to sleep inline for a server flood
+        # penalty above its small coroutine cap.  The adapter marks that
+        # definitive, unsent rejection explicitly so the durable delivery
+        # ledger can honor retry_after outside this inbound/send coroutine.
+        # Do not turn it into a formatting fallback or a failure notice: both
+        # are new sends to the same flood-limited bot.
+        if (
+            isinstance(result.raw_response, dict)
+            and result.raw_response.get("delivery_state") == "deferred"
+            and result.error_kind == "rate_limited"
+            and result.retry_after is not None
+        ):
+            return result
+
         error_str = result.error or ""
         is_network = result.retryable or self._is_retryable_error(error_str)
 
@@ -6746,6 +6760,7 @@ class BasePlatformAdapter(ABC):
                     if _obligation_id is not None:
                         try:
                             from gateway.delivery_ledger import (
+                                mark_deferred,
                                 mark_delivered,
                                 mark_failed,
                             )
@@ -6756,18 +6771,49 @@ class BasePlatformAdapter(ABC):
                                 _delivery_error = str(
                                     getattr(result, "error", "") or ""
                                 )
-                                await asyncio.to_thread(
-                                    mark_failed,
-                                    _obligation_id,
-                                    _delivery_error,
+                                _deferred_flood = (
+                                    event.source.platform == Platform.TELEGRAM
+                                    and isinstance(result.raw_response, dict)
+                                    and result.raw_response.get("delivery_state")
+                                    == "deferred"
+                                    and result.error_kind == "rate_limited"
+                                    and result.retry_after is not None
                                 )
+                                if _deferred_flood:
+                                    await asyncio.to_thread(
+                                        mark_deferred,
+                                        _obligation_id,
+                                        result.retry_after,
+                                    )
+                                    _schedule = getattr(
+                                        getattr(self, "gateway_runner", None),
+                                        "_schedule_telegram_deferred_delivery",
+                                        None,
+                                    )
+                                    if callable(_schedule):
+                                        _schedule(
+                                            profile=getattr(
+                                                delivery_adapter,
+                                                "_owner_profile",
+                                                None,
+                                            )
+                                        )
+                                else:
+                                    await asyncio.to_thread(
+                                        mark_failed,
+                                        _obligation_id,
+                                        _delivery_error,
+                                    )
                                 # A replacement can finish reconnecting before
                                 # this in-flight failure reaches mark_failed. In
                                 # that ordering the watcher's sweep found no row.
                                 # Signal a second transactional sweep only when a
                                 # new live adapter is already installed; atomic
                                 # claiming makes concurrent signals idempotent.
-                                if _delivery_error == "send_path_degraded":
+                                if (
+                                    not _deferred_flood
+                                    and _delivery_error == "send_path_degraded"
+                                ):
                                     _live_adapter = self._final_delivery_adapter(
                                         event.source
                                     )
