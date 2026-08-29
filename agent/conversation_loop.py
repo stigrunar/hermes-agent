@@ -140,6 +140,103 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
         return False
     used = getattr(agent, "session_input_tokens", 0)
     return isinstance(used, int) and not isinstance(used, bool) and used >= budget
+KANBAN_CLOSEOUT_RESERVE_NOTICE = (
+    "[SYSTEM NOTICE — Kanban closeout reserve active] "
+    "Stop expanding scope now. Use the evidence already gathered and preserve "
+    "the current candidate/checkpoint. Run at most one decisive directly "
+    "affected check if one is still missing, then make exactly one lifecycle "
+    "transition: `kanban_complete`, `kanban_request_review`, or `kanban_block`."
+)
+
+_KANBAN_TERMINAL_LIFECYCLE_TOOLS = frozenset(
+    {"kanban_complete", "kanban_request_review", "kanban_block"}
+)
+
+
+def _kanban_tool_call_name(tool_call: Any) -> str:
+    """Return a tool-call name from either dict or SDK-shaped call data."""
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool_call.get("name") or "")
+    function = getattr(tool_call, "function", None)
+    if function is not None:
+        return str(getattr(function, "name", "") or "")
+    return str(getattr(tool_call, "name", "") or "")
+
+
+def _kanban_terminal_lifecycle_called(messages: List[Dict[str, Any]]) -> bool:
+    """Return whether the transcript already contains a lifecycle transition."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            if any(
+                _kanban_tool_call_name(tool_call) in _KANBAN_TERMINAL_LIFECYCLE_TOOLS
+                for tool_call in (message.get("tool_calls") or [])
+            ):
+                return True
+        elif message.get("role") == "tool":
+            if str(message.get("name") or "") in _KANBAN_TERMINAL_LIFECYCLE_TOOLS:
+                return True
+    return False
+
+
+def _maybe_inject_kanban_closeout_reserve(
+    *,
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    api_call_count: int,
+) -> bool:
+    """Append the one-shot Kanban closeout notice to the newest tool result.
+
+    This is intentionally a direct mutation of one genuine ``role: tool`` row:
+    adding a user row would violate role alternation and placing a marker on a
+    synthetic row would pollute the durable transcript. The latch is set only
+    after a supported content append, so a worker with no tool result retries
+    on its next iteration.
+    """
+    if not (os.environ.get("HERMES_KANBAN_TASK") or "").strip():
+        return False
+    if getattr(agent, "_kanban_closeout_reserve_injected", False):
+        return False
+    if _kanban_terminal_lifecycle_called(messages):
+        return False
+    try:
+        maximum = int(agent.max_iterations)
+        used = int(api_call_count)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if maximum < 10 or used < maximum - 6:
+        return False
+
+    # Only the current tail can be the result of the immediately preceding
+    # tool round. Scanning backward would mutate a cached-prefix result when a
+    # current iteration has no new tool output.
+    message = messages[-1] if messages else None
+    if not isinstance(message, dict) or message.get("role") != "tool":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = content + "\n\n" + KANBAN_CLOSEOUT_RESERVE_NOTICE
+    elif isinstance(content, list):
+        message["content"] = [
+            *content,
+            {"type": "text", "text": KANBAN_CLOSEOUT_RESERVE_NOTICE},
+        ]
+    else:
+        # Do not latch when there is no content shape we can preserve.
+        return False
+    agent._kanban_closeout_reserve_injected = True
+    agent._session_messages = messages
+    logger.info(
+        "Kanban closeout reserve notice injected at %d/%d task=%s",
+        used,
+        maximum,
+        os.environ.get("HERMES_KANBAN_TASK", ""),
+    )
+    return True
 
 
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
@@ -2051,6 +2148,15 @@ def run_conversation(
                     f"the review tool loop before the next provider call."
                 )
             break
+        # Reserve the final few model calls of dispatcher-spawned Kanban
+        # workers for lifecycle closeout. The notice is attached to the newest
+        # real tool result so role alternation and the durable transcript stay
+        # intact.
+        _maybe_inject_kanban_closeout_reserve(
+            agent=agent,
+            messages=messages,
+            api_call_count=api_call_count,
+        )
         
         api_call_count += 1
         agent._api_call_count = api_call_count
@@ -8342,56 +8448,6 @@ def run_conversation(
                     agent._session_messages = messages
                     logger.debug("pre_verify nudge issued (attempt %d)",
                                  agent._pre_verify_nudges)
-                    _pending_verification_response = final_response
-                    _pending_verification_response_previewed = (
-                        agent._interim_content_was_streamed(final_response or "")
-                    )
-                    final_response = None
-                    continue
-
-                # ── Kanban worker terminal-tool stop guard ─────────────
-                # Workers must end with kanban_complete / kanban_block.
-                # Models sometimes narrate the next step ("Let me write the
-                # report") and stop with finish_reason=stop — a clean exit
-                # that the dispatcher records as protocol_violation. Nudge
-                # once or twice before allowing that exit.
-                try:
-                    from agent.kanban_stop import build_kanban_stop_nudge
-
-                    _kanban_nudge = build_kanban_stop_nudge(
-                        messages=messages,
-                        attempts=getattr(agent, "_kanban_stop_nudges", 0),
-                    )
-                except Exception:
-                    logger.debug("kanban stop-loop check failed", exc_info=True)
-                    _kanban_nudge = None
-
-                if _kanban_nudge:
-                    agent._kanban_stop_nudges = (
-                        getattr(agent, "_kanban_stop_nudges", 0) + 1
-                    )
-                    final_msg["finish_reason"] = "kanban_terminal_required"
-                    final_msg["_kanban_stop_synthetic"] = True
-                    append_message(messages, final_msg)
-                    append_message(messages, {
-                        "role": "user",
-                        "content": _kanban_nudge,
-                        "_kanban_stop_synthetic": True,
-                    })
-                    agent._session_messages = messages
-                    logger.info(
-                        "kanban stop-loop nudge issued (attempt %d) task=%s",
-                        agent._kanban_stop_nudges,
-                        os.environ.get("HERMES_KANBAN_TASK", ""),
-                    )
-                    agent._emit_status(
-                        "⚠️ Kanban worker tried to exit without "
-                        "kanban_complete/kanban_block — nudging to finish"
-                    )
-                    # Same finalizer contract as verify-on-stop: clear
-                    # final_response while continuing so a later budget
-                    # exhaustion path does not treat the narrated stop as
-                    # a completed answer.
                     _pending_verification_response = final_response
                     _pending_verification_response_previewed = (
                         agent._interim_content_was_streamed(final_response or "")

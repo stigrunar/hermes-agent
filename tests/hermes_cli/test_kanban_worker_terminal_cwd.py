@@ -52,7 +52,11 @@ def _capture_spawn_env(kb, monkeypatch, workspace: str) -> dict:
         return FakeProc()
 
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
-    kb._default_spawn(_make_task(kb), workspace)
+    kb._default_spawn(
+        _make_task(kb),
+        workspace,
+        scope_config=kb._worker_scope_config({"worker_scope": {"enabled": False}}),
+    )
     return captured
 
 

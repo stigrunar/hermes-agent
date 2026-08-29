@@ -23,6 +23,10 @@ def isolated_kanban_home(monkeypatch):
     test_home = tempfile.mkdtemp(prefix="kanban_cli_passthrough_")
     os.makedirs(os.path.join(test_home, "profiles", "default"), exist_ok=True)
     monkeypatch.setenv("HERMES_HOME", test_home)
+    monkeypatch.setenv("HERMES_KANBAN_HOME", test_home)
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BASE_DIR", raising=False)
     for mod in list(sys.modules.keys()):
         if mod.startswith("hermes_cli") or mod.startswith("hermes_state") or mod == "hermes_constants":
             del sys.modules[mod]
@@ -47,6 +51,9 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     }
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: fake_config
+    )
+    monkeypatch.setattr(
+        kanban_db, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg
     )
 
     captured = {}
@@ -79,6 +86,9 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
     fake_config = {"kanban": {"max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+    monkeypatch.setattr(
+        kanban_db, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg
+    )
 
     captured = {}
     monkeypatch.setattr(
@@ -94,3 +104,148 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
     )
 
 
+def test_cli_spawn_budget_is_separate_from_live_cap(
+    isolated_kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {"max_spawn": 4}}
+    )
+    monkeypatch.setattr(
+        kanban_db, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg
+    )
+    captured = {}
+    monkeypatch.setattr(
+        kanban_db, "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+    )
+    args = argparse.Namespace(
+        dry_run=True, max=3, spawn_budget=1, failure_limit=2, json=False
+    )
+    kb_cli._cmd_dispatch(args)
+    assert captured["max_spawn"] == 3
+    assert captured["max_new_spawns"] == 1
+
+
+def test_cli_dispatch_pregates_canonical_policy_before_init_or_connect(
+    isolated_kanban_home, monkeypatch, capsys,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BASE_DIR", raising=False)
+    with open(os.path.join(isolated_kanban_home, "config.yaml"), "w", encoding="utf-8") as handle:
+        handle.write("kanban:\n  max_in_progress: 2\n")
+    monkeypatch.setattr(
+        kanban_db,
+        "init_db",
+        lambda *_args, **_kwargs: pytest.fail("CLI initialized DB before admission"),
+    )
+    monkeypatch.setattr(
+        kanban_db,
+        "connect_closing",
+        lambda *_args, **_kwargs: pytest.fail("CLI opened DB before admission"),
+    )
+    monkeypatch.setattr(
+        kanban_db,
+        "connect_readonly_closing",
+        lambda *_args, **_kwargs: pytest.fail("CLI opened preview DB before admission"),
+    )
+    args = argparse.Namespace(
+        kanban_action="dispatch",
+        dry_run=True,
+        max=None,
+        spawn_budget=None,
+        failure_limit=2,
+        json=False,
+    )
+    assert kb_cli.kanban_command(args) == 1
+    assert "allowed_worker_profiles" in capsys.readouterr().err
+    assert not os.path.exists(os.path.join(isolated_kanban_home, "kanban.db"))
+
+
+def test_cli_dispatch_passes_the_prepared_snapshot_by_identity(
+    isolated_kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    snapshot = {"kanban": {"_canonical_parallel_dispatch": True}}
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {}}
+    )
+    monkeypatch.setattr(
+        kanban_db, "prepare_dispatch_admission", lambda *_a, **_k: snapshot
+    )
+
+    class Scope:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return None
+
+    received = {}
+    monkeypatch.setattr(kanban_db, "connect_readonly_closing", lambda: Scope())
+    monkeypatch.setattr(
+        kanban_db,
+        "dispatch_once",
+        lambda _conn, **kwargs: (
+            received.update(kwargs), kanban_db.DispatchResult()
+        )[1],
+    )
+    args = argparse.Namespace(
+        dry_run=True,
+        max=None,
+        spawn_budget=None,
+        failure_limit=2,
+        json=False,
+    )
+    kb_cli._cmd_dispatch(args)
+    assert received["effective_config"] is snapshot
+
+
+def test_forced_daemon_validates_before_database_initialization(
+    isolated_kanban_home, monkeypatch,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": "wide"}},
+    )
+    monkeypatch.setattr(
+        kanban_db, "init_db", lambda *_a, **_k: pytest.fail("DB initialized")
+    )
+    args = argparse.Namespace(
+        force=True, max=None, interval=1.0, failure_limit=2,
+        pidfile=None, verbose=False,
+    )
+    with pytest.raises(ValueError, match="positive integer"):
+        kb_cli._cmd_daemon(args)
+
+
+def test_cli_forced_daemon_wrapper_pregates_before_auto_init(
+    isolated_kanban_home, monkeypatch, capsys,
+):
+    from hermes_cli import kanban as kb_cli
+    from hermes_cli import kanban_db
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config",
+        lambda: {"kanban": {"max_in_progress": "wide"}},
+    )
+    monkeypatch.setattr(
+        kanban_db, "init_db", lambda *_a, **_k: pytest.fail("DB initialized")
+    )
+    args = argparse.Namespace(
+        kanban_action="daemon", force=True, max=None, interval=1.0,
+        failure_limit=2, pidfile=None, verbose=False,
+    )
+    assert kb_cli.kanban_command(args) == 1
+    assert "positive integer" in capsys.readouterr().err
