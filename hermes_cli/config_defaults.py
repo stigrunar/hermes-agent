@@ -2763,6 +2763,19 @@ DEFAULT_CONFIG = {
         # the assigned profile with the bundled sdlc-review skill. Disable for
         # boards where every review is performed manually from the dashboard.
         "review_dispatch": True,
+        # Optional Codex host router. Disabled and local-only unless an
+        # operator supplies a strict allowlist, selector argv, and bounded
+        # per-route settings in config.yaml.
+        "codex_host_router": {
+            "enabled": False,
+            "allowed_assignees": [],
+            "selector_command": [],
+            "selector_timeout_seconds": 5,
+            "selector_max_output_bytes": 65536,
+            "max_routes_per_tick": 0,
+            "max_total_routes": 0,
+            "routes": {},
+        },
         # Seconds between dispatcher ticks (idle or not). Lower = snappier
         # pickup of newly-ready tasks; higher = less SQL pressure.
         "dispatch_interval_seconds": 60,

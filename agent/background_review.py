@@ -1105,6 +1105,7 @@ def _run_review_in_thread(
     prompt: str,
     task_cfg: Optional[Dict[str, Any]] = None,
     review_run: Optional[_BackgroundReviewRun] = None,
+    notify_completion: bool = False,
 ) -> None:
     """Worker function executed in the background-review daemon thread.
 
@@ -1119,6 +1120,11 @@ def _run_review_in_thread(
     """
     if review_run is not None and review_run.cancel_requested.is_set():
         finish_background_review_run(agent, review_run)
+        if notify_completion and agent.background_review_callback:
+            agent.background_review_callback(
+                "⚗ Self-improvement review cancelled by a newer live turn; "
+                "no changes were saved."
+            )
         return
 
     # Local import to avoid a hard circular dep at module load.
@@ -1598,7 +1604,11 @@ def _run_review_in_thread(
             actions = summarize_background_review_actions(
                 review_messages,
                 messages_snapshot,
-                notification_mode=getattr(agent, "memory_notifications", "on"),
+                notification_mode=(
+                    "on"
+                    if notify_completion
+                    else getattr(agent, "memory_notifications", "on")
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -1623,6 +1633,19 @@ def _run_review_in_thread(
                 try:
                     _bg_cb(
                         f"💾 Self-improvement review: {summary}"
+                    )
+                except Exception:
+                    pass
+        elif notify_completion:
+            summary = "No memory or skill changes were saved."
+            agent._safe_print(
+                f"  💾 Self-improvement review complete: {summary}"
+            )
+            _bg_cb = agent.background_review_callback
+            if _bg_cb:
+                try:
+                    _bg_cb(
+                        f"💾 Self-improvement review complete: {summary}"
                     )
                 except Exception:
                     pass
@@ -1671,6 +1694,7 @@ def spawn_background_review_thread(
     focus: Optional[str] = None,
     task_cfg: Optional[Dict[str, Any]] = None,
     review_run: Optional[_BackgroundReviewRun] = None,
+    notify_completion: bool = False,
 ):
     """Build the review thread target and prompt for a background review.
 
@@ -1688,6 +1712,10 @@ def spawn_background_review_thread(
     from :func:`load_background_review_settings`. When omitted, config is
     read once here and shared with the worker (aux routing) so a single
     turn does not re-parse the config file.
+
+    ``notify_completion`` is true only for an explicit user-triggered review;
+    it keeps automatic no-op reviews silent while guaranteeing one terminal
+    receipt for ``/refine``.
     """
     if task_cfg is None:
         task_cfg = _background_review_task_config()
@@ -1717,6 +1745,7 @@ def spawn_background_review_thread(
             prompt,
             task_cfg=task_cfg,
             review_run=review_run,
+            notify_completion=notify_completion,
         )
 
     return _target, prompt
