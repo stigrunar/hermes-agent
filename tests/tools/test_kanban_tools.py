@@ -719,6 +719,118 @@ def test_create_dollydesign_triage_card_is_exempt(worker_env):
     assert out["status"] == "triage"
 
 
+def _dollyarchitect_routing():
+    return {
+        "invariant_outcome": "One ownership boundary for durable task truth",
+        "observed_evidence": [
+            "repo:TASKS.md@abc123",
+            "runtime receipt t_source completion metadata",
+        ],
+        "exact_source_authority": "repo TASKS.md at commit abc123 plus live DB schema",
+        "material_architecture_question": (
+            "Can the existing task model express the invariant without a new service?"
+        ),
+        "frozen_constraints_non_goals": [
+            "Preserve prompt caching",
+            "No implementation or deploy",
+        ],
+        "unresolved_owner_decisions": [
+            "Whether a later implementation should be activated"
+        ],
+        "implementation_authority": "none",
+    }
+
+
+def test_create_dollyarchitect_requires_architect_routing_even_for_triage(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous architecture task",
+        "assignee": "dollyarchitect",
+        "triage": True,
+        "body": "Work out the architecture and prepare code.",
+    }))
+
+    assert "ok" not in out
+    assert "architect_routing is required" in out["error"]
+    assert "triage to Dolly/default" in out["error"]
+
+
+def test_create_dollyarchitect_renders_outcome_contract_before_secondary_evidence(
+    worker_env,
+):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "architecture ownership review",
+        "assignee": "dollyarchitect",
+        "body": "Historical proposals and linked alternatives.",
+        "architect_routing": _dollyarchitect_routing(),
+    }))
+    assert out["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.body is not None
+        assert child.body.startswith("## Architect routing (authoritative)\n")
+        assert "Implementation authority: none" in child.body
+        assert "Material architecture question: Can the existing task model" in child.body
+        assert child.body.endswith(
+            "## Background and secondary evidence\n"
+            "Historical proposals and linked alternatives."
+        )
+    finally:
+        conn.close()
+
+
+def test_create_dollyarchitect_accepts_explicit_empty_owner_lists(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["frozen_constraints_non_goals"] = []
+    contract["unresolved_owner_decisions"] = []
+    out = json.loads(kt._handle_create({
+        "title": "bounded architecture question",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert out["ok"] is True
+
+
+def test_create_dollyarchitect_rejects_invalid_implementation_authority(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["implementation_authority"] = "must_create_dollycode"
+    out = json.loads(kt._handle_create({
+        "title": "overprescribed architecture task",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert "ok" not in out
+    assert "must be none, prepare, or authorized" in out["error"]
+
+
+def test_create_dollyarchitect_rejects_legacy_mechanism_first_fields(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["requested_actions"] = ["Design these concrete tables"]
+    out = json.loads(kt._handle_create({
+        "title": "mechanism-first architecture task",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert "ok" not in out
+    assert "unknown field(s): requested_actions" in out["error"]
+
+
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
     conn = kb.connect()

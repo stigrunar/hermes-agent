@@ -52,6 +52,7 @@ KANBAN_LIST_MAX_LIMIT = 200
 _DOLLYCODE_ASSIGNEES = {"dollycode"}
 _DOLLYQA_ASSIGNEES = {"dollyqa"}
 _DOLLYDESIGN_ASSIGNEES = {"dollydesign"}
+_DOLLYARCHITECT_ASSIGNEES = {"dollyarchitect"}
 _EXECUTION_CONTRACT_LIST_FIELDS = (
     "frozen_acceptance",
     "mutation_scope",
@@ -463,6 +464,111 @@ def _prepare_design_intake(
     background = str(body or "").strip()
     if background:
         rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_architect_routing(
+    *,
+    assignee: Any,
+    contract: Any,
+    body: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the outcome-first DollyArchitect routing contract."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    is_architect = assignee_name in _DOLLYARCHITECT_ASSIGNEES
+    if contract is None:
+        if is_architect:
+            return None, (
+                "architect_routing is required for DollyArchitect tasks. Provide "
+                "invariant_outcome, observed_evidence, exact_source_authority, "
+                "material_architecture_question, frozen_constraints_non_goals, "
+                "unresolved_owner_decisions, and implementation_authority. Route "
+                "contract-shaping triage to Dolly/default instead."
+            )
+        return (str(body) if body is not None else None), None
+    if not is_architect:
+        return None, "architect_routing is only valid for assignee=dollyarchitect"
+    if not isinstance(contract, dict):
+        return None, f"architect_routing must be an object, got {type(contract).__name__}"
+
+    allowed_fields = {
+        "invariant_outcome",
+        "observed_evidence",
+        "exact_source_authority",
+        "material_architecture_question",
+        "frozen_constraints_non_goals",
+        "unresolved_owner_decisions",
+        "implementation_authority",
+    }
+    unknown_fields = sorted(set(contract) - allowed_fields)
+    if unknown_fields:
+        return None, (
+            "architect_routing has unknown field(s): " + ", ".join(unknown_fields)
+        )
+
+    scalar_fields = (
+        "invariant_outcome",
+        "exact_source_authority",
+        "material_architecture_question",
+        "implementation_authority",
+    )
+    missing = [
+        field for field in scalar_fields
+        if not _compact_contract_text(contract.get(field))
+    ]
+    observed_evidence = contract.get("observed_evidence")
+    if not isinstance(observed_evidence, list) or not any(
+        _compact_contract_text(item) for item in observed_evidence
+    ):
+        missing.append("observed_evidence")
+    for field in ("frozen_constraints_non_goals", "unresolved_owner_decisions"):
+        if not isinstance(contract.get(field), list):
+            missing.append(field)
+    if missing:
+        return None, (
+            "architect_routing has missing or empty field(s): " + ", ".join(missing)
+        )
+
+    implementation_authority = _compact_contract_text(
+        contract["implementation_authority"]
+    ).casefold()
+    if implementation_authority not in {"none", "prepare", "authorized"}:
+        return None, (
+            "architect_routing.implementation_authority must be none, prepare, "
+            "or authorized"
+        )
+
+    def bullets(field: str, *, allow_empty: bool = False) -> list[str]:
+        values = [
+            f"- {_compact_contract_text(item)}"
+            for item in contract[field]
+            if _compact_contract_text(item)
+        ]
+        return values or (["- None declared"] if allow_empty else [])
+
+    lines = [
+        "## Architect routing (authoritative)",
+        f"Invariant outcome: {_compact_contract_text(contract['invariant_outcome'])}",
+        (
+            "Exact source authority: "
+            f"{_compact_contract_text(contract['exact_source_authority'])}"
+        ),
+        (
+            "Material architecture question: "
+            f"{_compact_contract_text(contract['material_architecture_question'])}"
+        ),
+        f"Implementation authority: {implementation_authority}",
+        "Observed evidence:",
+        *bullets("observed_evidence"),
+        "Frozen constraints and non-goals:",
+        *bullets("frozen_constraints_non_goals", allow_empty=True),
+        "Unresolved owner decisions:",
+        *bullets("unresolved_owner_decisions", allow_empty=True),
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and secondary evidence\n" + background
     return rendered, None
 
 
@@ -1837,6 +1943,13 @@ def _handle_create(args: dict, **kw) -> str:
     )
     if design_intake_error:
         return tool_error(design_intake_error)
+    body, architect_routing_error = _prepare_architect_routing(
+        assignee=assignee,
+        contract=args.get("architect_routing"),
+        body=body,
+    )
+    if architect_routing_error:
+        return tool_error(architect_routing_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -2784,6 +2897,45 @@ KANBAN_CREATE_SCHEMA = {
                     "user_job", "target_surface", "design_mode", "source_of_truth",
                     "repo_workspace_revision", "frozen_decisions", "open_decisions",
                     "evidence_available", "acceptance", "authority_and_exclusions",
+                ],
+            },
+            "architect_routing": {
+                "type": "object",
+                "description": (
+                    "Outcome-first DollyArchitect routing contract. Required for all "
+                    "DollyArchitect cards. It keeps evidence and frozen facts separate "
+                    "from the material architecture question and owner decisions, and "
+                    "leaves reuse/no-change valid when implementation is not authorized."
+                ),
+                "properties": {
+                    "invariant_outcome": {"type": "string"},
+                    "observed_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Exact artifact/revision/receipt references; link secondary "
+                            "evidence rather than duplicating its narrative."
+                        ),
+                    },
+                    "exact_source_authority": {"type": "string"},
+                    "material_architecture_question": {"type": "string"},
+                    "frozen_constraints_non_goals": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "unresolved_owner_decisions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "implementation_authority": {
+                        "type": "string",
+                        "enum": ["none", "prepare", "authorized"],
+                    },
+                },
+                "additionalProperties": False,
+                "required": [
+                    "invariant_outcome", "observed_evidence",
+                    "exact_source_authority", "material_architecture_question",
+                    "frozen_constraints_non_goals", "unresolved_owner_decisions",
+                    "implementation_authority",
                 ],
             },
             "parents": {
