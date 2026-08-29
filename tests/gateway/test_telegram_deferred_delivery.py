@@ -95,7 +95,7 @@ async def test_repeated_flood_reschedules_same_obligation():
     ))
     runner = _runner(adapter)
     task = runner._schedule_telegram_deferred_delivery(profile="default")
-    await _wait_for(lambda: _row()[0] == "deferred" and _row()[1] == 1)
+    await _wait_for(lambda: _row()[:2] == ("deferred", 1))
     state, attempts, error, due = _row()
     assert (state, attempts, error) == ("deferred", 1, "flood_control")
     assert due is not None
