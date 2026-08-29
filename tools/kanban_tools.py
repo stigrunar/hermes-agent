@@ -1101,7 +1101,15 @@ def _handle_comment(args: dict, **kw) -> str:
     # the future-worker context with what reads as a system directive.
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    # Session-scoped profile is authoritative for concurrent gateway turns;
+    # fall back to the process profile only for CLI/worker contexts.
+    from gateway.session_context import get_session_env
+
+    author = (
+        get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        or os.environ.get("HERMES_PROFILE")
+        or "worker"
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)

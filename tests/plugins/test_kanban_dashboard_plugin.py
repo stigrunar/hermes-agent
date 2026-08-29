@@ -8,6 +8,7 @@ REST surface without spinning up the whole dashboard.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import json
 import os
 import subprocess
@@ -16,7 +17,7 @@ import time
 from pathlib import Path
 
 import pytest
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.testclient import TestClient
 
 from hermes_cli import kanban_db as kb
@@ -49,6 +50,10 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BASE_DIR", raising=False)
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
     kb.init_db()
     return home
@@ -64,6 +69,115 @@ def client(kanban_home):
 # ---------------------------------------------------------------------------
 # GET /board on an empty DB
 # ---------------------------------------------------------------------------
+
+
+def test_dispatch_query_default_does_not_widen_canonical_cap():
+    router = _load_plugin_router()
+    endpoint = next(
+        route.endpoint for route in router.routes
+        if getattr(route, "path", None) == "/dispatch"
+    )
+    default = inspect.signature(endpoint).parameters["max_n"].default
+    assert default.default is None
+
+
+def test_dashboard_dispatch_pregates_before_connection_or_schema(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BASE_DIR", raising=False)
+    (home / "config.yaml").write_text(
+        "kanban:\n  max_in_progress: 2\n", encoding="utf-8"
+    )
+    monkeypatch.setattr(
+        kb,
+        "init_db",
+        lambda *_args, **_kwargs: pytest.fail("dashboard initialized DB before admission"),
+    )
+    monkeypatch.setattr(
+        kb,
+        "connect",
+        lambda *_args, **_kwargs: pytest.fail("dashboard opened DB before admission"),
+    )
+    monkeypatch.setattr(
+        kb,
+        "connect_readonly_closing",
+        lambda *_args, **_kwargs: pytest.fail(
+            "dashboard opened preview DB before admission"
+        ),
+    )
+    router = _load_plugin_router()
+    endpoint = next(
+        route.endpoint for route in router.routes
+        if getattr(route, "path", None) == "/dispatch"
+    )
+    with pytest.raises(HTTPException) as raised:
+        endpoint(dry_run=True, max_n=None, board=None)
+    assert raised.value.status_code == 400
+    assert "allowed_worker_profiles" in str(raised.value.detail)
+    assert not (home / "kanban.db").exists()
+
+
+def test_dashboard_dispatch_passes_prepared_snapshot_by_identity(
+    tmp_path, monkeypatch,
+):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
+    monkeypatch.delenv("HERMES_KANBAN_BASE_DIR", raising=False)
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: {"kanban": {}}
+    )
+    snapshot = {"kanban": {"_canonical_parallel_dispatch": True}}
+    monkeypatch.setattr(
+        kb, "prepare_dispatch_admission", lambda *_a, **_k: snapshot
+    )
+
+    class Scope:
+        def __enter__(self):
+            return object()
+
+        def __exit__(self, *_args):
+            return None
+
+    received = {}
+    monkeypatch.setattr(
+        kb, "connect_readonly_closing", lambda **_kwargs: Scope()
+    )
+    monkeypatch.setattr(
+        kb,
+        "dispatch_once",
+        lambda _conn, **kwargs: (
+            received.update(kwargs), kb.DispatchResult()
+        )[1],
+    )
+    router = _load_plugin_router()
+    endpoint = next(
+        route.endpoint for route in router.routes
+        if getattr(route, "path", None) == "/dispatch"
+    )
+    plugin_db = endpoint.__globals__["kanban_db"]
+    monkeypatch.setattr(
+        plugin_db, "prepare_dispatch_admission", lambda *_a, **_k: snapshot
+    )
+    monkeypatch.setattr(
+        plugin_db,
+        "dispatch_once",
+        lambda _conn, **kwargs: (
+            received.update(kwargs), plugin_db.DispatchResult()
+        )[1],
+    )
+    response = endpoint(dry_run=True, max_n=None, board=None)
+    assert isinstance(response, dict)
+    assert received["effective_config"] is snapshot
 
 
 def test_board_empty(client):
@@ -1228,5 +1342,3 @@ def test_specify_happy_path(client, monkeypatch):
 # ---------------------------------------------------------------------------
 # Final result visibility for Done cards
 # ---------------------------------------------------------------------------
-
-
