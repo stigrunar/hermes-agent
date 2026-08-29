@@ -193,6 +193,19 @@ def _wait_task(conn, task_id: str, statuses: set[str], timeout: float = 8.0):
     return conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
 
 
+def _wait_event(conn, task_id: str, kind: str, timeout: float = 15.0) -> bool:
+    """Wait for a committed lifecycle event, with timeout only as a guard."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if conn.execute(
+            "SELECT 1 FROM task_events WHERE task_id=? AND kind=? LIMIT 1",
+            (task_id, kind),
+        ).fetchone():
+            return True
+        time.sleep(0.05)
+    return False
+
+
 @pytest.fixture
 def isolated_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
@@ -427,11 +440,23 @@ def test_disconnect_before_mutation_cleans_and_disconnect_after_mutation_fences(
 
 
 def test_supervisor_timeout_is_fenced_without_local_retry(
-    isolated_home, tmp_path,
+    isolated_home, tmp_path, monkeypatch,
 ):
     _home, conn = isolated_home
     repo = _git_repo(tmp_path)
     task_id = _db_task(conn, repo, title="timeout task")
+    import hermes_cli.kanban_codex_host as host
+
+    # Route selection is a separate contract (covered above).  Keep this
+    # lifecycle regression deterministic by removing its selector subprocess
+    # from the contention surface; the remote helper remains a real process.
+    monkeypatch.setattr(
+        host,
+        "select_route",
+        lambda *_args, **_kwargs: {
+            "route": "mac_codex", "reason": "test-ready", "latency_ms": 0,
+        },
+    )
     # Leave enough time for prepare/helper interpreter startup under the full
     # parallel suite, while keeping the Codex child decisively beyond the run
     # deadline so this exercises the intended post-claim timeout path.
@@ -439,13 +464,20 @@ def test_supervisor_timeout_is_fenced_without_local_retry(
     rows = conn.execute("SELECT id, assignee FROM tasks WHERE id=?", (task_id,)).fetchall()
     result = kb.DispatchResult()
     kb._try_remote_codex_when_full(conn, rows, result, effective_config=raw, board="default")
-    row = _wait_task(conn, task_id, {"blocked"}, timeout=5)
+    assert _wait_event(conn, task_id, "remote_supervisor_ready")
+    assert _wait_event(conn, task_id, "blocked")
+    row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
     assert row["status"] == "blocked"
     # The shipped helper positively reports no mutation when its Codex child
     # is killed before it writes; the canonical capability block is therefore
     # safely retryable after an explicit unblock, without a remote fence.
     assert row["claim_lock"] is None
+    assert row["current_run_id"] is None
     assert conn.execute("SELECT COUNT(*) FROM task_runs WHERE task_id=?", (task_id,)).fetchone()[0] == 1
+    assert conn.execute(
+        "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='remote_supervisor_ready'",
+        (task_id,),
+    ).fetchone()[0] == 1
 
 
 def test_local_capacity_and_disabled_or_ineligible_tasks_never_contact_selector(

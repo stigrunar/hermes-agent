@@ -62,6 +62,10 @@ MAX_CHECK_COMMANDS = 32
 DEFAULT_SELECTOR_TIMEOUT = 5.0
 DEFAULT_REMOTE_TIMEOUT = 900.0
 DEFAULT_HEARTBEAT_SECONDS = 15.0
+SUPERVISOR_READY_TIMEOUT = 30.0
+MAX_SUPERVISOR_READY_BYTES = 4096
+REMOTE_RUN_START_TIMEOUT = 30.0
+REMOTE_FINALIZATION_TIMEOUT = 5.0
 HELPER_COMMAND = (
     "python3", "-m", "hermes_cli.kanban_codex_host", "helper",
 )
@@ -1063,6 +1067,23 @@ def _helper_run(request: Mapping[str, Any]) -> int:
         / ".hermes-codex-leases" / token / "state.json",
         state,
     )
+    # The supervisor must not measure the Codex deadline from SSH/helper
+    # transport launch: under contention that process can be runnable but not
+    # scheduled yet.  This receipt is the authoritative execution-start
+    # boundary; the final receipt remains the only terminal mutation proof.
+    print(
+        json.dumps(
+            _helper_response(
+                request,
+                ok=True,
+                op="run_started",
+                task_id=task_id,
+                remote_workspace=relative,
+            ),
+            separators=(",", ":"),
+        ),
+        flush=True,
+    )
     try:
         return_code, stdout, stderr, timed_out = _bounded_capture_process(
             codex,
@@ -1302,7 +1323,14 @@ def launch_supervisor(
     board: Optional[str],
     claim_lock: str,
 ) -> SupervisorPid:
-    """Launch the shipped local supervisor; no operator command is accepted."""
+    """Launch the shipped local supervisor and await its ready boundary.
+
+    ``Popen`` only proves that the interpreter was forked.  The supervisor
+    still has to import the Kanban DB, validate the claim/run/worktree fence,
+    and build the worker context before the caller can begin a lifecycle
+    deadline.  A bounded readiness receipt makes that boundary explicit and
+    prevents callers from measuring the timeout from an unready process.
+    """
     route_cfg = cfg.routes.get(prepared.route)
     if route_cfg is None:
         raise ProtocolError("remote route disappeared before launch")
@@ -1311,7 +1339,10 @@ def launch_supervisor(
     # never inherit model/API keys or task-shaped environment variables into
     # the remote helper boundary.
     env = _safe_subprocess_env()
-    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env, close_fds=True)
+    process = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL, env=env, close_fds=True,
+    )
     init = {
         "protocol": PROTOCOL,
         "marker": HELPER_MARKER,
@@ -1333,8 +1364,60 @@ def launch_supervisor(
         assert process.stdin is not None
         process.stdin.write(json.dumps(init, separators=(",", ":")).encode("utf-8"))
         process.stdin.close()
+        assert process.stdout is not None
+        ready_raw: list[bytes] = []
+        ready_done = threading.Event()
+
+        def _read_ready() -> None:
+            try:
+                ready_raw.append(process.stdout.readline(MAX_SUPERVISOR_READY_BYTES))
+            except (OSError, ValueError):
+                ready_raw.append(b"")
+            finally:
+                ready_done.set()
+
+        reader = threading.Thread(
+            target=_read_ready, name="kanban-supervisor-ready", daemon=True,
+        )
+        reader.start()
+        if not ready_done.wait(timeout=SUPERVISOR_READY_TIMEOUT):
+            process.kill()
+            process.wait(timeout=5)
+            reader.join(timeout=5)
+            raise ProtocolError("remote supervisor ready acknowledgement timed out")
+        reader.join(timeout=5)
+        raw = ready_raw[0] if ready_raw else b""
+        if len(raw) > MAX_SUPERVISOR_READY_BYTES:
+            raise ProtocolError("remote supervisor ready acknowledgement oversized")
+        try:
+            ready = json.loads(raw.decode("utf-8"))
+        except (UnicodeError, ValueError) as exc:
+            raise ProtocolError("remote supervisor ready acknowledgement malformed") from exc
+        if (
+            not isinstance(ready, Mapping)
+            or ready.get("protocol") != PROTOCOL
+            or ready.get("marker") != HELPER_MARKER
+            or ready.get("op") != "supervisor_ready"
+            or ready.get("task_id") != prepared.task_id
+            or ready.get("run_id") != int(task.current_run_id)
+            or ready.get("token") != prepared.token
+        ):
+            raise ProtocolError("remote supervisor ready acknowledgement invalid")
+        process.stdout.close()
     except Exception:
-        process.kill()
+        try:
+            process.kill()
+        except OSError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+        if process.stdout is not None:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
         raise
     return SupervisorPid(process.pid)
 
@@ -1628,6 +1711,36 @@ def _supervisor_main(argv: argparse.Namespace) -> int:
             ):
                 _fence_remote(kb, conn, argv.task_id, int(argv.run_id), "ownership_lost_before_supervisor")
                 return 2
+            with kb.write_txn(conn):
+                kb._append_event(
+                    conn,
+                    argv.task_id,
+                    "remote_supervisor_ready",
+                    {
+                        "contract": PROTOCOL,
+                        "route": argv.route,
+                    },
+                    run_id=int(argv.run_id),
+                )
+            print(
+                json.dumps(
+                    {
+                        "protocol": PROTOCOL,
+                        "marker": HELPER_MARKER,
+                        "op": "supervisor_ready",
+                        "task_id": argv.task_id,
+                        "run_id": int(argv.run_id),
+                        "token": init["token"],
+                    },
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            # Context assembly can read a large task/session payload and is
+            # deliberately outside the supervisor-start acknowledgement.  It
+            # has its own run-start boundary below, so a slow context read
+            # cannot make the parent mistake a live process for a failed
+            # launch.
             context = _remote_context(kb, conn, argv.task_id)
             task_limit = getattr(task, "max_runtime_seconds", None)
             runtime_limit = route.timeout_seconds
@@ -1647,19 +1760,69 @@ def _supervisor_main(argv: argparse.Namespace) -> int:
                 )
                 return 1
             started = time.monotonic()
-            # The helper enforces ``runtime_limit`` around the Codex child and
-            # then writes the authoritative mutation receipt.  Give that
-            # bounded finalization a small grace window; killing the transport
-            # at the exact same deadline races the no-mutation receipt and
-            # turns a safely timed-out writer into a permanent ambiguity fence.
-            supervisor_deadline = runtime_limit + max(
-                1.0, min(5.0, route.heartbeat_seconds * 4),
+            remote_output = bytearray()
+            remote_run_started = threading.Event()
+            remote_run_started_at: list[float] = []
+
+            def _read_remote_output() -> None:
+                stream = remote_proc.stdout
+                if stream is None:
+                    return
+                while True:
+                    line = stream.readline(MAX_PROTOCOL_OUTPUT + 1)
+                    if not line:
+                        return
+                    remaining = MAX_PROTOCOL_OUTPUT + 1 - len(remote_output)
+                    if remaining > 0:
+                        remote_output.extend(line[:remaining])
+                    try:
+                        value = json.loads(line.decode("utf-8"))
+                    except (UnicodeError, ValueError):
+                        continue
+                    if (
+                        isinstance(value, Mapping)
+                        and value.get("protocol") == PROTOCOL
+                        and value.get("marker") == HELPER_MARKER
+                        and value.get("op") == "run_started"
+                        and value.get("token") == init["token"]
+                        and value.get("task_id") == argv.task_id
+                        and value.get("remote_workspace") == init["remote_workspace"]
+                    ):
+                        remote_run_started_at.append(time.monotonic())
+                        remote_run_started.set()
+
+            remote_reader = threading.Thread(
+                target=_read_remote_output,
+                name="kanban-remote-output",
+                daemon=True,
             )
-            response_raw = b""
-            while remote_proc.poll() is None:
-                if time.monotonic() - started > supervisor_deadline:
-                    _kill_process_group(remote_proc)
+            remote_reader.start()
+
+            def _stop_remote_process() -> None:
+                _kill_process_group(remote_proc)
+                try:
                     remote_proc.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                remote_reader.join(timeout=5)
+
+            # The transport has a bounded window to prove that the helper
+            # entered its run.  Once that acknowledgement arrives, the child
+            # deadline starts at that lifecycle event, not at SSH Popen time.
+            while remote_proc.poll() is None:
+                now = time.monotonic()
+                if not remote_run_started.is_set():
+                    if now - started > REMOTE_RUN_START_TIMEOUT:
+                        _stop_remote_process()
+                        _handle_remote_failure(
+                            kb, conn, task, init, route,
+                            "remote_run_start_timeout", ambiguous=True,
+                        )
+                        return 1
+                elif remote_run_started_at and now - remote_run_started_at[0] > (
+                    runtime_limit + REMOTE_FINALIZATION_TIMEOUT
+                ):
+                    _stop_remote_process()
                     _handle_remote_failure(kb, conn, task, init, route, "remote_timeout", ambiguous=True)
                     return 1
                 current = kb.get_task(conn, argv.task_id)
@@ -1674,8 +1837,7 @@ def _supervisor_main(argv: argparse.Namespace) -> int:
                     or current_workspace != expected_workspace
                     or current.branch_name != init["branch"]
                 ):
-                    remote_proc.kill()
-                    remote_proc.wait(timeout=5)
+                    _stop_remote_process()
                     _handle_remote_failure(kb, conn, task, init, route, "ownership_lost", ambiguous=True)
                     return 1
                 claim_alive = kb.heartbeat_claim(
@@ -1687,16 +1849,25 @@ def _supervisor_main(argv: argparse.Namespace) -> int:
                     conn, argv.task_id, expected_run_id=int(argv.run_id),
                 )
                 if not claim_alive or not worker_heartbeat:
-                    remote_proc.kill()
-                    remote_proc.wait(timeout=5)
+                    _stop_remote_process()
                     _handle_remote_failure(kb, conn, task, init, route, "heartbeat_lost", ambiguous=True)
                     return 1
                 time.sleep(min(route.heartbeat_seconds, 1.0))
-            response_raw = remote_proc.stdout.read(MAX_PROTOCOL_OUTPUT + 1) if remote_proc.stdout else b""
+            remote_reader.join(timeout=5)
+            response_raw = bytes(remote_output)
             if remote_proc.returncode != 0 or len(response_raw) > MAX_PROTOCOL_OUTPUT:
                 _handle_remote_failure(kb, conn, task, init, route, "remote_transport_failed", ambiguous=True)
                 return 1
-            response = json.loads(response_raw.decode("utf-8"))
+            response = None
+            for line in response_raw.splitlines():
+                try:
+                    candidate = json.loads(line.decode("utf-8"))
+                except (UnicodeError, ValueError):
+                    continue
+                if isinstance(candidate, Mapping) and candidate.get("op") != "run_started":
+                    response = candidate
+            if response is None:
+                raise ProtocolError("remote run receipt missing")
             if (
                 not isinstance(response, Mapping)
                 or response.get("ok") is not True
