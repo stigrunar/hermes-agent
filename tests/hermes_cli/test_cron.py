@@ -262,6 +262,41 @@ def test_cron_create_failure_returns_nonzero(monkeypatch, capsys):
     assert "Failed to create job: boom" in out
 
 
+def test_cron_create_forwards_disabled_as_enabled_false(monkeypatch, capsys):
+    calls = []
+    monkeypatch.setattr(
+        cron_cli,
+        "_cron_api",
+        lambda **kwargs: calls.append(kwargs)
+        or {
+            "success": True,
+            "job_id": "job-1",
+            "name": "Later",
+            "schedule": "every 1h",
+            "next_run_at": None,
+            "job": {},
+        },
+    )
+
+    args = SimpleNamespace(
+        schedule="every 1h",
+        prompt="refresh docs",
+        name=None,
+        deliver=None,
+        repeat=None,
+        skill=None,
+        skills=None,
+        script=None,
+        workdir=None,
+        no_agent=False,
+        disabled=True,
+    )
+
+    assert cron_cli.cron_create(args) == 0
+    assert calls[0]["enabled"] is False
+    capsys.readouterr()
+
+
 class TestCronRunBackgroundDispatch:
     """`hermes cron run` must not report 'failed' when the run was dispatched
     to the background delegation worker.

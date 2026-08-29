@@ -33,6 +33,12 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     cron_create.add_argument(
         "prompt", nargs="?", help="Optional self-contained prompt or task instruction"
     )
+    cron_create.add_argument(
+        "--disabled",
+        action="store_true",
+        default=False,
+        help="Create the job paused/disabled without making it temporarily runnable.",
+    )
     cron_create.add_argument("--name", help="Optional human-friendly job name")
     cron_create.add_argument(
         "--deliver",

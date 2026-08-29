@@ -1484,6 +1484,7 @@ def cronjob(
     reasoning_effort: Optional[str] = None,
     task_id: str = None,
     session_id: Optional[str] = None,
+    enabled: Optional[bool] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -1598,6 +1599,7 @@ def cronjob(
                     # dispatch below: models do not make model-config
                     # decisions (standing policy).
                     reasoning_effort=reasoning_effort,
+                    enabled=True if enabled is None else enabled,
                 )
             except CronSchedulerRegistrationError as exc:
                 _partial = exc.to_dict()
@@ -2002,6 +2004,14 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
                 "default": False,
                 "description": "True = no LLM: the scheduler runs `script` (required) on schedule and delivers its stdout verbatim; empty stdout sends nothing (watchdog pattern). Use for script-only pings with fixed output; keep False for anything needing reasoning."
             },
+            "enabled": {
+                "type": "boolean",
+                "description": (
+                    "Optional create-time state. Defaults to True. Set False "
+                    "to persist the job paused/disabled atomically, without "
+                    "ever making it eligible for scheduling."
+                ),
+            },
             "context_from": {
                 "type": "array",
                 "items": {"type": "string"},
@@ -2090,6 +2100,7 @@ def _cronjob_handler(args, **kw):
         workdir=args.get("workdir"),
         no_agent=args.get("no_agent"),
         attach_to_session=args.get("attach_to_session"),
+        enabled=args.get("enabled"),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
         task_id=kw.get("task_id"),

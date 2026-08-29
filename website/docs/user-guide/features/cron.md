@@ -59,7 +59,20 @@ hermes cron create "every 1h" "Use both skills and combine the result" \
   --skill blogwatcher \
   --skill maps \
   --name "Skill combo"
+
+# Persist it paused from the first write; it is not briefly eligible to run.
+hermes cron create "every 1h" "Use both skills and combine the result" --disabled
 ```
+
+`--disabled` creates the job atomically paused: its first persisted record has
+no `next_run_at`, is excluded from due-job selection, and is not registered
+with an external scheduler. The equivalent tool call is
+`cronjob(action="create", ..., enabled=False)`. Resume it later with
+`hermes cron resume <job_id>` or `cronjob(action="resume", job_id="...")`.
+
+Creating an enabled job and then pausing it is not equivalent when zero
+transient scheduling eligibility is required: another scheduler process could
+observe and register the enabled job between those two operations.
 
 ### Through natural conversation
 

@@ -246,6 +246,40 @@ class TestUnifiedCronjobTool:
         assert listing["jobs"][0]["name"] == "Server Check"
         assert listing["jobs"][0]["state"] == "scheduled"
 
+    def test_create_disabled_propagates_and_is_hidden_from_default_list(self):
+        created = json.loads(
+            cronjob(
+                action="create",
+                prompt="Check later",
+                schedule="every 1h",
+                enabled=False,
+            )
+        )
+
+        assert created["success"] is True
+        assert created["job"]["enabled"] is False
+        assert created["next_run_at"] is None
+        assert created["job"]["state"] == "paused"
+        assert json.loads(cronjob(action="list"))["count"] == 0
+
+        all_jobs = json.loads(cronjob(action="list", include_disabled=True))
+        assert all_jobs["count"] == 1
+        assert all_jobs["jobs"][0]["enabled"] is False
+
+    def test_enabled_schema_is_optional_boolean(self):
+        from tools.cronjob_tools import CRONJOB_SCHEMA
+
+        params = CRONJOB_SCHEMA["parameters"]
+        assert params["properties"]["enabled"] == {
+            "type": "boolean",
+            "description": (
+                "Optional create-time state. Defaults to True. Set False "
+                "to persist the job paused/disabled atomically, without "
+                "ever making it eligible for scheduling."
+            ),
+        }
+        assert "enabled" not in params["required"]
+
     def test_list_handles_partial_legacy_job_records(self):
         from cron.jobs import save_jobs
 

@@ -545,6 +545,7 @@ def cron_create(args):
         monitor_url=getattr(args, "monitor_url", None),
         continuity=getattr(args, "continuity", None),
         reasoning_effort=getattr(args, "reasoning_effort", None),
+        enabled=not getattr(args, "disabled", False),
     )
     if not result.get("success"):
         print(color(f"Failed to create job: {result.get('error', 'unknown error')}", Colors.RED))
