@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -170,6 +171,12 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _profile_notifier_lock_path(kanban_home: Path, profile: str) -> Path:
+    """Return the stable per-profile notifier ownership lock path."""
+    digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:20]
+    return kanban_home / "kanban" / f".notifier-{digest}.lock"
+
+
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     """Return the tenant scope (Slack workspace) a subscription's wake keys to.
 
@@ -222,6 +229,44 @@ class GatewayKanbanWatchersMixin:
         _release_singleton_lock(handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Elect one kernel-locked notifier owner for this gateway profile."""
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
+            return
+
+        profile = getattr(self, "_active_profile_name")()
+        lock_path = _profile_notifier_lock_path(_kb.kanban_home(), profile)
+        retry_delay = min(1.0, max(0.1, float(interval)))
+        while getattr(self, "_running", False):
+            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+            if lock_state != "held":
+                if lock_state == "unavailable":
+                    logger.warning(
+                        "kanban notifier: profile %s lock unavailable; "
+                        "falling back to config-only ownership",
+                        profile,
+                    )
+                    await self._kanban_notifier_owner_loop(interval=interval)
+                    return
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.info(
+                "kanban notifier: acquired profile lease profile=%s (%s)",
+                profile,
+                lock_path,
+            )
+            try:
+                await self._kanban_notifier_owner_loop(interval=interval)
+            finally:
+                _release_singleton_lock(lock_handle)
+                logger.info(
+                    "kanban notifier: released profile lease profile=%s", profile
+                )
+            return
+
+    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the

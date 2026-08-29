@@ -31,6 +31,7 @@ import faulthandler
 import inspect
 import json
 import logging
+import math
 import os
 import queue
 import re
@@ -7090,6 +7091,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # sites are untouched when multiplexing is off (this dict is empty).
         # Populated by _start_secondary_profile_adapters().
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
+        self._telegram_deferred_drains: Dict[str, asyncio.Task] = {}
+        self._telegram_deferred_wakeups: Dict[str, asyncio.Event] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -12544,6 +12547,203 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
         return await self._redeliver_claimed_obligations(sendable)
 
+    def _schedule_telegram_deferred_delivery(
+        self, *, profile: Optional[str] = None
+    ) -> Optional[asyncio.Task]:
+        """Coalesce a drain signal for one exact Telegram bot identity."""
+        if not getattr(self, "_running", False):
+            logger.debug(
+                "Telegram deferred drain not scheduled while gateway is stopping"
+            )
+            return None
+        profile_key = "default" if not profile or profile == "default" else str(profile)
+        drains = getattr(self, "_telegram_deferred_drains", None)
+        if drains is None:
+            drains = self._telegram_deferred_drains = {}
+        wakeups = getattr(self, "_telegram_deferred_wakeups", None)
+        if wakeups is None:
+            wakeups = self._telegram_deferred_wakeups = {}
+        wakeup = wakeups.get(profile_key)
+        if wakeup is None:
+            wakeup = wakeups[profile_key] = asyncio.Event()
+        task = drains.get(profile_key)
+        if task is None or task.done():
+            task = asyncio.create_task(
+                self._drain_telegram_deferred_delivery(profile_key, wakeup),
+                name=f"telegram_deferred_delivery:{profile_key}",
+            )
+            drains[profile_key] = task
+
+            def _forget(done: asyncio.Task, key: str = profile_key) -> None:
+                if getattr(self, "_telegram_deferred_drains", {}).get(key) is done:
+                    self._telegram_deferred_drains.pop(key, None)
+                    self._telegram_deferred_wakeups.pop(key, None)
+                if not done.cancelled() and done.exception() is not None:
+                    logger.error(
+                        "Telegram deferred drain stopped unexpectedly (profile=%s)",
+                        key,
+                        exc_info=done.exception(),
+                    )
+
+            task.add_done_callback(_forget)
+        wakeup.set()
+        return task
+
+    async def _drain_telegram_deferred_delivery(
+        self, profile: str, wakeup: asyncio.Event
+    ) -> None:
+        """Serialize due durable sends for one Telegram profile forever.
+
+        The task is event-driven and idle when its queue is empty; no second
+        scheduler or in-memory outbox exists.  A claimed row remains durable
+        ``attempting`` if shutdown cancels an in-flight send, allowing the next
+        process to recover it through the same deferred claimant.
+        """
+        from gateway.delivery_ledger import (
+            RECONNECTED_MARKER,
+            claim_due_deferred,
+            mark_deferred,
+            mark_deferred_failed,
+            mark_delivered,
+            next_deferred_due,
+            release_deferred_claim,
+        )
+
+        async def _ledger_call(fn, /, *args, **kwargs):
+            """Finish one bounded atomic ledger operation before cancellation."""
+            task = asyncio.create_task(asyncio.to_thread(fn, *args, **kwargs))
+            try:
+                return await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # Cancelling an asyncio wrapper does not stop its worker
+                # thread. Observe the transaction before shutdown so an
+                # atomic claim/ACK transition cannot become detached.
+                await task
+                raise
+
+        while True:
+            wakeup.clear()
+            row = await _ledger_call(claim_due_deferred, profile=profile)
+            if row is not None:
+                adapter = self._authorization_adapter(Platform.TELEGRAM, profile)
+                if adapter is None:
+                    await _ledger_call(release_deferred_claim, row["obligation_id"])
+                    await _ledger_call(
+                        mark_deferred,
+                        row["obligation_id"],
+                        5.0,
+                        error_kind="adapter_unavailable",
+                    )
+                    continue
+
+                sendable = await self._clear_resume_pending_for_claimed_obligations(
+                    [row], require_success=True
+                )
+                if not sendable:
+                    await _ledger_call(release_deferred_claim, row["obligation_id"])
+                    await _ledger_call(
+                        mark_deferred,
+                        row["obligation_id"],
+                        5.0,
+                        error_kind="resume_pending_clear_failed",
+                    )
+                    continue
+
+                metadata = (
+                    {"thread_id": row["thread_id"]}
+                    if row.get("thread_id") else None
+                )
+                try:
+                    content = row["content"]
+                    if row.get("last_error") == "transient_delivery":
+                        content = RECONNECTED_MARKER + content
+                    result = await adapter.send(
+                        chat_id=row["chat_id"],
+                        content=content,
+                        metadata=metadata,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    result = None
+
+                if result is not None and getattr(result, "success", False):
+                    await _ledger_call(mark_delivered, row["obligation_id"])
+                    logger.info(
+                        "Telegram deferred delivery acknowledged "
+                        "(obligation=%s profile=%s attempt=%d state=delivered)",
+                        row["obligation_id"], profile, row["attempts"],
+                    )
+                elif (
+                    result is not None
+                    and isinstance(getattr(result, "raw_response", None), dict)
+                    and result.raw_response.get("delivery_state") == "deferred"
+                    and getattr(result, "error_kind", None) == "rate_limited"
+                    and getattr(result, "retry_after", None) is not None
+                ):
+                    due = await _ledger_call(
+                        mark_deferred,
+                        row["obligation_id"],
+                        result.retry_after,
+                    )
+                    logger.info(
+                        "Telegram deferred delivery rescheduled "
+                        "(obligation=%s profile=%s attempt=%d delay=%.1fs state=deferred)",
+                        row["obligation_id"], profile, row["attempts"],
+                        max(0.0, due - time.time()),
+                    )
+                elif result is None or getattr(result, "retryable", False):
+                    retry_after = getattr(result, "retry_after", None)
+                    try:
+                        retry_delay = float(retry_after)
+                        if not math.isfinite(retry_delay) or retry_delay < 0:
+                            raise ValueError
+                    except (TypeError, ValueError):
+                        # claim_due_deferred owns the total attempt/staleness
+                        # budget; this backoff only prevents a tight transport
+                        # failure loop while preserving durable retryability.
+                        retry_delay = min(60.0, 2.0 ** min(row["attempts"], 5))
+                    due = await _ledger_call(
+                        mark_deferred,
+                        row["obligation_id"],
+                        retry_delay,
+                        error_kind="transient_delivery",
+                    )
+                    logger.info(
+                        "Telegram deferred delivery transient retry "
+                        "(obligation=%s profile=%s attempt=%d delay=%.1fs state=deferred)",
+                        row["obligation_id"], profile, row["attempts"],
+                        max(0.0, due - time.time()),
+                    )
+                else:
+                    error_kind = str(
+                        getattr(result, "error_kind", None)
+                        or "deferred_send_failed"
+                    )
+                    await _ledger_call(
+                        mark_deferred_failed,
+                        row["obligation_id"],
+                        error_kind,
+                    )
+                    logger.info(
+                        "Telegram deferred delivery terminal failure "
+                        "(obligation=%s profile=%s attempt=%d state=failed)",
+                        row["obligation_id"], profile, row["attempts"],
+                    )
+                continue
+
+            due = await _ledger_call(next_deferred_due, profile=profile)
+            if wakeup.is_set():
+                continue
+            if due is None:
+                await wakeup.wait()
+                continue
+            delay = max(0.0, due - time.time())
+            try:
+                await asyncio.wait_for(wakeup.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
 
@@ -13317,6 +13517,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     logger.warning("No adapter available for %s", _pval)
                 continue
 
+            _set_owner = getattr(adapter, "set_owner_profile", None)
+            if callable(_set_owner):
+                _set_owner(self._active_profile_name())
+
             # Set up message + fatal error handlers. Under multiplexing the
             # default profile needs the same whole-handler runtime scope as a
             # secondary profile: authorization and prompt rendering both run
@@ -13691,6 +13895,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self._await_startup_boot_sends(
             planned_restart_notification_pending=planned_restart_notification_pending,
         )
+        if Platform.TELEGRAM in self.adapters:
+            self._schedule_telegram_deferred_delivery(
+                profile=self._active_profile_name()
+            )
+        for _profile, _adapters in self._profile_adapters.items():
+            if Platform.TELEGRAM in _adapters:
+                self._schedule_telegram_deferred_delivery(profile=_profile)
 
         # Automatically continue fresh sessions that were interrupted by the
         # previous gateway restart/shutdown.  The resume_pending flag is cleared
@@ -15125,6 +15336,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         del self._failed_platforms[platform]
                         continue
 
+                    _set_owner = getattr(adapter, "set_owner_profile", None)
+                    if callable(_set_owner):
+                        _set_owner(self._active_profile_name())
+
                     adapter.set_message_handler(self._primary_message_handler())
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
@@ -15169,6 +15384,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await self._redeliver_failed_obligations_for_platform(
                                 platform
                             )
+                            if platform == Platform.TELEGRAM:
+                                self._schedule_telegram_deferred_delivery(
+                                    profile=self._active_profile_name()
+                                )
                         except Exception:
                             logger.debug(
                                 "failed-obligation redelivery after %s reconnect failed",
@@ -15728,6 +15947,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             if cancel_completion_batches is not None:
                 await cancel_completion_batches()
+
+            # Stop durable Telegram drains before transport teardown.  An
+            # in-flight claimed row remains ``attempting`` with its due stamp;
+            # the next process can recover it without losing the obligation.
+            _deferred_tasks = list(
+                getattr(self, "_telegram_deferred_drains", {}).values()
+            )
+            for _task in _deferred_tasks:
+                _task.cancel()
+            if _deferred_tasks:
+                await asyncio.gather(*_deferred_tasks, return_exceptions=True)
+            getattr(self, "_telegram_deferred_drains", {}).clear()
+            getattr(self, "_telegram_deferred_wakeups", {}).clear()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
@@ -16296,6 +16528,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             await self._redeliver_failed_obligations_for_platform(
                                 platform, profile=profile_name
                             )
+                            if platform == Platform.TELEGRAM:
+                                self._schedule_telegram_deferred_delivery(
+                                    profile=profile_name
+                                )
                             return
                         # A newer reconnect already won the slot while this
                         # attempt was awaiting connect; do not replace it.

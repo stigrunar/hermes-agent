@@ -67,6 +67,78 @@ def _run(outcome="completed", run_id=1, error=None):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("status", ["done", "archived", "cancelled"])
+def test_prose_phantom_refs_ignores_terminal_task_history(status):
+    task = _task(status=status)
+    events = [
+        _event(
+            "suspected_hallucinated_references",
+            ts=100,
+            phantom_refs=["t_deadbeef99"],
+        ),
+    ]
+
+    diagnostics = kd._rule_prose_phantom_refs(
+        task, events, [], int(time.time()), {}
+    )
+
+    assert diagnostics == []
+
+
+def test_prose_phantom_refs_remains_available_for_non_terminal_task():
+    task = _task(status="blocked")
+    events = [
+        _event(
+            "suspected_hallucinated_references",
+            ts=100,
+            phantom_refs=["t_deadbeef99"],
+        ),
+    ]
+
+    diagnostics = kd._rule_prose_phantom_refs(
+        task, events, [], int(time.time()), {}
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].kind == "prose_phantom_refs"
+    assert diagnostics[0].data["phantom_refs"] == ["t_deadbeef99"]
+
+
+def test_repeated_crashes_reports_current_trailing_crash_loop():
+    task = _task(status="blocked", assignee="crashy")
+    runs = [
+        _run(outcome="completed", run_id=1),
+        _run(outcome="crashed", run_id=2, error="OOM"),
+        _run(outcome="crashed", run_id=3, error="OOM again"),
+    ]
+
+    diagnostics = kd._rule_repeated_crashes(
+        task, [], runs, int(time.time()), {}
+    )
+
+    assert len(diagnostics) == 1
+    assert diagnostics[0].kind == "repeated_crashes"
+    assert diagnostics[0].data["consecutive_crashes"] == 2
+
+
+@pytest.mark.parametrize("latest_outcome", ["blocked", "completed"])
+def test_repeated_crashes_clears_after_newer_non_crash_terminal_run(
+    latest_outcome,
+):
+    task = _task(status="blocked", assignee="recovered")
+    runs = [
+        _run(outcome="crashed", run_id=1, error="OOM"),
+        _run(outcome="crashed", run_id=2, error="OOM again"),
+        _run(outcome=latest_outcome, run_id=3),
+    ]
+
+    diagnostics = kd._rule_repeated_crashes(
+        task, [], runs, int(time.time()), {}
+    )
+
+    assert diagnostics == []
+
+
 
 
 
@@ -118,6 +190,26 @@ def test_repeated_crashes_truncates_huge_tracebacks():
     assert len(d.title) < 250
     # Detail contains the snippet with ellipsis.
     assert d.detail.endswith("…") or len(d.detail) < 700
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_count"),
+    [("cancelled", 0), ("blocked", 1), ("ready", 1), ("todo", 1)],
+)
+def test_repeated_failures_ignores_cancelled_but_not_active_statuses(
+    status, expected_count,
+):
+    task = _task(
+        status=status,
+        consecutive_failures=4,
+        last_failure_error="worker failed",
+    )
+
+    diagnostics = kd._rule_repeated_failures(
+        task, [], [], int(time.time()), {"failure_threshold": 2}
+    )
+
+    assert len(diagnostics) == expected_count
 
 
 # ---------------------------------------------------------------------------
