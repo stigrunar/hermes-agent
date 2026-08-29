@@ -47,6 +47,7 @@ import logging
 import math
 import os
 import random
+import re
 import sqlite3
 import threading
 import time
@@ -67,6 +68,7 @@ STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
 _MAX_DEFER_JITTER_SECONDS = 1.0
+_ERROR_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 # Visible prefix for redeliveries that might duplicate an already-received
 # message (crash mid-send / post-rejection retry). Honest at-least-once.
@@ -88,6 +90,12 @@ RECONNECTED_MARKER = (
 # (blocked bot, bad auth, missing chat) must not be retried merely because an
 # adapter reconnected.
 _RUNTIME_RETRYABLE_ERRORS = frozenset({"send_path_degraded"})
+
+
+def _sanitize_error_kind(value: Any, fallback: str) -> str:
+    """Keep durable receipts machine-categorical and free of raw error text."""
+    candidate = str(value or "")
+    return candidate if _ERROR_KIND_RE.fullmatch(candidate) else fallback
 
 
 def _db_path():
@@ -308,7 +316,7 @@ def mark_deferred(
         raise ValueError("now must be finite")
     jitter = random.uniform(0.0, _MAX_DEFER_JITTER_SECONDS)
     due = current + delay + max(0.0, min(float(jitter), _MAX_DEFER_JITTER_SECONDS))
-    sanitized_error = str(error_kind or "deferred_retry")[:100]
+    sanitized_error = _sanitize_error_kind(error_kind, "deferred_retry")
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
@@ -322,7 +330,7 @@ def mark_deferred(
 
 def mark_deferred_failed(obligation_id: str, error_kind: str) -> None:
     """Make a claimed deferred retry terminal without exposing raw errors."""
-    sanitized = str(error_kind or "deferred_send_failed")[:100]
+    sanitized = _sanitize_error_kind(error_kind, "deferred_send_failed")
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations

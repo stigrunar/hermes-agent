@@ -156,6 +156,26 @@ class TestDeferredTelegramQueue:
             dl.mark_deferred("ob-1", delay)
         assert _row("ob-1")["state"] == "pending"
 
+    def test_deferred_error_kinds_fail_closed_to_machine_categories(self):
+        _record(platform="telegram")
+        unsafe = "forbidden: bearer secret-value\nraw response"
+
+        dl.mark_deferred("ob-1", 0, now=100.0, error_kind=unsafe)
+        assert _row("ob-1")["last_error"] == "deferred_retry"
+
+        dl.mark_deferred_failed("ob-1", unsafe)
+        row = _row("ob-1")
+        assert row["state"] == "failed"
+        assert row["last_error"] == "deferred_send_failed"
+
+    def test_deferred_error_kinds_preserve_safe_categories(self):
+        _record(platform="telegram")
+        dl.mark_deferred("ob-1", 0, now=100.0, error_kind="transient_delivery")
+        assert _row("ob-1")["last_error"] == "transient_delivery"
+
+        dl.mark_deferred_failed("ob-1", "forbidden")
+        assert _row("ob-1")["last_error"] == "forbidden"
+
     def test_due_time_is_not_claimed_early_and_profile_is_exact(self, monkeypatch):
         monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
         _record(platform="telegram")
