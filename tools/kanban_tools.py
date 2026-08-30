@@ -242,7 +242,9 @@ def _prepare_review_contract(
             return None, f"review_contract.candidates[{index}] must be an object"
         allowed_candidate_fields = {
             "label", "source", "source_base", "workspace_or_url",
-            "commit", "tree", "artifact_sha256",
+            "commit", "tree", "artifact_sha256", "state",
+            "pushed_remote_ref", "pushed_remote_commit",
+            "clean_worktree_receipt", "proof_commit", "proof_tree",
         }
         unknown_candidate_fields = sorted(set(candidate) - allowed_candidate_fields)
         if unknown_candidate_fields:
@@ -276,6 +278,45 @@ def _prepare_review_contract(
                 f"review_contract.candidates[{index}] requires either full commit+tree "
                 "or a 64-character artifact_sha256"
             )
+        candidate_state = _compact_contract_text(candidate.get("state")).casefold()
+        explicit_ready = candidate_state in {"reviewable", "integration_ready"}
+        if explicit_ready:
+            if not has_git_identity:
+                return None, (
+                    f"review_contract.candidates[{index}] {candidate_state} requires "
+                    "immutable commit and tree identities"
+                )
+            pushed_ref = _compact_contract_text(candidate.get("pushed_remote_ref"))
+            pushed_commit = _compact_contract_text(candidate.get("pushed_remote_commit"))
+            clean_receipt = candidate.get("clean_worktree_receipt")
+            proof_commit = _compact_contract_text(candidate.get("proof_commit"))
+            proof_tree = _compact_contract_text(candidate.get("proof_tree"))
+            if not pushed_ref or not sha40.fullmatch(pushed_commit):
+                return None, (
+                    f"review_contract.candidates[{index}] {candidate_state} requires "
+                    "pushed remote ref readback identity"
+                )
+            if pushed_commit.casefold() != commit.casefold():
+                return None, (
+                    f"review_contract.candidates[{index}] pushed remote identity "
+                    "must match commit"
+                )
+            clean_text = _compact_contract_text(clean_receipt)
+            clean_marker = clean_text.casefold()
+            if (
+                not clean_text
+                or clean_marker in {"false", "0", "no"}
+                or re.search(r"\b(?:dirty|uncommitted|not clean)\b", clean_marker)
+            ):
+                return None, (
+                    f"review_contract.candidates[{index}] {candidate_state} requires "
+                    "a clean worktree receipt"
+                )
+            if proof_commit.casefold() != commit.casefold() or proof_tree.casefold() != tree.casefold():
+                return None, (
+                    f"review_contract.candidates[{index}] {candidate_state} requires "
+                    "proof bound to the exact commit/tree"
+                )
         normalized_candidates.append({
             "label": _compact_contract_text(candidate["label"]),
             "source": _compact_contract_text(candidate["source"]),
@@ -285,6 +326,16 @@ def _prepare_review_contract(
                 f"commit {commit} / tree {tree}"
                 if has_git_identity else f"artifact sha256 {artifact_sha256.lower()}"
             ),
+            "state": candidate_state,
+            "pushed_remote_ref": _compact_contract_text(candidate.get("pushed_remote_ref")),
+            "pushed_remote_commit": _compact_contract_text(
+                candidate.get("pushed_remote_commit")
+            ),
+            "clean_worktree_receipt": _compact_contract_text(
+                candidate.get("clean_worktree_receipt")
+            ),
+            "proof_commit": _compact_contract_text(candidate.get("proof_commit")),
+            "proof_tree": _compact_contract_text(candidate.get("proof_tree")),
         })
 
     def bullets(field: str) -> list[str]:
@@ -305,6 +356,22 @@ def _prepare_review_contract(
             f"  Source/base: {candidate['source']} @ {candidate['source_base']}",
             f"  Workspace/URL: {candidate['workspace_or_url']}",
         ])
+        if candidate["state"]:
+            lines.append(f"  State: {candidate['state']}")
+        if candidate["pushed_remote_ref"]:
+            lines.append(
+                "  Pushed remote readback: "
+                f"{candidate['pushed_remote_ref']} @ {candidate['pushed_remote_commit']}"
+            )
+        if candidate["clean_worktree_receipt"]:
+            lines.append(
+                f"  Clean worktree receipt: {candidate['clean_worktree_receipt']}"
+            )
+        if candidate["proof_commit"]:
+            lines.append(
+                "  Proof identity: "
+                f"commit {candidate['proof_commit']} / tree {candidate['proof_tree']}"
+            )
     lines.extend([
         f"Parent receipt: {_compact_contract_text(contract['parent_receipt'])}",
         "Frozen criteria:",
@@ -1865,6 +1932,20 @@ def _handle_create(args: dict, **kw) -> str:
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
     execution = args.get("execution")
+    # Accept the binding beside execution for callers that model it as a
+    # first-class task identity, while persisting one canonical nested shape.
+    top_level_binding = args.get("roadmap_binding")
+    if top_level_binding is not None:
+        if execution is None:
+            return tool_error("roadmap_binding requires an execution object")
+        if not isinstance(execution, dict):
+            return tool_error(
+                f"execution must be an object, got {type(execution).__name__}"
+            )
+        if "roadmap_binding" in execution and execution["roadmap_binding"] != top_level_binding:
+            return tool_error("roadmap_binding was supplied twice with different values")
+        execution = dict(execution)
+        execution["roadmap_binding"] = top_level_binding
     if execution is not None and not isinstance(execution, dict):
         return tool_error(
             f"execution must be an object, got {type(execution).__name__}"
@@ -2599,6 +2680,52 @@ KANBAN_ATTACHMENTS_SCHEMA = {
     },
 }
 
+_ROADMAP_BINDING_SCHEMA = {
+    "type": "object",
+    "description": (
+        "Strict project/lane admission identity. All fields are required when "
+        "the project register advertises schema-v2 mutation admission."
+    ),
+    "properties": {
+        "project_id": {"type": "string"},
+        "lane_id": {"type": "string"},
+        "roadmap_revision": {"type": "string"},
+        "canonical_ref": {"type": "string", "description": "remote/branch"},
+        "base_commit": {"type": "string", "description": "Full 40-character Git SHA"},
+        "acceptance_ref": {"type": "string"},
+        "implementation_repo": {
+            "type": "string",
+            "description": "Portable repository identifier, for example owner/repo",
+        },
+        "path_scope": {
+            "type": "array", "items": {"type": "string"}, "minItems": 1,
+            "description": "Non-empty repository-relative paths covered by this lane",
+        },
+        "dependency_pins": {
+            "type": "array", "minItems": 1,
+            "description": "Non-empty closed dependency pin objects",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "project": {"type": "string"},
+                    "commit": {"type": "string"},
+                    "path": {"type": "string"},
+                    "blob": {"type": "string"},
+                    "repo": {"type": "string"},
+                },
+                "additionalProperties": False,
+                "required": ["project", "commit", "path", "blob"],
+            },
+        },
+    },
+    "additionalProperties": False,
+    "required": [
+        "project_id", "lane_id", "roadmap_revision", "canonical_ref",
+        "base_commit", "acceptance_ref", "implementation_repo", "path_scope",
+        "dependency_pins",
+    ],
+}
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -2704,6 +2831,15 @@ KANBAN_CREATE_SCHEMA = {
                                 "commit": {"type": "string"},
                                 "tree": {"type": "string"},
                                 "artifact_sha256": {"type": "string"},
+                                "state": {
+                                    "type": "string",
+                                    "enum": ["reviewable", "integration_ready"],
+                                },
+                                "pushed_remote_ref": {"type": "string"},
+                                "pushed_remote_commit": {"type": "string"},
+                                "clean_worktree_receipt": {"type": "string"},
+                                "proof_commit": {"type": "string"},
+                                "proof_tree": {"type": "string"},
                             },
                             "additionalProperties": False,
                             "required": [
@@ -2844,6 +2980,7 @@ KANBAN_CREATE_SCHEMA = {
                     "task id), instead of a random branch."
                 ),
             },
+            "roadmap_binding": _ROADMAP_BINDING_SCHEMA,
             "triage": {
                 "type": "boolean",
                 "description": (
@@ -2958,6 +3095,7 @@ KANBAN_CREATE_SCHEMA = {
                         "type": "string",
                         "enum": ["R0", "R1", "R2", "R3"],
                     },
+                    "roadmap_binding": _ROADMAP_BINDING_SCHEMA,
                 },
                 "additionalProperties": False,
                 "required": ["environment", "action"],

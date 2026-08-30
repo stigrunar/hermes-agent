@@ -134,6 +134,9 @@ VALID_INITIAL_STATUSES = {"running", "blocked"}
 # ``None`` = legacy/un-typed block (treated as a generic human blocker).
 VALID_BLOCK_KINDS = {
     "dependency", "needs_input", "capability", "transient",
+    # A failed roadmap admission is a permanent non-runnable handoff until
+    # the owner explicitly repairs/replaces the binding.
+    "roadmap_binding_drift",
     # A worker that consumed its bounded turn budget is terminal and must not
     # be sent through the ordinary unblock/retry circuit.  The preserved
     # artifact is handed to the durable owner-replan control plane instead.
@@ -4063,7 +4066,9 @@ def create_task(
     # Resolve only after the project lookup above. An explicit execution
     # request with no usable project/profile still gets a conservative
     # persisted snapshot; only no profile + no request is legacy passthrough.
-    execution_preflight = resolve_project_execution_policy(project_repo, execution)
+    execution_preflight = resolve_project_execution_policy(
+        project_repo, execution, project_id=project_id,
+    )
     execution_preflight_json = canonical_execution_preflight(execution_preflight)
 
     # Retry once on the extremely unlikely id collision.
@@ -5324,6 +5329,240 @@ def _reap_dead_handoff_claim(
     return True
 
 
+_ROADMAP_BINDING_DRIFT = "roadmap_binding_drift"
+_ROADMAP_BINDING_TIMEOUT_SECONDS = 30
+
+
+def _roadmap_claim_binding(task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """Return the persisted binding for a task, if its preflight has one."""
+    preflight = parse_execution_preflight(task.get("execution_preflight"))
+    if not isinstance(preflight, Mapping):
+        return None
+    binding = preflight.get("roadmap_binding")
+    return dict(binding) if isinstance(binding, Mapping) else None
+
+
+def _roadmap_claim_failure(
+    *, phase: str, binding: Optional[Mapping[str, Any]] = None, detail: str = "",
+    observed_commit: Optional[str] = None, returncode: Optional[int] = None,
+) -> dict[str, Any]:
+    """Build a bounded, non-secret claim failure receipt."""
+    evidence: dict[str, Any] = {"phase": phase}
+    if detail:
+        evidence["detail"] = str(detail)[:240]
+    if observed_commit:
+        evidence["observed_commit"] = str(observed_commit)[:80]
+    if returncode is not None:
+        evidence["returncode"] = int(returncode)
+    return {
+        "reason": _ROADMAP_BINDING_DRIFT,
+        "binding": dict(binding) if isinstance(binding, Mapping) else None,
+        "evidence": evidence,
+    }
+
+
+def _run_roadmap_argv(
+    argv: list[str], *, cwd: str,
+) -> tuple[Optional[subprocess.CompletedProcess[str]], Optional[dict[str, Any]]]:
+    """Run one fixed argv with the bounded, no-shell admission policy."""
+    try:
+        completed = subprocess.run(
+            argv,
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            check=False,
+            shell=False,
+            timeout=_ROADMAP_BINDING_TIMEOUT_SECONDS,
+        )
+        return completed, None
+    except subprocess.TimeoutExpired:
+        return None, _roadmap_claim_failure(
+            phase="timeout", detail="admission command timed out",
+        )
+    except OSError as exc:
+        return None, _roadmap_claim_failure(
+            phase="process", detail=type(exc).__name__,
+        )
+
+
+def _refresh_roadmap_binding(task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """Refresh a required binding before ready->running CAS.
+
+    This function performs only host-local git/process/file work.  It must be
+    called before entering :func:`write_txn`; the caller records any failure
+    in a separate short transaction afterwards.
+    """
+    preflight = parse_execution_preflight(task.get("execution_preflight"))
+    if not isinstance(preflight, Mapping):
+        return None
+    resolved = preflight.get("resolved")
+    resolved = resolved if isinstance(resolved, Mapping) else {}
+    inputs = preflight.get("inputs")
+    inputs = inputs if isinstance(inputs, Mapping) else {}
+    action = str(resolved.get("action") or inputs.get("action") or "").strip().casefold()
+    if action not in {"build", "restart", "deploy", "migrate", "write", "destructive"}:
+        return None
+    persisted_admission = preflight.get("roadmap_admission")
+    persisted_admission = (
+        persisted_admission if isinstance(persisted_admission, Mapping) else None
+    )
+    binding = _roadmap_claim_binding(task)
+    project_repo = str(inputs.get("project_repo") or "").strip()
+    try:
+        from hermes_cli.project_execution_policy import roadmap_admission_state
+
+        current_admission = roadmap_admission_state(project_repo or None, binding)
+    except (TypeError, ValueError):
+        current_admission = None
+    if current_admission is None:
+        if persisted_admission is not None and persisted_admission.get("required"):
+            return _roadmap_claim_failure(
+                phase="register", binding=binding,
+                detail="required schema-v2 mutation admission disappeared or became invalid",
+            )
+        # A task created under a legacy register remains exempt when the
+        # current project is still legacy.
+        return None
+    if not current_admission.get("required"):
+        return None
+    admission = current_admission
+    if str(admission.get("validator") or "") != "scripts/check_workstream_admission.py":
+        return _roadmap_claim_failure(
+            phase="register", binding=binding,
+            detail="validator is not the approved repo-local checker",
+        )
+    if binding is None:
+        return _roadmap_claim_failure(phase="binding", detail="required binding is missing")
+    try:
+        from hermes_cli.project_execution_policy import validate_roadmap_binding
+
+        binding = validate_roadmap_binding(
+            binding,
+            project_id=str(task.get("project_id") or binding.get("project_id") or ""),
+        )
+    except (TypeError, ValueError) as exc:
+        return _roadmap_claim_failure(phase="binding", binding=binding, detail=str(exc))
+    task_project_id = str(task.get("project_id") or "").strip()
+    if task_project_id and task_project_id != str(binding["project_id"]):
+        return _roadmap_claim_failure(
+            phase="binding", binding=binding,
+            detail="binding project does not match the task project",
+        )
+    repo = project_repo
+    if not os.path.isdir(repo):
+        return _roadmap_claim_failure(
+            phase="repository", binding=binding,
+            detail="linked project primary repository unavailable",
+        )
+    canonical_ref = str(binding["canonical_ref"])
+    remote, separator, branch = canonical_ref.partition("/")
+    if not separator or not remote or not branch:
+        return _roadmap_claim_failure(
+            phase="canonical_ref", binding=binding, detail="remote/branch ref required",
+        )
+    fetched, failure = _run_roadmap_argv(["git", "fetch", remote, branch], cwd=repo)
+    if failure is not None:
+        failure["binding"] = dict(binding)
+        return failure
+    assert fetched is not None
+    if fetched.returncode != 0:
+        return _roadmap_claim_failure(
+            phase="fetch", binding=binding, returncode=fetched.returncode,
+        )
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    resolved_ref, failure = _run_roadmap_argv(
+        ["git", "rev-parse", "--verify", f"{tracking_ref}^{{commit}}"], cwd=repo,
+    )
+    if failure is not None:
+        failure["binding"] = dict(binding)
+        return failure
+    assert resolved_ref is not None
+    output = str(resolved_ref.stdout or "").strip()
+    observed_commit = output.splitlines()[0] if output else ""
+    if resolved_ref.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", observed_commit):
+        return _roadmap_claim_failure(
+            phase="remote_tracking", binding=binding,
+            detail="remote tracking ref could not be resolved",
+            observed_commit=observed_commit, returncode=resolved_ref.returncode,
+        )
+    validator = str(admission.get("validator") or "")
+    if validator != "scripts/check_workstream_admission.py":
+        return _roadmap_claim_failure(
+            phase="validator", binding=binding,
+            detail="validator is not the approved repo-local checker",
+        )
+    binding_file: Optional[str] = None
+    fd: Optional[int] = None
+    try:
+        fd, binding_file = tempfile.mkstemp(
+            prefix="hermes-roadmap-binding-", suffix=".json",
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            json.dump(binding, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+        validated, failure = _run_roadmap_argv(
+            [
+                sys.executable,
+                "scripts/check_workstream_admission.py",
+                "--source-ref", canonical_ref,
+                "--binding-file", binding_file,
+            ], cwd=repo,
+        )
+        if failure is not None:
+            failure["binding"] = dict(binding)
+            return failure
+        assert validated is not None
+        if validated.returncode != 0:
+            return _roadmap_claim_failure(
+                phase="validator", binding=binding,
+                detail="repo-local admission checker rejected binding",
+                returncode=validated.returncode,
+            )
+    except OSError as exc:
+        return _roadmap_claim_failure(
+            phase="binding_file", binding=binding, detail=type(exc).__name__,
+        )
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if binding_file:
+            try:
+                os.unlink(binding_file)
+            except OSError:
+                pass
+    return None
+
+
+def _record_roadmap_binding_drift(
+    conn: sqlite3.Connection, task_id: str, failure: Mapping[str, Any],
+) -> None:
+    """Atomically block pre-claim drift and emit one owner-replan intent."""
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None or row["status"] != "ready" or row["current_run_id"] is not None:
+            return
+        payload = dict(failure)
+        payload["reason"] = _ROADMAP_BINDING_DRIFT
+        _ensure_owner_replan_event(
+            conn, dict(row), terminal_run_id=None,
+            end_reason=_ROADMAP_BINDING_DRIFT, metadata=payload,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind=?, max_retries=0, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "current_run_id=NULL, consecutive_failures=0, block_recurrences=0 "
+            "WHERE id=? AND status='ready' AND current_run_id IS NULL",
+            (_ROADMAP_BINDING_DRIFT, task_id),
+        )
+        _append_event(conn, task_id, _ROADMAP_BINDING_DRIFT, payload)
+
+
 def claim_task(
     conn: sqlite3.Connection,
     task_id: str,
@@ -5336,6 +5575,19 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    # Refresh canonical roadmap identity before opening the claim transaction.
+    # This is intentionally a warm-path check: every ready retry re-fetches
+    # and re-runs the project-owned admission checker.
+    snapshot = conn.execute(
+        "SELECT * FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL",
+        (task_id,),
+    ).fetchone()
+    if snapshot is not None:
+        roadmap_failure = _refresh_roadmap_binding(dict(snapshot))
+        if roadmap_failure is not None:
+            _record_roadmap_binding_drift(conn, task_id, roadmap_failure)
+            return None
+
     # ``request_changes`` keeps a host-local review claim fenced while the
     # reviewer process is still unwinding.  A direct terminal/CLI claimant
     # must use the same reap seam as the dispatcher before attempting the
@@ -8812,21 +9064,67 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _roadmap_worktree_base(task: Task) -> Optional[str]:
+    """Return the immutable branch start declared by a task binding."""
+    preflight = parse_execution_preflight(task.execution_preflight)
+    if not isinstance(preflight, Mapping):
+        return None
+    binding = preflight.get("roadmap_binding")
+    if not isinstance(binding, Mapping):
+        return None
+    base_commit = str(binding.get("base_commit") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
+        raise ValueError("task roadmap binding has an invalid base_commit")
+    return base_commit
+
+
+def _git_ref_descends_from(repo_root: Path, base_commit: str, ref: str) -> bool:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "merge-base", "--is-ancestor", base_commit, ref],
+            capture_output=True,
+            text=True, encoding="utf-8", errors="replace",
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    start_point: str = "HEAD",
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None:
         target_common = _git_common_dir(target)
         if target_common == repo_common:
+            if start_point != "HEAD" and not _git_ref_descends_from(
+                target, start_point, "HEAD"
+            ):
+                raise RuntimeError(
+                    f"existing task worktree {target} is not descended from bound base"
+                )
             return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
+        if start_point != "HEAD" and not _git_ref_descends_from(
+            repo_root, start_point, f"refs/heads/{branch_name}"
+        ):
+            raise RuntimeError(
+                f"existing task branch {branch_name} is not descended from bound base"
+            )
         cmd = ["git", "-C", str(repo_root), "worktree", "add", str(target), branch_name]
     else:
         cmd = [
             "git", "-C", str(repo_root), "worktree", "add", "-b", branch_name,
-            str(target), "HEAD",
+            str(target), start_point,
         ]
     result = subprocess.run(
         cmd,
@@ -8856,6 +9154,7 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    start_point = _roadmap_worktree_base(task) or "HEAD"
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -8882,7 +9181,7 @@ def _resolve_worktree_workspace(
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, start_point=start_point)
         return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
@@ -8896,6 +9195,12 @@ def _resolve_worktree_workspace(
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            if start_point != "HEAD" and not _git_ref_descends_from(
+                requested, start_point, "HEAD"
+            ):
+                raise RuntimeError(
+                    f"existing task worktree {requested} is not descended from bound base"
+                )
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT
         # task's branch. Decompose children inherit the root's
@@ -8908,7 +9213,9 @@ def _resolve_worktree_workspace(
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if fallback.resolve(strict=False) != requested_resolved:
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(
+                    fallback_root, fallback, branch_name, start_point=start_point,
+                )
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this
         # task's own canonical worktree): keep the legacy reuse rather
@@ -8918,7 +9225,7 @@ def _resolve_worktree_workspace(
     repo_root = _git_toplevel(requested)
     if repo_root is not None and requested_resolved == repo_root:
         target = repo_root / ".worktrees" / task.id
-        _ensure_git_worktree(repo_root, target, branch_name)
+        _ensure_git_worktree(repo_root, target, branch_name, start_point=start_point)
         return target, branch_name
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
@@ -8927,7 +9234,9 @@ def _resolve_worktree_workspace(
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(
+        repo_root, requested, branch_name, start_point=start_point,
+    )
     return requested, branch_name
 
 
@@ -11121,14 +11430,21 @@ def _ensure_owner_replan_event(
     *,
     terminal_run_id: Optional[int],
     end_reason: str,
+    metadata: Optional[Mapping[str, Any]] = None,
 ) -> Optional[str]:
     """Append one durable owner intent without making the task runnable."""
     task_id = str(_row_value(task_snapshot, "id") or "")
-    if not task_id or terminal_run_id is None:
+    preclaim_drift = str(end_reason or "").casefold() == _ROADMAP_BINDING_DRIFT
+    if not task_id or (terminal_run_id is None and not preclaim_drift):
         return None
-    if str(_row_value(task_snapshot, "status") or "") != "running":
+    expected_status = "ready" if preclaim_drift else "running"
+    if str(_row_value(task_snapshot, "status") or "") != expected_status:
         return None
-    if int(_row_value(task_snapshot, "current_run_id") or 0) != int(terminal_run_id):
+    current_run_id = _row_value(task_snapshot, "current_run_id")
+    if preclaim_drift:
+        if current_run_id is not None:
+            return None
+    elif int(current_run_id or 0) != int(terminal_run_id):
         return None
     fields = _owner_replan_body_fields(task_snapshot)
     hygiene = str(_row_value(task_snapshot, "hygiene_class") or fields.get("hygiene_class") or "").casefold()
@@ -11164,7 +11480,7 @@ def _ensure_owner_replan_event(
         "board": board,
         "topic": route["topic"],
         "task_id": task_id,
-        "terminal_run_id": int(terminal_run_id),
+        "terminal_run_id": int(terminal_run_id) if terminal_run_id is not None else None,
         "contract_id": contract_id,
         "revision": revision,
         "end_reason": str(end_reason),
@@ -11175,6 +11491,18 @@ def _ensure_owner_replan_event(
         "retryable": False,
         "route": route,
     }
+    if preclaim_drift:
+        payload.update({
+            "source_status": "ready",
+            "reason": _ROADMAP_BINDING_DRIFT,
+            "owner_replan": {
+                "owner": "default",
+                "action": "refresh the roadmap binding and create a new runnable task",
+                "authority": "agent_internal",
+                "needs_user_decision": False,
+            },
+            "evidence": dict(metadata or {}),
+        })
     payload["fingerprint"] = _owner_replan_fingerprint(payload)
     fingerprint = str(payload["fingerprint"])
     for row in conn.execute(
@@ -11187,7 +11515,10 @@ def _ensure_owner_replan_event(
             continue
         if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
             return fingerprint
-    _append_event(conn, task_id, _OWNER_REPLAN_EVENT_KIND, payload, run_id=int(terminal_run_id))
+    _append_event(
+        conn, task_id, _OWNER_REPLAN_EVENT_KIND, payload,
+        run_id=(int(terminal_run_id) if terminal_run_id is not None else None),
+    )
     return fingerprint
 
 
@@ -16659,6 +16990,23 @@ def build_worker_context(conn: sqlite3.Connection, task_id: str) -> str:
         ceiling = preflight.get("ceiling") or {}
         proof = preflight.get("proof_policy") or {}
         lines.append("## Execution preflight")
+        binding = preflight.get("roadmap_binding")
+        if isinstance(binding, Mapping):
+            # Keep the identity ahead of the free-form Body.  The full
+            # binding remains in the persisted preflight for machine checks;
+            # this compact line is the worker-facing anti-drift reminder.
+            lines.append(
+                "Roadmap binding: "
+                f"project={binding.get('project_id')} "
+                f"lane={binding.get('lane_id')} "
+                f"revision={binding.get('roadmap_revision')} "
+                f"canonical_ref={binding.get('canonical_ref')} "
+                f"base_commit={binding.get('base_commit')} "
+                f"acceptance_ref={binding.get('acceptance_ref')} "
+                f"implementation_repo={binding.get('implementation_repo')} "
+                f"path_scope={','.join(str(p) for p in binding.get('path_scope', []))} "
+                f"dependency_pins={','.join(str(p) for p in binding.get('dependency_pins', []))}"
+            )
         lines.append(
             "Effective environment: "
             f"{resolved.get('environment') or '(unspecified)'}"

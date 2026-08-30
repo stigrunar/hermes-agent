@@ -10,6 +10,11 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Optional
 
@@ -46,6 +51,319 @@ ACTION_VALUES = frozenset({
     "write",
     "destructive",
 })
+
+# ``roadmap_binding`` is deliberately a small, closed object.  It is a
+# snapshot of the project/lane contract, not an invitation to copy arbitrary
+# roadmap prose into a task (or into a worker prompt).
+ROADMAP_BINDING_FIELDS = (
+    "project_id",
+    "lane_id",
+    "roadmap_revision",
+    "canonical_ref",
+    "base_commit",
+    "acceptance_ref",
+    "implementation_repo",
+    "path_scope",
+    "dependency_pins",
+)
+ROADMAP_DEPENDENCY_PIN_FIELDS = ("project", "commit", "path", "blob")
+ROADMAP_DEPENDENCY_PIN_OPTIONAL_FIELDS = ("repo",)
+ROADMAP_MUTATING_ACTIONS = frozenset({
+    "build", "restart", "deploy", "migrate", "write", "destructive",
+})
+_ROADMAP_CANONICAL_REF_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_./-]+$")
+_ROADMAP_SHA_RE = re.compile(r"^[0-9a-fA-F]{40}$")
+_ROADMAP_VALIDATOR = "scripts/check_workstream_admission.py"
+_ROADMAP_VALIDATOR_TIMEOUT_SECONDS = 30
+
+
+def _roadmap_text(value: Any) -> str:
+    """Return one compact scalar for the binding contract."""
+    return " ".join(str(value or "").split())
+
+
+def _roadmap_schema_v2(value: Any) -> bool:
+    if isinstance(value, Mapping):
+        schema_mapping = value.get("schema")
+        if isinstance(schema_mapping, Mapping) and _roadmap_schema_v2(schema_mapping):
+            return True
+        candidates = (
+            value.get("schema_version"), value.get("schema"), value.get("version"),
+        )
+    else:
+        candidates = (value,)
+    for candidate in candidates:
+        if isinstance(candidate, bool):
+            continue
+        if isinstance(candidate, int):
+            if candidate == 2:
+                return True
+            continue
+        if not isinstance(candidate, str):
+            continue
+        marker = _roadmap_text(candidate).casefold().replace("_", "-")
+        if marker in {"2", "v2", "schema-v2", "workstream-register-v2", "2.0"}:
+            return True
+    return False
+
+
+def _roadmap_register_admission(repo_path: Optional[str | Path]) -> Optional[dict[str, Any]]:
+    """Read the small machine-readable admission declaration, if present.
+
+    This helper intentionally reports only bounded metadata.  The register is
+    project-owned input and must never become unbounded worker context.
+    """
+    if repo_path is None:
+        return None
+    repo = Path(str(repo_path))
+    if not repo.is_absolute():
+        return None
+    register_path = repo / "docs" / "current" / "workstream-register.json"
+    try:
+        raw_bytes = register_path.read_bytes()
+        if len(raw_bytes) > 256 * 1024:
+            return None
+        register = json.loads(raw_bytes.decode("utf-8"))
+    except (OSError, UnicodeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(register, Mapping):
+        return None
+    admission = register.get("mutation_admission")
+    if admission is None:
+        admission = register.get("admission")
+    if not _roadmap_schema_v2(register) and not _roadmap_schema_v2(admission):
+        return None
+    if not isinstance(admission, Mapping) or admission.get("required") is not True:
+        return None
+    validator = _roadmap_text(admission.get("validator"))
+    if validator != _ROADMAP_VALIDATOR:
+        # A register may name a validator, but only this known repo-local
+        # entrypoint is safe for automatic admission.  Leave the declaration
+        # visible so callers fail closed instead of executing arbitrary argv.
+        validator = validator or "(missing)"
+    return {
+        "schema": "schema-v2",
+        "required": True,
+        "validator": validator,
+        "register_path": str(register_path),
+        "register_digest": hashlib.sha256(raw_bytes).hexdigest(),
+        "_register": register,
+    }
+
+
+def validate_roadmap_binding(
+    value: Any,
+    *,
+    project_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Validate and canonicalize one strict roadmap binding.
+
+    A supplied binding is always validated, even for read-only actions.  The
+    mutating-action requirement is applied by
+    :func:`resolve_project_execution_policy` after the project register is
+    inspected.
+    """
+    if not isinstance(value, Mapping):
+        raise ValueError(
+            "roadmap_binding must be an object, got "
+            f"{type(value).__name__}"
+        )
+    unknown = sorted(set(value) - set(ROADMAP_BINDING_FIELDS))
+    if unknown:
+        raise ValueError(
+            "roadmap_binding has unknown field(s): " + ", ".join(unknown)
+        )
+    missing = [
+        field for field in ROADMAP_BINDING_FIELDS
+        if field not in value or not _roadmap_text(value.get(field))
+    ]
+    if missing:
+        raise ValueError(
+            "roadmap_binding has missing or empty field(s): " + ", ".join(missing)
+        )
+    scalar_fields = set(ROADMAP_BINDING_FIELDS) - {"path_scope", "dependency_pins"}
+    non_text = sorted(
+        field for field in scalar_fields
+        if not isinstance(value.get(field), str)
+    )
+    if non_text:
+        raise ValueError(
+            "roadmap_binding scalar field(s) must be strings: "
+            + ", ".join(non_text)
+        )
+    normalized = {
+        field: _roadmap_text(value[field])
+        for field in ROADMAP_BINDING_FIELDS
+        if field not in {"path_scope", "dependency_pins"}
+    }
+    canonical_ref = normalized["canonical_ref"]
+    if not _ROADMAP_CANONICAL_REF_RE.fullmatch(canonical_ref):
+        raise ValueError(
+            "roadmap_binding.canonical_ref must be a safe remote/branch ref"
+        )
+    base_commit = normalized["base_commit"]
+    if not _ROADMAP_SHA_RE.fullmatch(base_commit):
+        raise ValueError(
+            "roadmap_binding.base_commit must be a full 40-character Git commit"
+        )
+    repo_text = str(value.get("implementation_repo") or "").strip()
+    repo_parts = repo_text.split("/")
+    if (
+        not repo_text
+        or repo_text.startswith(("/", "-"))
+        or "\\" in repo_text
+        or ":" in repo_text
+        or len(repo_parts) < 2
+        or any(part in {"", ".", ".."} for part in repo_parts)
+    ):
+        raise ValueError(
+            "roadmap_binding.implementation_repo must be a safe repository identifier"
+        )
+    path_scope = value.get("path_scope")
+    if not isinstance(path_scope, list) or not path_scope:
+        raise ValueError("roadmap_binding.path_scope must be a non-empty list of repository paths")
+    normalized_scope: list[str] = []
+    for item in path_scope:
+        text = item.strip() if isinstance(item, str) else ""
+        parts = text.split("/")
+        if (
+            not text
+            or text.startswith(("/", "-"))
+            or "\\" in text
+            or ":" in text
+            or any(part in {"", ".", ".."} for part in parts)
+        ):
+            raise ValueError(
+                "roadmap_binding.path_scope entries must be safe repository-relative paths"
+            )
+        normalized_scope.append(text)
+    pins = value.get("dependency_pins")
+    if not isinstance(pins, list) or not pins:
+        raise ValueError("roadmap_binding.dependency_pins must be a non-empty list")
+    allowed_pin_fields = set(ROADMAP_DEPENDENCY_PIN_FIELDS) | set(
+        ROADMAP_DEPENDENCY_PIN_OPTIONAL_FIELDS
+    )
+    normalized_pins: list[dict[str, str]] = []
+    for index, pin in enumerate(pins):
+        label = f"roadmap_binding.dependency_pins[{index}]"
+        if not isinstance(pin, Mapping):
+            raise ValueError(f"{label} must be an object")
+        unknown_pin_fields = sorted(set(pin) - allowed_pin_fields)
+        if unknown_pin_fields:
+            raise ValueError(
+                f"{label} has unknown field(s): " + ", ".join(unknown_pin_fields)
+            )
+        missing_pin_fields = [
+            field
+            for field in ROADMAP_DEPENDENCY_PIN_FIELDS
+            if field not in pin
+            or not isinstance(pin.get(field), str)
+            or not pin[field].strip()
+        ]
+        if missing_pin_fields:
+            raise ValueError(
+                f"{label} has missing or empty field(s): "
+                + ", ".join(missing_pin_fields)
+            )
+        if "repo" in pin and (
+            not isinstance(pin["repo"], str) or not pin["repo"].strip()
+        ):
+            raise ValueError(f"{label}.repo must be a non-empty string")
+        normalized_pin = {
+            field: pin[field]
+            for field in ROADMAP_DEPENDENCY_PIN_FIELDS
+        }
+        if "repo" in pin:
+            normalized_pin["repo"] = pin["repo"]
+        normalized_pins.append(normalized_pin)
+    normalized["path_scope"] = normalized_scope
+    normalized["dependency_pins"] = normalized_pins
+    if project_id is not None and normalized["project_id"] != _roadmap_text(project_id):
+        raise ValueError("roadmap_binding.project_id does not match the linked project")
+    return normalized
+
+
+def validate_roadmap_binding_current(
+    project_repo: str | Path,
+    binding: Mapping[str, Any],
+) -> None:
+    """Run the fixed repo-local admission checker before task persistence.
+
+    This is deliberately a no-network check: creation validates the current
+    checkout only.  Claim-time refresh performs the separate fetch/readback
+    step before invoking the same checker.  Process output is never included
+    in the exception because project-owned validators may print sensitive
+    paths or credentials.
+    """
+    repo = Path(str(project_repo))
+    if not repo.is_absolute() or not repo.is_dir():
+        raise ValueError("roadmap validator repository is unavailable")
+    canonical_ref = str(binding.get("canonical_ref") or "")
+    binding_file: Optional[str] = None
+    fd: Optional[int] = None
+    try:
+        fd, binding_file = tempfile.mkstemp(
+            prefix="hermes-roadmap-binding-", suffix=".json",
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            json.dump(
+                dict(binding), stream, ensure_ascii=False, sort_keys=True,
+                separators=(",", ":"),
+            )
+            stream.write("\n")
+        try:
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    _ROADMAP_VALIDATOR,
+                    "--source-ref", canonical_ref,
+                    "--binding-file", binding_file,
+                ],
+                cwd=str(repo),
+                capture_output=True,
+                text=True,
+                check=False,
+                shell=False,
+                timeout=_ROADMAP_VALIDATOR_TIMEOUT_SECONDS,
+            )
+        except subprocess.TimeoutExpired:
+            raise ValueError("roadmap validator timed out") from None
+        except OSError:
+            raise ValueError("roadmap validator could not be started") from None
+        if completed.returncode != 0:
+            raise ValueError(
+                "roadmap validator rejected current project state "
+                f"(returncode {completed.returncode})"
+            )
+    except OSError:
+        raise ValueError("roadmap binding file could not be created") from None
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if binding_file:
+            try:
+                os.unlink(binding_file)
+            except OSError:
+                pass
+
+
+def roadmap_admission_state(
+    project_repo: Optional[str | Path],
+    binding: Optional[Mapping[str, Any]],
+    *,
+    project_id: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Validate binding against the current local register and return metadata."""
+    admission = _roadmap_register_admission(project_repo)
+    if admission is None:
+        return None
+    admission.pop("_register", None)
+    return admission
 
 _MAX_PROFILE_BYTES = 128 * 1024
 _MAX_YAML_TOKENS = 4096
@@ -415,6 +733,8 @@ def _proof_policy(
 def resolve_project_execution_policy(
     project_repo: Optional[str | Path],
     execution: Optional[Mapping[str, Any]] = None,
+    *,
+    project_id: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
     """Resolve a deterministic execution preflight result.
 
@@ -486,6 +806,38 @@ def resolve_project_execution_policy(
         if requested_action is not None:
             diagnostics.append(_diagnostic("action_unknown"))
         action = "destructive" if has_execution else "inspect"
+
+    # Roadmap admission is opt-in at the project boundary.  A project that
+    # has not published the schema-v2 register keeps the historical optional
+    # execution policy; once it explicitly advertises required admission,
+    # every mutating task must carry the complete binding snapshot.
+    roadmap_binding_raw = request.get("roadmap_binding")
+    roadmap_binding: Optional[dict[str, Any]] = None
+    if roadmap_binding_raw is not None:
+        roadmap_binding = validate_roadmap_binding(
+            roadmap_binding_raw,
+            project_id=project_id,
+        )
+    roadmap_admission = roadmap_admission_state(
+        project_repo,
+        roadmap_binding,
+        project_id=project_id,
+    )
+    if (
+        action in ROADMAP_MUTATING_ACTIONS
+        and roadmap_admission is not None
+        and roadmap_admission.get("required")
+        and roadmap_binding is None
+    ):
+        raise ValueError(
+            "roadmap_binding is required for mutating actions in this project"
+        )
+    if roadmap_binding is not None and roadmap_admission is not None:
+        if roadmap_admission.get("validator") != _ROADMAP_VALIDATOR:
+            raise ValueError(
+                "roadmap register names an unsupported admission validator"
+            )
+        validate_roadmap_binding_current(project_repo, roadmap_binding)
     action_quality, action_risk, action_effect, action_continuity = _ACTION_MINIMUMS[
         action
     ]
@@ -607,6 +959,10 @@ def resolve_project_execution_policy(
         "reasons": reasons,
         "diagnostics": diagnostics,
     }
+    if roadmap_binding is not None:
+        result["roadmap_binding"] = roadmap_binding
+    if roadmap_admission is not None:
+        result["roadmap_admission"] = roadmap_admission
     return result
 
 
