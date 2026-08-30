@@ -31,6 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -47,6 +48,528 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+_DOLLYCODE_ASSIGNEES = {"dollycode"}
+_DOLLYQA_ASSIGNEES = {"dollyqa"}
+_DOLLYDESIGN_ASSIGNEES = {"dollydesign"}
+_DOLLYARCHITECT_ASSIGNEES = {"dollyarchitect"}
+_EXECUTION_CONTRACT_LIST_FIELDS = (
+    "frozen_acceptance",
+    "mutation_scope",
+    "will_not_do",
+    "verification",
+    "authority",
+    "stop_when",
+)
+
+
+def _compact_contract_text(value: Any) -> str:
+    """Render one contract value as a single injection-safe line."""
+    return " ".join(str(value or "").split())
+
+
+def _prepare_execution_contract(
+    *,
+    assignee: Any,
+    triage: bool,
+    contract: Any,
+    body: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative worker execution contract.
+
+    The dispatcher deliberately launches workers with only a task id. The card
+    body is therefore the durable worker input, and implementation cards need
+    one compact current contract before any background/history prose. Triage
+    cards remain exempt because their purpose is to create that contract.
+    """
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYCODE_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "execution_contract is required for runnable DollyCode tasks. "
+                "Provide outcome, frozen_acceptance, repo_workspace_base_revision, "
+                "mutation_scope, will_not_do, verification, authority, quality_mode, "
+                "qa_boundary, and stop_when; or create the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, (
+            "execution_contract must be an object, got "
+            f"{type(contract).__name__}"
+        )
+
+    scalar_fields = (
+        "outcome",
+        "repo_workspace_base_revision",
+        "quality_mode",
+        "qa_boundary",
+    )
+    missing = [
+        field for field in scalar_fields
+        if not _compact_contract_text(contract.get(field))
+    ]
+    for field in _EXECUTION_CONTRACT_LIST_FIELDS:
+        value = contract.get(field)
+        if not isinstance(value, list) or not any(
+            _compact_contract_text(item) for item in value
+        ):
+            missing.append(field)
+    if missing:
+        return None, (
+            "execution_contract has missing or empty field(s): "
+            + ", ".join(missing)
+        )
+
+    quality_mode = _compact_contract_text(contract["quality_mode"]).upper()
+    if quality_mode not in {"SPIKE", "FEATURE", "RELEASE"}:
+        return None, "execution_contract.quality_mode must be SPIKE, FEATURE, or RELEASE"
+
+    allowed_authority = {"inspect", "edit", "commit", "push", "integrate", "deploy"}
+    authority = [
+        _compact_contract_text(item).casefold()
+        for item in contract["authority"]
+        if _compact_contract_text(item)
+    ]
+    invalid_authority = sorted(set(authority) - allowed_authority)
+    if invalid_authority:
+        return None, (
+            "execution_contract.authority contains unsupported value(s): "
+            + ", ".join(invalid_authority)
+        )
+
+    def bullets(field: str) -> list[str]:
+        return [
+            f"- {_compact_contract_text(item)}"
+            for item in contract[field]
+            if _compact_contract_text(item)
+        ]
+
+    lines = [
+        "## Execution contract (authoritative)",
+        f"Outcome: {_compact_contract_text(contract['outcome'])}",
+        "Frozen acceptance:",
+        *bullets("frozen_acceptance"),
+        (
+            "Repo/workspace + base revision: "
+            f"{_compact_contract_text(contract['repo_workspace_base_revision'])}"
+        ),
+        "Mutation scope:",
+        *bullets("mutation_scope"),
+        "Will not do:",
+        *bullets("will_not_do"),
+        "Verification:",
+        *bullets("verification"),
+        f"Authority: {', '.join(authority)}",
+        f"Quality mode: {quality_mode}",
+        f"QA boundary: {_compact_contract_text(contract['qa_boundary'])}",
+        "Stop when:",
+        *bullets("stop_when"),
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_review_contract(
+    *,
+    assignee: Any,
+    triage: bool,
+    contract: Any,
+    body: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative detached-review contract."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYQA_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "review_contract is required for runnable DollyQA tasks. Provide "
+                "outcome, candidates, parent_receipt, frozen_criteria, "
+                "auth_fixture_state, owner, verification, qa_boundary, will_not_do, "
+                "and stop_when; or create the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, f"review_contract must be an object, got {type(contract).__name__}"
+
+    allowed_contract_fields = {
+        "outcome", "candidates", "parent_receipt", "frozen_criteria",
+        "auth_fixture_state", "owner", "verification", "qa_boundary",
+        "will_not_do", "stop_when",
+    }
+    unknown_contract_fields = sorted(set(contract) - allowed_contract_fields)
+    if unknown_contract_fields:
+        return None, (
+            "review_contract has unknown field(s): "
+            + ", ".join(unknown_contract_fields)
+        )
+
+    scalar_fields = (
+        "outcome",
+        "parent_receipt",
+        "auth_fixture_state",
+        "owner",
+        "qa_boundary",
+    )
+    list_fields = ("frozen_criteria", "verification", "will_not_do", "stop_when")
+    missing = [
+        field for field in scalar_fields
+        if not _compact_contract_text(contract.get(field))
+    ]
+    for field in list_fields:
+        value = contract.get(field)
+        if not isinstance(value, list) or not any(
+            _compact_contract_text(item) for item in value
+        ):
+            missing.append(field)
+
+    candidates = contract.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        missing.append("candidates")
+    if missing:
+        return None, (
+            "review_contract has missing or empty field(s): " + ", ".join(missing)
+        )
+    assert isinstance(candidates, list)
+
+    normalized_candidates: list[dict[str, str]] = []
+    sha40 = re.compile(r"^[0-9a-fA-F]{40}$")
+    sha256 = re.compile(r"^[0-9a-fA-F]{64}$")
+    for index, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict):
+            return None, f"review_contract.candidates[{index}] must be an object"
+        allowed_candidate_fields = {
+            "label", "source", "source_base", "workspace_or_url",
+            "commit", "tree", "artifact_sha256",
+        }
+        unknown_candidate_fields = sorted(set(candidate) - allowed_candidate_fields)
+        if unknown_candidate_fields:
+            return None, (
+                f"review_contract.candidates[{index}] has unknown field(s): "
+                + ", ".join(unknown_candidate_fields)
+            )
+        required_candidate_fields = ("label", "source", "source_base", "workspace_or_url")
+        candidate_missing = [
+            field for field in required_candidate_fields
+            if not _compact_contract_text(candidate.get(field))
+        ]
+        if candidate_missing:
+            return None, (
+                f"review_contract.candidates[{index}] has missing or empty field(s): "
+                + ", ".join(candidate_missing)
+            )
+
+        commit = _compact_contract_text(candidate.get("commit"))
+        tree = _compact_contract_text(candidate.get("tree"))
+        artifact_sha256 = _compact_contract_text(candidate.get("artifact_sha256"))
+        has_git_identity = bool(commit or tree)
+        if has_git_identity:
+            if not sha40.fullmatch(commit) or not sha40.fullmatch(tree):
+                return None, (
+                    f"review_contract.candidates[{index}] commit and tree must both "
+                    "be full 40-character hexadecimal Git identities"
+                )
+        elif not sha256.fullmatch(artifact_sha256):
+            return None, (
+                f"review_contract.candidates[{index}] requires either full commit+tree "
+                "or a 64-character artifact_sha256"
+            )
+        normalized_candidates.append({
+            "label": _compact_contract_text(candidate["label"]),
+            "source": _compact_contract_text(candidate["source"]),
+            "source_base": _compact_contract_text(candidate["source_base"]),
+            "workspace_or_url": _compact_contract_text(candidate["workspace_or_url"]),
+            "identity": (
+                f"commit {commit} / tree {tree}"
+                if has_git_identity else f"artifact sha256 {artifact_sha256.lower()}"
+            ),
+        })
+
+    def bullets(field: str) -> list[str]:
+        return [
+            f"- {_compact_contract_text(item)}"
+            for item in contract[field]
+            if _compact_contract_text(item)
+        ]
+
+    lines = [
+        "## Review contract (authoritative)",
+        f"Outcome: {_compact_contract_text(contract['outcome'])}",
+        "Candidates:",
+    ]
+    for candidate in normalized_candidates:
+        lines.extend([
+            f"- {candidate['label']}: {candidate['identity']}",
+            f"  Source/base: {candidate['source']} @ {candidate['source_base']}",
+            f"  Workspace/URL: {candidate['workspace_or_url']}",
+        ])
+    lines.extend([
+        f"Parent receipt: {_compact_contract_text(contract['parent_receipt'])}",
+        "Frozen criteria:",
+        *bullets("frozen_criteria"),
+        f"Auth/fixture state: {_compact_contract_text(contract['auth_fixture_state'])}",
+        f"Owner: {_compact_contract_text(contract['owner'])}",
+        "Verification:",
+        *bullets("verification"),
+        f"QA boundary: {_compact_contract_text(contract['qa_boundary'])}",
+        "Will not do:",
+        *bullets("will_not_do"),
+        "Stop when:",
+        *bullets("stop_when"),
+    ])
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_design_intake(
+    *,
+    assignee: Any,
+    triage: bool,
+    contract: Any,
+    body: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative DollyDesign intake contract."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYDESIGN_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "design_intake is required for runnable DollyDesign tasks. Provide "
+                "user_job, target_surface, design_mode, source_of_truth, "
+                "repo_workspace_revision, frozen_decisions, open_decisions, "
+                "evidence_available, acceptance, and authority_and_exclusions; "
+                "or create the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, f"design_intake must be an object, got {type(contract).__name__}"
+
+    allowed_fields = {
+        "user_job", "target_surface", "design_mode", "source_of_truth",
+        "repo_workspace_revision", "frozen_decisions", "open_decisions",
+        "evidence_available", "acceptance", "authority_and_exclusions",
+    }
+    unknown_fields = sorted(set(contract) - allowed_fields)
+    if unknown_fields:
+        return None, "design_intake has unknown field(s): " + ", ".join(unknown_fields)
+
+    scalar_fields = (
+        "user_job", "target_surface", "design_mode", "source_of_truth",
+        "repo_workspace_revision",
+    )
+    missing = [
+        field for field in scalar_fields
+        if not _compact_contract_text(contract.get(field))
+    ]
+    for field in ("frozen_decisions", "open_decisions", "evidence_available"):
+        if not isinstance(contract.get(field), list):
+            missing.append(field)
+    acceptance = contract.get("acceptance")
+    if not isinstance(acceptance, list) or not any(
+        _compact_contract_text(item) for item in acceptance
+    ):
+        missing.append("acceptance")
+    authority_contract = contract.get("authority_and_exclusions")
+    if not isinstance(authority_contract, dict):
+        missing.append("authority_and_exclusions")
+    if missing:
+        return None, "design_intake has missing or empty field(s): " + ", ".join(missing)
+
+    design_mode = _compact_contract_text(contract["design_mode"]).casefold()
+    if design_mode not in {"direction", "review", "handoff", "sign_off"}:
+        return None, (
+            "design_intake.design_mode must be direction, review, handoff, or sign_off"
+        )
+
+    assert isinstance(authority_contract, dict)
+    allowed_authority_fields = {"owner", "authority", "exclusions"}
+    unknown_authority_fields = sorted(
+        set(authority_contract) - allowed_authority_fields
+    )
+    if unknown_authority_fields:
+        return None, (
+            "design_intake.authority_and_exclusions has unknown field(s): "
+            + ", ".join(unknown_authority_fields)
+        )
+    owner = _compact_contract_text(authority_contract.get("owner"))
+    authority = authority_contract.get("authority")
+    exclusions = authority_contract.get("exclusions")
+    if not owner or not isinstance(authority, list) or not any(
+        _compact_contract_text(item) for item in authority
+    ) or not isinstance(exclusions, list) or not any(
+        _compact_contract_text(item) for item in exclusions
+    ):
+        return None, (
+            "design_intake.authority_and_exclusions requires non-empty owner, "
+            "authority, and exclusions"
+        )
+    normalized_authority = [
+        _compact_contract_text(item).casefold()
+        for item in authority
+        if _compact_contract_text(item)
+    ]
+    allowed_authority = {
+        "inspect", "propose", "design_direction", "design_review",
+        "design_handoff", "design_sign_off",
+    }
+    invalid_authority = sorted(set(normalized_authority) - allowed_authority)
+    if invalid_authority:
+        return None, (
+            "design_intake.authority_and_exclusions.authority contains unsupported "
+            "value(s): " + ", ".join(invalid_authority)
+        )
+
+    def bullets(field: str, *, allow_empty: bool = False) -> list[str]:
+        values = [
+            f"- {_compact_contract_text(item)}"
+            for item in contract[field]
+            if _compact_contract_text(item)
+        ]
+        return values or (["- None declared"] if allow_empty else [])
+
+    lines = [
+        "## Design intake (authoritative)",
+        f"User job: {_compact_contract_text(contract['user_job'])}",
+        f"Target surface: {_compact_contract_text(contract['target_surface'])}",
+        f"Design mode: {design_mode}",
+        f"Source of truth: {_compact_contract_text(contract['source_of_truth'])}",
+        (
+            "Repo/workspace + revision: "
+            f"{_compact_contract_text(contract['repo_workspace_revision'])}"
+        ),
+        "Frozen decisions:",
+        *bullets("frozen_decisions", allow_empty=True),
+        "Open decisions:",
+        *bullets("open_decisions", allow_empty=True),
+        "Evidence available:",
+        *bullets("evidence_available", allow_empty=True),
+        "Acceptance:",
+        *bullets("acceptance"),
+        f"Outcome owner: {owner}",
+        f"Authority: {', '.join(normalized_authority)}",
+        "Exclusions:",
+        *[
+            f"- {_compact_contract_text(item)}"
+            for item in exclusions
+            if _compact_contract_text(item)
+        ],
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_architect_routing(
+    *,
+    assignee: Any,
+    contract: Any,
+    body: Any,
+) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the outcome-first DollyArchitect routing contract."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    is_architect = assignee_name in _DOLLYARCHITECT_ASSIGNEES
+    if contract is None:
+        if is_architect:
+            return None, (
+                "architect_routing is required for DollyArchitect tasks. Provide "
+                "invariant_outcome, observed_evidence, exact_source_authority, "
+                "material_architecture_question, frozen_constraints_non_goals, "
+                "unresolved_owner_decisions, and implementation_authority. Route "
+                "contract-shaping triage to Dolly/default instead."
+            )
+        return (str(body) if body is not None else None), None
+    if not is_architect:
+        return None, "architect_routing is only valid for assignee=dollyarchitect"
+    if not isinstance(contract, dict):
+        return None, f"architect_routing must be an object, got {type(contract).__name__}"
+
+    allowed_fields = {
+        "invariant_outcome",
+        "observed_evidence",
+        "exact_source_authority",
+        "material_architecture_question",
+        "frozen_constraints_non_goals",
+        "unresolved_owner_decisions",
+        "implementation_authority",
+    }
+    unknown_fields = sorted(set(contract) - allowed_fields)
+    if unknown_fields:
+        return None, (
+            "architect_routing has unknown field(s): " + ", ".join(unknown_fields)
+        )
+
+    scalar_fields = (
+        "invariant_outcome",
+        "exact_source_authority",
+        "material_architecture_question",
+        "implementation_authority",
+    )
+    missing = [
+        field for field in scalar_fields
+        if not _compact_contract_text(contract.get(field))
+    ]
+    observed_evidence = contract.get("observed_evidence")
+    if not isinstance(observed_evidence, list) or not any(
+        _compact_contract_text(item) for item in observed_evidence
+    ):
+        missing.append("observed_evidence")
+    for field in ("frozen_constraints_non_goals", "unresolved_owner_decisions"):
+        if not isinstance(contract.get(field), list):
+            missing.append(field)
+    if missing:
+        return None, (
+            "architect_routing has missing or empty field(s): " + ", ".join(missing)
+        )
+
+    implementation_authority = _compact_contract_text(
+        contract["implementation_authority"]
+    ).casefold()
+    if implementation_authority not in {"none", "prepare", "authorized"}:
+        return None, (
+            "architect_routing.implementation_authority must be none, prepare, "
+            "or authorized"
+        )
+
+    def bullets(field: str, *, allow_empty: bool = False) -> list[str]:
+        values = [
+            f"- {_compact_contract_text(item)}"
+            for item in contract[field]
+            if _compact_contract_text(item)
+        ]
+        return values or (["- None declared"] if allow_empty else [])
+
+    lines = [
+        "## Architect routing (authoritative)",
+        f"Invariant outcome: {_compact_contract_text(contract['invariant_outcome'])}",
+        (
+            "Exact source authority: "
+            f"{_compact_contract_text(contract['exact_source_authority'])}"
+        ),
+        (
+            "Material architecture question: "
+            f"{_compact_contract_text(contract['material_architecture_question'])}"
+        ),
+        f"Implementation authority: {implementation_authority}",
+        "Observed evidence:",
+        *bullets("observed_evidence"),
+        "Frozen constraints and non-goals:",
+        *bullets("frozen_constraints_non_goals", allow_empty=True),
+        "Unresolved owner decisions:",
+        *bullets("unresolved_owner_decisions", allow_empty=True),
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and secondary evidence\n" + background
+    return rendered, None
 
 
 def _profile_has_kanban_toolset() -> bool:
@@ -503,6 +1026,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "current_run_id": task.current_run_id,
         "model_override": task.model_override,
         "provider_override": task.provider_override,
+        "execution_preflight": task.execution_preflight,
         "parents": parents,
         "children": children,
         "parent_count": len(parents),
@@ -549,6 +1073,7 @@ def _handle_show(args: dict, **kw) -> str:
                     "current_run_id": t.current_run_id,
                     "model_override": t.model_override,
                     "provider_override": t.provider_override,
+                    "execution_preflight": t.execution_preflight,
                 }
 
             def _run_dict(r):
@@ -1099,7 +1624,15 @@ def _handle_comment(args: dict, **kw) -> str:
     # the future-worker context with what reads as a system directive.
     # Cross-task commenting itself remains unrestricted (see #19713) —
     # comments are the deliberate handoff channel between tasks.
-    author = os.environ.get("HERMES_PROFILE") or "worker"
+    # Session-scoped profile is authoritative for concurrent gateway turns;
+    # fall back to the process profile only for CLI/worker contexts.
+    from gateway.session_context import get_session_env
+
+    author = (
+        get_session_env("HERMES_SESSION_PROFILE", "").strip()
+        or os.environ.get("HERMES_PROFILE")
+        or "worker"
+    )
     board = args.get("board")
     try:
         kb, conn = _connect(board=board)
@@ -1394,6 +1927,37 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    body, contract_error = _prepare_execution_contract(
+        assignee=assignee,
+        triage=triage,
+        contract=args.get("execution_contract"),
+        body=body,
+    )
+    if contract_error:
+        return tool_error(contract_error)
+    body, review_contract_error = _prepare_review_contract(
+        assignee=assignee,
+        triage=triage,
+        contract=args.get("review_contract"),
+        body=body,
+    )
+    if review_contract_error:
+        return tool_error(review_contract_error)
+    body, design_intake_error = _prepare_design_intake(
+        assignee=assignee,
+        triage=triage,
+        contract=args.get("design_intake"),
+        body=body,
+    )
+    if design_intake_error:
+        return tool_error(design_intake_error)
+    body, architect_routing_error = _prepare_architect_routing(
+        assignee=assignee,
+        contract=args.get("architect_routing"),
+        body=body,
+    )
+    if architect_routing_error:
+        return tool_error(architect_routing_error)
     idempotency_key = args.get("idempotency_key")
     max_runtime_seconds = args.get("max_runtime_seconds")
     initial_status = args.get("initial_status") or "running"
@@ -1413,6 +1977,21 @@ def _handle_create(args: dict, **kw) -> str:
     provider_override = args.get("provider")
     if provider_override and not model_override:
         return tool_error("'provider' requires 'model' to be set as well")
+    execution = args.get("execution")
+    if execution is not None and not isinstance(execution, dict):
+        return tool_error(
+            f"execution must be an object, got {type(execution).__name__}"
+        )
+    if execution is not None:
+        missing_execution_fields = [
+            field
+            for field in ("environment", "action")
+            if not str(execution.get(field) or "").strip()
+        ]
+        if missing_execution_fields:
+            return tool_error(
+                "execution requires non-empty environment and action"
+            )
     if isinstance(parents, str):
         parents = [parents]
     if not isinstance(parents, (list, tuple)):
@@ -1461,6 +2040,7 @@ def _handle_create(args: dict, **kw) -> str:
                 initial_status=str(initial_status),
                 created_by=os.environ.get("HERMES_PROFILE") or "worker",
                 session_id=session_id,
+                execution=execution,
             )
             new_task = kb.get_task(conn, new_tid)
             subscribed = _maybe_auto_subscribe(conn, new_tid)
@@ -1470,6 +2050,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                execution_preflight=(
+                    new_task.execution_preflight if new_task else None
+                ),
                 subscribed=subscribed,
             )
         finally:
@@ -2158,10 +2741,210 @@ KANBAN_CREATE_SCHEMA = {
             "body": {
                 "type": "string",
                 "description": (
-                    "Opening post: full spec, acceptance criteria, "
-                    "links. The assigned worker reads this as part of "
-                    "its context."
+                    "Background, evidence, and links. Put the current mutable "
+                    "worker mandate in execution_contract; the assigned worker "
+                    "reads the rendered contract before this background."
                 ),
+            },
+            "execution_contract": {
+                "type": "object",
+                "description": (
+                    "Compact authoritative mutation contract, rendered at the "
+                    "top of the card body. Required for runnable DollyCode cards; "
+                    "triage cards are exempt. Background prose cannot override it."
+                ),
+                "properties": {
+                    "outcome": {"type": "string"},
+                    "frozen_acceptance": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "repo_workspace_base_revision": {"type": "string"},
+                    "mutation_scope": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "will_not_do": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "verification": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "authority": {
+                        "type": "array",
+                        "items": {
+                            "type": "string",
+                            "enum": [
+                                "inspect", "edit", "commit", "push",
+                                "integrate", "deploy",
+                            ],
+                        },
+                    },
+                    "quality_mode": {
+                        "type": "string",
+                        "enum": ["SPIKE", "FEATURE", "RELEASE"],
+                    },
+                    "qa_boundary": {"type": "string"},
+                    "stop_when": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                },
+                "additionalProperties": False,
+                "required": [
+                    "outcome", "frozen_acceptance",
+                    "repo_workspace_base_revision", "mutation_scope",
+                    "will_not_do", "verification", "authority",
+                    "quality_mode", "qa_boundary", "stop_when",
+                ],
+            },
+            "review_contract": {
+                "type": "object",
+                "description": (
+                    "Compact authoritative detached-review contract, rendered at "
+                    "the top of the card body. Required for runnable DollyQA cards; "
+                    "triage cards are exempt. Each candidate needs immutable Git "
+                    "commit+tree identity or an artifact SHA-256."
+                ),
+                "properties": {
+                    "outcome": {"type": "string"},
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "label": {"type": "string"},
+                                "source": {"type": "string"},
+                                "source_base": {"type": "string"},
+                                "workspace_or_url": {"type": "string"},
+                                "commit": {"type": "string"},
+                                "tree": {"type": "string"},
+                                "artifact_sha256": {"type": "string"},
+                            },
+                            "additionalProperties": False,
+                            "required": [
+                                "label", "source", "source_base", "workspace_or_url",
+                            ],
+                        },
+                    },
+                    "parent_receipt": {"type": "string"},
+                    "frozen_criteria": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "auth_fixture_state": {"type": "string"},
+                    "owner": {"type": "string"},
+                    "verification": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "qa_boundary": {"type": "string"},
+                    "will_not_do": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "stop_when": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                },
+                "additionalProperties": False,
+                "required": [
+                    "outcome", "candidates", "parent_receipt", "frozen_criteria",
+                    "auth_fixture_state", "owner", "verification", "qa_boundary",
+                    "will_not_do", "stop_when",
+                ],
+            },
+            "design_intake": {
+                "type": "object",
+                "description": (
+                    "Compact authoritative DollyDesign intake contract, rendered "
+                    "above background evidence. Required for runnable DollyDesign "
+                    "cards; triage cards are exempt. It selects the design job, mode, "
+                    "truth source, decision state, evidence, acceptance, and authority."
+                ),
+                "properties": {
+                    "user_job": {"type": "string"},
+                    "target_surface": {"type": "string"},
+                    "design_mode": {
+                        "type": "string",
+                        "enum": ["direction", "review", "handoff", "sign_off"],
+                    },
+                    "source_of_truth": {"type": "string"},
+                    "repo_workspace_revision": {"type": "string"},
+                    "frozen_decisions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "open_decisions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "evidence_available": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "acceptance": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "authority_and_exclusions": {
+                        "type": "object",
+                        "properties": {
+                            "owner": {"type": "string"},
+                            "authority": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "enum": [
+                                        "inspect", "propose", "design_direction",
+                                        "design_review", "design_handoff",
+                                        "design_sign_off",
+                                    ],
+                                },
+                            },
+                            "exclusions": {
+                                "type": "array", "items": {"type": "string"},
+                            },
+                        },
+                        "additionalProperties": False,
+                        "required": ["owner", "authority", "exclusions"],
+                    },
+                },
+                "additionalProperties": False,
+                "required": [
+                    "user_job", "target_surface", "design_mode", "source_of_truth",
+                    "repo_workspace_revision", "frozen_decisions", "open_decisions",
+                    "evidence_available", "acceptance", "authority_and_exclusions",
+                ],
+            },
+            "architect_routing": {
+                "type": "object",
+                "description": (
+                    "Outcome-first DollyArchitect routing contract. Required for all "
+                    "DollyArchitect cards. It keeps evidence and frozen facts separate "
+                    "from the material architecture question and owner decisions, and "
+                    "leaves reuse/no-change valid when implementation is not authorized."
+                ),
+                "properties": {
+                    "invariant_outcome": {"type": "string"},
+                    "observed_evidence": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": (
+                            "Exact artifact/revision/receipt references; link secondary "
+                            "evidence rather than duplicating its narrative."
+                        ),
+                    },
+                    "exact_source_authority": {"type": "string"},
+                    "material_architecture_question": {"type": "string"},
+                    "frozen_constraints_non_goals": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "unresolved_owner_decisions": {
+                        "type": "array", "items": {"type": "string"},
+                    },
+                    "implementation_authority": {
+                        "type": "string",
+                        "enum": ["none", "prepare", "authorized"],
+                    },
+                },
+                "additionalProperties": False,
+                "required": [
+                    "invariant_outcome", "observed_evidence",
+                    "exact_source_authority", "material_architecture_question",
+                    "frozen_constraints_non_goals", "unresolved_owner_decisions",
+                    "implementation_authority",
+                ],
             },
             "parents": {
                 "type": "array",
@@ -2302,6 +3085,34 @@ KANBAN_CREATE_SCHEMA = {
                     "the profile's provider and will fail if it belongs "
                     "to a different one. Requires 'model'."
                 ),
+            },
+            "execution": {
+                "type": "object",
+                "description": (
+                    "Optional repository execution preflight. The resolver "
+                    "applies the named environment and action, then clamps "
+                    "quality/risk upward to the project's safety floor."
+                ),
+                "properties": {
+                    "environment": {"type": "string"},
+                    "action": {
+                        "type": "string",
+                        "enum": [
+                            "inspect", "test", "build", "restart",
+                            "deploy", "migrate", "write", "destructive",
+                        ],
+                    },
+                    "quality_mode": {
+                        "type": "string",
+                        "enum": ["SPIKE", "FEATURE", "RELEASE"],
+                    },
+                    "risk_tier": {
+                        "type": "string",
+                        "enum": ["R0", "R1", "R2", "R3"],
+                    },
+                },
+                "additionalProperties": False,
+                "required": ["environment", "action"],
             },
             "board": _board_schema_prop(),
         },
