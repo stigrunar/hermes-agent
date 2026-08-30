@@ -36,6 +36,7 @@ the port.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import sqlite3
@@ -1132,6 +1133,7 @@ def _set_status_direct(
     (user yanking a stuck worker back to the queue).
     """
     terminations: list[tuple[Optional[int], Optional[str]]] = []
+    parent_scope_release = None
     effective_status = new_status
     with kanban_db.write_txn(conn):
         # Snapshot current state so we know whether to close a run.
@@ -1170,6 +1172,18 @@ def _set_status_direct(
                 return False
 
         was_running = prev["status"] == "running"
+        leaving_running = was_running and effective_status != "running"
+        # Cleanup is an exact-transition side effect, so it belongs after all
+        # deterministic no-op/refusal guards. A confirmed native scope reap
+        # suppresses historical PID signaling; an ambiguous or malformed
+        # receipt leaves the task/run identity untouched.
+        if leaving_running and prev["current_run_id"] is not None:
+            parent_scope_release = kanban_db._scope_release_result(
+                conn, task_id, int(prev["current_run_id"]),
+            )
+            if not parent_scope_release.can_release:
+                return False
+
         reopening_satisfied_parent = (
             prev["status"] in {"done", "archived"}
             and effective_status not in {"done", "archived"}
@@ -1180,25 +1194,31 @@ def _set_status_direct(
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
             "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
+            "WHERE id = ? AND status = ? AND current_run_id IS ?",
             (
                 effective_status,
                 effective_status,
                 effective_status,
                 effective_status,
                 task_id,
+                prev["status"],
+                prev["current_run_id"],
             ),
         )
         if cur.rowcount != 1:
             return False
         run_id = None
-        if was_running and effective_status != "running" and prev["current_run_id"]:
+        if leaving_running and prev["current_run_id"]:
             run_id = kanban_db._end_run(
                 conn, task_id,
                 outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)",
             )
-            terminations.append((prev["worker_pid"], prev["claim_lock"]))
+            if (
+                parent_scope_release is None
+                or parent_scope_release.pid_signal_allowed
+            ):
+                terminations.append((prev["worker_pid"], prev["claim_lock"]))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) "
             "VALUES (?, ?, 'status', ?, ?)",
@@ -2282,22 +2302,45 @@ def get_task_log(
 @router.post("/dispatch")
 def dispatch(
     dry_run: bool = Query(False),
-    max_n: int = Query(8, alias="max"),
+    max_n: Optional[int] = Query(None, alias="max", ge=1),
     board: Optional[str] = Query(None),
 ):
     board = _resolve_board(board)
-    conn = _conn(board=board)
     try:
-        result = kanban_db.dispatch_once(
-            conn, dry_run=dry_run, max_spawn=max_n, board=board,
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        if not isinstance(cfg, dict):
+            raise ValueError("effective Hermes config must be a mapping")
+        admission_config = kanban_db.prepare_dispatch_admission(
+            cfg,
+            max_spawn=max_n,
         )
-        # DispatchResult is a dataclass.
-        try:
-            return asdict(result)
-        except TypeError:
-            return {"result": str(result)}
-    finally:
-        conn.close()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)[:512]) from exc
+    connection_scope = (
+        kanban_db.connect_readonly_closing(board=board)
+        if dry_run
+        else contextlib.closing(_conn(board=board))
+    )
+    try:
+        with connection_scope as conn:
+            result = kanban_db.dispatch_once(
+                conn,
+                dry_run=dry_run,
+                max_spawn=max_n,
+                effective_config=admission_config,
+                board=board,
+            )
+            try:
+                return asdict(result)
+            except TypeError:
+                return {"result": str(result)}
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"kanban board is unavailable for read-only preview: {exc}")[:512],
+        ) from exc
 
 
 # ---------------------------------------------------------------------------

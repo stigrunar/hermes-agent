@@ -40,6 +40,43 @@ def _build_healthy_db(db_path: Path) -> str:
     return sid
 
 
+def test_db_opens_cleanly_defaults_to_full_integrity_scan(tmp_path, monkeypatch):
+    """The bounded option skips only integrity_check; default callers do not."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    statements = []
+    real_connect = hermes_state.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", traced_connect)
+
+    assert hermes_state._db_opens_cleanly(db_path) is None
+    assert any(
+        statement.strip().lower().startswith("pragma integrity_check")
+        for statement in statements
+    )
+
+    statements.clear()
+    assert hermes_state._db_opens_cleanly(
+        db_path, skip_integrity_check=True
+    ) is None
+    assert not any(
+        statement.strip().lower().startswith("pragma integrity_check")
+        for statement in statements
+    )
+    traced_sql = "\n".join(statements).lower()
+    assert "pragma journal_mode" in traced_sql
+    assert "select count(*) from sessions" in traced_sql
+    assert " from messages_fts where messages_fts match " in traced_sql
+    assert "insert into messages" in traced_sql
+    assert "rollback" in traced_sql
+
+
 def _corrupt_duplicate_fts(db_path: Path) -> None:
     """Inject a duplicate messages_fts row into sqlite_master.
 

@@ -149,6 +149,98 @@ def test_same_card_review_supports_changes_and_approval_without_block_loop(conn)
     assert completed.block_recurrences == 0
 
 
+def test_request_changes_waits_for_live_review_worker_before_reclaim(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live reviewer must not race the implementer's replacement run."""
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "test-host:dispatcher")
+    live = True
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: live)
+
+    task_id = kb.create_task(conn, title="Preserve live review handoff", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="test-host:builder")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        summary="Ready for review.",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="test-host:reviewer")
+    assert review is not None
+    with kb.write_txn(conn):
+        conn.execute(
+            "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+            (4242, task_id),
+        )
+        conn.execute(
+            "UPDATE task_runs SET worker_pid = ? WHERE id = ?",
+            (4242, review.current_run_id),
+        )
+
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Fix the implementation.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+    retained = kb.get_task(conn, task_id)
+    assert retained is not None
+    assert retained.status == "ready"
+    assert retained.claim_lock == "test-host:reviewer"
+    assert retained.worker_pid == 4242
+    assert kb.claim_task(conn, task_id, claimer="test-host:replacement") is None
+
+    live = False
+    assert kb.release_stale_claims(conn) == 1
+    replacement = kb.claim_task(conn, task_id, claimer="test-host:replacement")
+    assert replacement is not None
+
+
+@pytest.mark.parametrize("worker_pid", [None, 4343])
+def test_request_changes_releases_without_a_live_review_worker(
+    conn,
+    monkeypatch: pytest.MonkeyPatch,
+    worker_pid: int | None,
+) -> None:
+    """No-PID and already-terminal workers keep the ordinary handoff path."""
+    monkeypatch.setattr(kb, "_claimer_id", lambda: "test-host:dispatcher")
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+
+    task_id = kb.create_task(conn, title="Release finished review handoff", assignee="builder")
+    implementation = kb.claim_task(conn, task_id, claimer="test-host:builder")
+    assert implementation is not None
+    assert kb.request_review(
+        conn,
+        task_id,
+        reviewer="reviewer",
+        summary="Ready for review.",
+        expected_run_id=implementation.current_run_id,
+    )
+    review = kb.claim_review_task(conn, task_id, claimer="test-host:reviewer")
+    assert review is not None
+    if worker_pid is not None:
+        with kb.write_txn(conn):
+            conn.execute(
+                "UPDATE tasks SET worker_pid = ? WHERE id = ?",
+                (worker_pid, task_id),
+            )
+
+    assert kb.request_changes(
+        conn,
+        task_id,
+        reason="Fix the implementation.",
+        expected_run_id=review.current_run_id,
+    ) == (True, "builder")
+    released = kb.get_task(conn, task_id)
+    assert released is not None
+    assert released.claim_lock is None
+    assert released.worker_pid is None
+    assert kb.claim_task(conn, task_id, claimer="test-host:replacement") is not None
+
+
 @pytest.mark.parametrize("bad_payload", [None, "{not-json", "{}"])
 def test_rereview_requires_explicit_reviewer_when_provenance_is_invalid(
     conn,

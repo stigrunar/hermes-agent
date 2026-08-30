@@ -794,7 +794,11 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_disp.add_argument("--dry-run", action="store_true",
                         help="Don't actually spawn processes; just print what would happen")
     p_disp.add_argument("--max", type=int, default=None,
-                        help="Cap number of spawns this pass")
+                        help="Narrow the configured per-board live-concurrency cap")
+    p_disp.add_argument(
+        "--spawn-budget", type=int, default=None,
+        help="Narrow the number of new starts in this invocation",
+    )
     p_disp.add_argument("--failure-limit", type=int,
                         default=kb.DEFAULT_SPAWN_FAILURE_LIMIT,
                         help=f"Auto-block a task after this many consecutive non-success attempts "
@@ -1131,6 +1135,18 @@ def kanban_command(args: argparse.Namespace) -> int:
     # schema creation; `create` / `list` / every other command would
     # error out on a fresh install.
     with board_scope:
+        # Dispatch and the forced legacy daemon are the task-level entry
+        # points whose admission policy must be frozen before any DB/schema/
+        # WAL work. Their handlers perform that pre-gate before opening a
+        # connection (or initializing the daemon DB); preserve the normal CLI
+        # error mapping while bypassing the historical auto-init below.
+        if action in {"dispatch", "daemon"}:
+            try:
+                handler = _cmd_dispatch if action == "dispatch" else _cmd_daemon
+                return int(handler(args) or 0)
+            except (ValueError, RuntimeError) as exc:
+                print(f"kanban: {exc}", file=sys.stderr)
+                return 1
         # `repair` must dispatch BEFORE the auto-init below: on a corrupt DB
         # init_db() itself raises KanbanDbCorruptError, which would turn
         # every `hermes kanban repair` into "could not initialize database"
@@ -2724,49 +2740,58 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # (#28805). Same semantics as the gateway dispatch path so behavior
     # matches whether the user runs the CLI directly or relies on the
     # gateway-embedded dispatcher.
+    max_new_spawns = getattr(args, "spawn_budget", None)
+    if max_new_spawns is not None and max_new_spawns < 0:
+        raise ValueError("--spawn-budget must be a non-negative integer")
+    config_error = None
     try:
         from hermes_cli.config import load_config
         _cfg = load_config()
-        _kanban_cfg = _cfg.get("kanban", {}) if isinstance(_cfg, dict) else {}
+        if not isinstance(_cfg, dict):
+            raise ValueError("effective Hermes config must be a mapping")
+        _kanban_cfg = _cfg.get("kanban", {}) or {}
+        if not isinstance(_kanban_cfg, dict):
+            raise ValueError("kanban config must be a mapping")
         default_assignee = (_kanban_cfg.get("default_assignee") or "").strip() or None
-
-        def _coerce_positive_int(value):
-            if value is None:
-                return None
-            try:
-                ival = int(value)
-            except (TypeError, ValueError):
-                return None
-            return ival if ival >= 1 else None
-
-        max_in_progress_per_profile = _coerce_positive_int(
-            _kanban_cfg.get("max_in_progress_per_profile")
+        max_in_progress_per_profile = _kanban_cfg.get("max_in_progress_per_profile")
+        max_spawn, max_in_progress = kb.resolve_dispatch_caps(
+            _cfg, max_spawn=getattr(args, "max", None)
         )
-        max_in_progress = _coerce_positive_int(_kanban_cfg.get("max_in_progress"))
-        # Memory-derived default when unset (OOF-30/OOF-77) — same
-        # fallback the gateway-embedded dispatcher applies, so behaviour
-        # matches regardless of which path runs the tick.
         max_in_progress = kb.resolve_max_in_progress(max_in_progress)
-        # CLI --max overrides config kanban.max_spawn when both are present;
-        # CLI is the more explicit signal so it wins.
-        cli_max = getattr(args, "max", None)
-        max_spawn = cli_max if cli_max is not None else _coerce_positive_int(
-            _kanban_cfg.get("max_spawn")
-        )
-    except Exception:
+    except Exception as exc:
+        config_error = exc
+        _cfg = None
         default_assignee = None
         max_in_progress_per_profile = None
-        max_in_progress = None
+        max_in_progress = getattr(args, "max", None)
         max_spawn = getattr(args, "max", None)
-    with kb.connect_closing() as conn:
+    if config_error is not None and kb.effective_max_spawn(
+        max_spawn, max_in_progress
+    ) is not None and kb.effective_max_spawn(max_spawn, max_in_progress) > 1:
+        raise ValueError(
+            "could not load effective Hermes config for parallel dispatch; "
+            "refusing to run without canonical admission policy"
+        ) from config_error
+    admission_config = kb.prepare_dispatch_admission(
+        _cfg,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
+    connection_scope = (
+        kb.connect_readonly_closing() if args.dry_run else kb.connect_closing()
+    )
+    with connection_scope as conn:
         res = kb.dispatch_once(
             conn,
             dry_run=args.dry_run,
             max_spawn=max_spawn,
+            max_new_spawns=max_new_spawns,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            effective_config=admission_config,
         )
     if getattr(args, "json", False):
         print(json.dumps({
@@ -2786,7 +2811,20 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
                 {"task_id": tid, "assignee": who, "current": current}
                 for (tid, who, current) in res.skipped_per_profile_capped
             ],
+            "skipped_worker_profile_not_allowed": [
+                {"task_id": tid, "assignee": who}
+                for (tid, who) in res.skipped_worker_profile_not_allowed
+            ],
+            "skipped_worker_profile_not_allowed_total": (
+                res.skipped_worker_profile_not_allowed_total
+            ),
+            "skipped_worker_profile_not_allowed_truncated": (
+                res.skipped_worker_profile_not_allowed_truncated
+            ),
             "auto_assigned_default": res.auto_assigned_default,
+            "admission_blocked": res.admission_blocked,
+            "admission_reason": res.admission_reason,
+            "admission_metrics": res.admission_metrics,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2819,11 +2857,15 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             print(
                 f"Deferred ({who} at per-profile cap, {current} running): {tid}"
             )
+    for tid, who in res.skipped_worker_profile_not_allowed:
+        print(f"Skipped ({who} is not admitted): {tid}")
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "
             f"{', '.join(res.skipped_nonspawnable)}"
         )
+    if res.admission_blocked:
+        print(f"Admission:    blocked ({res.admission_reason or 'unknown'})")
     return 0
 
 
@@ -2864,9 +2906,37 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
         )
         return 2
 
-    # Legacy path — same logic as before, kept behind --force.
-    # Make sure the DB exists before printing "started" so the user sees the
-    # correct DB path and any init error surfaces immediately.
+    # Resolve and validate canonical admission before DB creation, pidfiles,
+    # or the daemon loop. The forced path must not become an uncapped bypass.
+    from hermes_cli.config import load_config
+
+    daemon_cfg = load_config()
+    if not isinstance(daemon_cfg, dict):
+        raise ValueError("effective Hermes config must be a mapping")
+    daemon_kanban_cfg = daemon_cfg.get("kanban") or {}
+    if not isinstance(daemon_kanban_cfg, dict):
+        raise ValueError("kanban config must be a mapping")
+    daemon_max_spawn, daemon_max_in_progress = kb.resolve_dispatch_caps(
+        daemon_cfg, max_spawn=getattr(args, "max", None)
+    )
+    daemon_max_in_progress = kb.resolve_max_in_progress(
+        daemon_max_in_progress
+    )
+    daemon_snapshot = kb.prepare_dispatch_admission(
+        daemon_cfg,
+        max_spawn=daemon_max_spawn,
+        max_in_progress=daemon_max_in_progress,
+        max_in_progress_per_profile=daemon_kanban_cfg.get(
+            "max_in_progress_per_profile"
+        ),
+    )
+    daemon_allowed_worker_profiles = kb.resolve_worker_profile_admission(
+        daemon_snapshot,
+        max_spawn=daemon_max_spawn,
+        max_in_progress=daemon_max_in_progress,
+    )
+
+    # Legacy path — same loop as before, kept behind --force.
     kb.init_db()
 
     pidfile = getattr(args, "pidfile", None)
@@ -2954,7 +3024,10 @@ def _cmd_daemon(args: argparse.Namespace) -> int:
     try:
         kb.run_daemon(
             interval=args.interval,
-            max_spawn=args.max,
+            max_spawn=daemon_max_spawn,
+            max_in_progress=daemon_max_in_progress,
+            allowed_worker_profiles=daemon_allowed_worker_profiles,
+            effective_config=daemon_snapshot,
             failure_limit=getattr(args, "failure_limit", kb.DEFAULT_SPAWN_FAILURE_LIMIT),
             on_tick=_on_tick,
         )
