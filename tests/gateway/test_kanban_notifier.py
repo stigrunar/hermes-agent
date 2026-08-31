@@ -6,6 +6,7 @@ from pathlib import Path
 from gateway.config import Platform
 from gateway.kanban_watchers import (
     _acquire_singleton_lock,
+    _profile_notifier_lock_path,
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
@@ -34,14 +35,18 @@ class DisconnectedAdapters(dict):
 async def _run_one_notifier_tick(monkeypatch, runner):
     real_sleep = asyncio.sleep
 
+    async def fake_to_thread(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
     async def fake_sleep(delay):
         if delay == 5:
             return None
         runner._running = False
         await real_sleep(0)
 
+    monkeypatch.setattr(asyncio, "to_thread", fake_to_thread)
     monkeypatch.setattr(asyncio, "sleep", fake_sleep)
-    await runner._kanban_notifier_watcher(interval=1)
+    await runner._kanban_notifier_owner_loop(interval=1)
 
 
 def _make_runner(adapter):
@@ -265,6 +270,69 @@ def test_legacy_subscription_requires_confirmed_dispatcher_lock_owner(
     finally:
         _release_singleton_lock(loser_handle)
         _release_singleton_lock(winner_handle)
+
+
+def test_notifier_lease_is_singleton_per_profile_but_profiles_are_independent(
+    tmp_path, monkeypatch,
+):
+    """The watcher holds one profile lease while another profile can coexist."""
+    home = tmp_path / "hermes"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
+    default_path = _profile_notifier_lock_path(home, "default")
+    writer_path = _profile_notifier_lock_path(home, "writer")
+    runner = _make_runner(RecordingAdapter())
+    runner._active_profile_name = lambda: "default"
+
+    async def exercise_lease():
+        owner_started = asyncio.Event()
+        release_owner = asyncio.Event()
+
+        async def owner_loop(*, interval):
+            owner_started.set()
+            await release_owner.wait()
+
+        runner._kanban_notifier_owner_loop = owner_loop
+        watcher = asyncio.create_task(runner._kanban_notifier_watcher(interval=0.1))
+        await owner_started.wait()
+
+        default_contender, contender_state = _acquire_singleton_lock(default_path)
+        writer_owner, writer_state = _acquire_singleton_lock(writer_path)
+        try:
+            assert contender_state == "contended"
+            assert writer_state == "held"
+            assert default_path != writer_path
+        finally:
+            _release_singleton_lock(default_contender)
+            _release_singleton_lock(writer_owner)
+
+        release_owner.set()
+        await watcher
+
+        successor, successor_state = _acquire_singleton_lock(default_path)
+        try:
+            assert successor_state == "held"
+        finally:
+            _release_singleton_lock(successor)
+
+    asyncio.run(exercise_lease())
+
+
+def test_notifier_lock_unavailable_falls_back_to_config_only(monkeypatch):
+    runner = _make_runner(RecordingAdapter())
+    runner._active_profile_name = lambda: "default"
+    calls = []
+
+    async def owner_loop(*, interval):
+        calls.append(interval)
+
+    runner._kanban_notifier_owner_loop = owner_loop
+    monkeypatch.setattr(
+        "gateway.kanban_watchers._acquire_singleton_lock",
+        lambda _path: (None, "unavailable"),
+    )
+
+    asyncio.run(runner._kanban_notifier_watcher(interval=0.25))
+    assert calls == [0.25]
 
 
 class FailingAdapter:

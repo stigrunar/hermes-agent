@@ -2042,6 +2042,7 @@ def run_doctor(args):
     # Check SQLite session store
     state_db_path = hermes_home / "state.db"
     if state_db_path.exists():
+        _db_stats = None
         try:
             import sqlite3
             conn = sqlite3.connect(str(state_db_path))
@@ -2055,9 +2056,51 @@ def run_doctor(args):
             # through the triggers. `_db_opens_cleanly` now drives a rolled-back
             # write so this otherwise-silent corruption class is surfaced (and
             # repaired in place with --fix).
-            from hermes_state import _db_opens_cleanly, repair_state_db_schema
+            from hermes_state import (
+                _db_opens_cleanly,
+                collect_state_db_stats,
+                repair_state_db_schema,
+            )
 
-            _write_reason = _db_opens_cleanly(state_db_path)
+            # A full integrity scan walks every database page. Use the same
+            # logical size reported by the read-only stats probe when it is
+            # available, with the on-disk size as a fallback (or lower bound
+            # for sparse/sidecar-backed files). --fix always keeps the full
+            # scan because it is the deliberate repair path.
+            try:
+                _probe_stats = collect_state_db_stats(state_db_path)
+            except Exception:
+                _probe_stats = {}
+            else:
+                _db_stats = _probe_stats
+            _probe_sizes = [
+                _probe_stats.get("logical_size_bytes"),
+            ]
+            try:
+                _probe_sizes.append(state_db_path.stat().st_size)
+            except OSError:
+                pass
+            _probe_sizes = [size for size in _probe_sizes if isinstance(size, int)]
+            _probe_db_size = max(_probe_sizes) if _probe_sizes else None
+            _skip_integrity_check = (
+                not should_fix
+                and _probe_db_size is not None
+                and _probe_db_size > STATE_DB_SIZE_WARN_BYTES
+            )
+            if _skip_integrity_check:
+                check_info(
+                    f"{_DHH}/state.db PRAGMA integrity_check deferred/skipped "
+                    f"due to large DB ({_human_bytes(_probe_db_size)} > "
+                    f"{_human_bytes(STATE_DB_SIZE_WARN_BYTES)}; bounded "
+                    "schema/read/FTS-read/rolled-back-write probes still run)"
+                )
+
+            if _skip_integrity_check:
+                _write_reason = _db_opens_cleanly(
+                    state_db_path, skip_integrity_check=True
+                )
+            else:
+                _write_reason = _db_opens_cleanly(state_db_path)
             if _write_reason is not None:
                 check_warn(
                     f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)",
@@ -2146,7 +2189,8 @@ def run_doctor(args):
         try:
             from hermes_state import collect_state_db_stats, count_db_holders
 
-            _db_stats = collect_state_db_stats(state_db_path)
+            if _db_stats is None:
+                _db_stats = collect_state_db_stats(state_db_path)
             _db_holders = count_db_holders(state_db_path)
             for _kind, _text, _detail in _render_state_db_stats(
                 _db_stats, holders=_db_holders

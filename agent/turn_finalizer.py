@@ -71,7 +71,7 @@ def _record_kanban_budget_exhausted(
     max_iterations: int,
     logger: logging.Logger,
 ) -> None:
-    """Record a terminal ``timed_out`` outcome for a kanban worker that
+    """Record terminal iteration exhaustion for a kanban worker that
     exhausted its iteration budget.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run``
@@ -83,22 +83,28 @@ def _record_kanban_budget_exhausted(
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
         try:
-            _kb._record_task_failure(
+            error = (
+                f"Iteration budget exhausted "
+                f"({api_call_count}/{max_iterations}) — "
+                "task could not complete within the allowed iterations"
+            )
+            expected_run_id = None
+            # Dispatcher workers carry the run identity in their environment.
+            # Binding the finalizer to it prevents a stale worker from closing
+            # a successor run after its claim has been reclaimed.
+            raw_run_id = os.environ.get("HERMES_KANBAN_RUN_ID")
+            try:
+                if raw_run_id:
+                    expected_run_id = int(raw_run_id)
+            except (TypeError, ValueError):
+                pass
+            _kb._record_iteration_exhaustion(
                 _conn,
                 kanban_task,
-                error=(
-                    f"Iteration budget exhausted "
-                    f"({api_call_count}/{max_iterations}) — "
-                    "task could not complete within the allowed "
-                    "iterations"
-                ),
-                outcome="timed_out",
-                release_claim=True,
-                end_run=True,
-                event_payload_extra={
-                    "budget_used": api_call_count,
-                    "budget_max": max_iterations,
-                },
+                budget_used=api_call_count,
+                budget_max=max_iterations,
+                error=error,
+                expected_run_id=expected_run_id,
             )
         finally:
             try:
@@ -206,11 +212,11 @@ def finalize_turn(
         # worker could not complete (rather than treating it as a
         # protocol violation). This applies whether the user-facing fallback
         # came from the summary call or an explicitly pending continuation;
-        # both exhausted the task budget and must advance the failure circuit.
+        # both exhausted the task budget and must enter the non-retryable
+        # iteration-exhaustion transition.
         #
-        # We route through ``_record_task_failure(outcome="timed_out")``
-        # rather than ``kanban_block`` so this counts toward the dispatcher's
-        # consecutive-failure circuit breaker (#29747 gap 2).
+        # Scoped workers persist intent here; the dispatcher reaps the exact
+        # scope before closing the run and emitting the owner-replan signal.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")
         if _kanban_task:
             _record_kanban_budget_exhausted(
@@ -222,7 +228,7 @@ def finalize_turn(
         # anomalous exit_reason). If running as a kanban worker we must
         # still record a terminal outcome so the task does not remain in
         # an ambiguous lifecycle state. The worker's run is closed via
-        # ``_record_task_failure`` (compare-and-swap receipt path) which
+        # ``_record_iteration_exhaustion`` (compare-and-swap receipt path)
         # is a no-op if another path closed it — the CAS invariant in
         # ``_end_run`` (``WHERE ended_at IS NULL``) guarantees idempotence.
         _kanban_task = os.environ.get("HERMES_KANBAN_TASK")

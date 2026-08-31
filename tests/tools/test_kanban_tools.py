@@ -371,6 +371,33 @@ def test_comment_happy_path(worker_env):
         conn.close()
 
 
+def test_comment_prefers_session_scoped_profile(worker_env):
+    """Owner comments retain the session profile over process-global env."""
+    from gateway.session_context import reset_session_vars, set_session_vars
+    from tools import kanban_tools as kt
+
+    set_session_vars(profile="default")
+    try:
+        out = kt._handle_comment({
+            "task_id": worker_env,
+            "body": "owner scoped comment",
+        })
+    finally:
+        # Restore a fresh/unbound test context.  clear_session_vars() is the
+        # production handler-exit contract and intentionally masks env fallback,
+        # which would contaminate later env-based tools tests in this process.
+        reset_session_vars()
+    assert json.loads(out)["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        comments = kb.list_comments(conn, worker_env)
+        assert comments[0].author == "default"
+    finally:
+        conn.close()
+
+
 def test_comment_ignores_caller_supplied_author(worker_env):
     """``args["author"]`` is no longer honored — the author is always
     derived from ``HERMES_PROFILE`` so a worker can't forge a comment
@@ -414,6 +441,421 @@ def test_create_happy_path(worker_env):
         assert child.assignee == "peer"
     finally:
         conn.close()
+
+
+def _dollycode_execution_contract():
+    return {
+        "outcome": "Ship one bounded parser fix",
+        "frozen_acceptance": [
+            "Regression test passes",
+            "Existing behavior remains green",
+        ],
+        "repo_workspace_base_revision": "/repo/.worktrees/task @ abc123",
+        "mutation_scope": ["parser.py", "tests/test_parser.py"],
+        "will_not_do": ["No deploy", "No unrelated refactor"],
+        "verification": ["scripts/run_tests.sh tests/test_parser.py"],
+        "authority": ["inspect", "edit", "commit"],
+        "quality_mode": "FEATURE",
+        "qa_boundary": "Code proves focused tests; detached QA owns release proof",
+        "stop_when": ["Acceptance passes", "Block on missing source fixture"],
+    }
+
+
+def test_create_dollycode_requires_execution_contract(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous implementation",
+        "assignee": "dollycode",
+        "body": "Read the thread and work out what to do.",
+    }))
+
+    assert "ok" not in out
+    assert "execution_contract is required" in out["error"]
+
+
+def test_create_dollycode_renders_contract_before_background(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "bounded implementation",
+        "assignee": "dollycode",
+        "body": "Historical discussion and links.",
+        "execution_contract": _dollycode_execution_contract(),
+    }))
+    assert out["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.body is not None
+        rendered_body = child.body
+        assert rendered_body.startswith("## Execution contract (authoritative)\n")
+        assert "Outcome: Ship one bounded parser fix" in rendered_body
+        assert "Authority: inspect, edit, commit" in rendered_body
+        assert rendered_body.endswith(
+            "## Background and evidence\nHistorical discussion and links."
+        )
+    finally:
+        conn.close()
+
+
+def test_create_dollycode_triage_card_is_exempt(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "prepare implementation contract",
+        "assignee": "dollycode",
+        "triage": True,
+        "body": "Resolve the base revision and acceptance first.",
+    }))
+
+    assert out["ok"] is True
+    assert out["status"] == "triage"
+
+
+def _dollyqa_review_contract():
+    return {
+        "outcome": "Return one exact source-candidate verdict",
+        "candidates": [{
+            "label": "parser candidate",
+            "source": "origin/feature/parser",
+            "source_base": "origin/main@" + "a" * 40,
+            "workspace_or_url": "/repo/.worktrees/review",
+            "commit": "b" * 40,
+            "tree": "c" * 40,
+        }],
+        "parent_receipt": "t_source completion metadata with remote parity",
+        "frozen_criteria": ["Regression fixed", "No sibling behavior regression"],
+        "auth_fixture_state": "Synthetic fixtures only; no credentials required",
+        "owner": "default",
+        "verification": ["scripts/run_tests.sh tests/test_parser.py"],
+        "qa_boundary": "Source candidate only; not deployed/live acceptance",
+        "will_not_do": ["No edits", "No deploy"],
+        "stop_when": ["Return approved or changes_requested for the exact candidate"],
+    }
+
+
+def test_create_dollyqa_requires_review_contract(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous detached review",
+        "assignee": "dollyqa",
+        "body": "Inspect the parent and find the current candidate.",
+    }))
+
+    assert "ok" not in out
+    assert "review_contract is required" in out["error"]
+
+
+def test_create_dollyqa_renders_review_contract_before_background(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "exact detached review",
+        "assignee": "dollyqa",
+        "body": "Historical discussion and links.",
+        "review_contract": _dollyqa_review_contract(),
+    }))
+    assert out["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.body is not None
+        rendered_body = child.body
+        assert rendered_body.startswith("## Review contract (authoritative)\n")
+        assert "commit " + "b" * 40 + " / tree " + "c" * 40 in rendered_body
+        assert "Owner: default" in rendered_body
+        assert rendered_body.endswith(
+            "## Background and evidence\nHistorical discussion and links."
+        )
+    finally:
+        conn.close()
+
+
+def test_create_dollyqa_rejects_incomplete_candidate_identity(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyqa_review_contract()
+    contract["candidates"][0].pop("tree")
+    out = json.loads(kt._handle_create({
+        "title": "incomplete detached review",
+        "assignee": "dollyqa",
+        "review_contract": contract,
+    }))
+
+    assert "ok" not in out
+    assert "commit and tree must both" in out["error"]
+
+
+def test_create_dollyqa_accepts_artifact_sha256_identity(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyqa_review_contract()
+    contract["candidates"][0].pop("commit")
+    contract["candidates"][0].pop("tree")
+    contract["candidates"][0]["artifact_sha256"] = "d" * 64
+    out = json.loads(kt._handle_create({
+        "title": "exact artifact review",
+        "assignee": "dollyqa",
+        "review_contract": contract,
+    }))
+
+    assert out["ok"] is True
+
+
+def test_create_dollyqa_rejects_unknown_review_contract_field(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyqa_review_contract()
+    contract["infer_candidate_from_parent"] = True
+    out = json.loads(kt._handle_create({
+        "title": "unsafe inferred review",
+        "assignee": "dollyqa",
+        "review_contract": contract,
+    }))
+
+    assert "ok" not in out
+    assert "unknown field(s): infer_candidate_from_parent" in out["error"]
+
+
+def test_create_dollyqa_triage_card_is_exempt(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "resolve exact QA candidate",
+        "assignee": "dollyqa",
+        "triage": True,
+        "body": "Refresh candidate identity and parent receipt first.",
+    }))
+
+    assert out["ok"] is True
+    assert out["status"] == "triage"
+
+
+def _dollydesign_intake():
+    return {
+        "user_job": "Dispatch the next warehouse item without losing context",
+        "target_surface": "Warehouse exception worklist and detail drawer",
+        "design_mode": "direction",
+        "source_of_truth": "docs/design/warehouse-worklist.md revision 4",
+        "repo_workspace_revision": "/repo/.worktrees/design @ " + "a" * 40,
+        "frozen_decisions": ["Desktop-first internal operations surface"],
+        "open_decisions": ["Table plus drawer versus master-detail split"],
+        "evidence_available": ["Current route screenshots", "Existing DESIGN.md"],
+        "acceptance": [
+            "One recommended interaction pattern",
+            "Implementation-ready rejection criteria",
+        ],
+        "authority_and_exclusions": {
+            "owner": "default",
+            "authority": ["inspect", "propose", "design_direction"],
+            "exclusions": ["No production code", "No deploy", "No source writes"],
+        },
+    }
+
+
+def test_create_dollydesign_requires_design_intake(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous design task",
+        "assignee": "dollydesign",
+        "body": "Make the warehouse UI better.",
+    }))
+
+    assert "ok" not in out
+    assert "design_intake is required" in out["error"]
+
+
+def test_create_dollydesign_renders_intake_before_background(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "warehouse design direction",
+        "assignee": "dollydesign",
+        "body": "Historical screenshots and discussion.",
+        "design_intake": _dollydesign_intake(),
+    }))
+    assert out["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.body is not None
+        assert child.body.startswith("## Design intake (authoritative)\n")
+        assert "Design mode: direction" in child.body
+        assert "Authority: inspect, propose, design_direction" in child.body
+        assert child.body.endswith(
+            "## Background and evidence\nHistorical screenshots and discussion."
+        )
+    finally:
+        conn.close()
+
+
+def test_create_dollydesign_accepts_explicit_empty_decision_lists(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollydesign_intake()
+    contract["frozen_decisions"] = []
+    contract["open_decisions"] = []
+    contract["evidence_available"] = []
+    out = json.loads(kt._handle_create({
+        "title": "bounded blank-state design review",
+        "assignee": "dollydesign",
+        "design_intake": contract,
+    }))
+
+    assert out["ok"] is True
+
+
+def test_create_dollydesign_rejects_invalid_mode(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollydesign_intake()
+    contract["design_mode"] = "make_it_pop"
+    out = json.loads(kt._handle_create({
+        "title": "invalid design mode",
+        "assignee": "dollydesign",
+        "design_intake": contract,
+    }))
+
+    assert "ok" not in out
+    assert "design_mode must be direction, review, handoff, or sign_off" in out["error"]
+
+
+def test_create_dollydesign_triage_card_is_exempt(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "resolve design truth source",
+        "assignee": "dollydesign",
+        "triage": True,
+        "body": "Resolve the target surface and current design revision first.",
+    }))
+
+    assert out["ok"] is True
+    assert out["status"] == "triage"
+
+
+def _dollyarchitect_routing():
+    return {
+        "invariant_outcome": "One ownership boundary for durable task truth",
+        "observed_evidence": [
+            "repo:TASKS.md@abc123",
+            "runtime receipt t_source completion metadata",
+        ],
+        "exact_source_authority": "repo TASKS.md at commit abc123 plus live DB schema",
+        "material_architecture_question": (
+            "Can the existing task model express the invariant without a new service?"
+        ),
+        "frozen_constraints_non_goals": [
+            "Preserve prompt caching",
+            "No implementation or deploy",
+        ],
+        "unresolved_owner_decisions": [
+            "Whether a later implementation should be activated"
+        ],
+        "implementation_authority": "none",
+    }
+
+
+def test_create_dollyarchitect_requires_architect_routing_even_for_triage(worker_env):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "ambiguous architecture task",
+        "assignee": "dollyarchitect",
+        "triage": True,
+        "body": "Work out the architecture and prepare code.",
+    }))
+
+    assert "ok" not in out
+    assert "architect_routing is required" in out["error"]
+    assert "triage to Dolly/default" in out["error"]
+
+
+def test_create_dollyarchitect_renders_outcome_contract_before_secondary_evidence(
+    worker_env,
+):
+    from tools import kanban_tools as kt
+
+    out = json.loads(kt._handle_create({
+        "title": "architecture ownership review",
+        "assignee": "dollyarchitect",
+        "body": "Historical proposals and linked alternatives.",
+        "architect_routing": _dollyarchitect_routing(),
+    }))
+    assert out["ok"] is True
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, out["task_id"])
+        assert child is not None
+        assert child.body is not None
+        assert child.body.startswith("## Architect routing (authoritative)\n")
+        assert "Implementation authority: none" in child.body
+        assert "Material architecture question: Can the existing task model" in child.body
+        assert child.body.endswith(
+            "## Background and secondary evidence\n"
+            "Historical proposals and linked alternatives."
+        )
+    finally:
+        conn.close()
+
+
+def test_create_dollyarchitect_accepts_explicit_empty_owner_lists(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["frozen_constraints_non_goals"] = []
+    contract["unresolved_owner_decisions"] = []
+    out = json.loads(kt._handle_create({
+        "title": "bounded architecture question",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert out["ok"] is True
+
+
+def test_create_dollyarchitect_rejects_invalid_implementation_authority(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["implementation_authority"] = "must_create_dollycode"
+    out = json.loads(kt._handle_create({
+        "title": "overprescribed architecture task",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert "ok" not in out
+    assert "must be none, prepare, or authorized" in out["error"]
+
+
+def test_create_dollyarchitect_rejects_legacy_mechanism_first_fields(worker_env):
+    from tools import kanban_tools as kt
+
+    contract = _dollyarchitect_routing()
+    contract["requested_actions"] = ["Design these concrete tables"]
+    out = json.loads(kt._handle_create({
+        "title": "mechanism-first architecture task",
+        "assignee": "dollyarchitect",
+        "architect_routing": contract,
+    }))
+
+    assert "ok" not in out
+    assert "unknown field(s): requested_actions" in out["error"]
 
 
 def test_link_happy_path(worker_env):
