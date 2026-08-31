@@ -488,6 +488,8 @@ def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     Auto-clears when a fresh clean completion arrives AFTER the
     suspected event.
     """
+    if _task_field(task, "status") in {"done", "archived", "cancelled"}:
+        return []
     hits = _active_hallucination_events(events, "suspected_hallucinated_references")
     if not hits:
         return []
@@ -531,8 +533,8 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     Accepts the legacy ``spawn_failure_threshold`` config key for
     back-compat.
 
-    Terminal statuses are exempt: a done/archived card has nothing left
-    to retry, so a lingering failure streak is history, not a signal.
+    Terminal statuses are exempt: a done/archived/cancelled card has nothing
+    left to retry, so a lingering failure streak is history, not a signal.
     (``complete_task`` resets the counter, but a manual done — e.g. a
     dashboard drag — ends no run and used to leave the flag stuck.)
 
@@ -542,7 +544,9 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     "failed Nx", which reads as a current failure. It re-fires if the new
     run fails too (status leaves ``running`` with a recorded outcome).
     """
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in (
+        "done", "archived", "cancelled", "running",
+    ):
         return []
     threshold = _positive_int(cfg.get(
         "failure_threshold",
@@ -698,14 +702,10 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
-            # A success (or manual reclaim) breaks the streak.
-            break
         else:
-            # Other outcomes (timed_out, blocked, spawn_failed, gave_up)
-            # aren't crash signals — don't count them, but they also
-            # don't break the crash streak.
-            continue
+            # Only the current trailing run sequence is actionable. Any newer
+            # non-crash outcome supersedes crashes from older attempts.
+            break
     if consecutive < threshold:
         return []
     task_id = _task_field(task, "id")

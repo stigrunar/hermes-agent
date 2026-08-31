@@ -156,7 +156,7 @@ class TestDispatchOnceReconciles:
         _orphan_running(conn, tid)
 
         result = kb.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
-                                  dry_run=True)
+                                  max_new_spawns=0)
 
         assert tid in result.reconciled_orphans
         assert conn.execute(

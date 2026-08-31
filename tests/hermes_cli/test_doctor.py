@@ -17,6 +17,101 @@ from hermes_cli import doctor as doctor_mod
 from hermes_cli.doctor import _has_provider_env_config
 
 
+def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
+    from hermes_state import SessionDB
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text("memory: {}\n", encoding="utf-8")
+    db = SessionDB(db_path=home / "state.db")
+    db.create_session("doctor-probe", "cli")
+    db.close()
+
+    monkeypatch.setattr(doctor_mod, "HERMES_HOME", home)
+    monkeypatch.setattr(doctor_mod, "_DHH", str(home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        doctor_mod,
+        "_render_state_db_stats",
+        lambda stats, holders=None: [],
+    )
+
+    fake_model_tools = types.SimpleNamespace(
+        check_tool_availability=lambda *a, **kw: ([], []),
+        TOOLSET_REQUIREMENTS={},
+    )
+    monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
+
+    import hermes_state
+    import tools.browser_tool as browser_tool
+
+    monkeypatch.setattr(browser_tool, "warm_agent_browser_npx_cache", lambda: False)
+
+    probe_calls = []
+
+    def fake_probe(path, **kwargs):
+        probe_calls.append(kwargs)
+        return None
+
+    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", fake_probe)
+    monkeypatch.setattr(
+        hermes_state,
+        "collect_state_db_stats",
+        lambda path: {"logical_size_bytes": logical_size},
+    )
+    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: None)
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        doctor_mod.run_doctor(Namespace(fix=fix))
+    return probe_calls, buf.getvalue()
+
+
+def test_run_doctor_defers_integrity_scan_above_size_threshold(monkeypatch, tmp_path):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+
+    calls, output = _run_doctor_for_state_db_probe(
+        monkeypatch,
+        tmp_path,
+        logical_size=STATE_DB_SIZE_WARN_BYTES + 1,
+        fix=False,
+    )
+
+    assert calls == [{"skip_integrity_check": True}]
+    assert "PRAGMA integrity_check deferred/skipped due to large DB" in output
+
+
+def test_run_doctor_keeps_integrity_scan_for_fix_above_size_threshold(
+    monkeypatch, tmp_path
+):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+
+    calls, output = _run_doctor_for_state_db_probe(
+        monkeypatch,
+        tmp_path,
+        logical_size=STATE_DB_SIZE_WARN_BYTES + 1,
+        fix=True,
+    )
+
+    assert calls == [{}]
+    assert "PRAGMA integrity_check deferred/skipped due to large DB" not in output
+
+
+def test_run_doctor_keeps_integrity_scan_at_size_threshold(monkeypatch, tmp_path):
+    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+
+    calls, output = _run_doctor_for_state_db_probe(
+        monkeypatch,
+        tmp_path,
+        logical_size=STATE_DB_SIZE_WARN_BYTES,
+        fix=False,
+    )
+
+    assert calls == [{}]
+    assert "PRAGMA integrity_check deferred/skipped due to large DB" not in output
+
+
 class TestDoctorPlatformHints:
     def test_termux_package_hint(self, monkeypatch):
         monkeypatch.setenv("TERMUX_VERSION", "0.118.3")
