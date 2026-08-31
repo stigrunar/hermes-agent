@@ -585,7 +585,6 @@ def test_review_dispatch_honors_global_and_per_profile_caps(
         per_profile_capped = kb.dispatch_once(
             conn,
             dry_run=True,
-            max_in_progress=10,
             max_in_progress_per_profile=1,
         )
         spawned_reviews = [

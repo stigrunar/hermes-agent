@@ -168,10 +168,11 @@ def test_pending_response_does_not_mask_later_terminal_exit(
 def test_pending_response_records_kanban_timeout(monkeypatch):
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-123")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="record_iteration_exhaustion")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_iteration_exhaustion", record)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "42")
     agent = _LimitAgent()
 
     result = _finalize(
@@ -185,14 +186,13 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     record.assert_called_once_with(
         conn,
         "task-123",
+        budget_used=60,
+        budget_max=60,
         error=(
             "Iteration budget exhausted (60/60) — task could not complete "
             "within the allowed iterations"
         ),
-        outcome="timed_out",
-        release_claim=True,
-        end_run=True,
-        event_payload_extra={"budget_used": 60, "budget_max": 60},
+        expected_run_id=42,
     )
 
 
@@ -242,10 +242,10 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-456")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="record_iteration_exhaustion")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_iteration_exhaustion", record)
     agent = _LimitAgent()
 
     # Budget exhausted (60/60), interrupted, no fallback-eligible exit_reason
@@ -270,11 +270,15 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-456"
-    assert kwargs["outcome"] == "timed_out"
-    assert kwargs["release_claim"] is True
-    assert kwargs["end_run"] is True
-    assert kwargs["event_payload_extra"]["budget_used"] == 60
-    assert kwargs["event_payload_extra"]["budget_max"] == 60
+    assert kwargs == {
+        "budget_used": 60,
+        "budget_max": 60,
+        "error": (
+            "Iteration budget exhausted (60/60) — task could not complete "
+            "within the allowed iterations"
+        ),
+        "expected_run_id": None,
+    }
 
 
 def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
@@ -283,10 +287,10 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     """
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     monkeypatch.setenv("HERMES_KANBAN_TASK", "task-789")
-    record = MagicMock(name="record_task_failure")
+    record = MagicMock(name="record_iteration_exhaustion")
     conn = SimpleNamespace(close=lambda: None)
     monkeypatch.setattr("hermes_cli.kanban_db.connect", lambda: conn)
-    monkeypatch.setattr("hermes_cli.kanban_db._record_task_failure", record)
+    monkeypatch.setattr("hermes_cli.kanban_db._record_iteration_exhaustion", record)
     agent = _LimitAgent()
 
     result = finalize_turn(
@@ -308,7 +312,15 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     record.assert_called_once()
     args, kwargs = record.call_args
     assert args[1] == "task-789"
-    assert kwargs["outcome"] == "timed_out"
+    assert kwargs == {
+        "budget_used": 60,
+        "budget_max": 60,
+        "error": (
+            "Iteration budget exhausted (60/60) — task could not complete "
+            "within the allowed iterations"
+        ),
+        "expected_run_id": None,
+    }
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
@@ -371,5 +383,4 @@ def test_bounded_fallback_does_not_fire_when_budget_not_exhausted(monkeypatch):
     )
 
     record.assert_not_called()
-
 

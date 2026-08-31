@@ -1714,8 +1714,12 @@ class HindsightMemoryProvider(MemoryProvider):
             self._config.get("retain_assistant_prefix") or os.environ.get("HINDSIGHT_RETAIN_ASSISTANT_PREFIX", "Assistant")
         ).strip() or "Assistant"
 
-        # Retain controls
-        self._auto_retain = self._config.get("auto_retain", True)
+        # Retain controls. Tools-only mode is explicitly opt-in: shipped
+        # defaults must not retain every conversation turn merely because the
+        # provider is loaded to expose its tools.
+        self._auto_retain = bool(
+            self._config.get("auto_retain", True)
+        ) and self._memory_mode != "tools"
         self._retain_every_n_turns = max(1, int(self._config.get("retain_every_n_turns", 1)))
         self._retain_context = self._config.get("retain_context", "conversation between Hermes Agent and the User")
 
@@ -1768,16 +1772,12 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
 
-        # For local mode, start the embedded daemon in the background so it
-        # doesn't block the chat. Redirect stdout/stderr to a log file to
-        # prevent rich startup output from spamming the terminal.
+        # PostgreSQL's initdb refuses to run as root by design, so the embedded
+        # daemon can never initialize its data directory under root. Keep this
+        # guard ahead of the tools-only lazy branch: tools mode defers startup,
+        # but must not make the unsafe local_embedded configuration appear
+        # usable when an explicit memory tool eventually runs.
         if self._mode == "local_embedded":
-            # PostgreSQL's initdb refuses to run as root by design, so the
-            # embedded daemon can never initialize its data directory under
-            # root. Without this guard the daemon-start thread would fail,
-            # retry, and loop forever — each cycle reloading embedding models
-            # (~958MB RAM, ~33% CPU) with no user-visible error. Detect root
-            # up front and skip daemon startup with a clear message instead.
             if hasattr(os, "geteuid") and os.geteuid() == 0:
                 msg = (
                     "Hindsight local_embedded mode cannot run as root "
@@ -1796,6 +1796,14 @@ class HindsightMemoryProvider(MemoryProvider):
                 self._mode = "disabled"
                 return
 
+        # For automatic context modes, start the embedded daemon in the
+        # background so it does not block the chat. Tools-only mode is
+        # deliberately lazy: no recall or retain runs automatically, so loading
+        # the embedding stack at session initialization would pay roughly the
+        # full local-memory cost even when the user never calls a memory tool.
+        # The first explicit hindsight_* tool call still starts the daemon via
+        # _get_client() / HindsightEmbedded._ensure_started().
+        if self._mode == "local_embedded" and self._memory_mode != "tools":
             def _start_daemon():
                 import traceback
                 log_dir = get_hermes_home() / "logs"
@@ -1837,6 +1845,10 @@ class HindsightMemoryProvider(MemoryProvider):
 
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
+        elif self._mode == "local_embedded":
+            logger.info(
+                "Hindsight tools-only mode: embedded daemon startup deferred until first explicit tool call"
+            )
 
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":

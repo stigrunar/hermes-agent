@@ -11,6 +11,7 @@ behavior-neutral move that lifts ~1,000 LOC out of run.py.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
 import os
 import re
@@ -170,6 +171,12 @@ def _release_singleton_lock(handle) -> None:
         pass
 
 
+def _profile_notifier_lock_path(kanban_home: Path, profile: str) -> Path:
+    """Return the stable per-profile notifier ownership lock path."""
+    digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:20]
+    return kanban_home / "kanban" / f".notifier-{digest}.lock"
+
+
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     """Return the tenant scope (Slack workspace) a subscription's wake keys to.
 
@@ -208,6 +215,30 @@ def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
     return None
 
 
+def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
+    """Build one bounded, artifact-grounded continuation for Dolly/default."""
+    task_id = str(replan.get("task_id") or getattr(task, "id", ""))
+    fingerprint = str(replan.get("fingerprint") or "")
+    return (
+        "[HERMES OWNER REPLAN — one shot]\n"
+        f"Project: {replan.get('project_id') or replan.get('project') or 'unknown'} · board: {replan.get('board') or 'unknown'}\n"
+        f"Terminal task: {task_id} · run: {replan.get('terminal_run_id')} · reason: {replan.get('end_reason')}\n"
+        f"Contract/revision: {replan.get('contract_id')} / {replan.get('revision')}\n"
+        f"Semantic outcome: {replan.get('semantic_outcome') or replan.get('end_reason')} · action: {replan.get('action') or 'inspect preserved artifact'}\n"
+        f"Source topic target: {replan.get('topic_target') or 'unknown'}\n"
+        f"Required successor identity: continuation_of={task_id} · project_id={replan.get('project_id') or replan.get('project') or 'unknown'} · topic_target={replan.get('topic_target') or 'unknown'} · fingerprint={fingerprint}\n"
+        f"Preserved artifact: {replan.get('worktree') or 'unknown'} · branch: {replan.get('branch') or 'unknown'} · state: {replan.get('artifact_state') or 'unknown'}\n\n"
+        "Inspect the terminal run, preserved worktree/diff, tests, commit and push evidence. "
+        "Classify exactly one of: complete_candidate, useful_incomplete_patch, "
+        "new_blocker_or_unusable. Materialize exactly one current revision and one next "
+        "action or manual blocker in repo canon, preserving current dependencies and review gates. "
+        "Do not unblock or retry the terminal revision; do not spawn the same worker, Architect, "
+        "detached QA, a new root graph, merge, or deploy.\n"
+        f"After the current-revision/next-action receipt is durable, add one Kanban comment to {task_id} "
+        f"with this exact line: owner_replan_ack: {fingerprint}"
+    )
+
+
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
@@ -222,6 +253,44 @@ class GatewayKanbanWatchersMixin:
         _release_singleton_lock(handle)
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Elect one kernel-locked notifier owner for this gateway profile."""
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
+            return
+
+        profile = getattr(self, "_active_profile_name")()
+        lock_path = _profile_notifier_lock_path(_kb.kanban_home(), profile)
+        retry_delay = min(1.0, max(0.1, float(interval)))
+        while getattr(self, "_running", False):
+            lock_handle, lock_state = _acquire_singleton_lock(lock_path)
+            if lock_state != "held":
+                if lock_state == "unavailable":
+                    logger.warning(
+                        "kanban notifier: profile %s lock unavailable; "
+                        "falling back to config-only ownership",
+                        profile,
+                    )
+                    await self._kanban_notifier_owner_loop(interval=interval)
+                    return
+                await asyncio.sleep(retry_delay)
+                continue
+            logger.info(
+                "kanban notifier: acquired profile lease profile=%s (%s)",
+                profile,
+                lock_path,
+            )
+            try:
+                await self._kanban_notifier_owner_loop(interval=interval)
+            finally:
+                _release_singleton_lock(lock_handle)
+                logger.info(
+                    "kanban notifier: released profile lease profile=%s", profile
+                )
+            return
+
+    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         For each subscription row, fetches ``task_events`` newer than the
@@ -263,7 +332,11 @@ class GatewayKanbanWatchersMixin:
         # but is not a block (see kanban_db.request_review); the task is not
         # archived, so the subscription stays alive and later review
         # cycles keep notifying.
-        TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+        TERMINAL_KINDS = (
+            "completed", "blocked", "gave_up", "crashed", "timed_out",
+            "iteration_exhausted", "status", "archived", "unblocked",
+            "block_loop_detected", "review_requested", "changes_requested",
+        )
         # Subscriptions are removed only when the task reaches the irreversible
         # archived status. ``done`` is reversible in review/controller flows,
         # so removing its subscription would silence a later reopen. We used
@@ -486,9 +559,20 @@ class GatewayKanbanWatchersMixin:
                                         thread_id=sub.get("thread_id") or "",
                                         kinds=TERMINAL_KINDS,
                                     )
-                                    if not events:
-                                        continue
                                     task = _kb.get_task(conn, sub["task_id"])
+                                    # Peek only: the durable wake claim is made
+                                    # immediately before delivery, after the
+                                    # ordinary notification cursor succeeds.
+                                    owner_replan = _kb.claim_owner_replan_for_route(
+                                        conn,
+                                        task_id=sub["task_id"],
+                                        platform=sub["platform"],
+                                        chat_id=sub["chat_id"],
+                                        thread_id=sub.get("thread_id") or "",
+                                        claim=False,
+                                    )
+                                    if not events and owner_replan is None:
+                                        continue
                                     logger.debug(
                                         "kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                                         len(events), sub["task_id"], slug, old_cursor, cursor,
@@ -500,6 +584,7 @@ class GatewayKanbanWatchersMixin:
                                         "events": events,
                                         "task": task,
                                         "board": slug,
+                                        "owner_replan": owner_replan,
                                     })
                                 except Exception as sub_exc:
                                     # Isolate per-subscription failures so one
@@ -518,6 +603,7 @@ class GatewayKanbanWatchersMixin:
                     sub = d["sub"]
                     task = d["task"]
                     board_slug = d.get("board")
+                    owner_replan = d.get("owner_replan")
                     platform_str = (sub["platform"] or "").lower()
                     try:
                         plat = _Platform(platform_str)
@@ -627,6 +713,19 @@ class GatewayKanbanWatchersMixin:
                             msg = (
                                 f"⏱ {board_tag}{tag}Kanban {sub['task_id']} timed out "
                                 f"(max_runtime={limit}s); will retry"
+                            )
+                        elif kind == "iteration_exhausted":
+                            payload = ev.payload if isinstance(ev.payload, dict) else {}
+                            used = payload.get("budget_used")
+                            maximum = payload.get("budget_max")
+                            budget = (
+                                f" ({used}/{maximum} iterations)"
+                                if used is not None and maximum is not None
+                                else ""
+                            )
+                            msg = (
+                                f"⏹ {board_tag}{tag}Kanban {sub['task_id']} exhausted its "
+                                f"bounded iteration budget{budget}; owner replan required"
                             )
                         elif kind == "status":
                             new_status = ""
@@ -844,9 +943,14 @@ class GatewayKanbanWatchersMixin:
                             "blocked", "review_requested", "changes_requested",
                             "block_loop_detected",
                         )
+                        # A durable owner-replan intent is the sole bounded
+                        # agent wake for this terminal completion. Keep the
+                        # passive event notification, but do not also wake the
+                        # creator session with the generic summary.
+                        _owner_replan_wake = owner_replan is not None
                         _wake_kinds = (
                             {ev.kind for ev in d["events"] if ev.kind in _WAKE_KINDS}
-                            if wake_agent
+                            if wake_agent and not _owner_replan_wake
                             else set()
                         )
                         from gateway.wake import adapter_supports_push as _adapter_push_ok
@@ -1069,6 +1173,109 @@ class GatewayKanbanWatchersMixin:
                             # Nothing left to deliver on this path (the wake,
                             # if any, already succeeded above).
                             sub_fail_counts.pop(sub_key, None)
+
+                        # A terminal iteration exhaustion is deliberately not
+                        # sent through the generic creator-session wake list.
+                        # Claim and deliver the durable default-owner intent
+                        # once, after the authoritative event cursor has been
+                        # advanced. A prior interrupted claim is terminalized
+                        # as manual-only; it is never reclaimed into a second
+                        # wake attempt.
+                        if owner_replan is not None:
+                            _fingerprint = str(owner_replan.get("fingerprint") or "")
+                            _replan_event_id = int(owner_replan.get("replan_event_id") or 0)
+                            if owner_replan.get("interrupted_claim"):
+                                await asyncio.to_thread(
+                                    self._kanban_owner_replan_outcome,
+                                    board_slug,
+                                    sub["task_id"],
+                                    _fingerprint,
+                                    _replan_event_id,
+                                    "owner wake claim was interrupted before a delivery receipt",
+                                )
+                                logger.warning(
+                                    "kanban notifier: recovered interrupted owner replan for %s as manual-only",
+                                    sub["task_id"],
+                                )
+                            else:
+                                owner_replan = await asyncio.to_thread(
+                                    self._kanban_claim_owner_replan,
+                                    board_slug,
+                                    sub,
+                                )
+                                if owner_replan is not None:
+                                    _fingerprint = str(owner_replan.get("fingerprint") or "")
+                                    _replan_event_id = int(owner_replan.get("replan_event_id") or 0)
+                                    try:
+                                        from gateway.session import SessionSource
+                                        from gateway.wake import deliver_wake
+
+                                        _route = owner_replan.get("route") or {}
+                                        _owner_prompt = _owner_replan_prompt(task, owner_replan)
+                                        if _is_push_adapter:
+                                            _chat_type = str(
+                                                _route.get("chat_type")
+                                                or sub.get("chat_type")
+                                                or ""
+                                            ).strip() or "group"
+                                            _source = SessionSource(
+                                                platform=plat,
+                                                chat_id=str(_route.get("chat_id") or sub["chat_id"]),
+                                                chat_type=_chat_type,
+                                                thread_id=str(_route.get("thread_id") or "") or None,
+                                                user_id=str(_route.get("user_id") or "") or None,
+                                                profile="default",
+                                                scope_id=_wake_scope_id(adapter, sub),
+                                            )
+                                            _resolver = getattr(self, "_session_key_for_source", None)
+                                            _owner_session_key = (
+                                                _resolver(_source)
+                                                if callable(_resolver)
+                                                else str(getattr(task, "session_id", None) or "")
+                                            )
+                                            await deliver_wake(
+                                                adapter,
+                                                text=_owner_prompt,
+                                                session_id=_owner_session_key,
+                                                source=_source,
+                                            )
+                                        else:
+                                            _owner_session_key = str(
+                                                _route.get("session_key")
+                                                or getattr(task, "session_id", None)
+                                                or _route.get("chat_id")
+                                                or ""
+                                            ).strip()
+                                            await deliver_wake(
+                                                adapter,
+                                                text=_owner_prompt,
+                                                session_id=_owner_session_key,
+                                            )
+                                        await asyncio.to_thread(
+                                            self._kanban_owner_replan_outcome,
+                                            board_slug,
+                                            sub["task_id"],
+                                            _fingerprint,
+                                            _replan_event_id,
+                                            None,
+                                        )
+                                        logger.info(
+                                            "kanban notifier: delivered one-shot owner replan for %s run=%s",
+                                            sub["task_id"], owner_replan.get("terminal_run_id"),
+                                        )
+                                    except Exception as _owner_err:
+                                        await asyncio.to_thread(
+                                            self._kanban_owner_replan_outcome,
+                                            board_slug,
+                                            sub["task_id"],
+                                            _fingerprint,
+                                            _replan_event_id,
+                                            str(_owner_err),
+                                        )
+                                        logger.warning(
+                                            "kanban notifier: owner replan failed once for %s; manual-only: %s",
+                                            sub["task_id"], _owner_err,
+                                        )
                         # Unsubscribe only on archive. Completion (``done``)
                         # remains reversible: controllers reopen completed
                         # work for review corrections and continuation. The
@@ -1102,6 +1309,54 @@ class GatewayKanbanWatchersMixin:
                 if not self._running:
                     return
                 await asyncio.sleep(1)
+
+    def _kanban_claim_owner_replan(
+        self, board: Optional[str], sub: dict,
+    ) -> Optional[dict[str, Any]]:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return _kb.claim_owner_replan_for_route(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claim=True,
+            )
+        finally:
+            conn.close()
+
+    def _kanban_owner_replan_outcome(
+        self,
+        board: Optional[str],
+        task_id: str,
+        fingerprint: str,
+        replan_event_id: int,
+        error: Optional[str],
+    ) -> None:
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            if error is None:
+                _kb.mark_owner_replan_delivered(
+                    conn,
+                    task_id,
+                    fingerprint=fingerprint,
+                    replan_event_id=replan_event_id,
+                )
+            else:
+                _kb.mark_owner_replan_failed(
+                    conn,
+                    task_id,
+                    fingerprint=fingerprint,
+                    replan_event_id=replan_event_id,
+                    error=error,
+                )
+        finally:
+            conn.close()
 
     def _kanban_advance(
         self, sub: dict, cursor: int, board: Optional[str] = None,
@@ -1309,6 +1564,9 @@ class GatewayKanbanWatchersMixin:
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(kanban_cfg, dict):
+            logger.error("kanban dispatcher: kanban config must be a mapping")
+            return
         if not kanban_cfg.get("dispatch_in_gateway", True):
             logger.info(
                 "kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false"
@@ -1319,6 +1577,34 @@ class GatewayKanbanWatchersMixin:
             from hermes_cli import kanban_db as _kb
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            return
+
+        # Resolve the immutable shared-root admission snapshot before the
+        # gateway singleton lock. Configuration failure must be side-effect
+        # free, and every board in this watcher must receive the same policy.
+        try:
+            requested_spawn, requested_progress = _kb.resolve_dispatch_caps(cfg)
+            requested_progress = _kb.resolve_max_in_progress(requested_progress)
+            admission_config = _kb.prepare_dispatch_admission(
+                cfg,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+                max_in_progress_per_profile=kanban_cfg.get(
+                    "max_in_progress_per_profile"
+                ),
+            )
+            max_spawn, max_in_progress = _kb.resolve_dispatch_caps(
+                admission_config,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+            )
+            allowed_worker_profiles = _kb.resolve_worker_profile_admission(
+                admission_config,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error("kanban dispatcher: admission policy invalid: %s", exc)
             return
 
         # Single-dispatcher backstop. dispatch_in_gateway defaults to true, so a
@@ -1356,49 +1642,10 @@ class GatewayKanbanWatchersMixin:
             interval = 60.0
         interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-        # Read max_spawn config to limit concurrent kanban tasks
-        max_spawn = kanban_cfg.get("max_spawn", None)
         if max_spawn is not None:
             logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
-
-        # Cap the number of simultaneously running tasks so slow workers
-        # (local LLMs, resource-constrained hosts) don't pile up and time
-        # out. When set, the dispatcher skips spawning when the board
-        # already has this many tasks in 'running' status.
-        raw_max_in_progress = kanban_cfg.get("max_in_progress", None)
-        max_in_progress = None
-        if raw_max_in_progress is not None:
-            try:
-                max_in_progress = int(raw_max_in_progress)
-            except (TypeError, ValueError):
-                logger.warning(
-                    "kanban dispatcher: invalid kanban.max_in_progress=%r; ignoring",
-                    raw_max_in_progress,
-                )
-                max_in_progress = None
-            else:
-                if max_in_progress < 1:
-                    logger.warning(
-                        "kanban dispatcher: kanban.max_in_progress=%r is below 1; ignoring",
-                        raw_max_in_progress,
-                    )
-                    max_in_progress = None
-                else:
-                    logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
-        # When the operator never set kanban.max_in_progress, fall back to a
-        # memory-derived default (OOF-30/OOF-77): unbounded fan-out on small
-        # hosted VMs has repeatedly swap-thrashed the whole machine. Explicit
-        # config always wins; None stays None on hosts where total memory
-        # can't be read (macOS/Windows dev machines).
-        effective_max_in_progress = _kb.resolve_max_in_progress(max_in_progress)
-        if max_in_progress is None and effective_max_in_progress is not None:
-            logger.info(
-                "kanban dispatcher: kanban.max_in_progress unset; using "
-                "memory-derived default max_in_progress=%d "
-                "(set kanban.max_in_progress in config.yaml to override)",
-                effective_max_in_progress,
-            )
-        max_in_progress = effective_max_in_progress
+        if max_in_progress is not None:
+            logger.info("kanban dispatcher: max_in_progress=%s", max_in_progress)
 
         raw_failure_limit = kanban_cfg.get("failure_limit", _kb.DEFAULT_FAILURE_LIMIT)
         try:
@@ -1572,6 +1819,8 @@ class GatewayKanbanWatchersMixin:
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
                     max_in_progress_per_profile=max_in_progress_per_profile,
+                    allowed_worker_profiles=allowed_worker_profiles,
+                    effective_config=admission_config,
                     reconcile_orphans=reconcile_orphans,
                 )
             except sqlite3.DatabaseError as exc:
