@@ -4140,19 +4140,19 @@ def create_task(
         and isinstance(execution_preflight.get("roadmap_binding"), Mapping)
         else None
     )
-    if mutation_scope is None and preflight_binding is not None:
+    if outcome_id and mutation_scope is None and preflight_binding is not None:
         mutation_scope = preflight_binding.get("path_scope")
     normalized_mutation_scope = (
         _odb.normalize_scope(mutation_scope) if mutation_scope is not None else None
     )
-    if mutation_repository is None and preflight_binding is not None:
+    if outcome_id and mutation_repository is None and preflight_binding is not None:
         mutation_repository = str(preflight_binding.get("implementation_repo") or "").strip() or None
-    if mutation_base_ref is None and preflight_binding is not None:
+    if outcome_id and mutation_base_ref is None and preflight_binding is not None:
         canonical_ref = str(preflight_binding.get("canonical_ref") or "").strip()
         base_commit = str(preflight_binding.get("base_commit") or "").strip()
         if canonical_ref and base_commit:
             mutation_base_ref = f"{canonical_ref}@{base_commit}"
-    if mutation_repository is None and project_repo:
+    if outcome_id and mutation_repository is None and project_repo:
         try:
             remote = subprocess.run(
                 ["git", "-C", str(project_repo), "config", "--get", "remote.origin.url"],

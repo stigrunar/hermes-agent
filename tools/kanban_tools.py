@@ -2011,7 +2011,7 @@ def _handle_create(args: dict, **kw) -> str:
     )
     if contract_error:
         return tool_error(contract_error)
-    if isinstance(execution_contract, dict):
+    if isinstance(execution_contract, dict) and outcome_id:
         if mutation_scope is None:
             mutation_scope = execution_contract.get("mutation_scope")
         if mutation_base_ref is None:
