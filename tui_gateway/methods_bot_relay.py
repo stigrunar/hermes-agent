@@ -219,6 +219,9 @@ def register(server) -> None:
     server._WORKER_UNAVAILABLE = methods_groups._WORKER_UNAVAILABLE
     server._profile_name = methods_groups._profile_name
     server._requested_profile = methods_groups._requested_profile
+    server._room_project_binding = methods_groups._room_project_binding
+    server._enrich_project_room = methods_groups._enrich_project_room
+    server._bind_room_project = methods_groups._bind_room_project
     server._api_server_key = methods_groups._api_server_key
     server._room_link_run_storage_durable = (
         methods_groups._room_link_run_storage_durable

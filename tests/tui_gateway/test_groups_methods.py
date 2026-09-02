@@ -1011,3 +1011,99 @@ def test_approve_routes_one_exact_peer_action(home, monkeypatch):
         "request_id": "approval-1",
         "choice": "once",
     }
+
+
+def test_group_chat_can_bind_project_and_outcome_context(home):
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oc:
+        oid = odb.create_outcome(
+            oc,
+            project_id="p_ps",
+            outcome_key="STAFFING-TEST-ENABLER-R1",
+        )
+    room = _result(
+        srv._methods["groups.create"](
+            101,
+            {
+                "room_id": "project-ps",
+                "name": "Hovewest Prosjektstyring",
+                "members": [
+                    {"member_id": "default", "profile": "default", "handle": "hermes"},
+                    {"member_id": "ops", "profile": "ops", "handle": "ops"},
+                ],
+                "project_id": "p_ps",
+                "outcome_id": oid,
+                "lane_kind": "project_group",
+            },
+        )
+    )["room"]
+    binding = room["project_binding"]
+    assert binding["project_id"] == "p_ps"
+    assert binding["outcome_id"] == oid
+    assert binding["platform"] == "hermes_app_group"
+
+    listed = _result(srv._methods["groups.list"](102, {}))["rooms"]
+    assert listed[0]["project_binding"]["outcome_id"] == oid
+    state = _result(
+        srv._methods["groups.state"](103, {"room_id": "project-ps"})
+    )["room"]
+    assert state["project_binding"]["project_id"] == "p_ps"
+
+
+def test_existing_group_can_be_rebound_between_outcomes_in_same_project(home):
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oc:
+        sales = odb.create_outcome(oc, project_id="p_ps", outcome_key="SALES-R1")
+        staffing = odb.create_outcome(oc, project_id="p_ps", outcome_key="STAFFING-R1")
+    _result(
+        srv._methods["groups.create"](
+            111,
+            {
+                "room_id": "project-workstream",
+                "name": "Prosjektstyring workstream",
+                "members": [
+                    {"member_id": "default", "profile": "default", "handle": "hermes"},
+                    {"member_id": "ops", "profile": "ops", "handle": "ops"},
+                ],
+                "project_id": "p_ps",
+                "outcome_id": sales,
+            },
+        )
+    )
+    rebound = _result(
+        srv._methods["groups.bind_project"](
+            112,
+            {
+                "room_id": "project-workstream",
+                "project_id": "p_ps",
+                "outcome_id": staffing,
+                "lane_kind": "workstream",
+            },
+        )
+    )["room"]
+    assert rebound["project_binding"]["outcome_id"] == staffing
+
+
+def test_group_binding_does_not_move_conversation_to_another_project(home):
+    _result(
+        srv._methods["groups.create"](
+            121,
+            {
+                "room_id": "owned-room",
+                "name": "Owned",
+                "members": [
+                    {"member_id": "default", "profile": "default", "handle": "hermes"},
+                    {"member_id": "ops", "profile": "ops", "handle": "ops"},
+                ],
+                "project_id": "p_one",
+            },
+        )
+    )
+    response = srv._methods["groups.bind_project"](
+        122,
+        {"room_id": "owned-room", "project_id": "p_two"},
+    )
+    assert response["error"]["code"] == 5121
+    assert "already bound to another project" in response["error"]["message"]
