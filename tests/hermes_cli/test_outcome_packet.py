@@ -80,6 +80,7 @@ def test_materialized_status_is_projection_not_second_database(tmp_path, monkeyp
     assert "Repository origin: `git@github.com:example/prosjektstyring.git`" in text
     assert (target.parent / "receipts").is_dir()
     assert not (target.parent / "01-outcome.md").exists()
+    assert all(line == line.rstrip() for line in text.splitlines())
 
 
 def test_git_projection_preserves_clean_empty_status_and_ignores_generated_packets(tmp_path):
