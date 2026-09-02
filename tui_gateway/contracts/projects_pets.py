@@ -162,6 +162,155 @@ method("projects.for_cwd", params=ProjectsForCwdParams, result=ProjectsForCwdRes
        doc="Which project (if any) owns a directory, plus the resolved cwd and its git branch.")
 
 
+class OutcomeInfo(Result):
+    id: str
+    project_id: str
+    outcome_key: str
+    name: str
+    state: str
+    visible_owner: str | None = None
+    current_base_ref: str | None = None
+    current_candidate_ref: str | None = None
+    current_live_ref: str | None = None
+    frozen_acceptance: JsonValue = None
+    next_action: str | None = None
+    created_at: int
+    updated_at: int
+    archived: bool = False
+
+
+class ConversationLaneInfo(Result):
+    id: str
+    project_id: str
+    outcome_id: str | None = None
+    platform: str
+    chat_id: str
+    thread_id: str | None = None
+    label: str | None = None
+    lane_kind: str
+    created_at: int
+    updated_at: int
+
+
+class MutationLeaseInfo(Result):
+    id: str
+    project_id: str
+    outcome_id: str
+    repository: str
+    path_scope: list[str]
+    owner_execution_id: str
+    base_ref: str | None = None
+    acquired_at: int
+    released_at: int | None = None
+    release_reason: str | None = None
+
+
+class ProjectsOutcomesResult(Result):
+    project_id: str
+    outcomes: list[OutcomeInfo]
+    conversation_lanes: list[ConversationLaneInfo]
+    active_mutation_leases: list[MutationLeaseInfo]
+
+
+method("projects.outcomes", params=ProjectIdParams, result=ProjectsOutcomesResult,
+       doc="Outcomes, conversation lanes, and active mutation leases for one project.")
+
+
+class ProjectsOutcomeCreateParams(ProjectIdParams):
+    outcome_key: str
+    name: str | None = None
+    state: str | None = None
+    visible_owner: str | None = None
+    current_base_ref: str | None = None
+    frozen_acceptance: JsonValue = None
+    next_action: str | None = None
+
+
+class OutcomeResult(Result):
+    outcome: OutcomeInfo | None = None
+
+
+method("projects.outcome.create", params=ProjectsOutcomeCreateParams, result=OutcomeResult,
+       doc="Create a durable outcome for one project.")
+
+
+class ProjectsOutcomeUpdateParams(ProjectIdParams):
+    outcome_id: str
+    name: str | None = None
+    state: str | None = None
+    visible_owner: str | None = None
+    current_base_ref: str | None = None
+    current_candidate_ref: str | None = None
+    current_live_ref: str | None = None
+    frozen_acceptance: JsonValue = None
+    next_action: str | None = None
+    archived: bool | None = None
+
+
+method("projects.outcome.update", params=ProjectsOutcomeUpdateParams, result=OutcomeResult,
+       doc="Update a durable outcome belonging to one project.")
+
+
+class ProjectsLanesParams(ProjectIdParams):
+    outcome_id: str | None = None
+
+
+class ProjectsLanesResult(Result):
+    project_id: str
+    lanes: list[ConversationLaneInfo]
+
+
+method("projects.lanes", params=ProjectsLanesParams, result=ProjectsLanesResult,
+       doc="List a project's conversation lanes, optionally filtered by outcome.")
+
+
+class ProjectsLaneBindParams(ProjectIdParams):
+    outcome_id: str | None = None
+    platform: str
+    chat_id: str
+    thread_id: str | None = None
+    label: str | None = None
+    lane_kind: str | None = None
+
+
+class ConversationLaneResult(Result):
+    lane: ConversationLaneInfo
+
+
+method("projects.lane.bind", params=ProjectsLaneBindParams, result=ConversationLaneResult,
+       doc="Bind a platform conversation to a project and optional outcome.")
+
+
+class ProjectsMutationAcquireParams(ProjectIdParams):
+    outcome_id: str
+    repository: str
+    path_scope: list[str]
+    owner_execution_id: str
+    base_ref: str | None = None
+
+
+class MutationLeaseResult(Result):
+    lease: MutationLeaseInfo
+
+
+method("projects.mutation.acquire", params=ProjectsMutationAcquireParams, result=MutationLeaseResult,
+       doc="Acquire a repository/path mutation lease for one outcome execution.")
+
+
+class ProjectsMutationReleaseParams(ProjectIdParams):
+    lease_id: str | None = None
+    owner_execution_id: str | None = None
+    reason: str | None = None
+
+
+class MutationReleaseResult(Result):
+    released: bool
+
+
+method("projects.mutation.release", params=ProjectsMutationReleaseParams,
+       result=MutationReleaseResult, doc="Release one active mutation lease within the project.")
+
+
 # ── projects: repo discovery ──────────────────────────────────────────────────────────────────
 
 
