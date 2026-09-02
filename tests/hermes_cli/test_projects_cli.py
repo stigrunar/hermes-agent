@@ -7,6 +7,7 @@ import argparse
 import pytest
 
 from hermes_cli import projects_cmd
+from hermes_cli import outcomes_db as odb
 from hermes_cli import projects_db as pdb
 
 
@@ -114,6 +115,31 @@ def test_outcome_update_cli(capsys, tmp_path):
         "abc123",
     ]) == 0
     assert "state=candidate" in capsys.readouterr().out
+
+
+def test_outcome_create_and_update_frozen_acceptance_cli(capsys, tmp_path):
+    _run(["create", "P", str(tmp_path)])
+    capsys.readouterr()
+    assert _run([
+        "outcome-create", "p", "O1",
+        "--acceptance", "first criterion",
+        "--acceptance", "second criterion",
+    ]) == 0
+    capsys.readouterr()
+    with odb.connect_closing() as conn:
+        outcome = odb.get_outcome(conn, "O1")
+        assert outcome is not None
+        assert outcome.frozen_acceptance == ["first criterion", "second criterion"]
+
+    assert _run([
+        "outcome-update", "p", "O1",
+        "--acceptance", "replacement criterion",
+    ]) == 0
+    capsys.readouterr()
+    with odb.connect_closing() as conn:
+        updated = odb.get_outcome(conn, "O1")
+        assert updated is not None
+        assert updated.frozen_acceptance == ["replacement criterion"]
 
 
 def test_materialize_outcome_status_cli(capsys, tmp_path):
