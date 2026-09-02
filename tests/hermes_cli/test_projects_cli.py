@@ -59,3 +59,58 @@ def test_rename_and_archive(tmp_path):
 
 
 
+
+
+def test_outcome_lane_and_snapshot_cli(capsys, tmp_path):
+    assert _run(["create", "Prosjektstyring", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert _run([
+        "outcome-create",
+        "prosjektstyring",
+        "STAFFING-TEST-ENABLER-R1",
+        "--state",
+        "implementing",
+        "--next",
+        "Prove real read-only seam",
+    ]) == 0
+    created = capsys.readouterr().out
+    assert "STAFFING-TEST-ENABLER-R1" in created
+
+    assert _run([
+        "bind-lane",
+        "prosjektstyring",
+        "--platform",
+        "telegram",
+        "--chat-id",
+        "-1001",
+        "--thread-id",
+        "42",
+        "--outcome",
+        "STAFFING-TEST-ENABLER-R1",
+        "--label",
+        "Bemanning",
+    ]) == 0
+    assert "telegram:-1001:42" in capsys.readouterr().out
+
+    assert _run(["snapshot", "prosjektstyring"]) == 0
+    snapshot = capsys.readouterr().out
+    assert "STAFFING-TEST-ENABLER-R1" in snapshot
+    assert "implementing" in snapshot
+    assert "Conversation lanes: 1" in snapshot
+
+
+def test_outcome_update_cli(capsys, tmp_path):
+    _run(["create", "P", str(tmp_path)])
+    capsys.readouterr()
+    _run(["outcome-create", "p", "O1"])
+    capsys.readouterr()
+    assert _run([
+        "outcome-update",
+        "p",
+        "O1",
+        "--state",
+        "candidate",
+        "--candidate",
+        "abc123",
+    ]) == 0
+    assert "state=candidate" in capsys.readouterr().out
