@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 import functools
+import json
 import sys
 
 from hermes_cli import projects_db as pdb
@@ -54,6 +56,50 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     project_sub("bind-board", "Bind a kanban board to a project").add_argument(
         "board", nargs="?", default="", help="Board slug (omit to unbind)"
     )
+    p_outcomes = project_sub("outcomes", "List current Outcomes for a project")
+    p_outcomes.add_argument("--all", action="store_true", dest="include_archived")
+    p_outcome_create = project_sub("outcome-create", "Create a material Outcome")
+    p_outcome_create.add_argument(
+        "outcome_key", help="Stable key, e.g. STAFFING-TEST-ENABLER-R1")
+    p_outcome_create.add_argument("--name", default=None)
+    p_outcome_create.add_argument("--state", default="planning")
+    p_outcome_create.add_argument("--owner", default=None)
+    p_outcome_create.add_argument("--base", default=None, dest="current_base_ref")
+    p_outcome_create.add_argument("--next", default=None, dest="next_action")
+    p_outcome_update = project_sub(
+        "outcome-update", "Update current Outcome projection")
+    p_outcome_update.add_argument("outcome", help="Outcome id or key")
+    p_outcome_update.add_argument("--name", default=None)
+    p_outcome_update.add_argument("--state", default=None)
+    p_outcome_update.add_argument("--owner", default=None)
+    p_outcome_update.add_argument("--base", default=None, dest="current_base_ref")
+    p_outcome_update.add_argument(
+        "--candidate", default=None, dest="current_candidate_ref")
+    p_outcome_update.add_argument("--live", default=None, dest="current_live_ref")
+    p_outcome_update.add_argument("--next", default=None, dest="next_action")
+    p_outcome_update.add_argument("--archive", action="store_true")
+    p_lane = project_sub(
+        "bind-lane", "Bind a conversation lane to Project/Outcome context")
+    p_lane.add_argument("--platform", required=True)
+    p_lane.add_argument("--chat-id", required=True)
+    p_lane.add_argument("--thread-id", default=None)
+    p_lane.add_argument("--outcome", default=None)
+    p_lane.add_argument("--label", default=None)
+    p_lane.add_argument("--kind", default="workstream", dest="lane_kind")
+    p_snapshot = project_sub(
+        "snapshot", "Show one-screen Project/Outcome coordination state")
+    p_snapshot.add_argument("--json", action="store_true", dest="as_json")
+    p_tg = project_sub(
+        "telegram-provision",
+        "Create/bind topics in an existing Telegram forum supergroup",
+    )
+    p_tg.add_argument("chat_id", help="Existing Telegram forum supergroup id")
+    p_tg.add_argument(
+        "--control", default=None, metavar="NAME",
+        help="Create/reuse a project control topic with no Outcome binding")
+    p_tg.add_argument(
+        "--topic", action="append", default=[], metavar="NAME[=OUTCOME]",
+        help="Workstream topic; repeat for multiple topics")
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -225,6 +271,175 @@ def _cmd_bind_board(args, conn, proj) -> str:
     return f"Bound {proj.slug} -> board {args.board}"
 
 
+@_with_project
+def _cmd_outcomes(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as outcomes_conn:
+        outcomes = odb.list_outcomes(
+            outcomes_conn, proj.id, include_archived=bool(args.include_archived))
+    if not outcomes:
+        print(f"No Outcomes for {proj.slug}")
+        return 0
+    for outcome in outcomes:
+        marker = " (archived)" if outcome.archived else ""
+        print(f"{outcome.outcome_key:<36} {outcome.state:<14} [{outcome.id}]{marker}")
+        if outcome.next_action:
+            print(f"  next: {outcome.next_action}")
+    return 0
+
+
+@_with_project
+def _cmd_outcome_create(args, _conn, proj) -> str:
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as outcomes_conn:
+        outcome_id = odb.create_outcome(
+            outcomes_conn,
+            project_id=proj.id,
+            outcome_key=args.outcome_key,
+            name=args.name,
+            state=args.state,
+            visible_owner=args.owner,
+            current_base_ref=args.current_base_ref,
+            next_action=args.next_action,
+        )
+        outcome = odb.get_outcome(outcomes_conn, outcome_id)
+    return f"Outcome {outcome.outcome_key} [{outcome.id}] state={outcome.state}"
+
+
+@_with_project
+def _cmd_outcome_update(args, _conn, proj):
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as outcomes_conn:
+        outcome = odb.get_outcome(outcomes_conn, args.outcome, project_id=proj.id)
+        if outcome is None:
+            return _err(f"no such Outcome in {proj.slug}: {args.outcome}")
+        fields = {
+            attr: value
+            for attr in (
+                "name", "state", "current_base_ref", "current_candidate_ref",
+                "current_live_ref", "next_action")
+            if (value := getattr(args, attr, None)) is not None
+        }
+        if args.owner is not None:
+            fields["visible_owner"] = args.owner
+        if args.archive:
+            fields["archived"] = True
+        odb.update_outcome(outcomes_conn, outcome.id, **fields)
+        updated = odb.get_outcome(outcomes_conn, outcome.id)
+    return f"Outcome {updated.outcome_key} [{updated.id}] state={updated.state}"
+
+
+@_with_project
+def _cmd_bind_lane(args, _conn, proj):
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as outcomes_conn:
+        outcome_id = None
+        if args.outcome:
+            outcome = odb.get_outcome(
+                outcomes_conn, args.outcome, project_id=proj.id)
+            if outcome is None:
+                return _err(f"no such Outcome in {proj.slug}: {args.outcome}")
+            outcome_id = outcome.id
+        lane_id = odb.bind_conversation_lane(
+            outcomes_conn,
+            project_id=proj.id,
+            outcome_id=outcome_id,
+            platform=args.platform,
+            chat_id=args.chat_id,
+            thread_id=args.thread_id,
+            label=args.label,
+            lane_kind=args.lane_kind,
+        )
+        lane = next(
+            lane
+            for lane in odb.list_conversation_lanes(outcomes_conn, proj.id)
+            if lane.id == lane_id)
+    target = f"{lane.platform}:{lane.chat_id}"
+    if lane.thread_id:
+        target += f":{lane.thread_id}"
+    suffix = f" outcome={lane.outcome_id}" if lane.outcome_id else ""
+    return f"Bound {target} -> project={proj.id}{suffix}"
+
+
+@_with_project
+def _cmd_snapshot(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as outcomes_conn:
+        snapshot = odb.project_snapshot(outcomes_conn, proj.id)
+    if args.as_json:
+        print(json.dumps(snapshot, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    print(f"{proj.name} [{proj.id}]")
+    outcomes = snapshot["outcomes"]
+    if not outcomes:
+        print("  Outcomes: none")
+    else:
+        print("  Outcomes:")
+        for outcome in outcomes:
+            active = [
+                lease
+                for lease in snapshot["active_mutation_leases"]
+                if lease.get("outcome_id") == outcome["id"]]
+            mutator = active[0]["owner_execution_id"] if active else "-"
+            print(
+                f"    {outcome['outcome_key']:<34} "
+                f"{outcome['state']:<14} mutator={mutator}")
+            if outcome.get("next_action"):
+                print(f"      next: {outcome['next_action']}")
+    print(f"  Conversation lanes: {len(snapshot['conversation_lanes'])}")
+    print(f"  Active mutators: {len(snapshot['active_mutation_leases'])}")
+    return 0
+
+
+def _parse_topic_arg(raw: str):
+    from hermes_cli.project_forum import TopicSpec
+
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("--topic must be NAME or NAME=OUTCOME")
+    if "=" in text:
+        name, outcome = (part.strip() for part in text.split("=", 1))
+        if not name or not outcome:
+            raise ValueError("--topic must be NAME or NAME=OUTCOME")
+        return TopicSpec(name=name, outcome_id=outcome, lane_kind="workstream")
+    return TopicSpec(name=text, lane_kind="workstream")
+
+
+@_with_project
+def _cmd_telegram_provision(args, _conn, proj) -> int:
+    from hermes_cli.project_forum import (
+        TopicSpec,
+        provision_telegram_topics_with_configured_bot,
+    )
+
+    specs = []
+    if args.control:
+        specs.append(TopicSpec(name=args.control, lane_kind="control"))
+    specs.extend(_parse_topic_arg(raw) for raw in args.topic)
+    if not specs:
+        print("project: provide --control and/or at least one --topic", file=sys.stderr)
+        return 2
+    try:
+        results = asyncio.run(provision_telegram_topics_with_configured_bot(
+            project_id=proj.id, chat_id=args.chat_id, topics=specs))
+    except (ValueError, RuntimeError) as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    for result in results:
+        lane = result["lane"]
+        verb = "Created" if result["created"] else "Reused"
+        outcome = f" outcome={lane['outcome_id']}" if lane.get("outcome_id") else ""
+        print(
+            f"{verb} Telegram topic {lane.get('label')!r} "
+            f"thread={lane.get('thread_id')} -> project={proj.id}{outcome}")
+    return 0
+
+
 _HANDLERS = {
     "create": _cmd_create,
     "list": _cmd_list,
@@ -238,4 +453,10 @@ _HANDLERS = {
     "archive": _flag_command("archive_project", "Archived"),
     "restore": _flag_command("restore_project", "Restored"),
     "bind-board": _cmd_bind_board,
+    "outcomes": _cmd_outcomes,
+    "outcome-create": _cmd_outcome_create,
+    "outcome-update": _cmd_outcome_update,
+    "bind-lane": _cmd_bind_lane,
+    "snapshot": _cmd_snapshot,
+    "telegram-provision": _cmd_telegram_provision,
 }
