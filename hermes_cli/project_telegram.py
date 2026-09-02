@@ -356,6 +356,11 @@ async def _call(value):
     return await value if inspect.isawaitable(value) else value
 
 
+def _telegram_not_modified(exc: Exception, *, subject: str) -> bool:
+    normalized = str(exc).strip().lower().replace(" ", "_")
+    return f"{subject}_not_modified" in normalized
+
+
 async def sync_telegram_project(
     *,
     spec: TelegramProjectSpec,
@@ -485,13 +490,18 @@ async def sync_telegram_project(
         for topic, outcome_id, thread_id in resolved:
             lane = _lane_for_key(conn, project_id=project_id, chat_id=chat, topic=topic)
             if topic.telegram_general_topic and lane is None:
-                await _call(
-                    api.edit_general_forum_topic(spec.chat_id, name=topic.display_name)
-                )
-                actions.append({
-                    "action": "renamed_general",
-                    "name": topic.display_name,
-                })
+                try:
+                    await _call(
+                        api.edit_general_forum_topic(
+                            spec.chat_id, name=topic.display_name
+                        )
+                    )
+                    action = "renamed_general"
+                except Exception as exc:
+                    if not _telegram_not_modified(exc, subject="topic"):
+                        raise
+                    action = "reused_general"
+                actions.append({"action": action, "name": topic.display_name})
             if not thread_id:
                 created = await _call(
                     api.create_forum_topic(spec.chat_id, name=topic.display_name)
@@ -544,12 +554,18 @@ async def sync_telegram_project(
 
     if expected_id:
         if pinned_text != card_text:
-            await _call(
-                api.edit_message_text(
-                    card_text, chat_id=spec.chat_id, message_id=expected_id
+            try:
+                await _call(
+                    api.edit_message_text(
+                        card_text, chat_id=spec.chat_id, message_id=expected_id
+                    )
                 )
-            )
-            actions.append({"action": "edited_project_card", "message_id": expected_id})
+                action = "edited_project_card"
+            except Exception as exc:
+                if not _telegram_not_modified(exc, subject="message"):
+                    raise
+                action = "reused_project_card"
+            actions.append({"action": action, "message_id": expected_id})
         else:
             actions.append({"action": "reused_project_card", "message_id": expected_id})
     else:
@@ -594,7 +610,11 @@ async def sync_telegram_project_with_configured_bot(**kwargs) -> dict[str, Any]:
         raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
     try:
         from telegram import Bot
+        from telegram.error import TelegramError
     except Exception as exc:  # pragma: no cover
         raise RuntimeError("python-telegram-bot is unavailable") from exc
-    async with Bot(token=token) as bot:
-        return await sync_telegram_project(api=bot, **kwargs)
+    try:
+        async with Bot(token=token) as bot:
+            return await sync_telegram_project(api=bot, **kwargs)
+    except TelegramError as exc:
+        raise RuntimeError(f"Telegram API error: {exc}") from exc

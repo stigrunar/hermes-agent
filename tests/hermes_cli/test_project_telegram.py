@@ -162,6 +162,12 @@ class FakeTelegram:
         self.chat.pinned_message.text = text
 
 
+class AlreadyNamedTelegram(FakeTelegram):
+    async def edit_general_forum_topic(self, chat_id, *, name):
+        self.calls.append(("edit_general", chat_id, name))
+        raise Exception("Topic_not_modified")
+
+
 @pytest.mark.asyncio
 async def test_apply_binds_verified_ids_and_second_sync_has_no_telegram_writes(
     tmp_path, monkeypatch
@@ -221,6 +227,23 @@ async def test_apply_creates_only_explicit_missing_topic_and_returns_registry_up
     assert result["registry_updates"] == [
         {"project_id": "demo", "topic": "staffing", "thread_id": 21}
     ]
+
+
+@pytest.mark.asyncio
+async def test_apply_treats_telegram_topic_not_modified_as_idempotent(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    spec = load_project_registry(
+        _write_registry(tmp_path), project_ident="demo", canonical_project_id="p_123"
+    )
+    api = AlreadyNamedTelegram(render_project_card(spec))
+    result = await sync_telegram_project(
+        spec=spec, canonical_project_id="p_123", api=api
+    )
+    assert any(action["action"] == "reused_general" for action in result["actions"])
+    with odb.connect_closing() as conn:
+        assert len(odb.list_conversation_lanes(conn, "p_123")) == 3
 
 
 def test_material_control_event_filter_rejects_operational_noise():
