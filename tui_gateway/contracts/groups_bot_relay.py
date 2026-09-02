@@ -47,6 +47,19 @@ class RoomEvent(Result):
     idempotent: bool = False
 
 
+class ConversationLaneInfo(Result):
+    id: str
+    project_id: str
+    outcome_id: str | None = None
+    platform: str
+    chat_id: str
+    thread_id: str | None = None
+    label: str | None = None
+    lane_kind: str
+    created_at: int
+    updated_at: int
+
+
 class Room(Result):
     """``gateway/hosted_rooms.py::_room_from_row`` plus the branch-only keys ``create`` (legacy
     adoption), ``state`` (``authority_claim``) and ``rename`` (``event``) add."""
@@ -66,6 +79,7 @@ class Room(Result):
     claim_event: RoomEvent | None = None
     authority_claim: RoomEvent | None = None
     event: RoomEvent | None = None
+    project_binding: ConversationLaneInfo | None = None
 
 
 class RoomAuthority(Result):
@@ -184,6 +198,11 @@ class GroupsCreateParams(ProfileParams):
     members: list[RoomMemberInput]
     # Ignored: authority is always this gateway's install identity (a client cannot spoof it).
     authority_gateway_id: str | None = None
+    project_id: str | None = None
+    outcome_id: str | None = None
+    outcome: str | None = None
+    project_label: str | None = None
+    lane_kind: str | None = None
 
 
 class GroupsCreateResult(Result):
@@ -192,6 +211,18 @@ class GroupsCreateResult(Result):
 
 method("groups.create", params=GroupsCreateParams, result=GroupsCreateResult,
        doc="Create a hosted room idempotently; authority is this gateway's stable install identity.")
+
+
+class GroupsBindProjectParams(RoomParams):
+    project_id: str
+    outcome_id: str | None = None
+    outcome: str | None = None
+    project_label: str | None = None
+    lane_kind: str | None = None
+
+
+method("groups.bind_project", params=GroupsBindProjectParams, result=GroupsCreateResult,
+       doc="Bind an existing Group Chat to Project and optional Outcome context.")
 
 
 class GroupsStateParams(RoomParams):

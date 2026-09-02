@@ -16,7 +16,8 @@ method = _registry.method
 
 #: Wire order of ``groups.capabilities.methods``; every one runs on the RPC pool.
 _METHODS = (
-    "groups.capabilities", "groups.list", "groups.create", "groups.state", "groups.send",
+    "groups.capabilities", "groups.list", "groups.create", "groups.bind_project",
+    "groups.state", "groups.send",
     "groups.rename", "groups.log", "groups.disband", "groups.replicate", "groups.replica_state",
     "groups.promote", "groups.demote", "groups.stop", "groups.retry", "groups.approve",
     "groups.peer.invite", "groups.peer.revoke", "groups.peer.register")
@@ -107,6 +108,59 @@ def _requested_profile(params: dict) -> str:
         return requested
     _foreign_profile_home(requested)
     return str(_bound_server._response_profile_name(requested) or requested)
+
+
+_PROJECT_GROUP_PLATFORM = "hermes_app_group"
+
+
+def _room_project_binding(room_id: object) -> dict | None:
+    room_id = str(room_id or "").strip()
+    if not room_id:
+        return None
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as conn:
+        lane = odb.find_conversation_lane(
+            conn, platform=_PROJECT_GROUP_PLATFORM, chat_id=room_id)
+        return lane.to_dict() if lane is not None else None
+
+
+def _enrich_project_room(room: dict) -> dict:
+    enriched = dict(room)
+    binding = _room_project_binding(enriched.get("room_id"))
+    if binding is not None:
+        enriched["project_binding"] = binding
+    return enriched
+
+
+def _bind_room_project(*, room_id: object, room_name: object, params: dict) -> dict | None:
+    project_id = str(params.get("project_id") or "").strip()
+    if not project_id:
+        return _room_project_binding(room_id)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as conn:
+        outcome_id = str(
+            params.get("outcome_id") or params.get("outcome") or "").strip() or None
+        if outcome_id:
+            outcome = odb.get_outcome(conn, outcome_id, project_id=project_id)
+            if outcome is None:
+                raise ValueError("outcome does not resolve inside the project")
+            outcome_id = outcome.id
+        lane_id = odb.bind_conversation_lane(
+            conn,
+            project_id=project_id,
+            outcome_id=outcome_id,
+            platform=_PROJECT_GROUP_PLATFORM,
+            chat_id=str(room_id or "").strip(),
+            label=str(params.get("project_label") or room_name or "").strip() or None,
+            lane_kind=str(params.get("lane_kind") or "project_group"),
+        )
+        return next(
+            lane.to_dict()
+            for lane in odb.list_conversation_lanes(conn, project_id)
+            if lane.id == lane_id
+        )
 
 
 def _api_server_key(profile: str | None = None) -> str:
@@ -241,7 +295,7 @@ def _(rid, params: dict, _catalog=_local_catalog, _methods=_METHODS) -> dict:
         "features": [
             "authority_epoch", "coordinator_fencing", "room_identity", "monotonic_log",
             "idempotent_send", "replayable_disband", "typed_events", "actor_identity",
-            "log_replication", "authority_takeover"],
+            "log_replication", "authority_takeover", "project_outcome_binding"],
         "methods": list(_methods), "max_log_limit": MAX_LOG_LIMIT})
 
 
@@ -347,9 +401,12 @@ def _(rid, params: dict, db_path) -> dict:
     from gateway.hosted_rooms import MAX_ROOM_LIST_LIMIT, list_rooms
     limit = params.get("limit", MAX_ROOM_LIST_LIMIT)
     offset = params.get("offset", 0)
-    rooms = list_rooms(
-        db_path, include_disbanded=params.get("include_disbanded") is True, limit=limit,
-        offset=offset)
+    rooms = [
+        _enrich_project_room(room)
+        for room in list_rooms(
+            db_path, include_disbanded=params.get("include_disbanded") is True, limit=limit,
+            offset=offset)
+    ]
     next_offset = offset + limit if len(rooms) == limit else None
     return _ok(rid, {"rooms": rooms, "next_offset": next_offset})
 
@@ -361,6 +418,25 @@ def _(rid, params: dict, service) -> dict:
     """Create a hosted room idempotently; authority is this gateway's stable install identity."""
     room = service.create_room(
         room_id=params.get("room_id"), name=params.get("name"), members=params.get("members"))
+    binding = _bind_room_project(
+        room_id=room.get("room_id"), room_name=room.get("name"), params=params)
+    room = dict(room)
+    if binding is not None:
+        room["project_binding"] = binding
+    return _ok(rid, {"room": room})
+
+
+@_room_method("groups.bind_project", code=5121, room_code=4120, db=True)
+def _(rid, params: dict, db_path) -> dict:
+    """Bind an existing Group Chat to Project/Outcome conversation context."""
+    from gateway.hosted_rooms import room_state
+
+    room = room_state(db_path, room_id=params.get("room_id"), include_disbanded=False)
+    binding = _bind_room_project(
+        room_id=room.get("room_id"), room_name=room.get("name"), params=params)
+    room = dict(room)
+    if binding is not None:
+        room["project_binding"] = binding
     return _ok(rid, {"room": room})
 
 
@@ -368,9 +444,9 @@ def _(rid, params: dict, service) -> dict:
 def _(rid, params: dict, db_path) -> dict:
     """Return one hosted room's replay cursor and fenced authority state."""
     from gateway.hosted_rooms import room_state
-    room = room_state(
+    room = _enrich_project_room(room_state(
         db_path, room_id=params.get("room_id"),
-        include_disbanded=params.get("include_disbanded") is True)
+        include_disbanded=params.get("include_disbanded") is True))
     service = get_hosted_room_service()
     result = {"room": room}
     if service is not None and room.get("disbanded_at") is None:

@@ -254,6 +254,7 @@ def register(server) -> None:
     server._LONG_HANDLERS = server._LONG_HANDLERS | methods_groups.LONG_HANDLERS
     for name in (
         "get_hosted_room_service", "_WORKER_UNAVAILABLE", "_profile_name", "_requested_profile",
+        "_room_project_binding", "_enrich_project_room", "_bind_room_project",
         "_api_server_key", "_room_link_run_storage_durable"):
         setattr(server, name, getattr(methods_groups, name))
     methods_groups.bind_server(server)
