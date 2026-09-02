@@ -59,6 +59,13 @@ def test_methods_registered():
         "projects.archive",
         "projects.set_active",
         "projects.for_cwd",
+        "projects.outcomes",
+        "projects.outcome.create",
+        "projects.outcome.update",
+        "projects.lanes",
+        "projects.lane.bind",
+        "projects.mutation.acquire",
+        "projects.mutation.release",
     ):
         assert m in server._methods
 
@@ -885,3 +892,98 @@ def test_projects_without_a_profile_stay_on_the_launch_home(monkeypatch, tmp_pat
     assert not (Path(os.environ["HERMES_HOME"]) / "projects.db").exists()
 
 
+
+
+def test_project_outcomes_lanes_and_mutation_lease(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = _call(
+        "projects.create",
+        {"name": "Prosjektstyring", "folders": [str(repo)]},
+    )["project"]
+    outcome = _call(
+        "projects.outcome.create",
+        {
+            "id": project["id"],
+            "outcome_key": "STAFFING-TEST-ENABLER-R1",
+            "name": "Bemanning",
+            "state": "implementing",
+            "current_base_ref": "origin/main@abc",
+        },
+    )["outcome"]
+    lane = _call(
+        "projects.lane.bind",
+        {
+            "id": project["id"],
+            "outcome_id": outcome["id"],
+            "platform": "telegram",
+            "chat_id": "-1003828321118",
+            "thread_id": "20211",
+            "label": "Bemanning",
+        },
+    )["lane"]
+    assert lane["project_id"] == project["id"]
+    assert lane["outcome_id"] == outcome["id"]
+
+    snapshot = _call("projects.outcomes", {"id": project["id"]})
+    assert snapshot["outcomes"][0]["outcome_key"] == "STAFFING-TEST-ENABLER-R1"
+    assert snapshot["conversation_lanes"][0]["thread_id"] == "20211"
+
+    lease = _call(
+        "projects.mutation.acquire",
+        {
+            "id": project["id"],
+            "outcome_id": outcome["id"],
+            "repository": "stigrunar/hovewest-prosjektstyring",
+            "path_scope": ["apps/prosjektstyring/app/bemanning/**"],
+            "owner_execution_id": "codex:staffing-r1",
+            "base_ref": "abc",
+        },
+    )["lease"]
+    assert lease["owner_execution_id"] == "codex:staffing-r1"
+    assert _call(
+        "projects.mutation.release",
+        {
+            "id": project["id"],
+            "lease_id": lease["id"],
+            "reason": "candidate frozen",
+        },
+    )["released"] is True
+
+
+def test_project_mutation_rpc_rejects_overlapping_execution(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    project = _call("projects.create", {"name": "P", "folders": [str(repo)]})["project"]
+    one = _call(
+        "projects.outcome.create",
+        {"id": project["id"], "outcome_key": "ONE"},
+    )["outcome"]
+    two = _call(
+        "projects.outcome.create",
+        {"id": project["id"], "outcome_key": "TWO"},
+    )["outcome"]
+    _call(
+        "projects.mutation.acquire",
+        {
+            "id": project["id"],
+            "outcome_id": one["id"],
+            "repository": "repo",
+            "path_scope": ["src/bemanning/**"],
+            "owner_execution_id": "one",
+        },
+    )
+    response = server._methods["projects.mutation.acquire"](
+        99,
+        {
+            "id": project["id"],
+            "outcome_id": two["id"],
+            "repository": "repo",
+            "path_scope": ["src/bemanning/page.tsx"],
+            "owner_execution_id": "two",
+        },
+    )
+    assert response["error"]["code"] == server._E_PROJECT_ARG
+    assert "overlaps active execution" in response["error"]["message"]

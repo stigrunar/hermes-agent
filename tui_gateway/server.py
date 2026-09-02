@@ -15408,6 +15408,159 @@ def _(rid, params, pdb, conn) -> dict:
     return _ok(rid, {"project": proj.to_dict() if proj else None, "cwd": cwd, "branch": _git_branch_for_cwd(cwd)})
 
 
+def _project_outcome(odb, oconn, project_id: str, token: object):
+    outcome = odb.get_outcome(oconn, str(token or ""), project_id=project_id)
+    if outcome is None:
+        raise ValueError("no such outcome in project")
+    return outcome
+
+
+@_projects_method("projects.outcomes")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        return _ok(rid, odb.project_snapshot(oconn, proj.id))
+
+
+@_projects_method("projects.outcome.create")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        oid = odb.create_outcome(
+            oconn,
+            project_id=proj.id,
+            outcome_key=params.get("outcome_key"),
+            name=params.get("name"),
+            state=params.get("state") or "planning",
+            visible_owner=params.get("visible_owner"),
+            current_base_ref=params.get("current_base_ref"),
+            frozen_acceptance=params.get("frozen_acceptance"),
+            next_action=params.get("next_action"),
+        )
+        outcome = odb.get_outcome(oconn, oid)
+        return _ok(rid, {"outcome": outcome.to_dict() if outcome else None})
+
+
+@_projects_method("projects.outcome.update")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        outcome = _project_outcome(odb, oconn, proj.id, params.get("outcome_id"))
+        fields = {
+            key: params[key]
+            for key in (
+                "name",
+                "state",
+                "visible_owner",
+                "current_base_ref",
+                "current_candidate_ref",
+                "current_live_ref",
+                "frozen_acceptance",
+                "next_action",
+                "archived",
+            )
+            if key in params
+        }
+        odb.update_outcome(oconn, outcome.id, **fields)
+        updated = odb.get_outcome(oconn, outcome.id)
+        return _ok(rid, {"outcome": updated.to_dict() if updated else None})
+
+
+@_projects_method("projects.lanes")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        outcome_id = params.get("outcome_id")
+        if outcome_id:
+            outcome_id = _project_outcome(odb, oconn, proj.id, outcome_id).id
+        lanes = odb.list_conversation_lanes(
+            oconn, proj.id, outcome_id=outcome_id
+        )
+        return _ok(rid, {"project_id": proj.id, "lanes": [lane.to_dict() for lane in lanes]})
+
+
+@_projects_method("projects.lane.bind")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        outcome_id = params.get("outcome_id")
+        if outcome_id:
+            outcome_id = _project_outcome(odb, oconn, proj.id, outcome_id).id
+        lane_id = odb.bind_conversation_lane(
+            oconn,
+            project_id=proj.id,
+            outcome_id=outcome_id,
+            platform=params.get("platform"),
+            chat_id=params.get("chat_id"),
+            thread_id=params.get("thread_id"),
+            label=params.get("label"),
+            lane_kind=params.get("lane_kind") or "workstream",
+        )
+        lane = next(
+            lane
+            for lane in odb.list_conversation_lanes(oconn, proj.id)
+            if lane.id == lane_id
+        )
+        return _ok(rid, {"lane": lane.to_dict()})
+
+
+@_projects_method("projects.mutation.acquire")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        outcome = _project_outcome(odb, oconn, proj.id, params.get("outcome_id"))
+        lease = odb.acquire_mutation_lease(
+            oconn,
+            project_id=proj.id,
+            outcome_id=outcome.id,
+            repository=params.get("repository"),
+            path_scope=params.get("path_scope") or [],
+            owner_execution_id=params.get("owner_execution_id"),
+            base_ref=params.get("base_ref"),
+        )
+        return _ok(rid, {"lease": lease})
+
+
+@_projects_method("projects.mutation.release")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        # Project scoping is checked before release so one project surface cannot
+        # release another project's active execution by guessing its id.
+        lease_id = params.get("lease_id")
+        owner_execution_id = params.get("owner_execution_id")
+        leases = odb.active_mutation_leases(oconn, project_id=proj.id)
+        matching = [
+            lease
+            for lease in leases
+            if (lease_id and lease["id"] == str(lease_id))
+            or (owner_execution_id and lease["owner_execution_id"] == str(owner_execution_id))
+        ]
+        if not matching:
+            raise ValueError("no active mutation lease in project")
+        released = odb.release_mutation_lease(
+            oconn,
+            lease_id=str(lease_id) if lease_id else None,
+            owner_execution_id=str(owner_execution_id) if owner_execution_id else None,
+            reason=params.get("reason"),
+        )
+        return _ok(rid, {"released": released})
+
+
 def _non_workspace_dirs() -> set[str]:
     """Directories that are never a workspace, whichever tier proposes them.
 
