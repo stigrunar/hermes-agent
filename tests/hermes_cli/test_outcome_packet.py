@@ -16,6 +16,10 @@ def test_materialized_status_is_projection_not_second_database(tmp_path, monkeyp
     (repo / "README.md").write_text("x")
     subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+    subprocess.run([
+        "git", "-C", str(repo), "remote", "add", "origin",
+        "git@github.com:example/prosjektstyring.git",
+    ], check=True)
 
     with odb.connect_closing() as conn:
         oid = odb.create_outcome(
@@ -46,6 +50,18 @@ def test_materialized_status_is_projection_not_second_database(tmp_path, monkeyp
             path_scope=["apps/bemanning/**"],
             owner_execution_id="codex:staffing",
         )
+        required = odb.create_outcome(
+            conn,
+            project_id="p_source",
+            outcome_key="SOURCE-READY-R1",
+            name="Source ready",
+        )
+        odb.add_outcome_dependency(
+            conn,
+            outcome_id=oid,
+            depends_on_outcome_id=required,
+            dependency_kind="requires",
+        )
 
     target = materialize_status(
         project_id="p_ps",
@@ -60,6 +76,8 @@ def test_materialized_status_is_projection_not_second_database(tmp_path, monkeyp
     assert "telegram:-1001:42" in text
     assert "source-backed" in text
     assert "Implement real seam" in text
+    assert "`requires` → `p_source/SOURCE-READY-R1`" in text
+    assert "Repository origin: `git@github.com:example/prosjektstyring.git`" in text
     assert (target.parent / "receipts").is_dir()
     assert not (target.parent / "01-outcome.md").exists()
 

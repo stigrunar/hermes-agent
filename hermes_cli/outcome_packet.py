@@ -107,6 +107,11 @@ def render_status(
         if lane.get("outcome_id") in {None, outcome.id}
     ]
     acceptance = _as_lines(outcome.frozen_acceptance)
+    dependencies = [
+        dependency
+        for dependency in snapshot.get("outcome_dependencies", [])
+        if dependency.get("outcome_id") == outcome.id
+    ]
 
     lines = [
         f"# {outcome.outcome_key}",
@@ -154,6 +159,16 @@ def render_status(
     else:
         lines.append("- No conversation lane bound.")
 
+    lines.extend(["", "## Dependencies", ""])
+    if dependencies:
+        for dependency in dependencies:
+            relation = dependency.get("dependency_kind") or "requires"
+            required_project = dependency.get("depends_on_project_id") or "unknown-project"
+            required_outcome = dependency.get("depends_on_outcome_key") or dependency.get("depends_on_outcome_id") or "unknown-outcome"
+            lines.append(f"- `{relation}` → `{required_project}/{required_outcome}`")
+    else:
+        lines.append("- No outgoing Outcome dependency.")
+
     lines.extend(["", "## Frozen acceptance", ""])
     if acceptance:
         lines.extend(f"- {item}" for item in acceptance)
@@ -164,7 +179,7 @@ def render_status(
     if repo_state:
         lines.extend(
             [
-                f"- Repository: `{repo_state.get('repo')}`",
+                f"- Repository origin: `{repo_state.get('origin') or repo_state.get('repo')}`",
                 f"- Materialization checkout: `{repo_state.get('branch') or 'detached'}`",
                 f"- HEAD: `{repo_state.get('head') or 'unknown'}`",
                 f"- origin/main: `{repo_state.get('origin_main') or 'unknown'}`",

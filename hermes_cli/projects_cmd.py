@@ -115,6 +115,10 @@ def build_parser(
     p_outcome_create.add_argument("--state", default="planning")
     p_outcome_create.add_argument("--owner", default=None)
     p_outcome_create.add_argument("--base", default=None, dest="current_base_ref")
+    p_outcome_create.add_argument(
+        "--acceptance", action="append", default=None, dest="frozen_acceptance",
+        help="Frozen acceptance criterion (repeatable). Stored on the Outcome, not a task body.",
+    )
     p_outcome_create.add_argument("--next", default=None, dest="next_action")
 
     p_outcome_update = sub.add_parser("outcome-update", help="Update current Outcome projection")
@@ -126,6 +130,10 @@ def build_parser(
     p_outcome_update.add_argument("--base", default=None, dest="current_base_ref")
     p_outcome_update.add_argument("--candidate", default=None, dest="current_candidate_ref")
     p_outcome_update.add_argument("--live", default=None, dest="current_live_ref")
+    p_outcome_update.add_argument(
+        "--acceptance", action="append", default=None, dest="frozen_acceptance",
+        help="Replace frozen acceptance with the supplied criterion/criteria (repeatable).",
+    )
     p_outcome_update.add_argument("--next", default=None, dest="next_action")
     p_outcome_update.add_argument("--archive", action="store_true")
 
@@ -432,6 +440,7 @@ def _cmd_outcome_create(args, _conn, proj) -> int:
             state=args.state,
             visible_owner=args.owner,
             current_base_ref=args.current_base_ref,
+            frozen_acceptance=args.frozen_acceptance,
             next_action=args.next_action,
         )
         outcome = odb.get_outcome(oc, oid)
@@ -462,6 +471,8 @@ def _cmd_outcome_update(args, _conn, proj) -> int:
                 fields[attr] = value
         if args.owner is not None:
             fields["visible_owner"] = args.owner
+        if args.frozen_acceptance is not None:
+            fields["frozen_acceptance"] = args.frozen_acceptance
         if args.archive:
             fields["archived"] = True
         odb.update_outcome(oc, outcome.id, **fields)
