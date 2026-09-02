@@ -59,6 +59,37 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_cli_create_binds_outcome_and_mutation_scope(kanban_home):
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli import projects_db as pdb
+
+    repo = kanban_home.parent / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as projects_conn:
+        project_id = pdb.create_project(
+            projects_conn, name="CLI Outcome", folders=[str(repo)])
+        project = pdb.get_project(projects_conn, project_id)
+    with odb.connect_closing() as outcomes_conn:
+        outcome_id = odb.create_outcome(
+            outcomes_conn,
+            project_id=project.id,
+            outcome_key="CLI-OUTCOME-R1",
+            name="CLI outcome",
+        )
+
+    payload = json.loads(kc.run_slash(
+        "create 'outcome task' --project " + project.slug
+        + " --outcome CLI-OUTCOME-R1"
+        + " --mutation-repository stigrunar/example"
+        + " --mutation-scope 'src/bemanning/**'"
+        + " --mutation-base origin/main@abc --json"))
+    assert payload["project_id"] == project.id
+    assert payload["outcome_id"] == outcome_id
+    assert payload["mutation_repository"] == "stigrunar/example"
+    assert payload["mutation_scope"] == ["src/bemanning/**"]
+    assert payload["mutation_base_ref"] == "origin/main@abc"
+
+
 def test_kanban_show_json_includes_runtime_limit(kanban_home):
     with kbc.connect() as conn:
         bounded_id = kb.create_task(
@@ -242,5 +273,4 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-
 

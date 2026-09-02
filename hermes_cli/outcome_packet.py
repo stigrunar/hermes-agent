@@ -16,7 +16,13 @@ from typing import Any, Mapping, Optional
 from hermes_cli import outcomes_db as odb
 
 
-def _git(repo: Path, *args: str) -> Optional[str]:
+def _git_capture(repo: Path, *args: str) -> Optional[str]:
+    """Return stdout for a successful Git command, preserving empty output.
+
+    Empty stdout is meaningful for commands such as ``git status --porcelain``
+    (a clean checkout).  Callers that want an absent/empty value collapsed to
+    ``None`` can use :func:`_git` instead.
+    """
     try:
         proc = subprocess.run(
             ["git", "-C", str(repo), *args],
@@ -30,7 +36,12 @@ def _git(repo: Path, *args: str) -> Optional[str]:
         return None
     if proc.returncode != 0:
         return None
-    return proc.stdout.strip() or None
+    return proc.stdout.strip()
+
+
+def _git(repo: Path, *args: str) -> Optional[str]:
+    value = _git_capture(repo, *args)
+    return value or None
 
 
 def git_projection(repo: Path) -> dict[str, Any]:
@@ -39,7 +50,17 @@ def git_projection(repo: Path) -> dict[str, Any]:
     branch = _git(repo, "branch", "--show-current")
     origin = _git(repo, "config", "--get", "remote.origin.url")
     origin_main = _git(repo, "rev-parse", "origin/main")
-    status = _git(repo, "status", "--porcelain")
+    # Outcome packets are generated projection artifacts, not source changes.
+    # Ignore their own directory so materializing several Outcomes in one clean
+    # checkout does not make the second packet claim the source checkout is dirty.
+    status = _git_capture(
+        repo,
+        "status",
+        "--porcelain",
+        "--",
+        ".",
+        ":(exclude)docs/outcomes/**",
+    )
     return {
         "repo": str(repo),
         "head": head,
@@ -144,10 +165,10 @@ def render_status(
         lines.extend(
             [
                 f"- Repository: `{repo_state.get('repo')}`",
-                f"- Branch: `{repo_state.get('branch') or 'detached/unknown'}`",
+                f"- Materialization checkout: `{repo_state.get('branch') or 'detached'}`",
                 f"- HEAD: `{repo_state.get('head') or 'unknown'}`",
                 f"- origin/main: `{repo_state.get('origin_main') or 'unknown'}`",
-                f"- Clean: `{repo_state.get('clean')}`",
+                f"- Source checkout clean (excluding generated `docs/outcomes/**`): `{repo_state.get('clean')}`",
             ]
         )
     else:

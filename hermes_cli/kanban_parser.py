@@ -162,6 +162,17 @@ _SPECS = [
              help="Link to a project (id or slug). Anchors the task's "
                   "worktree under the project's primary repo with a "
                   "deterministic branch. See `hermes project list`."),
+        _arg("--outcome", dest="outcome_id",
+             help="Bind the task to a first-class Outcome (id or key). "
+                  "Requires --project or a project-scoped board."),
+        _arg("--mutation-repository",
+             help="Canonical repository identity for the mutation lease. "
+                  "Defaults to the linked Project repo when omitted."),
+        _arg("--mutation-scope", action="append",
+             help="Path/glob claimed by this mutating execution (repeatable). "
+                  "Requires --outcome and enables overlap protection."),
+        _arg("--mutation-base", dest="mutation_base_ref",
+             help="Exact base ref/SHA associated with the mutation lease."),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",

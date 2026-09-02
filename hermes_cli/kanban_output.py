@@ -17,7 +17,8 @@ _STATUS_ICONS = {
 
 _TASK_DICT_FIELDS = (
     "id", "title", "body", "assignee", "status", "priority", "tenant",
-    "workspace_kind", "workspace_path", "branch_name", "project_id",
+    "workspace_kind", "workspace_path", "branch_name", "project_id", "outcome_id",
+    "mutation_repository", "mutation_scope", "mutation_base_ref",
     "created_by", "created_at", "started_at", "completed_at", "result",
     "skills", "max_runtime_seconds", "max_retries", "model_override", "provider_override",
     "session_id", "workflow_template_id", "current_step_key", "completion_contract", "last_failure_error",
