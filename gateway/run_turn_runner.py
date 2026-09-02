@@ -47,6 +47,63 @@ _CARD_DESTINATION_REFUSALS = {
 }
 
 
+def _project_conversation_lane_prompt(source: Any) -> str:
+    """Stable Project/Outcome projection for one bound conversation lane.
+
+    The note is per-turn context, not cached prompt state, and carries no
+    repository mutation or deploy authority.
+    """
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not platform or not chat_id:
+        return ""
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    try:
+        from hermes_cli import outcomes_db as odb
+
+        with odb.connect_closing() as conn:
+            lane = odb.find_conversation_lane(
+                conn,
+                platform=str(platform).lower(),
+                chat_id=chat_id,
+                thread_id=thread_id,
+            )
+            if lane is None and thread_id:
+                lane = odb.find_conversation_lane(
+                    conn,
+                    platform=str(platform).lower(),
+                    chat_id=chat_id,
+                    thread_id=None,
+                )
+            if lane is None:
+                return ""
+            outcome = odb.get_outcome(conn, lane.outcome_id) if lane.outcome_id else None
+    except Exception as exc:
+        logger.debug(
+            "project conversation-lane lookup failed: %s", type(exc).__name__)
+        return ""
+
+    lines = [
+        "## Project coordination context",
+        f"Project ID: `{lane.project_id}`",
+        f"Conversation lane ID: `{lane.id}`",
+    ]
+    if outcome is not None:
+        lines.extend((
+            f"Outcome ID: `{outcome.id}`",
+            f"Outcome key: `{outcome.outcome_key}`",
+        ))
+    else:
+        lines.append("Outcome: project-level/control lane")
+    lines.append(
+        "This conversation lane provides context and status projection only. "
+        "It does not grant repository mutation or deploy authority. Before "
+        "starting mutating work, resolve the current Project/Outcome source and "
+        "mutation ownership instead of inferring authority from this topic."
+    )
+    return "\n".join(lines)
+
+
 def _renders_exec_approval_buttons(adapter_cls: type) -> bool:
     """True when the adapter class renders native approval buttons. BasePlatformAdapter subclasses
     say so through ``supports_exec_approval_buttons``; anything else (test doubles, relay-style
@@ -1849,6 +1906,7 @@ class TurnRunner:
                 ctx.source.platform, ctx.source.chat_id or "", thread_id=getattr(ctx.source, "thread_id", None),
                 parent_id=getattr(ctx.source, "parent_chat_id", None),
             ),
+            _project_conversation_lane_prompt(ctx.source),
         ):
             if extra:
                 combined = (combined + "\n\n" + extra).strip()
