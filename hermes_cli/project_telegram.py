@@ -478,7 +478,7 @@ async def sync_telegram_project(
     pinned_id = getattr(pinned, "message_id", None)
     pinned_text = str(getattr(pinned, "text", "") or "")
     expected_id = spec.control.pinned_message_id
-    if expected_id and pinned_id != expected_id:
+    if expected_id and pinned_id is not None and pinned_id != expected_id:
         raise ValueError(
             f"registered project card {expected_id} is not the chat's pinned message ({pinned_id})"
         )
@@ -553,7 +553,29 @@ async def sync_telegram_project(
             })
 
     if expected_id:
-        if pinned_text != card_text:
+        if pinned_id is None:
+            try:
+                await _call(
+                    api.edit_message_text(
+                        card_text, chat_id=spec.chat_id, message_id=expected_id
+                    )
+                )
+                action = "edited_project_card"
+            except Exception as exc:
+                if not _telegram_not_modified(exc, subject="message"):
+                    raise
+                action = "reused_project_card"
+            actions.append({"action": action, "message_id": expected_id})
+            await _call(
+                api.pin_chat_message(
+                    spec.chat_id, expected_id, disable_notification=True
+                )
+            )
+            actions.append({
+                "action": "repinned_project_card",
+                "message_id": expected_id,
+            })
+        elif pinned_text != card_text:
             try:
                 await _call(
                     api.edit_message_text(
