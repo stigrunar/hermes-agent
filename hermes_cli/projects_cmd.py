@@ -79,6 +79,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_outcome_update.add_argument("--live", default=None, dest="current_live_ref")
     p_outcome_update.add_argument("--next", default=None, dest="next_action")
     p_outcome_update.add_argument("--archive", action="store_true")
+    p_depend = project_sub(
+        "outcome-depend", "Bind one Outcome dependency")
+    p_depend.add_argument("outcome", help="Owning Outcome id or key")
+    p_depend.add_argument(
+        "depends_on_project", help="Required Project id or slug")
+    p_depend.add_argument(
+        "depends_on_outcome", help="Required Outcome id or key")
+    p_depend.add_argument(
+        "--kind", default="requires", dest="dependency_kind")
     p_lane = project_sub(
         "bind-lane", "Bind a conversation lane to Project/Outcome context")
     p_lane.add_argument("--platform", required=True)
@@ -342,6 +351,36 @@ def _cmd_outcome_update(args, _conn, proj):
 
 
 @_with_project
+def _cmd_outcome_depend(args, conn, proj) -> str | int:
+    from hermes_cli import outcomes_db as odb
+
+    required_project = pdb.get_project(conn, args.depends_on_project)
+    if required_project is None:
+        return _err(f"no such required project: {args.depends_on_project}")
+    with odb.connect_closing() as outcomes_conn:
+        outcome = odb.get_outcome(
+            outcomes_conn, args.outcome, project_id=proj.id)
+        required = odb.get_outcome(
+            outcomes_conn, args.depends_on_outcome,
+            project_id=required_project.id)
+        if outcome is None:
+            return _err(f"no such Outcome in {proj.slug}: {args.outcome}")
+        if required is None:
+            return _err(
+                f"no such required Outcome in {required_project.slug}: "
+                f"{args.depends_on_outcome}")
+        dependency_id = odb.add_outcome_dependency(
+            outcomes_conn,
+            outcome_id=outcome.id,
+            depends_on_outcome_id=required.id,
+            dependency_kind=args.dependency_kind,
+        )
+    return (
+        f"Dependency {dependency_id}: {proj.slug}/{outcome.outcome_key} -> "
+        f"{required_project.slug}/{required.outcome_key}")
+
+
+@_with_project
 def _cmd_bind_lane(args, _conn, proj):
     from hermes_cli import outcomes_db as odb
 
@@ -489,6 +528,7 @@ _HANDLERS = {
     "outcomes": _cmd_outcomes,
     "outcome-create": _cmd_outcome_create,
     "outcome-update": _cmd_outcome_update,
+    "outcome-depend": _cmd_outcome_depend,
     "bind-lane": _cmd_bind_lane,
     "snapshot": _cmd_snapshot,
     "materialize-status": _cmd_materialize_status,

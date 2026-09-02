@@ -205,10 +205,23 @@ class MutationLeaseInfo(Result):
     release_reason: str | None = None
 
 
+class OutcomeDependencyInfo(Result):
+    id: str
+    outcome_id: str
+    depends_on_outcome_id: str
+    dependency_kind: str
+    created_at: int
+    project_id: str
+    outcome_key: str
+    depends_on_project_id: str
+    depends_on_outcome_key: str
+
+
 class ProjectsOutcomesResult(Result):
     project_id: str
     outcomes: list[OutcomeInfo]
     conversation_lanes: list[ConversationLaneInfo]
+    outcome_dependencies: list[OutcomeDependencyInfo]
     active_mutation_leases: list[MutationLeaseInfo]
 
 
@@ -249,6 +262,22 @@ class ProjectsOutcomeUpdateParams(ProjectIdParams):
 
 method("projects.outcome.update", params=ProjectsOutcomeUpdateParams, result=OutcomeResult,
        doc="Update a durable outcome belonging to one project.")
+
+
+class ProjectsOutcomeDependParams(ProjectIdParams):
+    outcome_id: str
+    depends_on_project_id: str | None = None
+    depends_on_outcome_id: str
+    dependency_kind: str | None = None
+
+
+class OutcomeDependencyResult(Result):
+    dependency: OutcomeDependencyInfo
+
+
+method("projects.outcome.depend", params=ProjectsOutcomeDependParams,
+       result=OutcomeDependencyResult,
+       doc="Bind an explicit dependency between outcomes, including across projects.")
 
 
 class ProjectsLanesParams(ProjectIdParams):

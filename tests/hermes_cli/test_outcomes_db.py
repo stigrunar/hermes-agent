@@ -230,3 +230,45 @@ def test_repository_identity_normalizes_github_remote_forms():
     assert odb._normalize_repository("git@github.com:stigrunar/hovewest-prosjektstyring.git") == "stigrunar/hovewest-prosjektstyring"
     assert odb._normalize_repository("https://github.com/stigrunar/hovewest-prosjektstyring.git") == "stigrunar/hovewest-prosjektstyring"
     assert odb._normalize_repository("stigrunar/hovewest-prosjektstyring") == "stigrunar/hovewest-prosjektstyring"
+
+
+def test_cross_project_outcome_dependency_is_explicit_and_idempotent(conn):
+    staffing_surface = odb.create_outcome(
+        conn, project_id="p_ps", outcome_key="STAFFING-TEST-ENABLER-R1"
+    )
+    staffing_agent = odb.create_outcome(
+        conn, project_id="p_hw", outcome_key="HWSTAFFING-AGENT-R2"
+    )
+    first = odb.add_outcome_dependency(
+        conn,
+        outcome_id=staffing_agent,
+        depends_on_outcome_id=staffing_surface,
+    )
+    second = odb.add_outcome_dependency(
+        conn,
+        outcome_id=staffing_agent,
+        depends_on_outcome_id=staffing_surface,
+    )
+    assert second == first
+    deps = odb.list_outcome_dependencies(conn, outcome_id=staffing_agent)
+    assert deps == [
+        {
+            "id": first,
+            "outcome_id": staffing_agent,
+            "depends_on_outcome_id": staffing_surface,
+            "dependency_kind": "requires",
+            "created_at": deps[0]["created_at"],
+            "project_id": "p_hw",
+            "outcome_key": "HWSTAFFING-AGENT-R2",
+            "depends_on_project_id": "p_ps",
+            "depends_on_outcome_key": "STAFFING-TEST-ENABLER-R1",
+        }
+    ]
+    snapshot = odb.project_snapshot(conn, "p_ps")
+    assert snapshot["outcome_dependencies"][0]["project_id"] == "p_hw"
+
+
+def test_outcome_cannot_depend_on_itself(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    with pytest.raises(odb.OutcomeError, match="itself"):
+        odb.add_outcome_dependency(conn, outcome_id=oid, depends_on_outcome_id=oid)

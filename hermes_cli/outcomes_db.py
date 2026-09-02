@@ -77,6 +77,21 @@ CREATE TABLE IF NOT EXISTS conversation_lanes (
 CREATE INDEX IF NOT EXISTS idx_conversation_lanes_project
     ON conversation_lanes(project_id, outcome_id, updated_at);
 
+CREATE TABLE IF NOT EXISTS outcome_dependencies (
+    id                     TEXT PRIMARY KEY,
+    outcome_id             TEXT NOT NULL REFERENCES outcomes(id) ON DELETE CASCADE,
+    depends_on_outcome_id  TEXT NOT NULL REFERENCES outcomes(id) ON DELETE CASCADE,
+    dependency_kind        TEXT NOT NULL DEFAULT 'requires',
+    created_at             INTEGER NOT NULL,
+    UNIQUE(outcome_id, depends_on_outcome_id, dependency_kind),
+    CHECK(outcome_id <> depends_on_outcome_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_outcome_dependencies_outcome
+    ON outcome_dependencies(outcome_id, depends_on_outcome_id);
+CREATE INDEX IF NOT EXISTS idx_outcome_dependencies_required
+    ON outcome_dependencies(depends_on_outcome_id, outcome_id);
+
 CREATE TABLE IF NOT EXISTS mutation_leases (
     id                  TEXT PRIMARY KEY,
     project_id          TEXT NOT NULL,
@@ -633,6 +648,64 @@ def list_conversation_lanes(
     return [_lane_from_row(row) for row in conn.execute(sql, params).fetchall()]
 
 
+def add_outcome_dependency(
+    conn: sqlite3.Connection,
+    *,
+    outcome_id: str,
+    depends_on_outcome_id: str,
+    dependency_kind: str = "requires",
+) -> str:
+    outcome = get_outcome(conn, outcome_id)
+    required = get_outcome(conn, depends_on_outcome_id)
+    if outcome is None or required is None:
+        raise OutcomeError("both dependency Outcomes must exist")
+    if outcome.id == required.id:
+        raise OutcomeError("Outcome cannot depend on itself")
+    kind = _normalize_lane_kind(dependency_kind)
+    now = _now()
+    dep_id = _new_id("od_")
+    with write_txn(conn):
+        existing = conn.execute(
+            """SELECT id FROM outcome_dependencies
+                 WHERE outcome_id=? AND depends_on_outcome_id=? AND dependency_kind=?""",
+            (outcome.id, required.id, kind),
+        ).fetchone()
+        if existing is not None:
+            return str(existing["id"])
+        conn.execute(
+            """INSERT INTO outcome_dependencies
+               (id, outcome_id, depends_on_outcome_id, dependency_kind, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (dep_id, outcome.id, required.id, kind, now),
+        )
+    return dep_id
+
+
+def list_outcome_dependencies(
+    conn: sqlite3.Connection, *, outcome_id: Optional[str] = None, project_id: Optional[str] = None
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if outcome_id:
+        clauses.append("(d.outcome_id=? OR d.depends_on_outcome_id=?)")
+        params.extend([str(outcome_id), str(outcome_id)])
+    if project_id:
+        clauses.append("(o.project_id=? OR r.project_id=?)")
+        params.extend([str(project_id), str(project_id)])
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = conn.execute(
+        """SELECT d.id, d.outcome_id, d.depends_on_outcome_id, d.dependency_kind, d.created_at,
+                  o.project_id AS project_id, o.outcome_key AS outcome_key,
+                  r.project_id AS depends_on_project_id, r.outcome_key AS depends_on_outcome_key
+             FROM outcome_dependencies d
+             JOIN outcomes o ON o.id=d.outcome_id
+             JOIN outcomes r ON r.id=d.depends_on_outcome_id""" + where +
+        " ORDER BY d.created_at, d.id",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def _lease_from_row(row: sqlite3.Row) -> dict[str, Any]:
     return {
         "id": str(row["id"]),
@@ -826,9 +899,11 @@ def project_snapshot(conn: sqlite3.Connection, project_id: str) -> dict[str, Any
     outcomes = list_outcomes(conn, project_id)
     lanes = list_conversation_lanes(conn, project_id)
     leases = active_mutation_leases(conn, project_id=project_id)
+    dependencies = list_outcome_dependencies(conn, project_id=project_id)
     return {
         "project_id": str(project_id),
         "outcomes": [outcome.to_dict() for outcome in outcomes],
         "conversation_lanes": [lane.to_dict() for lane in lanes],
+        "outcome_dependencies": dependencies,
         "active_mutation_leases": leases,
     }
