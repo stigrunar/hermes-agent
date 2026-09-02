@@ -39,6 +39,32 @@ Every downstream-only change needed after upstream synchronization is classified
 
 No class may exist only as an unversioned runtime patch.
 
+### Current downstream delta classification
+
+The current maintained downstream line is `origin/main` plus a small downstream commit series. The legacy effective HRI behavior is preserved by `8daae18adf` and the Outcome/project changes are separate commits after it. Classification is by behavior family rather than pretending the historical squashed overlay has one semantic purpose:
+
+| Behavior family | Class | Current handling / removal condition |
+| --- | --- | --- |
+| HRI/Kanban task lifecycle, owner-replan, iteration-exhaustion semantics, review lifecycle, project execution policy, remote Codex host routing, worker scope/resource fencing | `LOCAL_PERMANENT` | Maintained as downstream operating behavior until an upstream equivalent is deliberately adopted and parity-tested. |
+| Project -> Outcome -> Execution model, conversation lanes, mutation leases, cross-project dependencies, current-state projection, outcome-first prompt/routing | `LOCAL_PERMANENT` | Hove West downstream product/operating-model capability. No upstream acceptance dependency. |
+| Telegram deferred-delivery/error normalization, delivery-ledger reliability, doctor bounded-state probes, worker env scrub, lazy memory/browser workers and related generic robustness fixes inside the HRI overlay | `UPSTREAM_CANDIDATE` | Used downstream immediately. May be proposed upstream independently; remove the local delta only after an upstream revision is proven behaviorally equivalent. |
+| Hindsight/provider and local operator integration adjustments carried by the HRI overlay | `LOCAL_PERMANENT` | Retained while this installation uses the local integration contract; upstreamable pieces may be split later without blocking runtime convergence. |
+| Compatibility-only source patches | `TEMPORARY_COMPAT` | **None currently required as unique runtime source.** Any future compat patch must name an explicit upstream/version removal condition and still live in downstream Git. |
+| `release/v0206-local-runtime-notifier-r1-20260828`, older topic/release/runtime fix branches, direct runtime-only source variants | `DROP` | Historical/rollback evidence only after cutover. Never eligible as a new development base or source-selection candidate. |
+
+This classification deliberately allows downstream divergence. The failure mode being removed is not "different from upstream"; it is "different from our own canonical downstream source".
+
+### Convergence verification evidence
+
+As of 2026-09-02:
+
+- current upstream `origin/main` is an ancestor of maintained `stig/downstream/main`;
+- the maintained downstream line is 15 commits ahead of the inspected upstream tip before the final documentation-only adjustment;
+- the effective HRI overlay merged onto the 2026-09-02 upstream tip without unresolved source conflicts;
+- targeted Outcome/Project/Kanban/Group Chat/gateway suites passed 99/99 tests;
+- the broader Projects/Kanban regression selection passed 131 tests with 1 skip and exactly two `projects.tree` failures;
+- those same two failures reproduce unchanged on pre-Outcome baseline `a73e7834cf`, so they are accepted unrelated baseline regressions rather than migration blockers.
+
 ## Data model
 
 ### Project
@@ -139,7 +165,7 @@ Migration must search these surfaces explicitly. A code change is not complete w
 
 ## Phases
 
-### Phase 1 — canonical downstream convergence
+### Phase 1 — canonical downstream convergence — source convergence implemented; runtime proof pending cutover
 
 1. Rebase/merge the effective `hri-r5` overlay onto current upstream.
 2. Run focused and broad tests for overlay-owned systems.
@@ -147,7 +173,7 @@ Migration must search these surfaces explicitly. A code change is not complete w
 4. Publish one maintained downstream branch/ref and make it the source for future releases.
 5. Verify runtime can be reproduced from exact repository commit + documented config, with no unique application source in runtime.
 
-### Phase 2 — Outcome core and mutation ownership
+### Phase 2 — Outcome core and mutation ownership — implemented
 
 1. Add Outcome and Conversation Lane tables/APIs to Projects.
 2. Add mutation lease storage and conservative overlap enforcement.
@@ -155,7 +181,7 @@ Migration must search these surfaces explicitly. A code change is not complete w
 4. Allow a bounded execution to acquire/release a lease and surface collisions before worker startup.
 5. Add tests for same-outcome, cross-outcome and cross-project collisions.
 
-### Phase 3 — execution simplification and skills migration
+### Phase 3 — execution simplification and skills migration — implemented in canonical source/skills
 
 1. Make direct bounded execution the normal feature route.
 2. Change automatic task-graph creation to trigger-based behavior.
@@ -163,7 +189,7 @@ Migration must search these surfaces explicitly. A code change is not complete w
 4. Route cross-project work as dependency/request by default.
 5. Make current source base mandatory for mutating executions and fail early on stale source.
 
-### Phase 4 — project conversations and projection
+### Phase 4 — project conversations and projection — implemented except Telegram group provisioning rollout
 
 1. Bind Hermes Group Chats to project/outcome identity.
 2. Add generic conversation-lane APIs usable by Telegram/forum topics and app rooms.
@@ -171,7 +197,7 @@ Migration must search these surfaces explicitly. A code change is not complete w
 4. Pilot Prosjektstyring workstreams and HWStaffing dependency projection.
 5. Preserve existing topic coordinates as aliases/projections during migration rather than treating them as execution owners.
 
-### Phase 5 — release cutover
+### Phase 5 — release cutover — pending
 
 1. Run release doctor/full targeted suites from canonical downstream source.
 2. Build one versioned release from an exact downstream commit.
