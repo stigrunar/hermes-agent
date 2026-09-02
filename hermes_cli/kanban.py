@@ -69,6 +69,10 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "workspace_path": t.workspace_path,
         "branch_name": t.branch_name,
         "project_id": t.project_id,
+        "outcome_id": t.outcome_id,
+        "mutation_repository": t.mutation_repository,
+        "mutation_scope": list(t.mutation_scope) if t.mutation_scope else [],
+        "mutation_base_ref": t.mutation_base_ref,
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -380,6 +384,17 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Link to a project (id or slug). Anchors the task's "
                                "worktree under the project's primary repo with a "
                                "deterministic branch. See `hermes project list`.")
+    p_create.add_argument("--outcome", default=None, dest="outcome_id",
+                          help="Bind the task to a first-class Outcome (id or key). "
+                               "Requires --project or a project-scoped board.")
+    p_create.add_argument("--mutation-repository", default=None,
+                          help="Canonical repository identity for the mutation lease. "
+                               "Defaults to the linked Project repo when omitted.")
+    p_create.add_argument("--mutation-scope", action="append", default=None,
+                          help="Path/glob claimed by this mutating execution (repeatable). "
+                               "Requires --outcome and enables overlap protection.")
+    p_create.add_argument("--mutation-base", default=None, dest="mutation_base_ref",
+                          help="Exact base ref/SHA associated with the mutation lease.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1689,6 +1704,10 @@ def _cmd_create(args: argparse.Namespace) -> int:
             workspace_path=ws_path,
             branch_name=branch_name,
             project_id=getattr(args, "project", None),
+            outcome_id=getattr(args, "outcome_id", None),
+            mutation_repository=getattr(args, "mutation_repository", None),
+            mutation_scope=getattr(args, "mutation_scope", None),
+            mutation_base_ref=getattr(args, "mutation_base_ref", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1873,6 +1892,16 @@ def _cmd_show(args: argparse.Namespace) -> int:
           (f" @ {task.workspace_path}" if task.workspace_path else ""))
     if task.branch_name:
         print(f"  branch:    {task.branch_name}")
+    if task.project_id:
+        print(f"  project:   {task.project_id}")
+    if task.outcome_id:
+        print(f"  outcome:   {task.outcome_id}")
+    if task.mutation_repository:
+        print(f"  mutation-repo: {task.mutation_repository}")
+    if task.mutation_scope:
+        print(f"  mutation-scope: {', '.join(task.mutation_scope)}")
+    if task.mutation_base_ref:
+        print(f"  mutation-base: {task.mutation_base_ref}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:

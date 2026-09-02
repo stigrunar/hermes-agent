@@ -57,6 +57,38 @@ def test_kanban_list_json_includes_session_id(kanban_home):
     )
 
 
+def test_cli_create_binds_outcome_and_mutation_scope(kanban_home):
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli import projects_db as pdb
+
+    repo = kanban_home.parent / "project-repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pc:
+        pid = pdb.create_project(pc, name="CLI Outcome", folders=[str(repo)])
+        project = pdb.get_project(pc, pid)
+    with odb.connect_closing() as oc:
+        oid = odb.create_outcome(
+            oc,
+            project_id=project.id,
+            outcome_key="CLI-OUTCOME-R1",
+            name="CLI outcome",
+        )
+
+    raw = kc.run_slash(
+        "create 'outcome task' --project " + project.slug
+        + " --outcome CLI-OUTCOME-R1"
+        + " --mutation-repository stigrunar/example"
+        + " --mutation-scope 'src/bemanning/**'"
+        + " --mutation-base origin/main@abc --json"
+    )
+    payload = json.loads(raw)
+    assert payload["project_id"] == project.id
+    assert payload["outcome_id"] == oid
+    assert payload["mutation_repository"] == "stigrunar/example"
+    assert payload["mutation_scope"] == ["src/bemanning/**"]
+    assert payload["mutation_base_ref"] == "origin/main@abc"
+
+
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):
     with kb.connect_closing() as conn:
         parent_id = kb.create_task(conn, title="parent task")

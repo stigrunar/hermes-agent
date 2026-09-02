@@ -3,7 +3,7 @@ from __future__ import annotations
 import subprocess
 
 from hermes_cli import outcomes_db as odb
-from hermes_cli.outcome_packet import materialize_status
+from hermes_cli.outcome_packet import git_projection, materialize_status
 
 
 def test_materialized_status_is_projection_not_second_database(tmp_path, monkeypatch):
@@ -62,3 +62,24 @@ def test_materialized_status_is_projection_not_second_database(tmp_path, monkeyp
     assert "Implement real seam" in text
     assert (target.parent / "receipts").is_dir()
     assert not (target.parent / "01-outcome.md").exists()
+
+
+def test_git_projection_preserves_clean_empty_status_and_ignores_generated_packets(tmp_path):
+    repo = tmp_path / "repo-clean"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-b", "main", str(repo)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "README.md").write_text("x")
+    subprocess.run(["git", "-C", str(repo), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True)
+
+    assert git_projection(repo)["clean"] is True
+
+    generated = repo / "docs" / "outcomes" / "O1" / "00-status.md"
+    generated.parent.mkdir(parents=True)
+    generated.write_text("generated")
+    assert git_projection(repo)["clean"] is True
+
+    (repo / "source.txt").write_text("real source change")
+    assert git_projection(repo)["clean"] is False
