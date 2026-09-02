@@ -13,6 +13,48 @@ delegates to subagents, runs scheduled jobs, and drives a real terminal and
 browser. It is extended primarily through **plugins and skills**, not by
 growing the core.
 
+## Hove West downstream execution policy
+
+This checkout may be maintained as a downstream distribution with local behavior
+that is not suitable for, or is still pending in, upstream Hermes. Upstream PR
+acceptance is therefore **not** a prerequisite for using a required local fix.
+The invariant is instead that durable application behavior lives in versioned
+downstream Git and that a running release resolves to one exact downstream
+commit.
+
+- **Runtime is a deployed artifact, never the canonical development surface.**
+  Do not make durable source-code fixes by editing the active runtime checkout or
+  by growing a long-lived release/runtime branch. Reproduce against canonical
+  downstream source, fix in a short-lived branch/worktree, test, land the fix,
+  then deploy an exact release. Emergency hotfix branches must converge back to
+  downstream canonical source immediately after validation.
+- **Project -> Outcome -> Execution is the normal software-work identity.** A
+  material user result is one Outcome inside a first-class Project. Telegram
+  topics and Hermes Group Chats are conversation lanes for context/projection;
+  they do not implicitly own source, mutation, or deploy authority.
+- **One overlapping mutation owner.** Before a mutating Project/Outcome
+  execution starts, bind the canonical repository/base and a bounded path scope.
+  Overlapping active scopes must not run under competing executions, even when
+  they originate from different boards, profiles, topics, or projects. A
+  cross-project request becomes a dependency on the owning Outcome unless
+  mutation ownership is explicitly transferred.
+- **Direct Codex is the default bounded FEATURE inner loop.** Keep edit -> test ->
+  inspect -> adjust coherent in one execution/worktree. Kanban is optional for
+  durable waiting/restart continuity, real cross-authority handoffs, genuinely
+  independent non-overlapping work, or required independent review/release
+  gates. Do not manufacture owner -> architect -> controller -> code -> QA graphs
+  for ordinary feature work.
+- **Architect/review are trigger-based.** Use Architect for unresolved structural
+  boundaries and detached QA/review when frozen acceptance or risk materially
+  requires an independent verdict. They are not ceremonial stages.
+- **Current status is projected, not reconstructed from topic history.** Git,
+  source systems, runtime identity, and frozen contracts keep their own
+  authority. Outcome status/`docs/outcomes/<OUTCOME>/00-status.md` materializes
+  which combination is current; it must never override those sources.
+
+The versioned design contract for this downstream model lives in
+`docs/rfcs/2026-09-hermes-outcome-conversation-runtime-convergence.md`.
+
 Two properties shape almost every design decision and are the lens for
 reviewing any change:
 

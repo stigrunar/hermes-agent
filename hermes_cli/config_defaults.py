@@ -2945,7 +2945,7 @@ DEFAULT_CONFIG = {
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or
         # the dashboard's Decompose button.
-        "auto_decompose": True,
+        "auto_decompose": False,
         # Max triage tasks to decompose per dispatcher tick. Prevents a
         # large bulk-load of triage tasks from spending a burst of aux
         # LLM calls in one tick. Excess tasks defer to the next tick.

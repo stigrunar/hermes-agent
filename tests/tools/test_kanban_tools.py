@@ -1019,6 +1019,9 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
+    assert "Do not manufacture a follow-up graph" in KANBAN_GUIDANCE
+    assert "mutation-lease collisions" in KANBAN_GUIDANCE
+    assert "ordinary FEATURE" in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------
