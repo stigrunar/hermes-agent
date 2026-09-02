@@ -177,3 +177,50 @@ def test_same_owner_acquire_is_idempotent(conn):
     first = odb.acquire_mutation_lease(conn, **kwargs)
     second = odb.acquire_mutation_lease(conn, **kwargs)
     assert second["id"] == first["id"]
+
+
+def test_expired_lease_does_not_permanently_hold_scope(conn, monkeypatch):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    clock = {"now": 1000}
+    monkeypatch.setattr(odb, "_now", lambda: clock["now"])
+    first = odb.acquire_mutation_lease(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        repository="repo",
+        path_scope=["src/**"],
+        owner_execution_id="first",
+        ttl_seconds=60,
+    )
+    assert first["expires_at"] == 1060
+    clock["now"] = 1061
+    second = odb.acquire_mutation_lease(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        repository="repo",
+        path_scope=["src/file.py"],
+        owner_execution_id="second",
+        ttl_seconds=60,
+    )
+    assert second["owner_execution_id"] == "second"
+    assert [x["owner_execution_id"] for x in odb.active_mutation_leases(conn)] == ["second"]
+
+
+def test_renew_mutation_lease_extends_crash_fence(conn, monkeypatch):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    clock = {"now": 2000}
+    monkeypatch.setattr(odb, "_now", lambda: clock["now"])
+    odb.acquire_mutation_lease(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        repository="repo",
+        path_scope=["src/**"],
+        owner_execution_id="worker",
+        ttl_seconds=60,
+    )
+    clock["now"] = 2030
+    assert odb.renew_mutation_lease(conn, owner_execution_id="worker", ttl_seconds=120)
+    lease = odb.active_mutation_leases(conn)[0]
+    assert lease["expires_at"] == 2150

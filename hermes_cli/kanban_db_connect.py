@@ -794,6 +794,7 @@ _EARLY_TASK_COLUMNS = (
     ("result", "result TEXT"),
     ("branch_name", "branch_name TEXT"),
     ("project_id", "project_id TEXT"),
+    ("outcome_id", "outcome_id TEXT"),
     ("idempotency_key", "idempotency_key TEXT"),
 )
 

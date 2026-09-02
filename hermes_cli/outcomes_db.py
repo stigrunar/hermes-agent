@@ -27,13 +27,16 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping, Optional
 
-from hermes_cli.sqlite_util import write_txn
+from hermes_cli.sqlite_util import add_column_if_missing, write_txn
 from hermes_constants import get_default_hermes_root
 
 
 _OUTCOME_KEY_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 _LANE_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 _GLOB_CHARS = frozenset("*?[")
+DEFAULT_MUTATION_LEASE_TTL_SECONDS = 6 * 60 * 60
+MIN_MUTATION_LEASE_TTL_SECONDS = 60
+MAX_MUTATION_LEASE_TTL_SECONDS = 24 * 60 * 60
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS outcomes (
@@ -83,6 +86,7 @@ CREATE TABLE IF NOT EXISTS mutation_leases (
     owner_execution_id  TEXT NOT NULL,
     base_ref            TEXT,
     acquired_at         INTEGER NOT NULL,
+    expires_at          INTEGER,
     released_at         INTEGER,
     release_reason      TEXT
 );
@@ -254,6 +258,13 @@ def connect(db_path: Optional[Path] = None) -> sqlite3.Connection:
         apply_wal_with_fallback(conn, db_label="outcomes.db")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.executescript(SCHEMA_SQL)
+        lease_columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(mutation_leases)")
+        }
+        if "expires_at" not in lease_columns:
+            add_column_if_missing(
+                conn, "mutation_leases", "expires_at", "expires_at INTEGER"
+            )
     except Exception:
         conn.close()
         raise
@@ -621,6 +632,7 @@ def _lease_from_row(row: sqlite3.Row) -> dict[str, Any]:
         "owner_execution_id": str(row["owner_execution_id"]),
         "base_ref": row["base_ref"],
         "acquired_at": int(row["acquired_at"]),
+        "expires_at": int(row["expires_at"]) if "expires_at" in row.keys() and row["expires_at"] is not None else None,
         "released_at": int(row["released_at"]) if row["released_at"] is not None else None,
         "release_reason": row["release_reason"],
     }
@@ -632,8 +644,9 @@ def active_mutation_leases(
     repository: Optional[str] = None,
     project_id: Optional[str] = None,
 ) -> list[dict[str, Any]]:
-    clauses = ["released_at IS NULL"]
-    params: list[Any] = []
+    now = _now()
+    clauses = ["released_at IS NULL", "(expires_at IS NULL OR expires_at>?)"]
+    params: list[Any] = [now]
     if repository is not None:
         clauses.append("repository=?")
         params.append(_normalize_repository(repository))
@@ -656,6 +669,7 @@ def acquire_mutation_lease(
     path_scope: Iterable[Any],
     owner_execution_id: str,
     base_ref: Optional[str] = None,
+    ttl_seconds: int = DEFAULT_MUTATION_LEASE_TTL_SECONDS,
 ) -> dict[str, Any]:
     project_id = _text(project_id, field="project_id", max_chars=256)
     outcome = get_outcome(conn, outcome_id)
@@ -667,6 +681,17 @@ def acquire_mutation_lease(
     scope = normalize_scope(path_scope)
     owner = _text(owner_execution_id, field="owner_execution_id", max_chars=512)
     base = _optional_text(base_ref, max_chars=4096)
+    if isinstance(ttl_seconds, bool):
+        raise OutcomeError("ttl_seconds must be an integer")
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except (TypeError, ValueError):
+        raise OutcomeError("ttl_seconds must be an integer") from None
+    if not MIN_MUTATION_LEASE_TTL_SECONDS <= ttl_seconds <= MAX_MUTATION_LEASE_TTL_SECONDS:
+        raise OutcomeError(
+            f"ttl_seconds must be between {MIN_MUTATION_LEASE_TTL_SECONDS} and "
+            f"{MAX_MUTATION_LEASE_TTL_SECONDS}"
+        )
     requested = {
         "project_id": project_id,
         "outcome_id": outcome.id,
@@ -676,7 +701,17 @@ def acquire_mutation_lease(
         "base_ref": base,
     }
     now = _now()
+    expires = now + ttl_seconds
     with write_txn(conn):
+        # Expiry is a crash fence, not a normal release path. Mark expired rows
+        # released before the partial unique-index checks so a dead execution
+        # cannot permanently reserve an owner id or repository scope.
+        conn.execute(
+            """UPDATE mutation_leases
+                  SET released_at=?, release_reason=COALESCE(release_reason, 'expired')
+                WHERE released_at IS NULL AND expires_at IS NOT NULL AND expires_at<=?""",
+            (now, now),
+        )
         existing_owner = conn.execute(
             "SELECT * FROM mutation_leases WHERE owner_execution_id=? AND released_at IS NULL",
             (owner,),
@@ -706,9 +741,9 @@ def acquire_mutation_lease(
         conn.execute(
             """INSERT INTO mutation_leases (
                    id, project_id, outcome_id, repository, scope_json,
-                   owner_execution_id, base_ref, acquired_at, released_at,
-                   release_reason
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
+                   owner_execution_id, base_ref, acquired_at, expires_at,
+                   released_at, release_reason
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)""",
             (
                 lease_id,
                 project_id,
@@ -718,10 +753,40 @@ def acquire_mutation_lease(
                 owner,
                 base,
                 now,
+                expires,
             ),
         )
         row = conn.execute("SELECT * FROM mutation_leases WHERE id=?", (lease_id,)).fetchone()
     return _lease_from_row(row)
+
+
+def renew_mutation_lease(
+    conn: sqlite3.Connection,
+    *,
+    owner_execution_id: str,
+    ttl_seconds: int = DEFAULT_MUTATION_LEASE_TTL_SECONDS,
+) -> bool:
+    owner = _text(owner_execution_id, field="owner_execution_id", max_chars=512)
+    if isinstance(ttl_seconds, bool):
+        raise OutcomeError("ttl_seconds must be an integer")
+    try:
+        ttl_seconds = int(ttl_seconds)
+    except (TypeError, ValueError):
+        raise OutcomeError("ttl_seconds must be an integer") from None
+    if not MIN_MUTATION_LEASE_TTL_SECONDS <= ttl_seconds <= MAX_MUTATION_LEASE_TTL_SECONDS:
+        raise OutcomeError(
+            f"ttl_seconds must be between {MIN_MUTATION_LEASE_TTL_SECONDS} and "
+            f"{MAX_MUTATION_LEASE_TTL_SECONDS}"
+        )
+    now = _now()
+    with write_txn(conn):
+        cur = conn.execute(
+            """UPDATE mutation_leases SET expires_at=?
+                 WHERE owner_execution_id=? AND released_at IS NULL
+                   AND (expires_at IS NULL OR expires_at>?)""",
+            (now + ttl_seconds, owner, now),
+        )
+    return cur.rowcount == 1
 
 
 def release_mutation_lease(

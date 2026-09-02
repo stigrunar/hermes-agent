@@ -384,14 +384,14 @@ _TASK_FIELDS = tuple(
     "created_at started_at completed_at result current_run_id model_override "
     "provider_override completion_contract last_failure_error".split())
 _TASK_SUMMARY_FIELDS = tuple(
-    "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
+    "id title assignee status priority tenant workspace_kind workspace_path project_id outcome_id created_by "
     "created_at started_at completed_at current_run_id model_override provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
 _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
-_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id")
+_CREATED_FIELDS = ("status", "workspace_kind", "workspace_path", "project_id", "outcome_id")
 
 
 def _fields(obj: Any, names: tuple[str, ...]) -> dict[str, Any]:
@@ -1009,6 +1009,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind, workspace_path = args.get("workspace_kind"), args.get("workspace_path")
     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
     project_id = args["project"] if "project" in args else args.get("project_id")
+    outcome_id = args["outcome"] if "outcome" in args else args.get("outcome_id")
     project_source_task_id = None
     triage, skills, goal_mode = (
         _parse_bool_arg(args, "triage"), _coerce_str_list(args.get("skills"), "skills", "skill names"),
@@ -1033,11 +1034,14 @@ def _handle_create(args: dict, **kw) -> str:
         if project_id is None and workspace_kind is None and workspace_path is None:
             if self_task is not None and self_task.project_id:
                 project_id, project_source_task_id = self_task.project_id, self_task.id
+                if outcome_id is None and self_task.outcome_id:
+                    outcome_id = self_task.outcome_id
         new_tid = kb.create_task(
             conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
+            outcome_id=outcome_id,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),

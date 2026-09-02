@@ -428,6 +428,11 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "primary repo with a deterministic branch (project slug + "
                 "task id), instead of a random branch."
         )),
+        "outcome": _prop("string", (
+                "Optional Outcome id/key inside the linked Project. A child "
+                "created from a project-linked Kanban worker inherits its "
+                "current Outcome unless explicitly routed elsewhere."
+        )),
         "triage": _prop("boolean", (
                 "If true, task lands in 'triage' instead of 'todo' "
                 "— a specifier profile is expected to flesh out "

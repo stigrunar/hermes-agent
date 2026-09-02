@@ -706,6 +706,7 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    outcome_id: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -759,7 +760,7 @@ _TASK_REQUIRED_COLUMNS = (
 )
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
-    "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
+    "branch_name", "project_id", "outcome_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
 )
@@ -884,6 +885,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Optional material Outcome inside the linked Project. Outcome identity is
+    -- root-shared across profiles/boards.
+    outcome_id           TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1257,6 +1261,7 @@ def create_task(
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+    outcome_id: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
@@ -1311,6 +1316,19 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
+    if outcome_id is not None:
+        outcome_id = str(outcome_id).strip() or None
+    if outcome_id:
+        if not project_id:
+            raise ValueError("outcome_id requires a valid linked project")
+        from hermes_cli import outcomes_db as _odb
+
+        with _odb.connect_closing() as outcomes_conn:
+            outcome = _odb.get_outcome(
+                outcomes_conn, outcome_id, project_id=project_id)
+        if outcome is None:
+            raise ValueError("outcome_id does not resolve inside the linked project")
+        outcome_id = outcome.id
     parents = tuple(p for p in parents if p)
     skills_list = _normalize_task_skills(skills)
 
@@ -1355,17 +1373,17 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, outcome_id, tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
-                        branch_name, project_id, tenant, idempotency_key,
+                        branch_name, project_id, outcome_id, tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
@@ -1388,6 +1406,7 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "outcome_id": outcome_id,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
