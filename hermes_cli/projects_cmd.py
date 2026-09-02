@@ -17,6 +17,7 @@ import asyncio
 import functools
 import json
 import sys
+from pathlib import Path
 
 from hermes_cli import projects_db as pdb
 
@@ -141,6 +142,16 @@ def build_parser(
     p_snapshot.add_argument("project", help="Project id or slug")
     p_snapshot.add_argument("--json", action="store_true", dest="as_json")
 
+    p_materialize = sub.add_parser(
+        "materialize-status",
+        help="Write docs/outcomes/<OUTCOME>/00-status.md from current Project/Outcome/Git state",
+    )
+    p_materialize.add_argument("project", help="Project id or slug")
+    p_materialize.add_argument("outcome", help="Outcome id or key")
+    p_materialize.add_argument(
+        "--repo", default=None, help="Repository root (defaults to Project primary path)"
+    )
+
     p_tg = sub.add_parser(
         "telegram-provision",
         help="Create/bind topics in an existing Telegram forum supergroup",
@@ -198,6 +209,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "outcome-update": _cmd_outcome_update,
         "bind-lane": _cmd_bind_lane,
         "snapshot": _cmd_snapshot,
+        "materialize-status": _cmd_materialize_status,
         "telegram-provision": _cmd_telegram_provision,
     }
     handler = handlers.get(action)
@@ -512,6 +524,30 @@ def _cmd_snapshot(args, _conn, proj) -> int:
                 print(f"      next: {outcome['next_action']}")
     print(f"  Conversation lanes: {len(snapshot['conversation_lanes'])}")
     print(f"  Active mutators: {len(snapshot['active_mutation_leases'])}")
+    return 0
+
+
+@_with_project
+def _cmd_materialize_status(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli.outcome_packet import materialize_status
+
+    with odb.connect_closing() as oc:
+        outcome = odb.get_outcome(oc, args.outcome, project_id=proj.id)
+        if outcome is None:
+            print(f"project: no such Outcome in {proj.slug}: {args.outcome}", file=sys.stderr)
+            return 1
+    repo = args.repo or proj.primary_path
+    if not repo:
+        print("project: Project has no primary repo; pass --repo", file=sys.stderr)
+        return 2
+    target = materialize_status(
+        project_id=proj.id,
+        project_name=proj.name,
+        outcome_id=outcome.id,
+        repo=Path(repo),
+    )
+    print(target)
     return 0
 
 
