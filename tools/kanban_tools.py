@@ -1087,6 +1087,9 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "workspace_path": task.workspace_path,
         "project_id": task.project_id,
         "outcome_id": task.outcome_id,
+        "mutation_repository": task.mutation_repository,
+        "mutation_scope": task.mutation_scope,
+        "mutation_base_ref": task.mutation_base_ref,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -1989,6 +1992,9 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     outcome_id = args.get("outcome") or args.get("outcome_id")
+    mutation_repository = args.get("mutation_repository")
+    mutation_scope = args.get("mutation_scope")
+    mutation_base_ref = args.get("mutation_base_ref")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -1996,14 +2002,20 @@ def _handle_create(args: dict, **kw) -> str:
     triage, bool_error = _parse_bool_arg(args, "triage")
     if bool_error:
         return tool_error(bool_error)
+    execution_contract = args.get("execution_contract")
     body, contract_error = _prepare_execution_contract(
         assignee=assignee,
         triage=triage,
-        contract=args.get("execution_contract"),
+        contract=execution_contract,
         body=body,
     )
     if contract_error:
         return tool_error(contract_error)
+    if isinstance(execution_contract, dict):
+        if mutation_scope is None:
+            mutation_scope = execution_contract.get("mutation_scope")
+        if mutation_base_ref is None:
+            mutation_base_ref = execution_contract.get("repo_workspace_base_revision")
     body, review_contract_error = _prepare_review_contract(
         assignee=assignee,
         triage=triage,
@@ -2109,6 +2121,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=workspace_path,
                 project_id=project_id,
                 outcome_id=outcome_id,
+                mutation_repository=mutation_repository,
+                mutation_scope=mutation_scope,
+                mutation_base_ref=mutation_base_ref,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -2137,6 +2152,9 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 outcome_id=new_task.outcome_id if new_task else None,
+                mutation_repository=new_task.mutation_repository if new_task else None,
+                mutation_scope=new_task.mutation_scope if new_task else None,
+                mutation_base_ref=new_task.mutation_base_ref if new_task else None,
                 execution_preflight=(
                     new_task.execution_preflight if new_task else None
                 ),
@@ -3145,6 +3163,26 @@ KANBAN_CREATE_SCHEMA = {
                     "created from a project-linked Kanban worker inherits its "
                     "current Outcome unless explicitly routed elsewhere."
                 ),
+            },
+            "mutation_repository": {
+                "type": "string",
+                "description": (
+                    "Canonical repository identity for the Outcome mutation lease. "
+                    "Normally inferred from the Project origin or roadmap binding."
+                ),
+            },
+            "mutation_scope": {
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 1,
+                "description": (
+                    "Repository-relative files/globs this runnable Outcome execution "
+                    "may mutate. Also inferred from execution_contract.mutation_scope."
+                ),
+            },
+            "mutation_base_ref": {
+                "type": "string",
+                "description": "Exact source/base identity used by the mutation lease.",
             },
             "roadmap_binding": _ROADMAP_BINDING_SCHEMA,
             "triage": {

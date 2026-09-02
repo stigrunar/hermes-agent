@@ -167,11 +167,22 @@ def _normalize_lane_kind(value: Any) -> str:
 
 def _normalize_repository(value: Any) -> str:
     repo = _text(value, field="repository", max_chars=1024)
-    # Git repository identifiers may be owner/repo or absolute paths. Normalize
-    # filesystem paths without requiring them to exist; remote ids stay literal.
+    # Filesystem paths are valid when a repository has no remote. Prefer a
+    # portable remote identity when callers have one. GitHub URL/scp forms are
+    # collapsed to owner/repo so a project-root-derived remote and a roadmap
+    # binding cannot accidentally acquire independent leases for the same repo.
     if repo.startswith(("/", "~")):
         return os.path.normcase(str(Path(repo).expanduser().resolve(strict=False)))
-    return repo.rstrip("/")
+    github_patterns = (
+        r"^git@github\.com:([^/]+/[^/]+?)(?:\.git)?$",
+        r"^ssh://git@github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+        r"^https?://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$",
+    )
+    for pattern in github_patterns:
+        match = re.fullmatch(pattern, repo, flags=re.IGNORECASE)
+        if match:
+            return match.group(1).removesuffix(".git")
+    return repo.rstrip("/").removesuffix(".git")
 
 
 def _normalize_scope_entry(value: Any) -> str:

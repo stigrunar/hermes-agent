@@ -104,3 +104,40 @@ def test_task_rejects_outcome_from_another_project(kanban_conn):
             project_id=b.id,
             outcome_id=oid,
         )
+
+
+def test_outcome_mutation_scope_is_persisted_with_canonical_repo(kanban_conn, tmp_path):
+    from hermes_cli import outcomes_db as odb
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    # A local repo without an origin intentionally falls back to its absolute
+    # repository path; Git-backed projects use their origin identity.
+    with pdb.connect_closing() as pc:
+        pid = pdb.create_project(pc, name="Scoped", folders=[str(repo)])
+        proj = pdb.get_project(pc, pid)
+    with odb.connect_closing() as oc:
+        oid = odb.create_outcome(oc, project_id=proj.id, outcome_key="O")
+    tid = kb.create_task(
+        kanban_conn,
+        title="Scoped mutation",
+        project_id=proj.id,
+        outcome_id=oid,
+        mutation_scope=["src/bemanning/**", "src/bemanning/**"],
+        mutation_base_ref="origin/main@abc",
+    )
+    task = kb.get_task(kanban_conn, tid)
+    assert task.mutation_repository == str(repo.resolve())
+    assert task.mutation_scope == ["src/bemanning/**"]
+    assert task.mutation_base_ref == "origin/main@abc"
+
+
+def test_mutation_scope_requires_outcome(kanban_conn):
+    proj = _make_project(name="No Outcome", repo="/tmp/no-outcome")
+    with pytest.raises(ValueError, match="requires outcome_id"):
+        kb.create_task(
+            kanban_conn,
+            title="invalid",
+            project_id=proj.id,
+            mutation_scope=["src/**"],
+        )
