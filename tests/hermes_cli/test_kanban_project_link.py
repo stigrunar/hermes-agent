@@ -64,3 +64,43 @@ def test_unlinked_task_unchanged(kanban_conn):
     assert task.branch_name is None
 
 
+
+
+def test_project_linked_task_can_bind_shared_outcome(kanban_conn):
+    from hermes_cli import outcomes_db as odb
+
+    proj = _make_project(name="Outcome App", repo="/tmp/outcome-app")
+    with odb.connect_closing() as oc:
+        oid = odb.create_outcome(
+            oc,
+            project_id=proj.id,
+            outcome_key="LOGIN-R1",
+            name="Login",
+        )
+
+    tid = kb.create_task(
+        kanban_conn,
+        title="Implement login",
+        project_id=proj.id,
+        outcome_id=oid,
+    )
+    task = kb.get_task(kanban_conn, tid)
+    assert task.project_id == proj.id
+    assert task.outcome_id == oid
+
+
+def test_task_rejects_outcome_from_another_project(kanban_conn):
+    from hermes_cli import outcomes_db as odb
+
+    a = _make_project(name="Project A", repo="/tmp/project-a")
+    b = _make_project(name="Project B", repo="/tmp/project-b")
+    with odb.connect_closing() as oc:
+        oid = odb.create_outcome(oc, project_id=a.id, outcome_key="O1")
+
+    with pytest.raises(ValueError, match="does not resolve inside"):
+        kb.create_task(
+            kanban_conn,
+            title="Wrong project",
+            project_id=b.id,
+            outcome_id=oid,
+        )

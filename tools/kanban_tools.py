@@ -1086,6 +1086,7 @@ def _task_summary_dict(kb, conn, task) -> dict[str, Any]:
         "workspace_kind": task.workspace_kind,
         "workspace_path": task.workspace_path,
         "project_id": task.project_id,
+        "outcome_id": task.outcome_id,
         "created_by": task.created_by,
         "created_at": task.created_at,
         "started_at": task.started_at,
@@ -1987,6 +1988,7 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_kind = args.get("workspace_kind")
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
+    outcome_id = args.get("outcome") or args.get("outcome_id")
     project_source_task_id = None
     _inherit_project = workspace_kind is None and workspace_path is None
     if workspace_kind is None:
@@ -2092,6 +2094,8 @@ def _handle_create(args: dict, **kw) -> str:
                     _self_task = kb.get_task(conn, _self_tid)
                     if _self_task is not None and _self_task.project_id:
                         project_id = _self_task.project_id
+                        if outcome_id is None and _self_task.outcome_id:
+                            outcome_id = _self_task.outcome_id
                         project_source_task_id = _self_task.id
             new_tid = kb.create_task(
                 conn,
@@ -2104,6 +2108,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=str(workspace_kind),
                 workspace_path=workspace_path,
                 project_id=project_id,
+                outcome_id=outcome_id,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -2131,6 +2136,7 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_kind=new_task.workspace_kind if new_task else None,
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
+                outcome_id=new_task.outcome_id if new_task else None,
                 execution_preflight=(
                     new_task.execution_preflight if new_task else None
                 ),
@@ -3130,6 +3136,14 @@ KANBAN_CREATE_SCHEMA = {
                     "set, the task becomes a git worktree under the project's "
                     "primary repo with a deterministic branch (project slug + "
                     "task id), instead of a random branch."
+                ),
+            },
+            "outcome": {
+                "type": "string",
+                "description": (
+                    "Optional Outcome id/key inside the linked Project. A child "
+                    "created from a project-linked Kanban worker inherits its "
+                    "current Outcome unless explicitly routed elsewhere."
                 ),
             },
             "roadmap_binding": _ROADMAP_BINDING_SCHEMA,
