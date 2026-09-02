@@ -133,3 +133,15 @@ def test_materialize_outcome_status_cli(capsys, tmp_path):
     output = capsys.readouterr().out.strip()
     assert output.endswith("docs/outcomes/O1/00-status.md")
     assert (tmp_path / "docs/outcomes/O1/00-status.md").exists()
+
+
+def test_cross_project_outcome_dependency_cli(capsys, tmp_path):
+    ps = tmp_path / "ps"; hw = tmp_path / "hw"
+    ps.mkdir(); hw.mkdir()
+    _run(["create", "PS", str(ps)]); capsys.readouterr()
+    _run(["create", "HW", str(hw)]); capsys.readouterr()
+    _run(["outcome-create", "ps", "STAFFING-R1"]); capsys.readouterr()
+    _run(["outcome-create", "hw", "HWSTAFF-R2"]); capsys.readouterr()
+    assert _run(["outcome-depend", "hw", "HWSTAFF-R2", "ps", "STAFFING-R1"]) == 0
+    out = capsys.readouterr().out
+    assert "hw/HWSTAFF-R2 -> ps/STAFFING-R1" in out

@@ -15472,6 +15472,35 @@ def _(rid, params, pdb, conn) -> dict:
         return _ok(rid, {"outcome": updated.to_dict() if updated else None})
 
 
+@_projects_method("projects.outcome.depend")
+def _(rid, params, pdb, conn) -> dict:
+    proj = _require_project(pdb, conn, params)
+    from hermes_cli import outcomes_db as odb
+
+    with odb.connect_closing() as oconn:
+        outcome = _project_outcome(odb, oconn, proj.id, params.get("outcome_id"))
+        required_project_id = str(params.get("depends_on_project_id") or proj.id).strip()
+        required = odb.get_outcome(
+            oconn,
+            str(params.get("depends_on_outcome_id") or ""),
+            project_id=required_project_id,
+        )
+        if required is None:
+            raise ValueError("required Outcome does not resolve inside depends_on_project_id")
+        dep_id = odb.add_outcome_dependency(
+            oconn,
+            outcome_id=outcome.id,
+            depends_on_outcome_id=required.id,
+            dependency_kind=params.get("dependency_kind") or "requires",
+        )
+        dependency = next(
+            item
+            for item in odb.list_outcome_dependencies(oconn, outcome_id=outcome.id)
+            if item["id"] == dep_id
+        )
+        return _ok(rid, {"dependency": dependency})
+
+
 @_projects_method("projects.lanes")
 def _(rid, params, pdb, conn) -> dict:
     proj = _require_project(pdb, conn, params)

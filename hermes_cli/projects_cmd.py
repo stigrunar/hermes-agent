@@ -129,6 +129,13 @@ def build_parser(
     p_outcome_update.add_argument("--next", default=None, dest="next_action")
     p_outcome_update.add_argument("--archive", action="store_true")
 
+    p_depend = sub.add_parser("outcome-depend", help="Bind one Outcome dependency")
+    p_depend.add_argument("project", help="Owning Project id or slug")
+    p_depend.add_argument("outcome", help="Owning Outcome id or key")
+    p_depend.add_argument("depends_on_project", help="Required Project id or slug")
+    p_depend.add_argument("depends_on_outcome", help="Required Outcome id or key")
+    p_depend.add_argument("--kind", default="requires", dest="dependency_kind")
+
     p_lane = sub.add_parser("bind-lane", help="Bind a conversation lane to Project/Outcome context")
     p_lane.add_argument("project", help="Project id or slug")
     p_lane.add_argument("--platform", required=True)
@@ -207,6 +214,7 @@ def projects_command(args: argparse.Namespace) -> int:
         "outcomes": _cmd_outcomes,
         "outcome-create": _cmd_outcome_create,
         "outcome-update": _cmd_outcome_update,
+        "outcome-depend": _cmd_outcome_depend,
         "bind-lane": _cmd_bind_lane,
         "snapshot": _cmd_snapshot,
         "materialize-status": _cmd_materialize_status,
@@ -459,6 +467,42 @@ def _cmd_outcome_update(args, _conn, proj) -> int:
         odb.update_outcome(oc, outcome.id, **fields)
         updated = odb.get_outcome(oc, outcome.id)
     print(f"Outcome {updated.outcome_key} [{updated.id}] state={updated.state}")
+    return 0
+
+
+@_with_project
+def _cmd_outcome_depend(args, conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli import projects_db as pdb
+
+    required_project = pdb.get_project(conn, args.depends_on_project)
+    if required_project is None:
+        print(f"project: no such required project: {args.depends_on_project}", file=sys.stderr)
+        return 1
+    with odb.connect_closing() as oc:
+        outcome = odb.get_outcome(oc, args.outcome, project_id=proj.id)
+        required = odb.get_outcome(
+            oc, args.depends_on_outcome, project_id=required_project.id
+        )
+        if outcome is None:
+            print(f"project: no such Outcome in {proj.slug}: {args.outcome}", file=sys.stderr)
+            return 1
+        if required is None:
+            print(
+                f"project: no such required Outcome in {required_project.slug}: {args.depends_on_outcome}",
+                file=sys.stderr,
+            )
+            return 1
+        dep_id = odb.add_outcome_dependency(
+            oc,
+            outcome_id=outcome.id,
+            depends_on_outcome_id=required.id,
+            dependency_kind=args.dependency_kind,
+        )
+    print(
+        f"Dependency {dep_id}: {proj.slug}/{outcome.outcome_key} -> "
+        f"{required_project.slug}/{required.outcome_key}"
+    )
     return 0
 
 

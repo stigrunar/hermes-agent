@@ -62,6 +62,7 @@ def test_methods_registered():
         "projects.outcomes",
         "projects.outcome.create",
         "projects.outcome.update",
+        "projects.outcome.depend",
         "projects.lanes",
         "projects.lane.bind",
         "projects.mutation.acquire",
@@ -987,3 +988,32 @@ def test_project_mutation_rpc_rejects_overlapping_execution(tmp_path, monkeypatc
     )
     assert response["error"]["code"] == server._E_PROJECT_ARG
     assert "overlaps active execution" in response["error"]["message"]
+
+
+def test_project_outcome_dependency_rpc_can_cross_projects(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    ps_repo = tmp_path / "ps"
+    hw_repo = tmp_path / "hw"
+    ps_repo.mkdir(); hw_repo.mkdir()
+    ps = _call("projects.create", {"name": "PS", "folders": [str(ps_repo)]})["project"]
+    hw = _call("projects.create", {"name": "HW", "folders": [str(hw_repo)]})["project"]
+    surface = _call(
+        "projects.outcome.create",
+        {"id": ps["id"], "outcome_key": "STAFFING-SURFACE-R1"},
+    )["outcome"]
+    agent = _call(
+        "projects.outcome.create",
+        {"id": hw["id"], "outcome_key": "HWSTAFF-R2"},
+    )["outcome"]
+    dep = _call(
+        "projects.outcome.depend",
+        {
+            "id": hw["id"],
+            "outcome_id": agent["id"],
+            "depends_on_project_id": ps["id"],
+            "depends_on_outcome_id": surface["id"],
+        },
+    )["dependency"]
+    assert dep["project_id"] == hw["id"]
+    assert dep["depends_on_project_id"] == ps["id"]
+    assert dep["depends_on_outcome_key"] == "STAFFING-SURFACE-R1"
