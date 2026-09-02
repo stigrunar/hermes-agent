@@ -7,6 +7,7 @@ import asyncio
 import functools
 import json
 import sys
+from pathlib import Path
 
 from hermes_cli import projects_db as pdb
 
@@ -89,6 +90,14 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_snapshot = project_sub(
         "snapshot", "Show one-screen Project/Outcome coordination state")
     p_snapshot.add_argument("--json", action="store_true", dest="as_json")
+    p_materialize = project_sub(
+        "materialize-status",
+        "Write docs/outcomes/<OUTCOME>/00-status.md from current Project/Outcome/Git state",
+    )
+    p_materialize.add_argument("outcome", help="Outcome id or key")
+    p_materialize.add_argument(
+        "--repo", default=None,
+        help="Repository root (defaults to Project primary path)")
     p_tg = project_sub(
         "telegram-provision",
         "Create/bind topics in an existing Telegram forum supergroup",
@@ -396,6 +405,30 @@ def _cmd_snapshot(args, _conn, proj) -> int:
     return 0
 
 
+@_with_project
+def _cmd_materialize_status(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli.outcome_packet import materialize_status
+
+    with odb.connect_closing() as outcomes_conn:
+        outcome = odb.get_outcome(
+            outcomes_conn, args.outcome, project_id=proj.id)
+        if outcome is None:
+            return _err(f"no such Outcome in {proj.slug}: {args.outcome}")
+    repo = args.repo or proj.primary_path
+    if not repo:
+        print("project: Project has no primary repo; pass --repo", file=sys.stderr)
+        return 2
+    target = materialize_status(
+        project_id=proj.id,
+        project_name=proj.name,
+        outcome_id=outcome.id,
+        repo=Path(repo),
+    )
+    print(target)
+    return 0
+
+
 def _parse_topic_arg(raw: str):
     from hermes_cli.project_forum import TopicSpec
 
@@ -458,5 +491,6 @@ _HANDLERS = {
     "outcome-update": _cmd_outcome_update,
     "bind-lane": _cmd_bind_lane,
     "snapshot": _cmd_snapshot,
+    "materialize-status": _cmd_materialize_status,
     "telegram-provision": _cmd_telegram_provision,
 }

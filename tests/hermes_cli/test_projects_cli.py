@@ -114,3 +114,22 @@ def test_outcome_update_cli(capsys, tmp_path):
         "abc123",
     ]) == 0
     assert "state=candidate" in capsys.readouterr().out
+
+
+def test_materialize_outcome_status_cli(capsys, tmp_path):
+    import subprocess
+
+    subprocess.run(["git", "init", "-b", "main", str(tmp_path)], check=True, capture_output=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.email", "test@example.com"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "config", "user.name", "Test"], check=True)
+    (tmp_path / "README.md").write_text("x")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "README.md"], check=True)
+    subprocess.run(["git", "-C", str(tmp_path), "commit", "-m", "init"], check=True, capture_output=True)
+    _run(["create", "P", str(tmp_path)])
+    capsys.readouterr()
+    _run(["outcome-create", "p", "O1", "--state", "implementing"])
+    capsys.readouterr()
+    assert _run(["materialize-status", "p", "O1"]) == 0
+    output = capsys.readouterr().out.strip()
+    assert output.endswith("docs/outcomes/O1/00-status.md")
+    assert (tmp_path / "docs/outcomes/O1/00-status.md").exists()
