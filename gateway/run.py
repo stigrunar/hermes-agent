@@ -4214,6 +4214,56 @@ def _channel_override_lookup_keys(
     return keys
 
 
+def _project_conversation_lane_prompt(source: Any) -> str:
+    """Return stable Project/Outcome context for a bound conversation lane.
+
+    This is appended as per-turn ephemeral context rather than mutating the
+    cached system prompt. Conversation coordinates are context/projection only;
+    the note deliberately carries no mutation/deploy authority or free-form
+    Outcome instructions.
+    """
+    platform = getattr(getattr(source, "platform", None), "value", None)
+    chat_id = str(getattr(source, "chat_id", "") or "").strip()
+    if not platform or not chat_id:
+        return ""
+    thread_id = str(getattr(source, "thread_id", "") or "").strip()
+    try:
+        from hermes_cli import outcomes_db as odb
+
+        with odb.connect_closing() as conn:
+            lane = odb.find_conversation_lane(
+                conn, platform=str(platform).lower(), chat_id=chat_id, thread_id=thread_id
+            )
+            if lane is None and thread_id:
+                lane = odb.find_conversation_lane(
+                    conn, platform=str(platform).lower(), chat_id=chat_id, thread_id=None
+                )
+            if lane is None:
+                return ""
+            outcome = odb.get_outcome(conn, lane.outcome_id) if lane.outcome_id else None
+    except Exception as exc:
+        logger.debug("project conversation-lane lookup failed: %s", type(exc).__name__)
+        return ""
+
+    lines = [
+        "## Project coordination context",
+        f"Project ID: `{lane.project_id}`",
+        f"Conversation lane ID: `{lane.id}`",
+    ]
+    if outcome is not None:
+        lines.append(f"Outcome ID: `{outcome.id}`")
+        lines.append(f"Outcome key: `{outcome.outcome_key}`")
+    else:
+        lines.append("Outcome: project-level/control lane")
+    lines.append(
+        "This conversation lane provides context and status projection only. "
+        "It does not grant repository mutation or deploy authority. Before "
+        "starting mutating work, resolve the current Project/Outcome source and "
+        "mutation ownership instead of inferring authority from this topic."
+    )
+    return "\n".join(lines)
+
+
 def _get_channel_override(
     config: GatewayConfig,
     platform: Platform,
@@ -5850,6 +5900,11 @@ class TurnRunner:
         )
         if cfg_channel_prompt:
             combined_ephemeral = (combined_ephemeral + "\n\n" + cfg_channel_prompt).strip()
+        project_lane_prompt = _project_conversation_lane_prompt(ctx.source)
+        if project_lane_prompt:
+            combined_ephemeral = (
+                combined_ephemeral + "\n\n" + project_lane_prompt
+            ).strip()
 
         max_iterations = _current_max_iterations()
 
