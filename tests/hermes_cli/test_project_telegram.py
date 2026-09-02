@@ -168,6 +168,82 @@ class AlreadyNamedTelegram(FakeTelegram):
         raise Exception("Topic_not_modified")
 
 
+class MissingPinnedTelegram(FakeTelegram):
+    def __init__(self, card_text: str):
+        super().__init__(card_text)
+        self.chat.pinned_message = None
+        self.edit_count = 0
+
+    async def edit_message_text(self, text, *, chat_id, message_id):
+        self.calls.append(("edit_card", chat_id, message_id))
+        self.edit_count += 1
+        if self.edit_count > 1:
+            raise Exception("Message_not_modified")
+
+    async def pin_chat_message(self, chat_id, message_id, *, disable_notification):
+        self.calls.append(("pin_card", chat_id, message_id))
+
+    async def send_message(
+        self, chat_id, text, *, message_thread_id, disable_web_page_preview
+    ):
+        self.calls.append(("send_card", chat_id, message_thread_id))
+        return SimpleNamespace(message_id=99)
+
+
+@pytest.mark.asyncio
+async def test_apply_rejects_nonmatching_registered_pinned_message(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    spec = load_project_registry(
+        _write_registry(tmp_path), project_ident="demo", canonical_project_id="p_123"
+    )
+    api = FakeTelegram(render_project_card(spec))
+    api.chat.pinned_message.message_id = 8
+
+    with pytest.raises(ValueError, match="registered project card 7"):
+        await sync_telegram_project(spec=spec, canonical_project_id="p_123", api=api)
+
+
+@pytest.mark.asyncio
+async def test_apply_repairs_missing_pinned_message_without_creating_card(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    spec = load_project_registry(
+        _write_registry(tmp_path), project_ident="demo", canonical_project_id="p_123"
+    )
+    api = MissingPinnedTelegram(render_project_card(spec))
+
+    first = await sync_telegram_project(
+        spec=spec, canonical_project_id="p_123", api=api
+    )
+    second = await sync_telegram_project(
+        spec=spec, canonical_project_id="p_123", api=api
+    )
+
+    assert [call[0] for call in api.calls if call[0] in {"edit_card", "pin_card"}] == [
+        "edit_card",
+        "pin_card",
+        "edit_card",
+        "pin_card",
+    ]
+    assert [call for call in api.calls if call[0] == "edit_card"] == [
+        ("edit_card", -100123, 7),
+        ("edit_card", -100123, 7),
+    ]
+    assert [call for call in api.calls if call[0] == "pin_card"] == [
+        ("pin_card", -100123, 7),
+        ("pin_card", -100123, 7),
+    ]
+    assert not [call for call in api.calls if call[0] in {"send_card", "create_topic"}]
+    assert any(action["action"] == "edited_project_card" for action in first["actions"])
+    assert any(
+        action["action"] == "reused_project_card" for action in second["actions"]
+    )
+    assert first["registry_updates"] == second["registry_updates"] == []
+
+
 @pytest.mark.asyncio
 async def test_apply_binds_verified_ids_and_second_sync_has_no_telegram_writes(
     tmp_path, monkeypatch
