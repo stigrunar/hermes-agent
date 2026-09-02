@@ -117,7 +117,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
         help="Repository root (defaults to Project primary path)")
     p_tg = project_sub(
         "telegram-provision",
-        "Create/bind topics in an existing Telegram forum supergroup",
+        "Legacy manual topic provisioning (prefer telegram-sync)",
     )
     p_tg.add_argument("chat_id", help="Existing Telegram forum supergroup id")
     p_tg.add_argument(
@@ -126,6 +126,19 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_tg.add_argument(
         "--topic", action="append", default=[], metavar="NAME[=OUTCOME]",
         help="Workstream topic; repeat for multiple topics")
+    p_tg_sync = project_sub(
+        "telegram-sync",
+        "Sync one registry-declared Telegram project group projection",
+    )
+    p_tg_sync.add_argument(
+        "--registry", required=True, metavar="PATH",
+        help="Versioned Telegram project registry")
+    p_tg_sync.add_argument(
+        "--dry-run", action="store_true",
+        help="Validate and print actions without API/DB writes")
+    p_tg_sync.add_argument(
+        "--json", action="store_true", dest="as_json",
+        help="Emit machine-readable JSON")
     parser.set_defaults(_project_parser=parser)
     return parser
 
@@ -523,6 +536,49 @@ def _cmd_telegram_provision(args, _conn, proj) -> int:
     return 0
 
 
+@_with_project
+def _cmd_telegram_sync(args, _conn, proj) -> int:
+    from hermes_cli.project_telegram import (
+        load_project_registry,
+        sync_telegram_project,
+        sync_telegram_project_with_configured_bot,
+    )
+
+    try:
+        spec = load_project_registry(
+            args.registry,
+            project_ident=proj.slug,
+            canonical_project_id=proj.id,
+        )
+        if args.dry_run:
+            result = asyncio.run(sync_telegram_project(
+                spec=spec, canonical_project_id=proj.id, dry_run=True))
+        else:
+            result = asyncio.run(sync_telegram_project_with_configured_bot(
+                spec=spec, canonical_project_id=proj.id, dry_run=False))
+    except (ValueError, RuntimeError) as exc:
+        print(f"project: {exc}", file=sys.stderr)
+        return 2
+    if args.as_json:
+        print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+        return 0
+    mode = "DRY RUN" if result["dry_run"] else "SYNCED"
+    print(
+        f"{mode}: {proj.slug} -> Telegram {result['chat_id']} "
+        f"({len(result['actions'])} action(s))")
+    for action in result["actions"]:
+        detail = " ".join(
+            f"{key}={value}" for key, value in action.items()
+            if key != "action" and value is not None)
+        print(f"  {action['action']}{(' ' + detail) if detail else ''}")
+    if result["registry_updates"]:
+        print("Registry write-through required:", file=sys.stderr)
+        print(json.dumps(
+            result["registry_updates"], ensure_ascii=False, sort_keys=True),
+            file=sys.stderr)
+    return 0
+
+
 _HANDLERS = {
     "create": _cmd_create,
     "list": _cmd_list,
@@ -544,4 +600,5 @@ _HANDLERS = {
     "snapshot": _cmd_snapshot,
     "materialize-status": _cmd_materialize_status,
     "telegram-provision": _cmd_telegram_provision,
+    "telegram-sync": _cmd_telegram_sync,
 }
