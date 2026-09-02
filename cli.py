@@ -82,6 +82,7 @@ try:
         install_cmd_backspace_alias,
         install_ctrl_enter_alias,
         install_ignored_terminal_sequences,
+        install_keypress_data_normalization,
         install_modify_other_keys_aliases,
         install_shift_enter_alias,
     )
@@ -89,8 +90,9 @@ try:
     install_ctrl_enter_alias()
     install_cmd_backspace_alias()
     install_modify_other_keys_aliases()
+    install_keypress_data_normalization()
     install_ignored_terminal_sequences()
-    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_modify_other_keys_aliases, install_ignored_terminal_sequences
+    del install_shift_enter_alias, install_ctrl_enter_alias, install_cmd_backspace_alias, install_modify_other_keys_aliases, install_keypress_data_normalization, install_ignored_terminal_sequences
 except Exception:
     pass
 import threading
@@ -5362,6 +5364,30 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # clobber an explicit override with the session's stored model.
         self._explicit_model_override = bool(model)
         self.model = model or _config_model or _DEFAULT_CONFIG_MODEL
+        _startup_provider_override = ""
+        _startup_base_url_override = ""
+        _startup_api_key_override = ""
+        if self.model:
+            from hermes_cli.model_switch import resolve_startup_model_route
+
+            _startup_route = resolve_startup_model_route(
+                self.model,
+                explicit_provider=provider or "",
+                current_provider=(
+                    provider
+                    or _nested_provider
+                    or CLI_CONFIG["model"].get("provider")
+                    or os.getenv("HERMES_INFERENCE_PROVIDER")
+                    or ""
+                ),
+                user_providers=CLI_CONFIG.get("providers"),
+                custom_providers=CLI_CONFIG.get("custom_providers"),
+            )
+            if _startup_route is not None:
+                self.model = _startup_route.model
+                _startup_provider_override = _startup_route.provider
+                _startup_base_url_override = _startup_route.base_url
+                _startup_api_key_override = _startup_route.api_key
         # A ``moa:<preset>`` model string selects the MoA virtual provider in
         # one shot (parity with interactive ``/moa`` and the model picker). Do
         # this before provider resolution so ``-Q -m moa:<preset>`` routes
@@ -5398,13 +5424,16 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             not _config_model or _config_model == _DEFAULT_CONFIG_MODEL
         )
 
-        self._explicit_api_key = api_key
+        # An explicit --api-key wins; otherwise a URL-bearing startup alias
+        # carries its own credential for the alias host (#28660).
+        self._explicit_api_key = api_key or _startup_api_key_override or None
         self._explicit_base_url = base_url
 
         # Provider selection is resolved lazily at use-time via _ensure_runtime_credentials().
         self.requested_provider = (
             _moa_provider_override
             or provider
+            or _startup_provider_override
             or _nested_provider
             or CLI_CONFIG["model"].get("provider")
             or os.getenv("HERMES_INFERENCE_PROVIDER")
@@ -5438,6 +5467,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self.acp_args: list[str] = []
         self.base_url = (
             base_url
+            or _startup_base_url_override
             or CLI_CONFIG["model"].get("base_url", "")
             or os.getenv("OPENROUTER_BASE_URL", "")
         ) or None
@@ -5831,6 +5861,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
                 session_id=self.session_id,
                 surface=surface,
                 config=self.config,
+                # Writer identity for re-entrancy (#94595): a re-claim by this
+                # same process for this same session replaces its own entry
+                # instead of fencing itself out.
+                metadata={"live_session_id": str(self.session_id)},
             )
         except Exception as exc:
             logger.warning("Failed to claim active session slot: %s", exc)
@@ -6633,6 +6667,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             context_tokens = getattr(compressor, "last_prompt_tokens", 0) or 0
             if context_tokens < 0:
                 context_tokens = 0
+            # Durable-transcript view: on reasoning models a long tool loop
+            # replays the current turn's thinking + scaffolding on every
+            # request, so the LAST request's prompt_tokens can exceed the
+            # durable transcript by hundreds of K — all of which evaporates
+            # at the turn boundary. Rendering that raw figure makes the bar
+            # sawtooth (e.g. 850K mid-turn -> 600K next turn) and reads as a
+            # broken compaction. Anchor the display on the turn's FIRST
+            # response (minimal replay) plus a delta estimate of messages
+            # appended since, excluding stale thinking. Display-only: the
+            # compression trigger keeps using real last-request usage.
+            try:
+                from agent.model_metadata import anchored_context_tokens
+
+                _msgs = getattr(agent, "_session_messages", None)
+                _anchored = anchored_context_tokens(
+                    _msgs if isinstance(_msgs, list) else [],
+                    getattr(agent, "_turn_base_usage_anchor", None),
+                    charge_stale_thinking=False,
+                )
+                if _anchored is not None and _anchored > 0:
+                    context_tokens = _anchored
+            except Exception:
+                pass
             context_length = getattr(compressor, "context_length", 0) or 0
             if context_length < 0:
                 context_length = 0
@@ -15708,6 +15765,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         # _voice_message_prefix property and its usage in _process_message().
 
         tts_status = " (TTS enabled)" if self._voice_tts else ""
+        if self._voice_tts:
+            # Speech output is on from the start — warm the engine now so the
+            # first spoken reply doesn't pay the model load as dead air.
+            self._tts_lease_async(True)
         # Use the startup-pinned cache so the advertised shortcut always
         # matches the live prompt_toolkit binding — reading live config
         # here would drift after a mid-session config edit (Copilot
@@ -15765,6 +15826,11 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             self._voice_mode = False
             self._voice_tts = False
             self._voice_continuous = False
+
+        # Speech output is off with the mode — release the TTS engine lease so
+        # a resident local model (piper/kittentts) is freed once nothing else
+        # in this process still needs it.
+        self._tts_lease_async(False)
 
         # Shut down the persistent audio stream in background
         if recorder is not None:
@@ -16013,6 +16079,29 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         if not owned:
             _cprint(f"  {_DIM}Enable with /wake on{_RST}")
 
+    def _tts_lease_async(self, active: bool) -> None:
+        """Acquire/release this CLI's TTS engine lease in the background.
+
+        The /voice tts toggle (and voice-mode on/off with speech output set)
+        is the "TTS is about to be needed / no longer needed" signal:
+        acquiring pre-loads the configured provider so the first reply starts
+        hot; releasing lets the last-holder path unload resident local models.
+        Never blocks the toggle and never fails it.
+        """
+
+        def _run():
+            try:
+                from tools.tts_tool import acquire_tts_lease, release_tts_lease
+
+                if active:
+                    acquire_tts_lease("cli:voice-tts")
+                else:
+                    release_tts_lease("cli:voice-tts")
+            except Exception as e:
+                logger.debug("voice: tts lease active=%s failed: %s", active, e)
+
+        threading.Thread(target=_run, name="tts-lease-cli", daemon=True).start()
+
     def _toggle_voice_tts(self):
         """Toggle TTS output for voice mode."""
         if not self._voice_mode:
@@ -16027,6 +16116,10 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             from tools.tts_tool import check_tts_requirements
             if not check_tts_requirements():
                 _cprint(f"{_DIM}Warning: No TTS provider available. Install edge-tts or set API keys.{_RST}")
+
+        # Toggle = warm-up / release signal for the TTS engine (see
+        # tools.tts_tool.acquire_tts_lease).
+        self._tts_lease_async(self._voice_tts)
 
         _cprint(f"{_ACCENT}Voice TTS {status}.{_RST}")
 
@@ -21698,6 +21791,13 @@ def main(
     # Handle gateway mode (messaging + cron)
     if gateway:
         import asyncio
+        # Startup-liveness watchdog (OOF-298): this legacy entry point must
+        # be covered too — arm before importing the gateway graph.
+        try:
+            from hermes_startup_watchdog import arm_startup_watchdog
+            arm_startup_watchdog()
+        except Exception:
+            pass
         from gateway.run import start_gateway
         print("Starting Hermes Gateway (messaging platforms)...")
         asyncio.run(start_gateway())
@@ -21820,22 +21920,31 @@ def main(
     parsed_skills = _parse_skills_argument(skills)
 
     # Create CLI instance
-    cli = HermesCLI(
-        model=model,
-        toolsets=toolsets_list,
-        provider=provider,
-        reasoning=reasoning,
-        api_key=api_key,
-        base_url=base_url,
-        max_turns=max_turns,
-        run_budget=run_budget,
-        verbose=verbose,
-        compact=compact,
-        resume=resume,
-        checkpoints=checkpoints,
-        pass_session_id=pass_session_id,
-        ignore_rules=ignore_rules,
-    )
+    try:
+        cli = HermesCLI(
+            model=model,
+            toolsets=toolsets_list,
+            provider=provider,
+            reasoning=reasoning,
+            api_key=api_key,
+            base_url=base_url,
+            max_turns=max_turns,
+            run_budget=run_budget,
+            verbose=verbose,
+            compact=compact,
+            resume=resume,
+            checkpoints=checkpoints,
+            pass_session_id=pass_session_id,
+            ignore_rules=ignore_rules,
+        )
+    except ImportError as e:
+        # Direct `python cli.py` / `python -m cli` bypasses cmd_chat's
+        # ImportError handler. Same mixed-tree class as #96900.
+        from hermes_constants import emit_partial_update_hint
+
+        if emit_partial_update_hint(e):
+            sys.exit(1)
+        raise
 
     if parsed_skills:
         # Load the skill payloads in the background: skill_view walks the
