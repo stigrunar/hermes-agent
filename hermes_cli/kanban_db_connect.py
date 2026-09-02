@@ -795,6 +795,9 @@ _EARLY_TASK_COLUMNS = (
     ("branch_name", "branch_name TEXT"),
     ("project_id", "project_id TEXT"),
     ("outcome_id", "outcome_id TEXT"),
+    ("mutation_repository", "mutation_repository TEXT"),
+    ("mutation_scope", "mutation_scope TEXT"),
+    ("mutation_base_ref", "mutation_base_ref TEXT"),
     ("idempotency_key", "idempotency_key TEXT"),
 )
 

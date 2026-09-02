@@ -24,7 +24,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from toolsets import get_toolset_names
 
@@ -707,6 +707,9 @@ class Task:
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
     outcome_id: Optional[str] = None
+    mutation_repository: Optional[str] = None
+    mutation_scope: Optional[list[str]] = None
+    mutation_base_ref: Optional[str] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -739,6 +742,12 @@ class Task:
         g = lambda col, default=None: _lossy_text(_row_get(row, col, default))  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        parsed_scope = _json_or(g("mutation_scope"))
+        mutation_scope = (
+            [str(item) for item in parsed_scope if item]
+            if isinstance(parsed_scope, list)
+            else None
+        )
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -748,6 +757,7 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            mutation_scope=mutation_scope,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -760,7 +770,8 @@ _TASK_REQUIRED_COLUMNS = (
 )
 # Later-added columns read as NULL when absent from the row.
 _TASK_OPTIONAL_COLUMNS = (
-    "branch_name", "project_id", "outcome_id", "tenant", "result", "idempotency_key", "worker_pid",
+    "branch_name", "project_id", "outcome_id", "mutation_repository", "mutation_base_ref",
+    "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
 )
@@ -888,6 +899,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- Optional material Outcome inside the linked Project. Outcome identity is
     -- root-shared across profiles/boards.
     outcome_id           TEXT,
+    mutation_repository  TEXT,
+    mutation_scope       TEXT,
+    mutation_base_ref    TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1262,6 +1276,9 @@ def create_task(
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
     outcome_id: Optional[str] = None,
+    mutation_repository: Optional[str] = None,
+    mutation_scope: Optional[Iterable[str]] = None,
+    mutation_base_ref: Optional[str] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
@@ -1352,6 +1369,34 @@ def create_task(
         if board_default:
             workspace_path = str(board_default)
 
+    from hermes_cli import outcomes_db as _odb
+
+    normalized_mutation_scope = (
+        _odb.normalize_scope(mutation_scope) if mutation_scope is not None else None)
+    if mutation_repository is None and project_repo:
+        try:
+            remote = subprocess.run(
+                ["git", "-C", str(project_repo), "config", "--get", "remote.origin.url"],
+                capture_output=True,
+                text=True,
+                check=False,
+                timeout=3,
+                shell=False,
+            )
+            mutation_repository = remote.stdout.strip() if remote.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            mutation_repository = None
+        mutation_repository = mutation_repository or str(project_repo)
+    normalized_mutation_repository = (
+        _odb._normalize_repository(mutation_repository) if mutation_repository else None)
+    normalized_mutation_base_ref = str(mutation_base_ref or "").strip() or None
+    if normalized_mutation_scope is not None:
+        if not outcome_id:
+            raise ValueError("mutation_scope requires outcome_id")
+        if not normalized_mutation_repository:
+            raise ValueError(
+                "mutation_scope requires mutation_repository or linked project repo")
+
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
@@ -1373,17 +1418,24 @@ def create_task(
                     INSERT INTO tasks (
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
-                        branch_name, project_id, outcome_id, tenant, idempotency_key,
+                        branch_name, project_id, outcome_id,
+                        mutation_repository, mutation_scope, mutation_base_ref,
+                        tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
-                        branch_name, project_id, outcome_id, tenant, idempotency_key,
+                        branch_name, project_id, outcome_id,
+                        normalized_mutation_repository,
+                        (json.dumps(normalized_mutation_scope)
+                         if normalized_mutation_scope is not None else None),
+                        normalized_mutation_base_ref,
+                        tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
@@ -1407,6 +1459,9 @@ def create_task(
                         "branch_name": branch_name,
                         "project_id": project_id,
                         "outcome_id": outcome_id,
+                        "mutation_repository": normalized_mutation_repository,
+                        "mutation_scope": normalized_mutation_scope,
+                        "mutation_base_ref": normalized_mutation_base_ref,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -1965,6 +2020,103 @@ def _append_event(
     )
 
 
+def _mutation_lease_owner(task_id: str) -> str:
+    return f"kanban:{get_current_board()}:{task_id}"
+
+
+def _acquire_task_mutation_lease(task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    outcome_id = str(task.get("outcome_id") or "").strip()
+    repository = str(task.get("mutation_repository") or "").strip()
+    raw_scope = task.get("mutation_scope")
+    if isinstance(raw_scope, str):
+        raw_scope = _json_or(raw_scope)
+    if not outcome_id or not repository or not isinstance(raw_scope, list) or not raw_scope:
+        return None
+    project_id = str(task.get("project_id") or "").strip()
+    if not project_id:
+        return None
+    from hermes_cli import outcomes_db as _odb
+
+    ttl = _odb.DEFAULT_MUTATION_LEASE_TTL_SECONDS
+    max_runtime = task.get("max_runtime_seconds")
+    if max_runtime is not None:
+        try:
+            ttl = max(ttl, int(max_runtime) + 600)
+        except (TypeError, ValueError):
+            pass
+        ttl = min(ttl, _odb.MAX_MUTATION_LEASE_TTL_SECONDS)
+    with _odb.connect_closing() as outcomes_conn:
+        return _odb.acquire_mutation_lease(
+            outcomes_conn,
+            project_id=project_id,
+            outcome_id=outcome_id,
+            repository=repository,
+            path_scope=raw_scope,
+            owner_execution_id=_mutation_lease_owner(str(task.get("id") or "")),
+            base_ref=str(task.get("mutation_base_ref") or "").strip() or None,
+            ttl_seconds=ttl,
+        )
+
+
+def _renew_task_mutation_lease(task_id: str) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as outcomes_conn:
+            _odb.renew_mutation_lease(
+                outcomes_conn, owner_execution_id=_mutation_lease_owner(task_id))
+    except Exception as exc:
+        _log.warning(
+            "mutation lease renewal failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _release_task_mutation_lease(task_id: str, *, reason: str) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as outcomes_conn:
+            _odb.release_mutation_lease(
+                outcomes_conn,
+                owner_execution_id=_mutation_lease_owner(task_id),
+                reason=reason,
+            )
+    except Exception as exc:
+        _log.warning(
+            "mutation lease release failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _record_mutation_lease_conflict(
+    conn: sqlite3.Connection,
+    task_id: str,
+    conflict: Mapping[str, Any],
+) -> None:
+    conflicting = conflict.get("conflicting") if isinstance(conflict, Mapping) else None
+    if not isinstance(conflicting, Mapping):
+        return
+    lease_id = str(conflicting.get("id") or "")
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if last is not None and last["kind"] == "mutation_lease_conflict":
+        payload = _json_dict(last["payload"])
+        if str(payload.get("conflicting_lease_id") or "") == lease_id:
+            return
+    _append_event(
+        conn,
+        task_id,
+        "mutation_lease_conflict",
+        {
+            "conflicting_lease_id": lease_id or None,
+            "conflicting_owner": conflicting.get("owner_execution_id"),
+            "conflicting_project_id": conflicting.get("project_id"),
+            "conflicting_outcome_id": conflicting.get("outcome_id"),
+            "repository": conflicting.get("repository"),
+            "path_scope": conflicting.get("path_scope"),
+        },
+    )
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -1996,6 +2148,7 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    _release_task_mutation_lease(task_id, reason=outcome)
     return run_id
 
 
@@ -2306,8 +2459,34 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
+        lease = None
+        claim_snapshot = conn.execute(
+            "SELECT * FROM tasks WHERE id=? AND status='ready'", (task_id,)
+        ).fetchone()
+        if claim_snapshot is not None:
+            try:
+                lease = _acquire_task_mutation_lease(dict(claim_snapshot))
+            except Exception as exc:
+                from hermes_cli import outcomes_db as _odb
+
+                if isinstance(exc, _odb.MutationLeaseConflict):
+                    _record_mutation_lease_conflict(
+                        conn,
+                        task_id,
+                        {"conflicting": exc.conflicting, "requested": exc.requested},
+                    )
+                    return None
+                _append_event(
+                    conn,
+                    task_id,
+                    "mutation_lease_error",
+                    {"error_type": type(exc).__name__},
+                )
+                return None
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
+            if lease is not None:
+                _release_task_mutation_lease(task_id, reason="claim_lost")
             return None
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
@@ -2414,6 +2593,7 @@ def heartbeat_claim(
         if cur.rowcount != 1:
             return False
         _extend_run_claim(conn, task_id, expires)
+        _renew_task_mutation_lease(task_id)
         return True
 
 

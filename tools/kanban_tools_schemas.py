@@ -433,6 +433,21 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "created from a project-linked Kanban worker inherits its "
                 "current Outcome unless explicitly routed elsewhere."
         )),
+        "mutation_repository": _prop("string", (
+                "Canonical repository identity for the Outcome mutation lease. "
+                "Normally inferred from the linked Project origin."
+        )),
+        "mutation_scope": {
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "description": (
+                "Repository-relative files/globs this runnable Outcome execution "
+                "may mutate."
+            ),
+        },
+        "mutation_base_ref": _prop(
+            "string", "Exact source/base identity used by the mutation lease."),
         "triage": _prop("boolean", (
                 "If true, task lands in 'triage' instead of 'todo' "
                 "— a specifier profile is expected to flesh out "

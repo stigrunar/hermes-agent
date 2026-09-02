@@ -224,3 +224,9 @@ def test_renew_mutation_lease_extends_crash_fence(conn, monkeypatch):
     assert odb.renew_mutation_lease(conn, owner_execution_id="worker", ttl_seconds=120)
     lease = odb.active_mutation_leases(conn)[0]
     assert lease["expires_at"] == 2150
+
+
+def test_repository_identity_normalizes_github_remote_forms():
+    assert odb._normalize_repository("git@github.com:stigrunar/hovewest-prosjektstyring.git") == "stigrunar/hovewest-prosjektstyring"
+    assert odb._normalize_repository("https://github.com/stigrunar/hovewest-prosjektstyring.git") == "stigrunar/hovewest-prosjektstyring"
+    assert odb._normalize_repository("stigrunar/hovewest-prosjektstyring") == "stigrunar/hovewest-prosjektstyring"
