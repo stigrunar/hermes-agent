@@ -58,9 +58,13 @@ commit.
 - **Cross-backend capacity and shared resources are root coordination state.**
   Direct Codex, Kanban and external mutating executions consume the same configured
   mutation budget. Repository/path collisions use mutation leases; scarce shared
-  environments use generic resource leases. `vectorworks-local` has capacity 1.
-  TTL is only a liveness signal for a generic resource and never authority to steal
-  it without verified terminal/dead execution evidence.
+  environments use generic, opt-in resource leases declared by the execution
+  contract (for example a private deploy target, migration target, shared browser
+  session, device or test rig). Hermes does not reserve or own a resource merely
+  because another tool/workflow uses it. Undeclared resources default to capacity 1
+  when first requested; concurrent requests must agree on capacity. TTL is only a
+  liveness signal and never authority to steal a resource without verified
+  terminal/dead execution evidence.
 - **Architect/review are trigger-based.** Use Architect for unresolved structural
   boundaries and detached QA/review when frozen acceptance or risk materially
   requires an independent verdict. They are not ceremonial stages.

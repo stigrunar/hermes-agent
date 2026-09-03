@@ -80,7 +80,7 @@ def test_cli_create_binds_outcome_and_mutation_scope(kanban_home):
         + " --mutation-repository stigrunar/example"
         + " --mutation-scope 'src/bemanning/**'"
         + " --mutation-base origin/main@abc"
-        + " --resource vectorworks-local --json"
+        + " --resource deploy-private-canary --json"
     )
     payload = json.loads(raw)
     assert payload["project_id"] == project.id
@@ -88,7 +88,7 @@ def test_cli_create_binds_outcome_and_mutation_scope(kanban_home):
     assert payload["mutation_repository"] == "stigrunar/example"
     assert payload["mutation_scope"] == ["src/bemanning/**"]
     assert payload["mutation_base_ref"] == "origin/main@abc"
-    assert payload["resource_requirements"] == ["vectorworks-local"]
+    assert payload["resource_requirements"] == ["deploy-private-canary"]
 
 
 def test_kanban_show_text_renders_graph_with_open_connection(kanban_home):

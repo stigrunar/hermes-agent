@@ -40,7 +40,7 @@ MIN_MUTATION_LEASE_TTL_SECONDS = 60
 MAX_MUTATION_LEASE_TTL_SECONDS = 24 * 60 * 60
 DEFAULT_GLOBAL_MUTATING_CAP = 3
 DEFAULT_OWNER_MUTATING_CAP = 2
-DEFAULT_RESOURCE_CAPACITIES = {"vectorworks-local": 1}
+DEFAULT_RESOURCE_CAPACITY = 1
 DEFAULT_RESOURCE_LEASE_TTL_SECONDS = 6 * 60 * 60
 
 EXECUTION_MODES = frozenset({"direct_codex", "kanban", "external"})
@@ -1455,12 +1455,10 @@ def _promote_resource_waiters_in_txn(
     ).fetchall()
     if not waiting_rows:
         return []
-    configured_capacity = DEFAULT_RESOURCE_CAPACITIES.get(key)
-    declared_capacity = (
-        configured_capacity
-        if configured_capacity is not None
-        else max([int(row["capacity"]) for row in active_rows + waiting_rows] or [1])
-    )
+    capacities = {int(row["capacity"]) for row in active_rows + waiting_rows}
+    if len(capacities) > 1:
+        raise OutcomeError(f"resource {key} has inconsistent active queue capacity")
+    declared_capacity = next(iter(capacities), DEFAULT_RESOURCE_CAPACITY)
     available = max(0, declared_capacity - len(active_rows))
     promoted: list[str] = []
     for row in waiting_rows[:available]:
@@ -1486,15 +1484,24 @@ def _promote_resource_waiters_in_txn(
     return promoted
 
 
-def _resolve_resource_capacity(resource_key: str, capacity: Optional[int]) -> int:
-    configured = DEFAULT_RESOURCE_CAPACITIES.get(resource_key)
-    if configured is not None:
-        if capacity is not None and _positive_int(capacity, field="capacity") != configured:
-            raise OutcomeError(
-                f"resource {resource_key} capacity is fixed at {configured}"
-            )
-        return configured
-    return _positive_int(capacity if capacity is not None else 1, field="capacity")
+def _resolve_resource_capacity(
+    conn: sqlite3.Connection, resource_key: str, capacity: Optional[int]
+) -> int:
+    requested = _positive_int(
+        capacity if capacity is not None else DEFAULT_RESOURCE_CAPACITY,
+        field="capacity",
+    )
+    rows = conn.execute(
+        "SELECT DISTINCT capacity FROM resource_leases "
+        "WHERE resource_key=? AND state IN ('waiting','acquired')",
+        (resource_key,),
+    ).fetchall()
+    declared = {int(row["capacity"]) for row in rows}
+    if declared and declared != {requested}:
+        raise OutcomeError(
+            f"resource {resource_key} capacity conflicts with active queue"
+        )
+    return requested
 
 
 def _request_resource_lease_in_transaction(
@@ -1509,7 +1516,7 @@ def _request_resource_lease_in_transaction(
     execution = get_execution(conn, owner_execution_id)
     if execution is None:
         raise OutcomeError(f"unknown execution for resource lease: {owner_execution_id}")
-    resolved_capacity = _resolve_resource_capacity(key, capacity)
+    resolved_capacity = _resolve_resource_capacity(conn, key, capacity)
     now = _now()
     existing = conn.execute(
         """SELECT * FROM resource_leases

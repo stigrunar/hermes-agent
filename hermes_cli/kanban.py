@@ -398,7 +398,7 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                           help="Exact base ref/SHA associated with the mutation lease.")
     p_create.add_argument("--resource", action="append", default=None, dest="resource_requirements",
                           help="Shared execution resource required before worker start (repeatable), "
-                               "for example vectorworks-local.")
+                               "for example deploy:private.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",

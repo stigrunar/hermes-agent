@@ -293,26 +293,26 @@ def test_kanban_resource_requirement_waits_then_runs_after_release(stores):
             execution_mode="direct_codex",
             owner="default",
             mutating=False,
-            resource_requirements=["vectorworks-local"],
+            resource_requirements=["deploy-private-canary"],
         )
         assert odb.admit_execution(oc, holder)["state"] == "running"
         active = odb.list_resource_leases(
-            oc, resource_key="vectorworks-local", owner_execution_id=holder
+            oc, resource_key="deploy-private-canary", owner_execution_id=holder
         )
         assert len(active) == 1 and active[0]["state"] == "acquired"
 
     task_id = kb.create_task(
         first_db,
-        title="vectorworks qa waiter",
+        title="deploy target waiter",
         project_id=project.id,
         outcome_id=outcome,
-        resource_requirements=["vectorworks-local"],
+        resource_requirements=["deploy-private-canary"],
     )
     task = kb.get_task(first_db, task_id)
     assert task is not None
-    assert task.resource_requirements == ["vectorworks-local"]
+    assert task.resource_requirements == ["deploy-private-canary"]
 
-    # The Kanban task must not claim while direct Codex owns Vectorworks.
+    # The Kanban task must not claim while direct Codex owns the shared deploy target.
     assert kb.claim_task(first_db, task_id, claimer="qa") is None
     assert kb.get_task(first_db, task_id).status == "ready"
     execution_id = kb.kanban_execution_id(task_id)
@@ -321,7 +321,7 @@ def test_kanban_resource_requirement_waits_then_runs_after_release(stores):
         assert waiting is not None
         assert waiting["state"] == "waiting_resource"
         leases = odb.list_resource_leases(
-            oc, resource_key="vectorworks-local", owner_execution_id=execution_id
+            oc, resource_key="deploy-private-canary", owner_execution_id=execution_id
         )
         assert len(leases) == 1 and leases[0]["state"] == "waiting"
 
@@ -330,17 +330,17 @@ def test_kanban_resource_requirement_waits_then_runs_after_release(stores):
         promoted = odb.get_execution(oc, execution_id)
         assert promoted is not None and promoted["state"] == "queued"
         leases = odb.list_resource_leases(
-            oc, resource_key="vectorworks-local", owner_execution_id=execution_id
+            oc, resource_key="deploy-private-canary", owner_execution_id=execution_id
         )
         assert len(leases) == 1 and leases[0]["state"] == "acquired"
 
     claimed = kb.claim_task(first_db, task_id, claimer="qa")
     assert claimed is not None and claimed.status == "running"
-    assert kb.complete_task(first_db, task_id, result="vectorworks qa done")
+    assert kb.complete_task(first_db, task_id, result="deploy target done")
     with odb.connect_closing() as oc:
         finished = odb.get_execution(oc, execution_id)
         assert finished is not None and finished["state"] == "completed"
         assert odb.list_resource_leases(
-            oc, resource_key="vectorworks-local", owner_execution_id=execution_id,
+            oc, resource_key="deploy-private-canary", owner_execution_id=execution_id,
             active_only=True,
         ) == []
