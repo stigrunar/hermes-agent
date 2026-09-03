@@ -246,3 +246,37 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
     assert [(s["chat_id"], s["thread_id"]) for s in kb.list_notify_subs(first_db, child)] == [
         ("-100123", "43")
     ]
+
+
+def test_child_parent_execution_identity_uses_connection_board(stores, tmp_path):
+    project, outcome, _first_db, _ = stores
+    board_db = tmp_path / ".hermes" / "kanban" / "boards" / "hermes" / "kanban.db"
+    board_db.parent.mkdir(parents=True, exist_ok=True)
+    conn = kb.connect(db_path=board_db)
+    try:
+        with odb.connect_closing() as oc:
+            lane = odb.bind_conversation_lane(
+                oc,
+                project_id=project.id,
+                outcome_id=outcome,
+                platform="telegram",
+                chat_id="-100999",
+                thread_id="6",
+            )
+        parent = kb.create_task(
+            conn,
+            title="board-parent",
+            project_id=project.id,
+            outcome_id=outcome,
+            conversation_lane_id=lane,
+        )
+        child = kb.create_task(conn, title="board-child", parents=[parent])
+        child_task = kb.get_task(conn, child)
+        assert child_task is not None
+        assert child_task.parent_execution_id == f"kanban:hermes:{parent}"
+        assert child_task.project_id == project.id
+        assert child_task.outcome_id == outcome
+        assert child_task.conversation_lane_id == lane
+        assert child_task.topic_target == "telegram:-100999:6"
+    finally:
+        conn.close()
