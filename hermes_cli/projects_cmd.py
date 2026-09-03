@@ -140,6 +140,32 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_exec_terminal.add_argument(
         "--receipt", default=None, dest="receipt_uri")
     p_exec_terminal.add_argument("--reason", default=None)
+    p_direct_codex = project_sub(
+        "direct-codex-run",
+        "Register, admit, heartbeat and terminalize one bounded direct Codex execution",
+    )
+    p_direct_codex.add_argument("outcome", help="Outcome id or key")
+    p_direct_codex.add_argument(
+        "--repo", required=True, help="Clean isolated repo/worktree path")
+    p_direct_codex.add_argument(
+        "--scope", action="append", required=True, dest="mutation_scope",
+        help="Repository-relative mutation scope (repeatable)")
+    p_direct_codex.add_argument("--base", default=None, dest="base_ref")
+    p_direct_codex.add_argument("--owner", default="default")
+    p_direct_codex.add_argument(
+        "--lane", default=None, dest="conversation_lane_id")
+    p_direct_codex.add_argument(
+        "--resource", action="append", default=None, dest="resources")
+    p_direct_codex.add_argument("--prompt-file", required=True)
+    p_direct_codex.add_argument("--output-file", required=True)
+    p_direct_codex.add_argument("--stderr-file", required=True)
+    p_direct_codex.add_argument("--codex-exe", default=None)
+    p_direct_codex.add_argument("--codex-profile", default="writer")
+    p_direct_codex.add_argument(
+        "--sandbox", default="workspace-write",
+        choices=["read-only", "workspace-write"])
+    p_direct_codex.add_argument("--heartbeat-seconds", type=float, default=15.0)
+    p_direct_codex.add_argument("--timeout-seconds", type=int, default=1800)
     p_resource_request = project_sub(
         "resource-request", "Request/acquire a shared execution resource")
     p_resource_request.add_argument("execution")
@@ -622,6 +648,70 @@ def _cmd_execution_terminal(args, _conn, proj) -> int:
 
 
 @_with_project
+def _cmd_direct_codex_run(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    from hermes_cli.direct_codex_execution import (
+        DirectCodexExecutionError,
+        canonical_repo_identity,
+        current_base_ref,
+        run_direct_codex_execution,
+    )
+
+    repo = Path(args.repo).expanduser().resolve(strict=False)
+    with odb.connect_closing() as outcomes_conn:
+        outcome = _resolve_project_outcome(
+            outcomes_conn, proj, args.outcome)
+        execution_id = odb.create_execution(
+            outcomes_conn,
+            project_id=proj.id,
+            outcome_id=outcome.id,
+            execution_mode="direct_codex",
+            owner=args.owner,
+            backend_id="codex-cli",
+            mutating=True,
+            conversation_lane_id=args.conversation_lane_id,
+            repository=canonical_repo_identity(repo),
+            mutation_scope=args.mutation_scope,
+            base_ref=args.base_ref or current_base_ref(repo),
+            resource_requirements=args.resources,
+        )
+        try:
+            result = run_direct_codex_execution(
+                outcomes_conn,
+                execution_id=execution_id,
+                repo=repo,
+                prompt_file=Path(args.prompt_file),
+                output_file=Path(args.output_file),
+                stderr_file=Path(args.stderr_file),
+                codex_executable=args.codex_exe,
+                codex_profile=args.codex_profile,
+                sandbox=args.sandbox,
+                heartbeat_seconds=args.heartbeat_seconds,
+                timeout_seconds=args.timeout_seconds,
+            )
+        except odb.ExecutionAdmissionBlocked as exc:
+            current = odb.get_execution(outcomes_conn, execution_id)
+            print(json.dumps({
+                "ok": False,
+                "execution": current,
+                "reason": exc.reason,
+                "counts": exc.counts,
+                "durable_wait_required": exc.reason == "waiting_resource",
+            }, ensure_ascii=False, sort_keys=True))
+            return 3
+        except DirectCodexExecutionError as exc:
+            current = odb.get_execution(outcomes_conn, execution_id)
+            print(json.dumps({
+                "ok": False,
+                "execution": current,
+                "error": str(exc),
+            }, ensure_ascii=False, sort_keys=True))
+            return 2
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
+    return 0 if result.get("ok") else 1
+
+
+@_with_project
 def _cmd_resource_request(args, _conn, proj) -> int:
     from hermes_cli import outcomes_db as odb
     with odb.connect_closing() as outcomes_conn:
@@ -789,6 +879,7 @@ _HANDLERS = {
     "execution-admit": _cmd_execution_admit,
     "execution-heartbeat": _cmd_execution_heartbeat,
     "execution-terminal": _cmd_execution_terminal,
+    "direct-codex-run": _cmd_direct_codex_run,
     "resource-request": _cmd_resource_request,
     "resource-release": _cmd_resource_release,
     "materialize-status": _cmd_materialize_status,
