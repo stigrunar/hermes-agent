@@ -73,6 +73,7 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "mutation_repository": t.mutation_repository,
         "mutation_scope": list(t.mutation_scope) if t.mutation_scope else [],
         "mutation_base_ref": t.mutation_base_ref,
+        "resource_requirements": list(t.resource_requirements) if t.resource_requirements else [],
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -395,6 +396,9 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
                                "Requires --outcome and enables overlap protection.")
     p_create.add_argument("--mutation-base", default=None, dest="mutation_base_ref",
                           help="Exact base ref/SHA associated with the mutation lease.")
+    p_create.add_argument("--resource", action="append", default=None, dest="resource_requirements",
+                          help="Shared execution resource required before worker start (repeatable), "
+                               "for example vectorworks-local.")
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1708,6 +1712,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             mutation_repository=getattr(args, "mutation_repository", None),
             mutation_scope=getattr(args, "mutation_scope", None),
             mutation_base_ref=getattr(args, "mutation_base_ref", None),
+            resource_requirements=getattr(args, "resource_requirements", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1902,6 +1907,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  mutation-scope: {', '.join(task.mutation_scope)}")
     if task.mutation_base_ref:
         print(f"  mutation-base: {task.mutation_base_ref}")
+    if task.resource_requirements:
+        print(f"  resources:  {', '.join(task.resource_requirements)}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:

@@ -1096,6 +1096,7 @@ class Task:
     mutation_repository: Optional[str] = None
     mutation_scope: Optional[list[str]] = None
     mutation_base_ref: Optional[str] = None
+    resource_requirements: Optional[list[str]] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1191,6 +1192,16 @@ class Task:
                     mutation_scope_value = [str(item) for item in parsed_scope if item]
             except Exception:
                 mutation_scope_value = None
+        resource_requirements_value: Optional[list[str]] = None
+        if "resource_requirements" in keys and row["resource_requirements"]:
+            try:
+                parsed_resources = json.loads(row["resource_requirements"])
+                if isinstance(parsed_resources, list):
+                    resource_requirements_value = [
+                        str(item) for item in parsed_resources if item
+                    ]
+            except Exception:
+                resource_requirements_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1221,6 +1232,7 @@ class Task:
             mutation_base_ref=(
                 row["mutation_base_ref"] if "mutation_base_ref" in keys else None
             ),
+            resource_requirements=resource_requirements_value,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1474,6 +1486,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     mutation_repository  TEXT,
     mutation_scope       TEXT,
     mutation_base_ref    TEXT,
+    resource_requirements TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -3131,6 +3144,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "mutation_base_ref", "mutation_base_ref TEXT"
         )
+    if "resource_requirements" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "resource_requirements", "resource_requirements TEXT"
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -3915,6 +3932,7 @@ def create_task(
     mutation_repository: Optional[str] = None,
     mutation_scope: Optional[Iterable[str]] = None,
     mutation_base_ref: Optional[str] = None,
+    resource_requirements: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
     execution: Optional[Mapping[str, Any]] = None,
 ) -> str:
@@ -4299,6 +4317,11 @@ def create_task(
         _odb._normalize_repository(mutation_repository) if mutation_repository else None
     )
     normalized_mutation_base_ref = str(mutation_base_ref or "").strip() or None
+    normalized_resource_requirements = _odb.normalize_resource_requirements(
+        resource_requirements
+    )
+    if normalized_resource_requirements and not outcome_id:
+        raise ValueError("resource_requirements requires outcome_id")
     if normalized_mutation_scope is not None:
         if not outcome_id:
             raise ValueError("mutation_scope requires outcome_id")
@@ -4381,11 +4404,11 @@ def create_task(
                         branch_name, project_id, outcome_id,
                         conversation_lane_id, topic_target, parent_execution_id,
                         mutation_repository, mutation_scope, mutation_base_ref,
-                        tenant, idempotency_key, max_runtime_seconds,
+                        resource_requirements, tenant, idempotency_key, max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, execution_preflight
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4407,6 +4430,8 @@ def create_task(
                         normalized_mutation_repository,
                         json.dumps(normalized_mutation_scope) if normalized_mutation_scope is not None else None,
                         normalized_mutation_base_ref,
+                        json.dumps(normalized_resource_requirements)
+                        if normalized_resource_requirements else None,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -4450,6 +4475,7 @@ def create_task(
                         "mutation_repository": normalized_mutation_repository,
                         "mutation_scope": normalized_mutation_scope,
                         "mutation_base_ref": normalized_mutation_base_ref,
+                        "resource_requirements": normalized_resource_requirements or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -5336,6 +5362,17 @@ def _task_projection_payload(task: Mapping[str, Any]) -> Optional[dict[str, Any]
         except (TypeError, ValueError, json.JSONDecodeError):
             raw_scope = None
     mutation_scope = raw_scope if isinstance(raw_scope, list) and raw_scope else None
+    raw_resources = task.get("resource_requirements")
+    if isinstance(raw_resources, str):
+        try:
+            raw_resources = json.loads(raw_resources)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            raw_resources = None
+    resource_requirements = (
+        [str(item) for item in raw_resources if item]
+        if isinstance(raw_resources, list)
+        else []
+    )
     return {
         "execution_id": kanban_execution_id(str(task.get("id") or "")),
         "project_id": project_id,
@@ -5349,6 +5386,7 @@ def _task_projection_payload(task: Mapping[str, Any]) -> Optional[dict[str, Any]
         "repository": str(task.get("mutation_repository") or "").strip() or None,
         "mutation_scope": mutation_scope,
         "base_ref": str(task.get("mutation_base_ref") or "").strip() or None,
+        "resource_requirements": resource_requirements,
     }
 
 
