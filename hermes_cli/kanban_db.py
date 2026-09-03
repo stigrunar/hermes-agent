@@ -4006,7 +4006,13 @@ def create_task(
     conversation_lane_id = _inherit_one("conversation_lane_id", conversation_lane_id)
     topic_target = _inherit_one("topic_target", topic_target)
     if parent_execution_id is None and len(parent_tasks) == 1:
-        parent_execution_id = kanban_execution_id(parent_tasks[0].id)
+        # The parent execution identity is board-qualified root state. Derive
+        # the board from the owning SQLite connection when the caller did not
+        # pass one explicitly; ambient/default board context is not authority.
+        parent_execution_id = kanban_execution_id(
+            parent_tasks[0].id,
+            board=board or _board_slug_for_connection(conn),
+        )
     parent_execution_id = str(parent_execution_id or "").strip() or None
     topic_target = _normalize_structured_topic_target(topic_target)
     # A worker profile may not have the creator's per-profile projects.db. When
