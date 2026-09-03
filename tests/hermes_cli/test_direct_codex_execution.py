@@ -80,7 +80,7 @@ def _execution(conn, oid: str, repo: Path, *, eid: str, resources=None) -> str:
 def test_runner_tracks_heartbeats_and_terminal_receipt(store, tmp_path, monkeypatch):
     conn, oid = store
     repo = _repo(tmp_path)
-    eid = _execution(conn, oid, repo, eid="ex_direct", resources=["vectorworks-local"])
+    eid = _execution(conn, oid, repo, eid="ex_direct", resources=["deploy-private-canary"])
     prompt = tmp_path / "prompt.txt"
     prompt.write_text("make artifact", encoding="utf-8")
     output = tmp_path / "last.md"
@@ -132,11 +132,11 @@ def test_resource_wait_never_launches_direct_process(store, tmp_path):
         execution_mode="external",
         owner="dollyqa",
         mutating=False,
-        resource_requirements=["vectorworks-local"],
+        resource_requirements=["deploy-private-canary"],
     )
     assert odb.admit_execution(conn, holder)["state"] == "running"
     waiter = _execution(
-        conn, oid, waiter_repo, eid="ex_waiter", resources=["vectorworks-local"]
+        conn, oid, waiter_repo, eid="ex_waiter", resources=["deploy-private-canary"]
     )
     prompt = tmp_path / "waiter-prompt.txt"
     prompt.write_text("must not launch", encoding="utf-8")

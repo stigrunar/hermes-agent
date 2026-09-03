@@ -470,23 +470,38 @@ def test_per_owner_mutating_cap_is_independent_of_global_cap(conn):
         odb.admit_execution(conn, third, global_cap=10, owner_cap=2)
 
 
-def test_vectorworks_capacity_is_fixed_at_one(conn):
+def test_generic_resource_capacity_is_queue_consistent(conn):
     oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
-    eid = odb.create_execution(
+    for eid in ("ex_capacity_a", "ex_capacity_b", "ex_capacity_c"):
+        odb.create_execution(
+            conn,
+            execution_id=eid,
+            project_id="p",
+            outcome_id=oid,
+            execution_mode="external",
+            owner=eid,
+            mutating=False,
+        )
+    first = odb.request_resource_lease(
         conn,
-        execution_id="ex_capacity",
-        project_id="p",
-        outcome_id=oid,
-        execution_mode="external",
-        owner="dollyqa",
-        mutating=False,
+        resource_key="deploy-private-canary",
+        owner_execution_id="ex_capacity_a",
+        capacity=2,
     )
-    with pytest.raises(odb.OutcomeError, match="fixed at 1"):
+    second = odb.request_resource_lease(
+        conn,
+        resource_key="deploy-private-canary",
+        owner_execution_id="ex_capacity_b",
+        capacity=2,
+    )
+    assert first["state"] == "acquired"
+    assert second["state"] == "acquired"
+    with pytest.raises(odb.OutcomeError, match="conflicts with active queue"):
         odb.request_resource_lease(
             conn,
-            resource_key="vectorworks-local",
-            owner_execution_id=eid,
-            capacity=2,
+            resource_key="deploy-private-canary",
+            owner_execution_id="ex_capacity_c",
+            capacity=1,
         )
 
 
@@ -504,25 +519,25 @@ def test_resource_lease_is_fifo_and_never_stolen_by_ttl_alone(conn, monkeypatch)
         )
     clock = {"now": 2000}
     monkeypatch.setattr(odb, "_now", lambda: clock["now"])
-    a = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_a")
-    b = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_b")
-    c = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_c")
+    a = odb.request_resource_lease(conn, resource_key="deploy-private-canary", owner_execution_id="ex_a")
+    b = odb.request_resource_lease(conn, resource_key="deploy-private-canary", owner_execution_id="ex_b")
+    c = odb.request_resource_lease(conn, resource_key="deploy-private-canary", owner_execution_id="ex_c")
     assert a["state"] == "acquired"
     assert b["state"] == "waiting"
     assert c["state"] == "waiting"
     clock["now"] = a["expires_at"] + 1
     with pytest.raises(odb.OutcomeError, match="verified_dead"):
         odb.release_resource_lease(conn, lease_id=a["id"], stale=True)
-    assert odb.list_resource_leases(conn, resource_key="vectorworks-local")[0]["owner_execution_id"] == "ex_a"
+    assert odb.list_resource_leases(conn, resource_key="deploy-private-canary")[0]["owner_execution_id"] == "ex_a"
     released = odb.release_resource_lease(conn, lease_id=a["id"], reason="done")
     assert released["promoted"] == [b["id"]]
-    active = odb.list_resource_leases(conn, resource_key="vectorworks-local")
+    active = odb.list_resource_leases(conn, resource_key="deploy-private-canary")
     assert [(item["owner_execution_id"], item["state"]) for item in active] == [
         ("ex_b", "acquired"),
         ("ex_c", "waiting"),
     ]
     odb.terminalize_execution(conn, "ex_b", state="completed")
-    assert odb.list_resource_leases(conn, resource_key="vectorworks-local")[0]["owner_execution_id"] == "ex_c"
+    assert odb.list_resource_leases(conn, resource_key="deploy-private-canary")[0]["owner_execution_id"] == "ex_c"
 
 
 def test_resource_requirement_blocks_admission_until_promoted(conn):
@@ -535,7 +550,7 @@ def test_resource_requirement_blocks_admission_until_promoted(conn):
         execution_mode="kanban",
         owner="dollyqa",
         mutating=False,
-        resource_requirements=["vectorworks-local"],
+        resource_requirements=["deploy-private-canary"],
     )
     second = odb.create_execution(
         conn,
@@ -545,7 +560,7 @@ def test_resource_requirement_blocks_admission_until_promoted(conn):
         execution_mode="direct_codex",
         owner="default",
         mutating=False,
-        resource_requirements=["vectorworks-local"],
+        resource_requirements=["deploy-private-canary"],
     )
     assert odb.admit_execution(conn, first)["state"] == "running"
     with pytest.raises(odb.ExecutionAdmissionBlocked, match="waiting_resource"):

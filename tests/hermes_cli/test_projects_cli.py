@@ -195,7 +195,7 @@ def test_execution_and_resource_cli(capsys, tmp_path, monkeypatch):
     assert _run([
         "execution-create", "plugin-a", "PLUGIN-A-R1", "--mode", "direct_codex",
         "--owner", "default", "--read-only", "--lane", lane_id,
-        "--resource", "vectorworks-local",
+        "--resource", "deploy-private-canary",
     ]) == 0
     created = __import__("json").loads(capsys.readouterr().out)
     execution_id = created["execution_id"]
