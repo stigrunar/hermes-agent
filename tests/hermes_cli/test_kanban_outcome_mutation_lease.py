@@ -13,6 +13,7 @@ from hermes_cli import projects_db as pdb
 def stores(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: True)
     repo = tmp_path / "repo"
     repo.mkdir()
     with pdb.connect_closing() as pc:
@@ -106,3 +107,142 @@ def test_heartbeat_renews_active_mutation_lease(stores, monkeypatch):
     with odb.connect_closing() as oc:
         after = odb.active_mutation_leases(oc)[0]["expires_at"]
     assert after >= before
+
+
+def test_kanban_claim_projects_execution_and_completion_terminalizes(stores):
+    project, outcome, first_db, _ = stores
+    task_id = _task(first_db, project, outcome, title="projected")
+    execution_id = kb.kanban_execution_id(task_id)
+
+    assert kb.claim_task(first_db, task_id, claimer="worker") is not None
+    with odb.connect_closing() as oc:
+        execution = odb.get_execution(oc, execution_id)
+        assert execution is not None
+        assert execution["execution_mode"] == "kanban"
+        assert execution["backend_id"] == task_id
+        assert execution["state"] == "running"
+        assert execution["mutating"] is True
+        assert odb.active_mutation_leases(oc)[0]["owner_execution_id"] == execution_id
+
+    assert kb.heartbeat_claim(first_db, task_id, claimer="worker")
+    assert kb.complete_task(first_db, task_id, result="done")
+    with odb.connect_closing() as oc:
+        execution = odb.get_execution(oc, execution_id)
+        assert execution is not None
+        assert execution["state"] == "completed"
+        assert execution["receipt_uri"] == f"kanban:default:{task_id}"
+        assert odb.active_mutation_leases(oc) == []
+
+
+def test_child_inheritance_survives_worker_without_local_project_db(stores, monkeypatch):
+    project, outcome, first_db, _ = stores
+    with odb.connect_closing() as oc:
+        lane = odb.bind_conversation_lane(
+            oc,
+            project_id=project.id,
+            outcome_id=outcome,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="41",
+        )
+    parent = kb.create_task(
+        first_db,
+        title="parent-cross-profile",
+        project_id=project.id,
+        outcome_id=outcome,
+        conversation_lane_id=lane,
+    )
+    # Simulate a worker profile whose own projects.db cannot resolve the
+    # creator's Project. Parent task identity is the durable fallback.
+    monkeypatch.setattr(pdb, "get_project", lambda *_args, **_kwargs: None)
+    child = kb.create_task(first_db, title="child-cross-profile", parents=[parent])
+    child_task = kb.get_task(first_db, child)
+    assert child_task is not None
+    assert child_task.project_id == project.id
+    assert child_task.outcome_id == outcome
+    assert child_task.conversation_lane_id == lane
+    assert child_task.topic_target == "telegram:-100123:41"
+
+
+def test_structured_topic_binding_overrides_origin_and_inherits(stores):
+    project, outcome, first_db, _ = stores
+    with odb.connect_closing() as oc:
+        lane = odb.bind_conversation_lane(
+            oc,
+            project_id=project.id,
+            outcome_id=outcome,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="42",
+            label="Plugin A",
+        )
+        lane2 = odb.bind_conversation_lane(
+            oc,
+            project_id=project.id,
+            outcome_id=outcome,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="43",
+            label="Plugin A next",
+        )
+
+    parent = kb.create_task(
+        first_db,
+        title="parent",
+        project_id=project.id,
+        outcome_id=outcome,
+        conversation_lane_id=lane,
+    )
+    parent_task = kb.get_task(first_db, parent)
+    assert parent_task is not None
+    assert parent_task.topic_target == "telegram:-100123:42"
+
+    # Simulate creation from Dolly main-DM. Structured target must win and the
+    # origin DM must not remain as a duplicate visible subscription.
+    kb.add_notify_sub(
+        first_db,
+        task_id=parent,
+        platform="telegram",
+        chat_id="12345",
+        chat_type="dm",
+        notifier_profile="default",
+        delivery_mode="notify+wake",
+    )
+    subs = kb.list_notify_subs(first_db, parent)
+    assert [(s["platform"], s["chat_id"], s["thread_id"]) for s in subs] == [
+        ("telegram", "-100123", "42")
+    ]
+    assert subs[0]["chat_type"] == "group"
+
+    child = kb.create_task(first_db, title="child", parents=[parent])
+    child_task = kb.get_task(first_db, child)
+    assert child_task is not None
+    assert child_task.project_id == project.id
+    assert child_task.outcome_id == outcome
+    assert child_task.conversation_lane_id == lane
+    assert child_task.topic_target == "telegram:-100123:42"
+    assert child_task.parent_execution_id == kb.kanban_execution_id(parent)
+
+    kb.add_notify_sub(
+        first_db,
+        task_id=child,
+        platform="telegram",
+        chat_id="12345",
+        chat_type="dm",
+        notifier_profile="default",
+        delivery_mode="notify+wake",
+    )
+    assert [(s["chat_id"], s["thread_id"]) for s in kb.list_notify_subs(first_db, child)] == [
+        ("-100123", "42")
+    ]
+
+    assert kb.rebind_task_conversation(
+        first_db, child, conversation_lane_id=lane2
+    )
+    rebound = kb.get_task(first_db, child)
+    assert rebound is not None
+    assert rebound.conversation_lane_id == lane2
+    assert rebound.topic_target == "telegram:-100123:43"
+    assert [(s["chat_id"], s["thread_id"]) for s in kb.list_notify_subs(first_db, child)] == [
+        ("-100123", "43")
+    ]

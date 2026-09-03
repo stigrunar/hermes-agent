@@ -171,3 +171,48 @@ def test_cross_project_outcome_dependency_cli(capsys, tmp_path):
     assert _run(["outcome-depend", "hw", "HWSTAFF-R2", "ps", "STAFFING-R1"]) == 0
     out = capsys.readouterr().out
     assert "hw/HWSTAFF-R2 -> ps/STAFFING-R1" in out
+
+
+def test_execution_and_resource_cli(capsys, tmp_path, monkeypatch):
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: True)
+    assert _run(["create", "Plugin A", str(tmp_path)]) == 0
+    capsys.readouterr()
+    assert _run(["outcome-create", "plugin-a", "PLUGIN-A-R1"]) == 0
+    capsys.readouterr()
+    assert _run([
+        "bind-lane", "plugin-a", "--platform", "telegram", "--chat-id", "-1001",
+        "--thread-id", "42", "--outcome", "PLUGIN-A-R1",
+    ]) == 0
+    capsys.readouterr()
+    with pdb.connect_closing() as project_conn:
+        project = pdb.get_project(project_conn, "plugin-a")
+        assert project is not None
+        project_id = project.id
+    with odb.connect_closing() as conn:
+        lanes = odb.list_conversation_lanes(conn, project_id)
+        lane_id = lanes[0].id
+
+    assert _run([
+        "execution-create", "plugin-a", "PLUGIN-A-R1", "--mode", "direct_codex",
+        "--owner", "default", "--read-only", "--lane", lane_id,
+        "--resource", "vectorworks-local",
+    ]) == 0
+    created = __import__("json").loads(capsys.readouterr().out)
+    execution_id = created["execution_id"]
+    assert created["delivery_target"] == "telegram:-1001:42"
+
+    assert _run(["execution-admit", "plugin-a", execution_id]) == 0
+    admitted = __import__("json").loads(capsys.readouterr().out)
+    assert admitted["admitted"] is True
+    assert admitted["execution"]["state"] == "running"
+
+    assert _run(["execution-heartbeat", "plugin-a", execution_id]) == 0
+    assert __import__("json").loads(capsys.readouterr().out)["ok"] is True
+
+    assert _run([
+        "execution-terminal", "plugin-a", execution_id, "--state", "completed",
+        "--receipt", "receipt://plugin-a",
+    ]) == 0
+    terminal = __import__("json").loads(capsys.readouterr().out)
+    assert terminal["execution"]["state"] == "completed"
+    assert terminal["execution"]["receipt_uri"] == "receipt://plugin-a"

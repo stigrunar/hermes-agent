@@ -1891,6 +1891,9 @@ DEFAULT_CONFIG = {
         # Auto-run the decomposer on Triage tasks every tick. False = manual via `hermes kanban
         # decompose <id>` or the dashboard's Decompose button.
         "auto_decompose": False,
+        # Default-off until existing work is reconciled into the shared
+        # cross-backend execution projection.
+        "cross_project_orchestration_v1_enabled": False,
         # Max triage tasks decomposed per tick, bounding the aux-LLM burst from a bulk load. Excess
         # defers to the next tick.
         "auto_decompose_per_tick": 3,

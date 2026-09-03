@@ -107,6 +107,51 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_snapshot = project_sub(
         "snapshot", "Show one-screen Project/Outcome coordination state")
     p_snapshot.add_argument("--json", action="store_true", dest="as_json")
+    p_exec_create = project_sub(
+        "execution-create", "Register one root-shared Outcome execution")
+    p_exec_create.add_argument("outcome", help="Outcome id or key")
+    p_exec_create.add_argument(
+        "--mode", required=True,
+        choices=["direct_codex", "kanban", "external"])
+    p_exec_create.add_argument("--owner", required=True)
+    p_exec_create.add_argument("--backend-id", default=None)
+    p_exec_create.add_argument("--read-only", action="store_true")
+    p_exec_create.add_argument(
+        "--lane", default=None, dest="conversation_lane_id")
+    p_exec_create.add_argument(
+        "--target", default=None, dest="delivery_target")
+    p_exec_create.add_argument("--repo", default=None, dest="repository")
+    p_exec_create.add_argument(
+        "--scope", action="append", default=None, dest="mutation_scope")
+    p_exec_create.add_argument("--base", default=None, dest="base_ref")
+    p_exec_create.add_argument(
+        "--resource", action="append", default=None, dest="resources")
+    for action, help_text in (
+        ("execution-admit", "Admit a registered execution"),
+        ("execution-heartbeat", "Heartbeat one execution"),
+    ):
+        project_sub(action, help_text).add_argument("execution")
+    p_exec_terminal = project_sub(
+        "execution-terminal", "Terminalize one execution")
+    p_exec_terminal.add_argument("execution")
+    p_exec_terminal.add_argument(
+        "--state", required=True,
+        choices=["completed", "cancelled", "failed"])
+    p_exec_terminal.add_argument(
+        "--receipt", default=None, dest="receipt_uri")
+    p_exec_terminal.add_argument("--reason", default=None)
+    p_resource_request = project_sub(
+        "resource-request", "Request/acquire a shared execution resource")
+    p_resource_request.add_argument("execution")
+    p_resource_request.add_argument("resource")
+    p_resource_request.add_argument("--purpose", default=None)
+    p_resource_request.add_argument("--capacity", type=int, default=None)
+    p_resource_release = project_sub(
+        "resource-release", "Release shared resources held by an execution")
+    p_resource_release.add_argument("execution")
+    p_resource_release.add_argument("--reason", default=None)
+    p_resource_release.add_argument("--stale", action="store_true")
+    p_resource_release.add_argument("--verified-dead", action="store_true")
     p_materialize = project_sub(
         "materialize-status",
         "Write docs/outcomes/<OUTCOME>/00-status.md from current Project/Outcome/Git state",
@@ -464,7 +509,149 @@ def _cmd_snapshot(args, _conn, proj) -> int:
             if outcome.get("next_action"):
                 print(f"      next: {outcome['next_action']}")
     print(f"  Conversation lanes: {len(snapshot['conversation_lanes'])}")
+    print(f"  Active executions: {len(snapshot.get('active_executions', []))}")
     print(f"  Active mutators: {len(snapshot['active_mutation_leases'])}")
+    print(
+        f"  Shared resource leases: "
+        f"{len(snapshot.get('active_resource_leases', []))}")
+    return 0
+
+
+def _resolve_project_outcome(outcomes_conn, proj, outcome_ident: str):
+    from hermes_cli import outcomes_db as odb
+    outcome = odb.get_outcome(
+        outcomes_conn, outcome_ident, project_id=proj.id)
+    if outcome is None:
+        raise ValueError(f"no such Outcome in {proj.slug}: {outcome_ident}")
+    return outcome
+
+
+def _resolve_project_execution(outcomes_conn, proj, execution_id: str):
+    from hermes_cli import outcomes_db as odb
+    execution = odb.get_execution(outcomes_conn, execution_id)
+    if execution is None or execution.get("project_id") != proj.id:
+        raise ValueError(f"no such execution in {proj.slug}: {execution_id}")
+    return execution
+
+
+@_with_project
+def _cmd_execution_create(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        outcome = _resolve_project_outcome(
+            outcomes_conn, proj, args.outcome)
+        execution_id = odb.create_execution(
+            outcomes_conn,
+            project_id=proj.id,
+            outcome_id=outcome.id,
+            execution_mode=args.mode,
+            owner=args.owner,
+            backend_id=args.backend_id,
+            mutating=not bool(args.read_only),
+            conversation_lane_id=args.conversation_lane_id,
+            delivery_target=args.delivery_target,
+            repository=args.repository,
+            mutation_scope=args.mutation_scope,
+            base_ref=args.base_ref,
+            resource_requirements=args.resources,
+        )
+        execution = odb.get_execution(outcomes_conn, execution_id)
+    print(json.dumps(execution, ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@_with_project
+def _cmd_execution_admit(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        execution = _resolve_project_execution(
+            outcomes_conn, proj, args.execution)
+        try:
+            admitted = odb.admit_execution(
+                outcomes_conn, execution["execution_id"],
+                require_feature_gate=True)
+        except odb.ExecutionAdmissionBlocked as exc:
+            current = odb.get_execution(
+                outcomes_conn, execution["execution_id"])
+            print(json.dumps({
+                "execution": current,
+                "admitted": False,
+                "reason": exc.reason,
+                "counts": exc.counts,
+            }, ensure_ascii=False, sort_keys=True))
+            return 3
+    print(json.dumps(
+        {"execution": admitted, "admitted": True},
+        ensure_ascii=False, sort_keys=True))
+    return 0
+
+
+@_with_project
+def _cmd_execution_heartbeat(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        execution = _resolve_project_execution(
+            outcomes_conn, proj, args.execution)
+        ok = odb.heartbeat_execution(
+            outcomes_conn, execution["execution_id"])
+        current = odb.get_execution(outcomes_conn, execution["execution_id"])
+    print(json.dumps(
+        {"ok": ok, "execution": current},
+        ensure_ascii=False, sort_keys=True))
+    return 0 if ok else 1
+
+
+@_with_project
+def _cmd_execution_terminal(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        execution = _resolve_project_execution(
+            outcomes_conn, proj, args.execution)
+        ok = odb.terminalize_execution(
+            outcomes_conn,
+            execution["execution_id"],
+            state=args.state,
+            receipt_uri=args.receipt_uri,
+            reason=args.reason,
+        )
+        current = odb.get_execution(outcomes_conn, execution["execution_id"])
+    print(json.dumps(
+        {"ok": ok, "execution": current},
+        ensure_ascii=False, sort_keys=True))
+    return 0 if ok else 1
+
+
+@_with_project
+def _cmd_resource_request(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        execution = _resolve_project_execution(
+            outcomes_conn, proj, args.execution)
+        lease = odb.request_resource_lease(
+            outcomes_conn,
+            resource_key=args.resource,
+            owner_execution_id=execution["execution_id"],
+            purpose=args.purpose,
+            capacity=args.capacity,
+        )
+    print(json.dumps(lease, ensure_ascii=False, sort_keys=True))
+    return 0 if lease["state"] == "acquired" else 3
+
+
+@_with_project
+def _cmd_resource_release(args, _conn, proj) -> int:
+    from hermes_cli import outcomes_db as odb
+    with odb.connect_closing() as outcomes_conn:
+        execution = _resolve_project_execution(
+            outcomes_conn, proj, args.execution)
+        result = odb.release_resource_lease(
+            outcomes_conn,
+            owner_execution_id=execution["execution_id"],
+            reason=args.reason,
+            stale=bool(args.stale),
+            verified_dead=bool(args.verified_dead),
+        )
+    print(json.dumps(result, ensure_ascii=False, sort_keys=True))
     return 0
 
 
@@ -598,6 +785,12 @@ _HANDLERS = {
     "outcome-depend": _cmd_outcome_depend,
     "bind-lane": _cmd_bind_lane,
     "snapshot": _cmd_snapshot,
+    "execution-create": _cmd_execution_create,
+    "execution-admit": _cmd_execution_admit,
+    "execution-heartbeat": _cmd_execution_heartbeat,
+    "execution-terminal": _cmd_execution_terminal,
+    "resource-request": _cmd_resource_request,
+    "resource-release": _cmd_resource_release,
     "materialize-status": _cmd_materialize_status,
     "telegram-provision": _cmd_telegram_provision,
     "telegram-sync": _cmd_telegram_sync,

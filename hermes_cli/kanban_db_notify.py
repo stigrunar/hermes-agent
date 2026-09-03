@@ -91,6 +91,28 @@ def add_notify_sub(
     caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
     """
+    structured_target: Optional[tuple[str, str, Optional[str]]] = None
+    task_row = conn.execute(
+        "SELECT topic_target FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if task_row is not None and task_row["topic_target"]:
+        structured_target = _kb.parse_structured_topic_target(
+            str(task_row["topic_target"]))
+        platform, chat_id, thread_id = structured_target
+        metadata_override = dict(delivery_metadata or {})
+        for stale_key in (
+            "telegram_dm_topic_reply_fallback",
+            "direct_messages_topic_id",
+            "telegram_reply_to_message_id",
+        ):
+            metadata_override.pop(stale_key, None)
+        if thread_id:
+            metadata_override["thread_id"] = thread_id
+        else:
+            metadata_override.pop("thread_id", None)
+        if platform == "telegram" and str(chat_id).startswith("-100"):
+            chat_type = "group"
+            metadata_override["chat_type"] = "group"
+        delivery_metadata = metadata_override or None
     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
     # api_server is stateless: the adapter has no send(), the wake self-post IS
     # the delivery. A plain 'notify' default would leave those subs with no
@@ -98,6 +120,17 @@ def add_notify_sub(
     insert_mode = valid_mode or ("notify+wake" if platform == "api_server" else "notify")
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        if structured_target is not None:
+            target_platform, target_chat_id, target_thread_id = structured_target
+            conn.execute(
+                """DELETE FROM kanban_notify_subs
+                     WHERE task_id=?
+                       AND NOT (
+                           LOWER(platform)=LOWER(?) AND chat_id=? AND thread_id=?
+                       )""",
+                (task_id, target_platform, target_chat_id,
+                 target_thread_id or ""),
+            )
         existing = conn.execute(
             "SELECT delivery_metadata FROM kanban_notify_subs " + _SUB_KEY_WHERE,
             key,
