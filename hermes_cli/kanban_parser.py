@@ -173,6 +173,8 @@ _SPECS = [
                   "Requires --outcome and enables overlap protection."),
         _arg("--mutation-base", dest="mutation_base_ref",
              help="Exact base ref/SHA associated with the mutation lease."),
+        _arg("--resource", action="append", dest="resource_requirements",
+             help="Shared resource required by this execution (repeatable)."),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",

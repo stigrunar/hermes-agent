@@ -82,12 +82,14 @@ def test_cli_create_binds_outcome_and_mutation_scope(kanban_home):
         + " --outcome CLI-OUTCOME-R1"
         + " --mutation-repository stigrunar/example"
         + " --mutation-scope 'src/bemanning/**'"
-        + " --mutation-base origin/main@abc --json"))
+        + " --mutation-base origin/main@abc"
+        + " --resource vectorworks-local --json"))
     assert payload["project_id"] == project.id
     assert payload["outcome_id"] == outcome_id
     assert payload["mutation_repository"] == "stigrunar/example"
     assert payload["mutation_scope"] == ["src/bemanning/**"]
     assert payload["mutation_base_ref"] == "origin/main@abc"
+    assert payload["resource_requirements"] == ["vectorworks-local"]
 
 
 def test_kanban_show_json_includes_runtime_limit(kanban_home):
@@ -273,4 +275,3 @@ def test_run_slash_reclaim_running_task(kanban_home):
 # ---------------------------------------------------------------------------
 # /kanban help / no-args / unknown-action UX (issue #21794)
 # ---------------------------------------------------------------------------
-

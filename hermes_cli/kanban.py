@@ -376,6 +376,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             mutation_repository=getattr(args, "mutation_repository", None),
             mutation_scope=getattr(args, "mutation_scope", None),
             mutation_base_ref=getattr(args, "mutation_base_ref", None),
+            resource_requirements=getattr(args, "resource_requirements", None),
             tenant=args.tenant, priority=args.priority,
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
@@ -532,6 +533,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         field("mutation-scope", ", ".join(task.mutation_scope))
     if task.mutation_base_ref:
         field("mutation-base", task.mutation_base_ref)
+    if task.resource_requirements:
+        field("resources", ", ".join(task.resource_requirements))
     if task.skills:
         field("skills", ", ".join(task.skills))
     if task.model_override:

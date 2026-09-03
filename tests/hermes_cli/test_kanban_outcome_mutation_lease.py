@@ -280,3 +280,67 @@ def test_child_parent_execution_identity_uses_connection_board(stores, tmp_path)
         assert child_task.topic_target == "telegram:-100999:6"
     finally:
         conn.close()
+
+
+def test_kanban_resource_requirement_waits_then_runs_after_release(stores):
+    project, outcome, first_db, _ = stores
+    with odb.connect_closing() as oc:
+        holder = odb.create_execution(
+            oc,
+            execution_id="ex_vectorworks_holder",
+            project_id=project.id,
+            outcome_id=outcome,
+            execution_mode="direct_codex",
+            owner="default",
+            mutating=False,
+            resource_requirements=["vectorworks-local"],
+        )
+        assert odb.admit_execution(oc, holder)["state"] == "running"
+        active = odb.list_resource_leases(
+            oc, resource_key="vectorworks-local", owner_execution_id=holder
+        )
+        assert len(active) == 1 and active[0]["state"] == "acquired"
+
+    task_id = kb.create_task(
+        first_db,
+        title="vectorworks qa waiter",
+        project_id=project.id,
+        outcome_id=outcome,
+        resource_requirements=["vectorworks-local"],
+    )
+    task = kb.get_task(first_db, task_id)
+    assert task is not None
+    assert task.resource_requirements == ["vectorworks-local"]
+
+    # The Kanban task must not claim while direct Codex owns Vectorworks.
+    assert kb.claim_task(first_db, task_id, claimer="qa") is None
+    assert kb.get_task(first_db, task_id).status == "ready"
+    execution_id = kb.kanban_execution_id(task_id)
+    with odb.connect_closing() as oc:
+        waiting = odb.get_execution(oc, execution_id)
+        assert waiting is not None
+        assert waiting["state"] == "waiting_resource"
+        leases = odb.list_resource_leases(
+            oc, resource_key="vectorworks-local", owner_execution_id=execution_id
+        )
+        assert len(leases) == 1 and leases[0]["state"] == "waiting"
+
+        # Releasing the holder promotes the exact queued Kanban waiter.
+        assert odb.terminalize_execution(oc, holder, state="completed")
+        promoted = odb.get_execution(oc, execution_id)
+        assert promoted is not None and promoted["state"] == "queued"
+        leases = odb.list_resource_leases(
+            oc, resource_key="vectorworks-local", owner_execution_id=execution_id
+        )
+        assert len(leases) == 1 and leases[0]["state"] == "acquired"
+
+    claimed = kb.claim_task(first_db, task_id, claimer="qa")
+    assert claimed is not None and claimed.status == "running"
+    assert kb.complete_task(first_db, task_id, result="vectorworks qa done")
+    with odb.connect_closing() as oc:
+        finished = odb.get_execution(oc, execution_id)
+        assert finished is not None and finished["state"] == "completed"
+        assert odb.list_resource_leases(
+            oc, resource_key="vectorworks-local", owner_execution_id=execution_id,
+            active_only=True,
+        ) == []

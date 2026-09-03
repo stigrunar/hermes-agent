@@ -713,6 +713,7 @@ class Task:
     mutation_repository: Optional[str] = None
     mutation_scope: Optional[list[str]] = None
     mutation_base_ref: Optional[str] = None
+    resource_requirements: Optional[list[str]] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -751,6 +752,10 @@ class Task:
             if isinstance(parsed_scope, list)
             else None
         )
+        parsed_resources = _json_or(g("resource_requirements"))
+        resource_requirements = (
+            [str(item) for item in parsed_resources if item]
+            if isinstance(parsed_resources, list) else None)
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -761,6 +766,7 @@ class Task:
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
             mutation_scope=mutation_scope,
+            resource_requirements=resource_requirements,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -909,6 +915,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     mutation_repository  TEXT,
     mutation_scope       TEXT,
     mutation_base_ref    TEXT,
+    resource_requirements TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1159,6 +1166,23 @@ def kanban_execution_id(task_id: str, *, board: Optional[str] = None) -> str:
     return f"kanban:{board_slug}:{token}"
 
 
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Resolve a board identity from its SQLite path, failing to default."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = Path(str(row[2])).expanduser() if row and row[2] else None
+    except Exception:
+        path = None
+    if (
+        path is not None
+        and path.name == "kanban.db"
+        and path.parent.parent.name == "boards"
+        and path.parent.name
+    ):
+        return str(path.parent.name)
+    return DEFAULT_BOARD
+
+
 def _normalize_structured_topic_target(value: Optional[str]) -> Optional[str]:
     target = str(value or "").strip() or None
     if target is None:
@@ -1321,6 +1345,7 @@ def create_task(
     mutation_repository: Optional[str] = None,
     mutation_scope: Optional[Iterable[str]] = None,
     mutation_base_ref: Optional[str] = None,
+    resource_requirements: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
@@ -1500,6 +1525,8 @@ def create_task(
     normalized_mutation_repository = (
         _odb._normalize_repository(mutation_repository) if mutation_repository else None)
     normalized_mutation_base_ref = str(mutation_base_ref or "").strip() or None
+    normalized_resource_requirements = _odb.normalize_resource_requirements(
+        resource_requirements)
     if normalized_mutation_scope is not None:
         if not outcome_id:
             raise ValueError("mutation_scope requires outcome_id")
@@ -1531,12 +1558,13 @@ def create_task(
                         branch_name, project_id, outcome_id,
                         conversation_lane_id, topic_target, parent_execution_id,
                         mutation_repository, mutation_scope, mutation_base_ref,
+                        resource_requirements,
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1547,6 +1575,8 @@ def create_task(
                         (json.dumps(normalized_mutation_scope)
                          if normalized_mutation_scope is not None else None),
                         normalized_mutation_base_ref,
+                        (json.dumps(normalized_resource_requirements)
+                         if normalized_resource_requirements else None),
                         tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -1574,6 +1604,7 @@ def create_task(
                         "mutation_repository": normalized_mutation_repository,
                         "mutation_scope": normalized_mutation_scope,
                         "mutation_base_ref": normalized_mutation_base_ref,
+                        "resource_requirements": normalized_resource_requirements or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -2247,6 +2278,10 @@ def _task_projection_payload(task: Mapping[str, Any]) -> Optional[dict[str, Any]
             task.get("mutation_repository") or "").strip() or None,
         "mutation_scope": mutation_scope,
         "base_ref": str(task.get("mutation_base_ref") or "").strip() or None,
+        "resource_requirements": (
+            _json_or(task.get("resource_requirements"))
+            if isinstance(task.get("resource_requirements"), str)
+            else task.get("resource_requirements")) or [],
     }
 
 
