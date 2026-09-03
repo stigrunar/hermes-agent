@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import concurrent.futures
+import threading
+from pathlib import Path
+
 import pytest
 
 from hermes_cli import outcomes_db as odb
@@ -272,3 +276,302 @@ def test_outcome_cannot_depend_on_itself(conn):
     oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
     with pytest.raises(odb.OutcomeError, match="itself"):
         odb.add_outcome_dependency(conn, outcome_id=oid, depends_on_outcome_id=oid)
+
+
+def test_feature_gate_can_fail_closed_before_admission(conn, monkeypatch):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    eid = odb.create_execution(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="direct_codex",
+        owner="default",
+        mutating=False,
+    )
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: False)
+    with pytest.raises(odb.ExecutionAdmissionBlocked, match="feature_gate_disabled"):
+        odb.admit_execution(conn, eid, require_feature_gate=True)
+    assert odb.get_execution(conn, eid)["state"] == "queued"
+
+
+def test_orchestration_mode_is_project_only_for_bound_lane(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    lane_id = odb.bind_conversation_lane(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        platform="telegram",
+        chat_id="-1001",
+        thread_id="42",
+    )
+    assert odb.resolve_orchestration_mode(
+        conn, platform="telegram", chat_id="-1001", thread_id="42"
+    ) == {
+        "mode": "project",
+        "project_id": "p",
+        "outcome_id": oid,
+        "conversation_lane_id": lane_id,
+    }
+    assert odb.resolve_orchestration_mode(
+        conn, platform="telegram", chat_id="123"
+    )["mode"] == "portfolio"
+    assert odb.resolve_orchestration_mode(
+        conn,
+        platform="telegram",
+        chat_id="-1001",
+        thread_id="42",
+        force_portfolio=True,
+    )["mode"] == "portfolio"
+
+
+def test_execution_crud_heartbeat_and_context_validation(conn, monkeypatch):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    other = odb.create_outcome(conn, project_id="other", outcome_key="O")
+    lane = odb.bind_conversation_lane(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        platform="telegram",
+        chat_id="-1001",
+        thread_id="7",
+    )
+    clock = {"now": 1000}
+    monkeypatch.setattr(odb, "_now", lambda: clock["now"])
+    eid = odb.create_execution(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="direct_codex",
+        owner="default",
+        mutating=False,
+        conversation_lane_id=lane,
+    )
+    execution = odb.get_execution(conn, eid)
+    assert execution["delivery_target"] == "telegram:-1001:7"
+    assert execution["state"] == "queued"
+    odb.admit_execution(conn, eid)
+    assert odb.get_execution(conn, eid)["state"] == "running"
+    clock["now"] = 1010
+    assert odb.heartbeat_execution(conn, eid)
+    assert odb.get_execution(conn, eid)["last_heartbeat_at"] == 1010
+    assert odb.terminalize_execution(conn, eid, state="completed", receipt_uri="receipt://done")
+    assert odb.get_execution(conn, eid)["receipt_uri"] == "receipt://done"
+    with pytest.raises(odb.OutcomeError, match="unknown outcome"):
+        odb.create_execution(
+            conn,
+            project_id="p",
+            outcome_id=other,
+            execution_mode="kanban",
+            owner="dollycode",
+        )
+
+
+def test_unified_mutating_admission_counts_backends_and_excludes_read_only(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    for idx, mode in enumerate(("direct_codex", "kanban", "external"), start=1):
+        kwargs = {}
+        if mode == "direct_codex":
+            kwargs = {"repository": "repo", "mutation_scope": ["direct/**"]}
+        eid = odb.create_execution(
+            conn,
+            execution_id=f"ex_{idx}",
+            project_id="p",
+            outcome_id=oid,
+            execution_mode=mode,
+            owner=f"owner-{idx}",
+            mutating=True,
+            **kwargs,
+        )
+        odb.admit_execution(conn, eid)
+    read_only = odb.create_execution(
+        conn,
+        execution_id="ex_read",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="direct_codex",
+        owner="reader",
+        mutating=False,
+        state="running",
+    )
+    assert odb.get_execution(conn, read_only)["state"] == "running"
+    fourth = odb.create_execution(
+        conn,
+        execution_id="ex_fourth",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="kanban",
+        owner="owner-4",
+        mutating=True,
+    )
+    with pytest.raises(odb.ExecutionAdmissionBlocked, match="global_mutating_cap"):
+        odb.admit_execution(conn, fourth)
+
+
+def test_concurrent_admission_cannot_overbook_last_global_slot(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    for eid in ("ex_race_a", "ex_race_b"):
+        odb.create_execution(
+            conn,
+            execution_id=eid,
+            project_id="p",
+            outcome_id=oid,
+            execution_mode="direct_codex",
+            owner=eid,
+            mutating=True,
+            repository="repo",
+            mutation_scope=[f"race/{eid}/**"],
+        )
+    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+    barrier = threading.Barrier(2)
+
+    def _admit(eid: str) -> str:
+        local = odb.connect(db_path)
+        try:
+            barrier.wait(timeout=5)
+            try:
+                odb.admit_execution(local, eid, global_cap=1, owner_cap=2)
+                return "running"
+            except odb.ExecutionAdmissionBlocked as exc:
+                return exc.reason
+        finally:
+            local.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        results = sorted(pool.map(_admit, ("ex_race_a", "ex_race_b")))
+    assert results == ["global_mutating_cap", "running"]
+    assert len(odb.list_executions(conn, states=["running"])) == 1
+
+
+def test_per_owner_mutating_cap_is_independent_of_global_cap(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    for idx in range(2):
+        eid = odb.create_execution(
+            conn,
+            execution_id=f"ex_owner_{idx}",
+            project_id="p",
+            outcome_id=oid,
+            execution_mode="direct_codex",
+            owner="default",
+            mutating=True,
+            repository="repo",
+            mutation_scope=[f"owner/{idx}/**"],
+        )
+        odb.admit_execution(conn, eid, global_cap=10, owner_cap=2)
+    third = odb.create_execution(
+        conn,
+        execution_id="ex_owner_3",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="kanban",
+        owner="default",
+        mutating=True,
+    )
+    with pytest.raises(odb.ExecutionAdmissionBlocked, match="owner_mutating_cap"):
+        odb.admit_execution(conn, third, global_cap=10, owner_cap=2)
+
+
+def test_vectorworks_capacity_is_fixed_at_one(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    eid = odb.create_execution(
+        conn,
+        execution_id="ex_capacity",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="external",
+        owner="dollyqa",
+        mutating=False,
+    )
+    with pytest.raises(odb.OutcomeError, match="fixed at 1"):
+        odb.request_resource_lease(
+            conn,
+            resource_key="vectorworks-local",
+            owner_execution_id=eid,
+            capacity=2,
+        )
+
+
+def test_resource_lease_is_fifo_and_never_stolen_by_ttl_alone(conn, monkeypatch):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    for eid in ("ex_a", "ex_b", "ex_c"):
+        odb.create_execution(
+            conn,
+            execution_id=eid,
+            project_id="p",
+            outcome_id=oid,
+            execution_mode="direct_codex",
+            owner=eid,
+            mutating=False,
+        )
+    clock = {"now": 2000}
+    monkeypatch.setattr(odb, "_now", lambda: clock["now"])
+    a = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_a")
+    b = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_b")
+    c = odb.request_resource_lease(conn, resource_key="vectorworks-local", owner_execution_id="ex_c")
+    assert a["state"] == "acquired"
+    assert b["state"] == "waiting"
+    assert c["state"] == "waiting"
+    clock["now"] = a["expires_at"] + 1
+    with pytest.raises(odb.OutcomeError, match="verified_dead"):
+        odb.release_resource_lease(conn, lease_id=a["id"], stale=True)
+    assert odb.list_resource_leases(conn, resource_key="vectorworks-local")[0]["owner_execution_id"] == "ex_a"
+    released = odb.release_resource_lease(conn, lease_id=a["id"], reason="done")
+    assert released["promoted"] == [b["id"]]
+    active = odb.list_resource_leases(conn, resource_key="vectorworks-local")
+    assert [(item["owner_execution_id"], item["state"]) for item in active] == [
+        ("ex_b", "acquired"),
+        ("ex_c", "waiting"),
+    ]
+    odb.terminalize_execution(conn, "ex_b", state="completed")
+    assert odb.list_resource_leases(conn, resource_key="vectorworks-local")[0]["owner_execution_id"] == "ex_c"
+
+
+def test_resource_requirement_blocks_admission_until_promoted(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    first = odb.create_execution(
+        conn,
+        execution_id="ex_first",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="kanban",
+        owner="dollyqa",
+        mutating=False,
+        resource_requirements=["vectorworks-local"],
+    )
+    second = odb.create_execution(
+        conn,
+        execution_id="ex_second",
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="direct_codex",
+        owner="default",
+        mutating=False,
+        resource_requirements=["vectorworks-local"],
+    )
+    assert odb.admit_execution(conn, first)["state"] == "running"
+    with pytest.raises(odb.ExecutionAdmissionBlocked, match="waiting_resource"):
+        odb.admit_execution(conn, second)
+    assert odb.get_execution(conn, second)["state"] == "waiting_resource"
+    assert odb.terminalize_execution(conn, first, state="completed")
+    assert odb.get_execution(conn, second)["state"] == "queued"
+    assert odb.admit_execution(conn, second)["state"] == "running"
+
+
+def test_visible_event_idempotency_is_stable(conn):
+    oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
+    eid = odb.create_execution(
+        conn,
+        project_id="p",
+        outcome_id=oid,
+        execution_mode="external",
+        owner="default",
+        mutating=False,
+    )
+    first_key, first_new = odb.record_visible_event(
+        conn, execution_id=eid, event_kind="completed", candidate_revision="abc"
+    )
+    second_key, second_new = odb.record_visible_event(
+        conn, execution_id=eid, event_kind="completed", candidate_revision="abc"
+    )
+    assert first_key == second_key
+    assert first_new is True
+    assert second_new is False

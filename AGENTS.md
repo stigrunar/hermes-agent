@@ -38,12 +38,26 @@ commit.
   they originate from different boards, profiles, topics, or projects. A
   cross-project request becomes a dependency on the owning Outcome unless
   mutation ownership is explicitly transferred.
+- **Dolly/default is the cross-project orchestrator and normal human-facing owner.**
+  Main-DM/control surfaces operate in portfolio mode; a bound Project conversation
+  lane operates in project mode under the same profile. Do not introduce a standing
+  Project Lead profile. Specialist profiles remain worker lanes behind Outcome
+  routing and return receipts to Dolly/default for visible closeout.
 - **Direct Codex is the default bounded FEATURE inner loop.** Keep edit -> test ->
   inspect -> adjust coherent in one execution/worktree. Kanban is optional for
   durable waiting/restart continuity, real cross-authority handoffs, genuinely
   independent non-overlapping work, or required independent review/release
   gates. Do not manufacture owner -> architect -> controller -> code -> QA graphs
-  for ordinary feature work.
+  for ordinary feature work. If an otherwise-direct execution cannot immediately
+  acquire a required shared resource, do not leave an untracked direct process
+  waiting: retain the same Outcome and route the waiting continuation through the
+  durable Kanban path.
+- **Cross-backend capacity and shared resources are root coordination state.**
+  Direct Codex, Kanban and external mutating executions consume the same configured
+  mutation budget. Repository/path collisions use mutation leases; scarce shared
+  environments use generic resource leases. `vectorworks-local` has capacity 1.
+  TTL is only a liveness signal for a generic resource and never authority to steal
+  it without verified terminal/dead execution evidence.
 - **Architect/review are trigger-based.** Use Architect for unresolved structural
   boundaries and detached QA/review when frozen acceptance or risk materially
   requires an independent verdict. They are not ceremonial stages.

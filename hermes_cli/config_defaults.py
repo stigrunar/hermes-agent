@@ -2941,6 +2941,12 @@ DEFAULT_CONFIG = {
         # otherwise saturate one profile's local model / API quota /
         # browser pool while leaving other profiles idle.
         "max_in_progress_per_profile": None,
+        # Hove West downstream Cross-Project Orchestration V1. Default-off so
+        # additive schema/source can be deployed before existing running Kanban
+        # work is drained/reconciled into the root execution projection. When
+        # enabled, Project/Outcome Kanban claims participate in the same
+        # cross-backend admission/resource coordination used by direct Codex.
+        "cross_project_orchestration_v1_enabled": False,
         # When true, the kanban dispatcher auto-runs the decomposer on
         # tasks that land in Triage (every dispatcher tick). When false,
         # decomposition is manual via `hermes kanban decompose <id>` or

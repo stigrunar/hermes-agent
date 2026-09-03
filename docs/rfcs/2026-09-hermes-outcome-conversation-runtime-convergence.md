@@ -15,6 +15,16 @@ A material outcome has at most one active mutating execution for an overlapping 
 
 Direct Codex is the default implementation inner loop for a bounded feature. Kanban remains available for durable scheduling, cross-authority handoff, long-lived waiting work, or genuinely independent execution, but a normal feature must not automatically expand into owner -> architect -> controller -> code -> QA graphs.
 
+### Cross-Project Orchestration V1 decision — 2026-09-03
+
+Dolly/default is the only normal human-facing Hermes project/portfolio agent. Main-DM and configured control surfaces use portfolio mode; an exact bound conversation lane uses project mode under the same profile. No standing Project Lead profile is added. Specialist profiles remain execution workers and return receipts to Dolly/default.
+
+Root-shared Outcome coordination now also projects executions across backends (`direct_codex`, `kanban`, `external`), using the existing `kanban.max_in_progress` and `kanban.max_in_progress_per_profile` values as the single configured mutation-cap authority. Admission is serialized by the root Outcome store so capacity read + resource/mutation acquisition + running transition is atomic across backends. Kanban tasks carry first-class `conversation_lane_id`, `topic_target` and `parent_execution_id`; child/retry creation inherits these fields mechanically and exact structured topic targets override the originating DM/session for notifier delivery.
+
+Repository/path conflicts continue to use mutation leases. Generic resource leases cover scarce non-repository environments; V1 defines `vectorworks-local` with fixed capacity 1. Generic resource TTL expiry alone never authorizes takeover without verified terminal/dead execution evidence. If an otherwise-direct Codex execution cannot immediately acquire a required shared resource, the waiting continuation must become durable Kanban work under the same Outcome rather than leaving an untracked direct process parked.
+
+Rollout is guarded by `kanban.cross_project_orchestration_v1_enabled`, default `false`. Deploy additive schema/code first with the gate off, reconcile/drain pre-V1 running mutations, verify effective `max_in_progress=3` / per-profile cap 2, then enable the gate and run the bounded topic/cap/Vectorworks canaries. A rollback disables the gate before reverting runtime code.
+
 ## Canonical convergence baseline
 
 Observed before this change:
