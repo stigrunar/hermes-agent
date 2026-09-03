@@ -13,7 +13,7 @@ Normal software work is organized as Project -> Outcome -> Execution. Conversati
 
 A material outcome has at most one active mutating execution for an overlapping repository/path scope. Other projects, topics, bots, QA actors, and dependency owners may observe, request, review, or depend on the outcome without creating a competing mutation.
 
-Direct Codex is the default implementation inner loop for a bounded feature. Kanban remains available for durable scheduling, cross-authority handoff, long-lived waiting work, or genuinely independent execution, but a normal feature must not automatically expand into owner -> architect -> controller -> code -> QA graphs.
+Direct Codex is the default implementation inner loop for a bounded feature. Under Cross-Project Orchestration V1 the mutating route is wrapped by the tracked `hermes project direct-codex-run` primitive (or equivalent API): it registers/admit the root execution, launches one clean-worktree Codex process only after capacity/resource/mutation admission, heartbeats while the process runs, and terminalizes the same execution with the Codex last-message receipt. Kanban remains available for durable scheduling, cross-authority handoff, long-lived waiting work, or genuinely independent execution, but a normal feature must not automatically expand into owner -> architect -> controller -> code -> QA graphs.
 
 ### Cross-Project Orchestration V1 decision — 2026-09-03
 

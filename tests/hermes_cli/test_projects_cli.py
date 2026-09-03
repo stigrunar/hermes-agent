@@ -216,3 +216,58 @@ def test_execution_and_resource_cli(capsys, tmp_path, monkeypatch):
     terminal = __import__("json").loads(capsys.readouterr().out)
     assert terminal["execution"]["state"] == "completed"
     assert terminal["execution"]["receipt_uri"] == "receipt://plugin-a"
+
+
+def test_direct_codex_run_cli_is_one_tracked_execution(capsys, tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: True)
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "seed"], check=True)
+
+    fake = tmp_path / "fake-codex"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import pathlib, sys
+args = sys.argv[1:]
+out = pathlib.Path(args[args.index('-o') + 1])
+prompt = sys.stdin.read()
+pathlib.Path('artifact.txt').write_text('cli-change\\n', encoding='utf-8')
+out.write_text('cli-receipt:' + prompt, encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    prompt = tmp_path / "prompt.txt"
+    output = tmp_path / "last.md"
+    stderr = tmp_path / "stderr.log"
+    prompt.write_text("make cli artifact", encoding="utf-8")
+
+    assert _run(["create", "Direct", str(repo)]) == 0
+    capsys.readouterr()
+    assert _run(["outcome-create", "direct", "DIRECT-R1"]) == 0
+    capsys.readouterr()
+    assert _run([
+        "direct-codex-run", "direct", "DIRECT-R1",
+        "--repo", str(repo),
+        "--scope", "artifact.txt",
+        "--prompt-file", str(prompt),
+        "--output-file", str(output),
+        "--stderr-file", str(stderr),
+        "--codex-exe", str(fake),
+        "--heartbeat-seconds", "0.1",
+        "--timeout-seconds", "5",
+    ]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["execution"]["execution_mode"] == "direct_codex"
+    assert result["execution"]["state"] == "completed"
+    assert result["execution"]["receipt_uri"] == output.resolve().as_uri()
+    assert (repo / "artifact.txt").read_text(encoding="utf-8") == "cli-change\n"
