@@ -89,6 +89,33 @@ _INTERVAL_TOKEN_RE = re.compile(
     r"^(?=\d)(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE
 )
 
+# A cadence stated in prompt prose is ambiguous scheduling input. Recognize
+# common explicit cadence phrases only so an ordinary self-paced loop can be
+# rejected instead of silently receiving the configured short floor. This is
+# intentionally not a duration parser: callers must use a leading interval or
+# ``--self-paced <interval>`` when they want scheduling semantics.
+_CADENCE_PROSE_RE = re.compile(
+    r"""
+    \b(?:every|each|per)\s+
+    (?:
+        (?:\d+(?:[.,]\d+)?\s*)?
+        (?:s|sec(?:ond)?s?|m|min(?:ute)?s?|h|hr(?:s)?|hour(?:s)?|
+           d|day(?:s)?|w|week(?:s)?|month(?:s)?)
+        |half\s+(?:an?\s+)?hour
+    )\b
+    |
+    \b(?:hourly|daily|weekly|monthly)\b
+    |
+    \bhver\s+
+    (?:
+        (?:\d+(?:[.,]\d+)?\.?\s*)?
+        (?:sekund(?:er)?|minutt(?:er)?|time(?:r)?|dag(?:er)?|uke(?:r)?|måned(?:er)?)
+        |halv(?:e)?\s*time
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 WAKEUP_PROMPT_TEMPLATE = (
     "[/loop wakeup #{tick}{cadence}]\n"
@@ -154,12 +181,14 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
     Returns ``{"interval_seconds": int|None,
     "requested_interval_seconds": int|None, "prompt": str, "times": int,
     "until": str, "error": str|None}``. ``interval_seconds`` None means
-    self-paced; ``requested_interval_seconds`` is an optional explicit hard
-    floor for that self-paced mode. The floor is accepted only through the
+    ``requested_interval_seconds`` is an optional explicit hard floor for
+    that self-paced mode. The floor is accepted only through the
     structured ``--self-paced <interval>`` form, never inferred from prompt
-    prose. ``--self-paced`` therefore requires the interval token; omit the
-    option for the ordinary self-paced mode. ``error`` is set for unusable
-    input (empty prompt, interval-only, bad --times).
+    prose. An ordinary self-paced prompt containing explicit cadence language
+    is rejected for the same reason. ``--self-paced`` therefore requires the
+    interval token; omit the option for ordinary self-paced mode. ``error`` is
+    set for unusable input (empty prompt, interval-only, bad --times, or an
+    ambiguous prose cadence).
     """
     raw = (text or "").strip()
     result: Dict[str, Any] = {
@@ -197,6 +226,8 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
         until = m_until.group(1).strip()
         raw = raw[: m_until.start()].strip()
 
+    has_cadence_prose = _CADENCE_PROSE_RE.search(raw) is not None
+
     # Leading "every" sugar: /loop every 5m <prompt>
     tokens = raw.split(None, 1)
     if tokens and tokens[0].lower() == "every" and len(tokens) > 1:
@@ -231,6 +262,14 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
 
     if not raw:
         result["error"] = "missing prompt (usage: /loop [interval] <prompt>)"
+        return result
+
+    if not self_paced_with_floor and interval is None and has_cadence_prose:
+        result["error"] = (
+            "cadence language in a self-paced prompt must be explicit; use a "
+            "leading interval for fixed cadence or "
+            "'--self-paced <interval>' for a self-paced minimum"
+        )
         return result
 
     result["interval_seconds"] = interval

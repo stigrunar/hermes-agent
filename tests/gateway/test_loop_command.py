@@ -190,6 +190,18 @@ async def test_self_paced_requested_interval_matches_incident_shape(loop_env):
 
 
 @pytest.mark.asyncio
+async def test_gateway_rejects_unstructured_incident_cadence(loop_env):
+    runner = _make_runner()
+    response = await GatewayRunner._handle_loop_command(
+        runner,
+        _make_event("/loop hold fremgang i prosjektene — sjekk hver halvtime"),
+    )
+
+    assert "must be explicit" in response
+    assert loops.load_loop("sid-gateway-loop") is None
+
+
+@pytest.mark.asyncio
 async def test_gateway_watcher_honors_not_before_on_retry(loop_env):
     runner = _make_runner()
     runner._running = True

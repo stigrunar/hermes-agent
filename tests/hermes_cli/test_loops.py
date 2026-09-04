@@ -104,6 +104,15 @@ class TestParseLoopArgs:
         assert p["requested_interval_seconds"] is None
         assert p["prompt"].startswith("keep refining")
 
+    def test_self_paced_rejects_unstructured_incident_cadence(self):
+        from hermes_cli.loops import parse_loop_args
+
+        p = parse_loop_args("hold fremgang i prosjektene — sjekk hver halvtime")
+        assert p["interval_seconds"] is None
+        assert p["requested_interval_seconds"] is None
+        assert p["error"] is not None
+        assert "must be explicit" in p["error"]
+
     def test_self_paced_explicit_interval_floor_is_structured(self):
         from hermes_cli.loops import parse_loop_args
 
@@ -744,6 +753,19 @@ class TestDispatchLoopCommand:
         result = dispatch_loop_command(mgr, "keep fixing the tests")
         assert result["created"] is True
         assert "Self-paced" in result["output"]
+
+    def test_incident_cadence_is_not_admitted_as_60s_self_paced(self, hermes_home):
+        from hermes_cli.loops import LoopManager, dispatch_loop_command, load_loop
+
+        mgr = LoopManager(session_id="d2-incident")
+        result = dispatch_loop_command(
+            mgr, "hold fremgang i prosjektene — sjekk hver halvtime"
+        )
+
+        assert result["created"] is False
+        assert "must be explicit" in result["output"]
+        assert mgr.state is None
+        assert load_loop("d2-incident") is None
 
     def test_create_fires_immediately(self, hermes_home):
         from hermes_cli.loops import LoopManager, dispatch_loop_command
