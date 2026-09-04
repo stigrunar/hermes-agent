@@ -101,7 +101,25 @@ class TestParseLoopArgs:
 
         p = parse_loop_args("keep refining the failing test until the suite passes")
         assert p["interval_seconds"] is None
+        assert p["requested_interval_seconds"] is None
         assert p["prompt"].startswith("keep refining")
+
+    def test_self_paced_explicit_interval_floor_is_structured(self):
+        from hermes_cli.loops import parse_loop_args
+
+        p = parse_loop_args(
+            "--self-paced 30m hold fremgang i prosjektene — sjekk hver halvtime"
+        )
+        assert p["interval_seconds"] is None
+        assert p["requested_interval_seconds"] == 1800
+        assert p["prompt"] == "hold fremgang i prosjektene — sjekk hver halvtime"
+
+    def test_self_paced_option_rejects_unstructured_interval(self):
+        from hermes_cli.loops import parse_loop_args
+
+        p = parse_loop_args("--self-paced every half hour hold project progress")
+        assert p["error"] is not None
+        assert "expects an interval" in p["error"]
 
     def test_times_flag(self):
         from hermes_cli.loops import parse_loop_args
@@ -221,6 +239,7 @@ class TestLoopStateSerde:
             prompt="check CI",
             mode="interval",
             interval_seconds=300.0,
+            requested_interval_seconds=300.0,
             current_delay=300.0,
             times=5,
             until="ci is green",
@@ -231,6 +250,7 @@ class TestLoopStateSerde:
         s2 = LoopState.from_json(s.to_json())
         assert s2.prompt == "check CI"
         assert s2.interval_seconds == 300.0
+        assert s2.requested_interval_seconds == 300.0
         assert s2.times == 5
         assert s2.until == "ci is green"
         assert s2.not_before_at == 1234.5
@@ -412,6 +432,55 @@ class TestTickLifecycle:
 
             fired.abandon_tick()
             assert load_loop("t3-stale-abandon").next_due_at == completed_due
+
+    def test_self_paced_requested_floor_survives_completion_and_session_continuation(
+        self, hermes_home
+    ):
+        from hermes_cli.loops import (
+            LoopManager,
+            dispatch_loop_command,
+            load_loop,
+            migrate_loop_to_session,
+        )
+
+        clock = [100.0]
+        prompt = "hold fremgang i prosjektene — sjekk hver halvtime"
+        with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+            mgr = LoopManager(session_id="incident-parent")
+            result = dispatch_loop_command(mgr, f"--self-paced 30m {prompt}")
+            assert result["created"] is True
+            state = mgr.state
+            assert state is not None
+            assert state.mode == "self_paced"
+            assert state.interval_seconds == 0.0
+            assert state.requested_interval_seconds == 1800.0
+
+            # The real incident shape: a self-paced row fires immediately,
+            # then a quick completion must still honor the explicit 30m
+            # cadence instead of falling back to the 60s self-paced floor.
+            assert mgr.fire_tick() is not None
+            clock[0] = 105.0
+            LoopManager(session_id="incident-parent").complete_tick("still working")
+            parent = load_loop("incident-parent")
+            assert parent is not None
+            assert parent.not_before_at == 1900.0
+            assert parent.next_due_at == 1905.0
+
+            # Compression/session continuation uses a fresh manager and must
+            # carry the same durable bound; a retry at the old timestamp is
+            # not due on either row.
+            assert migrate_loop_to_session(
+                "incident-parent", "incident-child", reason="compression"
+            ) is True
+            child = load_loop("incident-child")
+            assert child is not None
+            assert child.mode == "self_paced"
+            assert child.requested_interval_seconds == 1800.0
+            assert child.not_before_at == 1900.0
+            assert child.next_due_at == 1905.0
+            child_mgr = LoopManager(session_id="incident-child")
+            assert child_mgr.is_due(1904.0) is False
+            assert child_mgr.is_due(1905.0) is True
 
     def test_slash_prompt_returned_raw(self, hermes_home):
         from hermes_cli.loops import LoopManager

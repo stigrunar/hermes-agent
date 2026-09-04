@@ -84,11 +84,14 @@ def parse_interval_token(token: str) -> Optional[int]:
 def parse_loop_args(text: str) -> Dict[str, Any]:
     """Parse ``/loop [interval] <prompt> [--times N] [--until ...]``.
 
-    Returns ``{"interval_seconds": int|None, "prompt", "times", "until", "error"}``;
-    ``interval_seconds`` None means self-paced, ``error`` is set for unusable input.
+    ``--self-paced <interval>`` sets a hard floor while retaining adaptive cadence.
     """
     raw = (text or "").strip()
-    result: Dict[str, Any] = {"interval_seconds": None, "prompt": "", "times": 0, "until": "", "error": None}
+    result: Dict[str, Any] = {
+        "interval_seconds": None,
+        "requested_interval_seconds": None,
+        "prompt": "", "times": 0, "until": "", "error": None,
+    }
     if not raw:
         return {**result, "error": "empty"}
 
@@ -116,13 +119,34 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
         raw = tokens[1]
         tokens = raw.split(None, 1)
 
+    self_paced_with_floor = bool(
+        tokens and tokens[0].lower() == "--self-paced")
+    if self_paced_with_floor:
+        raw = tokens[1].strip() if len(tokens) > 1 else ""
+        tokens = raw.split(None, 1)
     interval = parse_interval_token(tokens[0]) if tokens else None
-    if interval is not None:
+    requested_interval = None
+    if self_paced_with_floor and interval is not None:
+        requested_interval = interval
+        interval = None
+        raw = tokens[1].strip() if len(tokens) > 1 else ""
+    elif self_paced_with_floor:
+        return {
+            **result,
+            "error": "--self-paced expects an interval before the prompt "
+                     "(for ordinary self-paced mode, omit --self-paced)",
+        }
+    elif interval is not None:
         raw = tokens[1].strip() if len(tokens) > 1 else ""
 
     if not raw:
         return {**result, "error": "missing prompt (usage: /loop [interval] <prompt>)"}
-    return {**result, "interval_seconds": interval, "prompt": raw, "times": times, "until": until}
+    return {
+        **result,
+        "interval_seconds": interval,
+        "requested_interval_seconds": requested_interval,
+        "prompt": raw, "times": times, "until": until,
+    }
 
 
 def format_interval(seconds: float) -> str:
@@ -180,6 +204,7 @@ class LoopState:
     status: str = "active"            # active | paused | done | cleared
     mode: str = "interval"            # interval | self_paced
     interval_seconds: float = 0.0     # fixed cadence (mode == "interval")
+    requested_interval_seconds: float = 0.0  # explicit self-paced floor
     current_delay: float = 0.0        # live cadence (self-paced backoff)
     times: int = 0                    # user cap (--times N); 0 = none
     until: str = ""                   # judged stop condition; "" = none
@@ -225,7 +250,10 @@ class LoopState:
     def cadence_label(self) -> str:
         if self.mode == "self_paced":
             live = f", currently {format_interval(self.current_delay)}" if self.current_delay else ""
-            return f"self-paced{live}"
+            requested = (
+                f", minimum {format_interval(self.requested_interval_seconds)}"
+                if self.requested_interval_seconds > 0 else "")
+            return f"self-paced{requested}{live}"
         return f"every {format_interval(self.interval_seconds)}"
 
     def remaining_label(self) -> str:
@@ -444,6 +472,7 @@ class LoopManager:
         prompt: str,
         *,
         interval_seconds: Optional[int] = None,
+        requested_interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
         route: Optional[Dict[str, str]] = None,
@@ -456,11 +485,17 @@ class LoopManager:
         now = time.time()
         self_paced = interval_seconds is None
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
+        requested = (
+            max(int(requested_interval_seconds), min_interval_seconds())
+            if requested_interval_seconds is not None else 0)
+        self_paced_floor = max(self_paced_floor_seconds(), requested)
         state = LoopState(
             prompt=prompt,
             mode="self_paced" if self_paced else "interval",
             interval_seconds=interval,
-            current_delay=float(self_paced_floor_seconds()) if self_paced else interval,
+            requested_interval_seconds=(
+                float(requested) if self_paced else float(interval)),
+            current_delay=float(self_paced_floor) if self_paced else interval,
             times=max(0, int(times or 0)),
             until=(until or "").strip(),
             max_ticks=max_ticks_default(),
@@ -509,6 +544,10 @@ class LoopManager:
 
     @staticmethod
     def _requested_interval_floor(s: LoopState) -> float:
+        requested = float(
+            getattr(s, "requested_interval_seconds", 0.0) or 0.0)
+        if requested > 0:
+            return requested
         if s.mode == "interval" and s.interval_seconds > 0:
             return float(s.interval_seconds)
         return float(self_paced_floor_seconds())
@@ -621,9 +660,11 @@ class LoopManager:
         # 5. Still looping — schedule the next tick from turn end.
         if s.mode == "self_paced":
             digest = _digest_response(last_response)
-            floor = self_paced_floor_seconds()
+            floor = self._requested_interval_floor(s)
             if digest and digest == s.last_response_digest:
-                s.current_delay = min(max(s.current_delay, floor) * 2, self_paced_ceiling_seconds())
+                s.current_delay = min(
+                    max(s.current_delay, floor) * 2,
+                    max(self_paced_ceiling_seconds(), floor))
             else:
                 s.current_delay = float(floor)
             s.last_response_digest = digest
@@ -655,6 +696,7 @@ LOOP_HELP = (
     "  /loop 5m check the deploy status      — first run now, then every 5m\n"
     "  /loop every 10m /recap                — loop a slash command\n"
     "  /loop keep fixing tests until green   — self-paced (backs off while output is unchanged)\n"
+    "  /loop --self-paced 30m watch progress — self-paced with a 30m hard minimum\n"
     "  /loop 2m poll CI --times 30           — stop after 30 runs\n"
     "  /loop 5m watch the queue --until queue is empty\n"
     "Controls: /loop status · /loop pause · /loop resume · /loop stop\n"
@@ -710,6 +752,7 @@ def dispatch_loop_command(
         state = mgr.set(
             parsed["prompt"],
             interval_seconds=parsed["interval_seconds"],
+            requested_interval_seconds=parsed["requested_interval_seconds"],
             times=parsed["times"],
             until=parsed["until"],
             route=route,
@@ -726,9 +769,13 @@ def dispatch_loop_command(
             "loops.min_interval_seconds)"
         )
     if state.mode == "self_paced":
+        minimum = (
+            f"minimum {format_interval(state.requested_interval_seconds)}; "
+            if state.requested_interval_seconds > 0 else "")
         lines.append(
-            f"Self-paced: first check in {format_interval(state.current_delay)}; "
-            f"backs off up to {format_interval(self_paced_ceiling_seconds())} while nothing changes."
+            f"Self-paced: {minimum}first check in {format_interval(state.current_delay)}; "
+            f"backs off up to {format_interval(max(self_paced_ceiling_seconds(), state.requested_interval_seconds))} "
+            "while nothing changes."
         )
     if state.times:
         lines.append(f"Runs {state.times} time{'s' if state.times != 1 else ''}, then stops.")
