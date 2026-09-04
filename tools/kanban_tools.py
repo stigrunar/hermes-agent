@@ -1006,6 +1006,19 @@ def _handle_create(args: dict, **kw) -> str:
     assignee = args.get("assignee")
     _check(assignee, "assignee is required — name the profile that should execute this "
                      "task (the dispatcher will only spawn tasks with an assignee)")
+    required_capabilities = args.get("required_capabilities")
+    if isinstance(required_capabilities, str):
+        required_capabilities = [required_capabilities]
+    _check(
+        required_capabilities is None or isinstance(required_capabilities, (list, tuple)),
+        "required_capabilities must be a list of capability names",
+    )
+    if required_capabilities is not None:
+        try:
+            from hermes_cli import kanban_db as capability_kb
+            capability_kb.normalize_required_worker_capabilities(required_capabilities)
+        except (TypeError, ValueError) as exc:
+            return tool_error(f"required_capabilities: {exc}")
     # Workspace sharing is always explicit: omitted fields mean a fresh scratch workspace
     # even for a dispatcher-spawned creator (reusing the parent's path would let a child
     # mutate review evidence or race its checkout). Project identity is the one safe thing
@@ -1052,6 +1065,7 @@ def _handle_create(args: dict, **kw) -> str:
             mutation_repository=mutation_repository,
             mutation_scope=mutation_scope,
             mutation_base_ref=mutation_base_ref,
+            required_capabilities=required_capabilities,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),

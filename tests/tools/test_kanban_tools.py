@@ -580,6 +580,40 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_schema_and_persistence_include_required_capabilities(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    capability_schema = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
+        "required_capabilities"
+    ]
+    assert set(capability_schema["items"]["enum"]) == set(kb.WORKER_CAPABILITY_NAMES)
+    result = json.loads(kt._handle_create({
+        "title": "capability child",
+        "assignee": "peer",
+        "required_capabilities": ["workspace_access", "terminal"],
+    }))
+    assert result["ok"] is True
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child is not None
+        assert child.required_capabilities == ["terminal", "workspace_access"]
+    finally:
+        conn.close()
+
+
+def test_create_rejects_invalid_required_capability(worker_env):
+    from tools import kanban_tools as kt
+
+    result = json.loads(kt._handle_create({
+        "title": "invalid capability child",
+        "assignee": "peer",
+        "required_capabilities": ["not_a_worker_capability"],
+    }))
+    assert "required_capabilities" in result["error"]
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(

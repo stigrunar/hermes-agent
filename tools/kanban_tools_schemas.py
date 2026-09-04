@@ -27,6 +27,19 @@ def _board_schema_prop() -> dict[str, str]:
     return _prop("string", _DESC_BOARD)
 
 
+def _required_capabilities_schema() -> dict[str, Any]:
+    from hermes_cli import kanban_db as kb
+
+    return {
+        "type": "array",
+        "items": {"type": "string", "enum": sorted(kb.WORKER_CAPABILITY_NAMES)},
+        "description": (
+            "Explicit worker capabilities required before dispatch. Use only "
+            "canonical capability names; do not infer requirements from task prose."
+        ),
+    }
+
+
 def _schema(name: str, description: str, properties: dict[str, Any], required: list[str]) -> dict[str, Any]:
     """Build a tool schema; every kanban tool takes an optional trailing ``board``."""
     return {
@@ -390,6 +403,7 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "links. The assigned worker reads this as part of "
                 "its context."
         )),
+        "required_capabilities": _required_capabilities_schema(),
         "parents": {
             "type": "array",
             "items": {"type": "string"},
