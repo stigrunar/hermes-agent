@@ -188,6 +188,8 @@ class LoopState:
     created_at: float = 0.0
     last_fired_at: float = 0.0
     next_due_at: float = 0.0
+    # Durable floor that stale retry, pause/resume, and adaptation cannot shorten.
+    not_before_at: float = 0.0
     # True between "wakeup injected" and "that turn's response evaluated": stops a tick from
     # double-firing mid-turn and tells the post-turn hook the turn that just ended was ours.
     awaiting_response: bool = False
@@ -482,8 +484,11 @@ class LoopManager:
             return None
         s.status, s.paused_reason, s.awaiting_response = "active", None, False
         # Re-arm relative to now so a long pause doesn't fire instantly N times.
-        delay = s.current_delay or s.interval_seconds or self_paced_floor_seconds()
-        s.next_due_at = time.time() + min(delay, 5.0)
+        floor = self._requested_interval_floor(s)
+        delay = max(float(s.current_delay or 0.0), floor)
+        s.current_delay = delay
+        s.not_before_at = self._not_before_at(s)
+        s.next_due_at = max(time.time() + min(delay, 5.0), s.not_before_at)
         return self._save()
 
     def clear(self) -> bool:
@@ -497,10 +502,24 @@ class LoopManager:
     def is_due(self, now: Optional[float] = None) -> bool:
         """Cheap check: active, not mid-wakeup, and the clock has passed."""
         s = self._state
-        return (
-            s is not None and s.status == "active" and not s.awaiting_response
-            and (now if now is not None else time.time()) >= s.next_due_at
-        )
+        if s is None or s.status != "active" or s.awaiting_response:
+            return False
+        current = now if now is not None else time.time()
+        return current >= max(s.next_due_at, self._not_before_at(s))
+
+    @staticmethod
+    def _requested_interval_floor(s: LoopState) -> float:
+        if s.mode == "interval" and s.interval_seconds > 0:
+            return float(s.interval_seconds)
+        return float(self_paced_floor_seconds())
+
+    @classmethod
+    def _not_before_at(cls, s: LoopState) -> float:
+        stored = float(s.not_before_at or 0.0)
+        if stored > 0:
+            return stored
+        floor = cls._requested_interval_floor(s)
+        return s.last_fired_at + floor if s.last_fired_at > 0 else 0.0
 
     def fire_tick(self) -> Optional[str]:
         """Claim a due tick; returns the message to inject, or None.
@@ -515,9 +534,13 @@ class LoopManager:
         s.ticks_fired += 1
         s.last_fired_at = time.time()
         s.awaiting_response = True
+        floor = self._requested_interval_floor(s)
+        s.not_before_at = max(s.not_before_at, s.last_fired_at + floor)
         # Provisional schedule from NOW: complete_tick reschedules from turn end, but if the
         # process dies mid-turn this keeps the persisted loop from being 'due' in a tight loop.
-        s.next_due_at = s.last_fired_at + (s.current_delay or s.interval_seconds or self_paced_floor_seconds())
+        delay = max(float(s.current_delay or 0.0), floor)
+        s.current_delay = delay
+        s.next_due_at = max(s.last_fired_at + delay, s.not_before_at)
         self._save()
 
         if s.prompt.lstrip().startswith("/"):
@@ -528,6 +551,7 @@ class LoopManager:
 
     def abandon_tick(self) -> None:
         """Roll back a fired tick whose injection failed (nothing ran)."""
+        self.refresh()
         s = self._state
         if s is None or not s.awaiting_response:
             return
@@ -605,7 +629,8 @@ class LoopManager:
             s.last_response_digest = digest
         else:
             s.current_delay = s.interval_seconds
-        s.next_due_at = now + s.current_delay
+        s.not_before_at = self._not_before_at(s)
+        s.next_due_at = max(now + s.current_delay, s.not_before_at)
         self._save()
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 

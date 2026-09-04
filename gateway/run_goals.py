@@ -381,7 +381,8 @@ class GatewayGoalsMixin:
         the store being scanned (None = default); a ``profile`` persisted in the route wins."""
         from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
-        if state.awaiting_response or now < state.next_due_at:
+        if state.awaiting_response or now < max(
+                state.next_due_at, getattr(state, "not_before_at", 0.0)):
             return
         route = state.route or {}
         platform_name = route.get("platform", "")
