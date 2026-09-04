@@ -169,6 +169,7 @@ async def _shutdown_abandoned_app(app) -> None:
 
 try:
     from telegram import Update, Bot, Message, InlineKeyboardButton, InlineKeyboardMarkup
+
     try:
         from telegram import LinkPreviewOptions
     except ImportError:
@@ -193,6 +194,7 @@ except ImportError:
     Message = Any
     InlineKeyboardButton = Any
     InlineKeyboardMarkup = Any
+
     LinkPreviewOptions = None
     Application = Any
     CommandHandler = Any
@@ -5404,6 +5406,76 @@ class TelegramAdapter(BasePlatformAdapter):
             return True
         else:  # "first" (default)
             return chunk_index == 0
+
+    async def send_voice_mini_app_launcher(
+        self,
+        event: MessageEvent,
+        *,
+        url: Optional[str] = None,
+    ) -> SendResult:
+        """Send the one-button Telegram Voice Mini App launcher.
+
+        ``url`` is minted by the gateway command handler and already contains
+        the one-time opaque receipt.  This adapter only renders it; it never
+        puts session/profile authority in the Telegram URL.  The route's
+        Telegram ``initData`` exchange is deliberately separate from the
+        API-server bearer-key surface.
+        """
+        if not self._bot:
+            live = self._replacement_telegram_adapter()
+            if live is not None and live is not self:
+                return await live.send_voice_mini_app_launcher(event, url=url)
+            if self._is_permanent_fatal() or not await self._wait_for_reconnection():
+                return SendResult(success=False, error="Not connected", retryable=not self._is_permanent_fatal())
+            if not self._bot:
+                return SendResult(success=False, error="Not connected", retryable=True)
+
+        source = getattr(event, "source", event)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id:
+            return SendResult(success=False, error="Missing Telegram chat", retryable=False)
+        if not url:
+            text = (
+                "Voice Mini App is not configured. Set "
+                "platforms.telegram.extra.voice_mini_app_url in config.yaml."
+            )
+            keyboard = None
+        else:
+            text = "Open Voice controls in the Mini App:"
+            # Use a normal direct-link URL button. Telegram's ``web_app``
+            # inline buttons are private-chat-only, while this launcher must
+            # work in forum topics and groups as well as DMs.
+            keyboard = InlineKeyboardMarkup(
+                [[InlineKeyboardButton("Open Voice controls", url=url)]]
+            )
+
+        thread_id = getattr(source, "thread_id", None)
+        if thread_id is not None and str(thread_id).strip() in {"", "1"}:
+            thread_id = None
+        metadata: Dict[str, Any] = {}
+        if thread_id is not None:
+            metadata["thread_id"] = str(thread_id)
+            if getattr(source, "chat_type", None) == "dm":
+                metadata["telegram_dm_topic_reply_fallback"] = True
+                metadata["direct_messages_topic_id"] = str(thread_id)
+        try:
+            # A launcher is lane-bound by its receipt.  Do not use the
+            # control-message helper here: its retry intentionally drops a
+            # missing thread id, which could put this authenticated launcher
+            # in the chat root instead of the requested topic.
+            msg = await self._bot.send_message(
+                chat_id=normalize_telegram_chat_id(chat_id),
+                text=text,
+                parse_mode=None,
+                reply_markup=keyboard,
+                **self._thread_kwargs_for_send(chat_id, thread_id, metadata),
+                **self._notification_kwargs({"notify": True}),
+            )
+            return SendResult(success=True, message_id=str(getattr(msg, "message_id", "")))
+        except Exception as exc:
+            safe_error = _redact_telegram_error_text(exc)
+            logger.warning("[%s] Voice Mini App launcher send failed: %s", self.name, safe_error)
+            return SendResult(success=False, error=safe_error, retryable=False)
 
     async def send(
         self,

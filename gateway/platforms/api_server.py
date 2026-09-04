@@ -2093,6 +2093,18 @@ class APIServerAdapter(BasePlatformAdapter):
 
         return web.json_response(result if isinstance(result, dict) else {})
 
+    async def _handle_voice_telegram_exchange(self, request: "web.Request") -> "web.Response":
+        """Exchange a Telegram Voice Mini App receipt for the exact lane session.
+
+        This route intentionally bypasses ``_check_auth``.  Telegram WebApp
+        ``initData`` HMAC validation plus a one-time launch receipt is the
+        route-specific authentication contract; an API_SERVER_KEY is neither
+        available to, nor appropriate for, the Telegram Mini App browser.
+        """
+        from gateway.voice_topic_binding import handle_telegram_exchange
+
+        return await handle_telegram_exchange(request, self)
+
     # ------------------------------------------------------------------
     # Multi-profile multiplexing (/p/<profile>/…)
     # ------------------------------------------------------------------
@@ -2252,6 +2264,9 @@ class APIServerAdapter(BasePlatformAdapter):
             # the target adapter's own verifier (platform-signed bearer), NOT
             # API_SERVER_KEY — external platforms hold no API server key.
             ("POST", "/api/platforms/{platform}/events", self._handle_platform_event_callback),
+            # Route-specific auth: Telegram initData + one-time opaque receipt;
+            # deliberately not gated by API_SERVER_KEY.
+            ("POST", "/api/voice/telegram/exchange", self._handle_voice_telegram_exchange),
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
