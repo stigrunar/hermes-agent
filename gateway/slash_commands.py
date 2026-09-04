@@ -664,6 +664,31 @@ class GatewaySlashCommandsMixin(
         voice_key = self._voice_key_for_source(event.source)
         adapter = self._delivery_adapter_for(event.source)
 
+        # Telegram's bare /voice opens the configured Mini App.  Keep every
+        # existing subcommand (and bare /voice on other platforms) on the
+        # historical toggle path below.  The launcher sends its own Telegram
+        # message and therefore this handler must return an empty response so
+        # the platform adapter does not duplicate it.
+        launcher_adapter = adapter
+        if not args and event.source.platform == Platform.TELEGRAM and launcher_adapter is not None:
+            launcher = getattr(launcher_adapter, "send_voice_mini_app_launcher", None)
+            if callable(launcher):
+                try:
+                    from gateway.voice_topic_binding import mint_voice_launch
+
+                    launch_url = await mint_voice_launch(self, event, launcher_adapter)
+                except Exception as exc:
+                    # A missing/invalid URL is reported by the adapter as a
+                    # normal Telegram message. Do not turn a launcher failure
+                    # into a duplicate slash-command response.
+                    logger.warning("Telegram Voice Mini App launch unavailable: %s", exc)
+                    launch_url = None
+                try:
+                    await launcher(event, url=launch_url)
+                except Exception:
+                    logger.debug("Telegram Voice Mini App launcher send failed", exc_info=True)
+                return ""
+
         def _set_mode(mode: str) -> None:
             self._voice_mode[voice_key] = mode
             self._save_voice_modes()
