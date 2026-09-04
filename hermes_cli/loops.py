@@ -40,6 +40,22 @@ _INTERVAL_TOKEN_RE = re.compile(
     r"^(?=\d)(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE
 )
 
+_CADENCE_PROSE_RE = re.compile(
+    r"""
+    \b(?:every|each|per)\s+
+    (?:(?:\d+(?:[.,]\d+)?\s*)?
+       (?:s|sec(?:ond)?s?|m|min(?:ute)?s?|h|hr(?:s)?|hour(?:s)?|
+          d|day(?:s)?|w|week(?:s)?|month(?:s)?)
+       |half\s+(?:an?\s+)?hour)\b
+    |\b(?:hourly|daily|weekly|monthly)\b
+    |\bhver\s+
+    (?:(?:\d+(?:[.,]\d+)?\.?\s*)?
+       (?:sekund(?:er)?|minutt(?:er)?|time(?:r)?|dag(?:er)?|uke(?:r)?|måned(?:er)?)
+       |halv(?:e)?\s*time)\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
 
 WAKEUP_PROMPT_TEMPLATE = (
     "[/loop wakeup #{tick}{cadence}]\n"
@@ -113,6 +129,8 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
         until = m_until.group(1).strip()
         raw = raw[: m_until.start()].strip()
 
+    has_cadence_prose = _CADENCE_PROSE_RE.search(raw) is not None
+
     # Leading "every" sugar: /loop every 5m <prompt>
     tokens = raw.split(None, 1)
     if tokens and tokens[0].lower() == "every" and len(tokens) > 1:
@@ -141,6 +159,13 @@ def parse_loop_args(text: str) -> Dict[str, Any]:
 
     if not raw:
         return {**result, "error": "missing prompt (usage: /loop [interval] <prompt>)"}
+    if not self_paced_with_floor and interval is None and has_cadence_prose:
+        return {
+            **result,
+            "error": "cadence language in a self-paced prompt must be explicit; "
+                     "use a leading interval for fixed cadence or "
+                     "'--self-paced <interval>' for a self-paced minimum",
+        }
     return {
         **result,
         "interval_seconds": interval,
