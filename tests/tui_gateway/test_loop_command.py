@@ -96,6 +96,27 @@ def test_loop_set_persists(server, session):
     assert mgr.state.interval_seconds == 300.0
 
 
+def test_self_paced_requested_interval_is_structured(server, session):
+    sid, session_key, _ = session
+    r = _call(
+        server,
+        "command.dispatch",
+        name="loop",
+        arg="--self-paced 30m hold fremgang i prosjektene — sjekk hver halvtime",
+        session_id=sid,
+    )
+    assert r["result"]["type"] == "exec"
+    assert "minimum 30m" in r["result"]["output"]
+
+    from hermes_cli.loops import LoopManager
+
+    state = LoopManager(session_key).state
+    assert state is not None
+    assert state.mode == "self_paced"
+    assert state.requested_interval_seconds == 1800.0
+    assert state.interval_seconds == 0.0
+
+
 def test_loop_proactive_alias_resolves(server, session):
     sid, _, _ = session
     r = _call(server, "command.dispatch", name="proactive", arg="5m ping", session_id=sid)

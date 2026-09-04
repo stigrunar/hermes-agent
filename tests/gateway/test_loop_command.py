@@ -159,15 +159,50 @@ async def test_post_turn_completion_preserves_requested_interval_floor(loop_env)
 
 
 @pytest.mark.asyncio
+async def test_self_paced_requested_interval_matches_incident_shape(loop_env):
+    runner = _make_runner()
+    clock = [100.0]
+    prompt = "hold fremgang i prosjektene — sjekk hver halvtime"
+    with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+        response = await GatewayRunner._handle_loop_command(
+            runner, _make_event(f"/loop --self-paced 30m {prompt}")
+        )
+        assert "minimum 30m" in response
+
+        mgr = loops.LoopManager(session_id="sid-gateway-loop")
+        state = mgr.state
+        assert state is not None
+        assert state.mode == "self_paced"
+        assert state.requested_interval_seconds == 1800.0
+        assert mgr.fire_tick() is not None
+        clock[0] = 105.0
+        await GatewayRunner._post_turn_loop_completion(
+            runner,
+            session_entry=_FakeSessionEntry(),
+            source=None,
+            final_response="still working",
+        )
+
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded is not None
+    assert reloaded.not_before_at == 1900.0
+    assert reloaded.next_due_at == 1905.0
+
+
+@pytest.mark.asyncio
 async def test_gateway_watcher_honors_not_before_on_retry(loop_env):
     runner = _make_runner()
     runner._running = True
     runner._warm_goals_session_db = AsyncMock()
-    state = loops.LoopManager(session_id="sid-gateway-loop").set(
-        "poll CI",
-        interval_seconds=1800,
+    mgr = loops.LoopManager(session_id="sid-gateway-loop")
+    result = loops.dispatch_loop_command(
+        mgr,
+        "--self-paced 30m hold fremgang i prosjektene — sjekk hver halvtime",
         route={"platform": "discord", "chat_id": "chat-loop"},
     )
+    assert result["created"] is True
+    state = mgr.state
+    assert state is not None
     state.next_due_at = 100.0
     state.not_before_at = 1900.0
     loops.save_loop("sid-gateway-loop", state)
