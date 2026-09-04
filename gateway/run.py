@@ -24435,6 +24435,56 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
 
+    @staticmethod
+    def _dedupe_loop_wakeup_candidates(candidates):
+        """Keep one due-loop candidate per routed conversation.
+
+        ``list_active_loops`` resolves durable compression lineage. This second
+        guard protects the egress boundary if a stale snapshot, another worker,
+        or a test double still presents parent/child rows in one scan. The
+        candidate with the latest cadence floor/schedule wins so deduplication
+        cannot turn a retry into an early wakeup.
+        """
+        routed = {}
+        unrouted = []
+        for candidate in candidates:
+            sid, state = candidate
+            route = state.route or {}
+            platform_name = route.get("platform", "")
+            chat_id = route.get("chat_id", "")
+            if not platform_name or not chat_id:
+                unrouted.append(candidate)
+                continue
+            route_key = tuple(
+                route.get(field, "")
+                for field in (
+                    "platform",
+                    "chat_id",
+                    "chat_type",
+                    "thread_id",
+                    "user_id",
+                )
+            )
+
+            def _number(value):
+                try:
+                    return float(value or 0.0)
+                except (TypeError, ValueError):
+                    return 0.0
+
+            candidate_key = (
+                _number(getattr(state, "not_before_at", 0.0)),
+                _number(getattr(state, "next_due_at", 0.0)),
+                _number(getattr(state, "ticks_fired", 0)),
+                _number(getattr(state, "created_at", 0.0)),
+                sid,
+            )
+            previous = routed.get(route_key)
+            if previous is None or candidate_key > previous[0]:
+                routed[route_key] = (candidate_key, candidate)
+
+        return [entry[1] for entry in routed.values()] + unrouted
+
     async def _loop_wakeup_watcher(self, interval: float = 15.0) -> None:
         """Fire due /loop wakeups for idle gateway sessions.
 
@@ -24466,7 +24516,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 await self._warm_goals_session_db("loop wakeup")
 
                 now = time.time()
-                for sid, state in list_active_loops():
+                for sid, state in self._dedupe_loop_wakeup_candidates(
+                    list_active_loops()
+                ):
                     if state.awaiting_response or now < max(
                         state.next_due_at, getattr(state, "not_before_at", 0.0)
                     ):

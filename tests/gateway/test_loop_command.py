@@ -239,6 +239,31 @@ async def test_gateway_watcher_honors_not_before_on_retry(loop_env):
     assert reloaded.awaiting_response is False
 
 
+def test_gateway_wakeup_dedupes_same_route_at_same_timestamp():
+    parent = loops.LoopState(
+        prompt="poll CI",
+        next_due_at=100.0,
+        not_before_at=100.0,
+        created_at=10.0,
+        route={
+            "platform": "discord",
+            "chat_id": "chat-loop",
+            "chat_type": "channel",
+            "thread_id": "thread-9",
+            "user_id": "user-loop",
+        },
+    )
+    child = loops.LoopState.from_json(parent.to_json())
+
+    candidates = GatewayRunner._dedupe_loop_wakeup_candidates(
+        [("parent-session", parent), ("z-child-session", child)]
+    )
+
+    assert [(sid, state.next_due_at) for sid, state in candidates] == [
+        ("z-child-session", 100.0)
+    ]
+
+
 @pytest.mark.asyncio
 async def test_post_turn_loop_completion_noop_without_inflight_tick(loop_env):
     runner = _make_runner()

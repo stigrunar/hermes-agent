@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import patch
 
 import pytest
@@ -330,6 +331,91 @@ class TestPersistence:
         LoopManager(session_id="c2").set("child loop", interval_seconds=60)
         assert migrate_loop_to_session("p2", "c2") is False
         assert load_loop("c2").prompt == "child loop"
+
+    def test_concurrent_migration_targets_have_one_atomic_owner(self, hermes_home):
+        from hermes_cli.loops import (
+            LoopManager,
+            list_active_loops,
+            load_loop,
+            migrate_loop_to_session,
+            save_loop,
+        )
+
+        with patch("hermes_cli.loops.time.time", return_value=100.0):
+            state = LoopManager(session_id="atomic-parent").set(
+                "watch the rollout",
+                interval_seconds=None,
+                requested_interval_seconds=1800,
+                route={"platform": "discord", "chat_id": "atomic-chat"},
+            )
+            state.not_before_at = 1900.0
+            state.next_due_at = 1905.0
+            save_loop("atomic-parent", state)
+
+            def migrate(child_id):
+                return migrate_loop_to_session(
+                    "atomic-parent", child_id, reason="compression"
+                )
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(
+                    pool.map(migrate, ("atomic-child-a", "atomic-child-b"))
+                )
+
+        assert sorted(results) == [False, True]
+        active = list_active_loops()
+        assert len(active) == 1
+        winner_id, winner = active[0]
+        assert winner_id in {"atomic-child-a", "atomic-child-b"}
+        assert winner.requested_interval_seconds == 1800.0
+        assert winner.not_before_at == 1900.0
+        assert winner.next_due_at == 1905.0
+        assert load_loop("atomic-parent").status == "cleared"
+
+        # A retry after the first transaction committed must not mint a second
+        # continuation row or make a second wakeup eligible.
+        assert migrate_loop_to_session("atomic-parent", "atomic-child-retry") is False
+        assert len(list_active_loops()) == 1
+
+    def test_stale_compression_rows_are_retired_before_wakeup_scan(self, hermes_home):
+        from hermes_cli import goals
+        from hermes_cli.loops import (
+            LoopManager,
+            LoopState,
+            list_active_loops,
+            load_loop,
+            save_loop,
+        )
+
+        db = goals._get_session_db()
+        db.create_session("lineage-parent", source="cli")
+        db.end_session("lineage-parent", "compression")
+        db.create_session(
+            "lineage-child",
+            source="cli",
+            parent_session_id="lineage-parent",
+        )
+
+        parent = LoopManager(session_id="lineage-parent").set(
+            "watch the rollout",
+            interval_seconds=1800,
+            route={"platform": "discord", "chat_id": "lineage-chat"},
+        )
+        parent.next_due_at = 100.0
+        parent.not_before_at = 100.0
+        save_loop("lineage-parent", parent)
+        save_loop("lineage-child", LoopState.from_json(parent.to_json()))
+
+        active = list_active_loops()
+
+        assert [(session_id, state.status) for session_id, state in active] == [
+            ("lineage-child", "active")
+        ]
+        assert load_loop("lineage-parent").status == "cleared"
+        child = load_loop("lineage-child")
+        assert child is not None
+        assert child.requested_interval_seconds == parent.requested_interval_seconds
+        assert child.not_before_at == 100.0
 
 
 # ──────────────────────────────────────────────────────────────────────

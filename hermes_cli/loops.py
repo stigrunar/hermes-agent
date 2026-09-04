@@ -523,7 +523,10 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
 
     Used by the gateway's idle wakeup watcher, which has no per-session
     scheduler and instead scans for due loops on a coarse tick. Best-effort:
-    any DB error yields ``[]``.
+    any DB error yields ``[]``. Compression continuations are one logical
+    conversation even though their durable loop rows use different session ids;
+    stale active rows in one compression lineage are retired before returning
+    the newest live owner.
     """
     db = _get_session_db()
     if db is None:
@@ -533,7 +536,7 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
     except Exception as exc:
         logger.debug("LoopManager: list_meta_prefix failed: %s", exc)
         return []
-    out: List[Tuple[str, LoopState]] = []
+    candidates: List[Tuple[str, LoopState]] = []
     for key, raw in rows:
         session_id = key[len(_META_PREFIX):]
         if not session_id or not raw:
@@ -543,8 +546,167 @@ def list_active_loops() -> List[Tuple[str, LoopState]]:
         except Exception:
             continue
         if state.status == "active":
-            out.append((session_id, state))
+            candidates.append((session_id, state))
+
+    # Normally this is a single row per session. A pre-fix race can leave an
+    # active parent and one or more active continuation siblings, though, and
+    # returning all of them would make the gateway emit one wakeup per row at
+    # the same timestamp. Resolve the compression root from the durable session
+    # lineage, not from route metadata: one chat can legitimately have more
+    # than one unrelated session.
+    session_cache: Dict[str, Optional[Dict[str, Any]]] = {}
+    groups: Dict[str, List[Tuple[str, LoopState]]] = {}
+    for session_id, state in candidates:
+        root = _loop_compression_root(db, session_id, session_cache)
+        groups.setdefault(root, []).append((session_id, state))
+
+    out: List[Tuple[str, LoopState]] = []
+    for grouped in groups.values():
+        winner = max(
+            grouped,
+            key=lambda candidate: _loop_owner_sort_key(
+                db, candidate[0], session_cache
+            ),
+        )
+        if len(grouped) > 1:
+            _clear_superseded_loop_rows(
+                db, [session_id for session_id, _state in grouped], winner[0]
+            )
+        out.append(winner)
     return out
+
+
+def _session_row_for_loop(
+    db: Any,
+    session_id: str,
+    cache: Dict[str, Optional[Dict[str, Any]]],
+) -> Optional[Dict[str, Any]]:
+    """Read one session row for loop-lineage arbitration, best-effort."""
+    if session_id in cache:
+        return cache[session_id]
+    getter = getattr(db, "get_session", None)
+    if not callable(getter):
+        cache[session_id] = None
+        return None
+    try:
+        row = getter(session_id)
+    except Exception:
+        row = None
+    if row is not None and not isinstance(row, dict):
+        try:
+            row = dict(row)
+        except Exception:
+            row = None
+    cache[session_id] = row
+    return row
+
+
+def _session_child_has_explicit_owner(row: Dict[str, Any]) -> bool:
+    """Return whether a session row is a branch/delegate, not a continuation."""
+    if str(row.get("source") or "") == "tool":
+        return True
+    config = row.get("model_config")
+    if isinstance(config, str):
+        try:
+            config = json.loads(config)
+        except (TypeError, ValueError):
+            config = {}
+    if not isinstance(config, dict):
+        return False
+    return any(
+        config.get(marker) is not None
+        for marker in ("_branched_from", "_delegate_from", "_reset_from")
+    )
+
+
+def _loop_compression_root(
+    db: Any,
+    session_id: str,
+    cache: Dict[str, Optional[Dict[str, Any]]],
+) -> str:
+    """Return the root id for a session's compression-continuation lineage."""
+    current = session_id
+    seen = {current}
+    for _ in range(100):
+        child = _session_row_for_loop(db, current, cache)
+        if not child or _session_child_has_explicit_owner(child):
+            return current
+        parent_id = str(child.get("parent_session_id") or "")
+        if not parent_id or parent_id in seen:
+            return current
+        parent = _session_row_for_loop(db, parent_id, cache)
+        if not parent or parent.get("end_reason") != "compression":
+            return current
+        current = parent_id
+        seen.add(current)
+    return current
+
+
+def _loop_timestamp(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _loop_owner_sort_key(
+    db: Any,
+    session_id: str,
+    cache: Dict[str, Optional[Dict[str, Any]]],
+) -> Tuple[int, float, float, str]:
+    """Prefer a live, newest continuation when stale rows share one lineage."""
+    row = _session_row_for_loop(db, session_id, cache)
+    if not row:
+        return (0, 0.0, 0.0, session_id)
+    return (
+        1 if row.get("ended_at") is None else 0,
+        _loop_timestamp(row.get("last_active_at") or row.get("updated_at")),
+        _loop_timestamp(row.get("started_at")),
+        session_id,
+    )
+
+
+def _clear_superseded_loop_rows(
+    db: Any, session_ids: List[str], winner_session_id: str
+) -> None:
+    """Retire stale active rows after lineage arbitration.
+
+    The watcher can still make progress if this cleanup fails because callers
+    already receive only the winner. Keeping the cleanup transactional makes a
+    concurrent retry converge rather than reintroduce the stale rows.
+    """
+    execute_write = getattr(db, "_execute_write", None)
+    if not callable(execute_write):
+        return
+
+    def _do(conn):
+        for session_id in session_ids:
+            if session_id == winner_session_id:
+                continue
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_meta_key(session_id),),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                state = LoopState.from_json(row[0])
+            except Exception:
+                continue
+            if state.status not in {"active", "paused"}:
+                continue
+            state.status = "cleared"
+            state.last_stop_reason = "superseded by compression continuation"
+            conn.execute(
+                """INSERT INTO state_meta(key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (_meta_key(session_id), state.to_json()),
+            )
+
+    try:
+        execute_write(_do)
+    except Exception as exc:  # pragma: no cover - defensive best effort
+        logger.debug("LoopManager: stale lineage cleanup failed: %s", exc)
 
 
 def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason: str = "") -> bool:
@@ -558,19 +720,171 @@ def migrate_loop_to_session(old_session_id: str, new_session_id: str, *, reason:
     """
     if not old_session_id or not new_session_id or old_session_id == new_session_id:
         return False
+    db = _get_session_db()
+    if db is None:
+        return False
+    execute_write = getattr(db, "_execute_write", None)
+    if not callable(execute_write):
+        logger.debug("LoopManager: atomic loop migration unavailable")
+        return False
+
+    migrated = False
+
+    def _do(conn):
+        nonlocal migrated
+        old_row = conn.execute(
+            "SELECT value FROM state_meta WHERE key = ?",
+            (_meta_key(old_session_id),),
+        ).fetchone()
+        if old_row is None:
+            return False
+        try:
+            old_state = LoopState.from_json(old_row[0])
+        except Exception:
+            return False
+
+        lineage_rows = conn.execute(
+            """
+            WITH RECURSIVE compression_lineage(id, depth) AS (
+                SELECT ?, 0
+                UNION ALL
+                SELECT child.id, compression_lineage.depth + 1
+                  FROM sessions AS child
+                  JOIN compression_lineage
+                    ON child.parent_session_id = compression_lineage.id
+                  JOIN sessions AS parent ON parent.id = compression_lineage.id
+                 WHERE parent.end_reason = 'compression'
+                   AND compression_lineage.depth < 100
+                   AND json_extract(
+                         CASE
+                           WHEN json_valid(COALESCE(child.model_config, '{}'))
+                           THEN child.model_config
+                           ELSE '{}'
+                         END,
+                         '$._branched_from'
+                       ) IS NULL
+                   AND json_extract(
+                         CASE
+                           WHEN json_valid(COALESCE(child.model_config, '{}'))
+                           THEN child.model_config
+                           ELSE '{}'
+                         END,
+                         '$._delegate_from'
+                       ) IS NULL
+                   AND json_extract(
+                         CASE
+                           WHEN json_valid(COALESCE(child.model_config, '{}'))
+                           THEN child.model_config
+                           ELSE '{}'
+                         END,
+                         '$._reset_from'
+                       ) IS NULL
+                   AND COALESCE(child.source, '') != 'tool'
+            )
+            SELECT id FROM compression_lineage
+            """,
+            (old_session_id,),
+        ).fetchall()
+        lineage_ids = [row[0] for row in lineage_rows]
+        if old_session_id not in lineage_ids:
+            lineage_ids.insert(0, old_session_id)
+        if new_session_id not in lineage_ids:
+            lineage_ids.append(new_session_id)
+
+        loop_rows: Dict[str, Tuple[Any, LoopState]] = {}
+        for session_id in lineage_ids:
+            row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (_meta_key(session_id),),
+            ).fetchone()
+            if row is None:
+                continue
+            try:
+                state = LoopState.from_json(row[0])
+            except Exception:
+                continue
+            loop_rows[session_id] = (row[0], state)
+
+        target = loop_rows.get(new_session_id)
+        live_target = target is not None and target[1].status in {"active", "paused"}
+        source_live = old_state.status in {"active", "paused"}
+        winner_session_id: Optional[str] = None
+
+        if live_target:
+            # A prior attempt already published the target. Never overwrite it;
+            # retire the source and any stale siblings in this same transaction.
+            winner_session_id = new_session_id
+        elif source_live and target is None:
+            # The source JSON is copied verbatim. In particular, do not rebuild
+            # the state from defaults: requested_interval_seconds and
+            # not_before_at are the accepted cadence/floor contract.
+            conn.execute(
+                """INSERT INTO state_meta(key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (_meta_key(new_session_id), old_row[0]),
+            )
+            loop_rows[new_session_id] = (old_row[0], old_state)
+            winner_session_id = new_session_id
+            migrated = True
+        elif source_live:
+            # Preserve an existing target row of any non-live status rather than
+            # clobbering its audit state. The active source remains the owner.
+            winner_session_id = old_session_id
+        else:
+            # A retry may arrive after the source was already archived. Pick the
+            # one remaining live row and retire any stale siblings; importantly,
+            # do not mint another target row on a retry.
+            live_ids = [
+                session_id
+                for session_id, (_raw, state) in loop_rows.items()
+                if state.status in {"active", "paused"}
+            ]
+            if live_ids:
+                session_rows = {}
+                for session_id in live_ids:
+                    session_rows[session_id] = conn.execute(
+                        "SELECT ended_at, started_at FROM sessions WHERE id = ?",
+                        (session_id,),
+                    ).fetchone()
+
+                def _retry_sort_key(session_id: str) -> Tuple[int, float, str]:
+                    row = session_rows.get(session_id)
+                    if row is None:
+                        return (0, 0.0, session_id)
+                    return (
+                        1 if row[0] is None else 0,
+                        _loop_timestamp(row[1]),
+                        session_id,
+                    )
+
+                winner_session_id = max(live_ids, key=_retry_sort_key)
+
+        if winner_session_id is None:
+            return False
+
+        # Clear every other active/paused row that belongs to this compression
+        # lineage. The write is part of the same BEGIN IMMEDIATE transaction as
+        # publication, so two different continuation ids cannot both win.
+        for session_id, (_raw, state) in loop_rows.items():
+            if session_id == winner_session_id or state.status not in {"active", "paused"}:
+                continue
+            state.status = "cleared"
+            state.last_stop_reason = "superseded by compression continuation"
+            conn.execute(
+                """INSERT INTO state_meta(key, value) VALUES (?, ?)
+                   ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+                (_meta_key(session_id), state.to_json()),
+            )
+        return migrated
+
     try:
-        state = load_loop(old_session_id)
-        if state is None or state.status == "cleared":
-            return False
-        if load_loop(new_session_id) is not None:
-            return False
-        save_loop(new_session_id, state)
-        clear_loop(old_session_id)
-        logger.debug(
-            "LoopManager: migrated loop %s -> %s (%s)",
-            old_session_id, new_session_id, reason or "rotation",
-        )
-        return True
+        result = bool(execute_write(_do))
+        if result:
+            logger.debug(
+                "LoopManager: migrated loop %s -> %s (%s)",
+                old_session_id, new_session_id, reason or "rotation",
+            )
+        return result
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("LoopManager: loop migration failed: %s", exc)
         return False
