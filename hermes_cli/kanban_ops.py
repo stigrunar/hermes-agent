@@ -113,9 +113,16 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "rate_limited": res.rate_limited,
             "skipped_locked": res.skipped_locked,
             "memory_pressure": res.memory_pressure,
+            "capability_rejections": res.capability_rejections,
         }, ascii=True)
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
+    for diagnostic in res.capability_rejections:
+        missing = ", ".join(diagnostic.get("missing_capabilities", [])) or "unknown"
+        print(
+            f"Skipped ({diagnostic.get('assignee') or '-'} missing worker "
+            f"capabilities: {missing}): {diagnostic.get('task_id')}"
+        )
     if res.reaped_terminal_workers:
         print(f"Reaped workers of finished tasks: {', '.join(res.reaped_terminal_workers)}")
     for label, items in (

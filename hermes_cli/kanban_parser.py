@@ -175,6 +175,8 @@ _SPECS = [
              help="Exact base ref/SHA associated with the mutation lease."),
         _arg("--resource", action="append", dest="resource_requirements",
              help="Shared resource required by this execution (repeatable)."),
+        _arg("--capability", action="append", dest="required_capabilities",
+             help="Explicit worker capability required for dispatch (repeatable)."),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",

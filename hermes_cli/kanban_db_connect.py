@@ -802,6 +802,7 @@ _EARLY_TASK_COLUMNS = (
     ("mutation_scope", "mutation_scope TEXT"),
     ("mutation_base_ref", "mutation_base_ref TEXT"),
     ("resource_requirements", "resource_requirements TEXT"),
+    ("required_capabilities", "required_capabilities TEXT"),
     ("idempotency_key", "idempotency_key TEXT"),
 )
 

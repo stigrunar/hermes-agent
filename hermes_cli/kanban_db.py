@@ -111,6 +111,47 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+WORKER_CAPABILITY_NAMES = frozenset({
+    "workspace_access", "terminal", "local_file_read", "local_file_hash",
+    "task_attachment_write",
+})
+_WORKER_CAPABILITY_ALIASES = {
+    "workspace": "workspace_access", "workspace_access": "workspace_access",
+    "workspace_materialization": "workspace_access", "terminal": "terminal",
+    "command": "terminal", "command_execution": "terminal", "process_manage": "terminal",
+    "file": "local_file_read", "file_read": "local_file_read",
+    "local_file": "local_file_read", "local_file_read": "local_file_read",
+    "read_file": "local_file_read", "search_files": "local_file_read",
+    "file_hash": "local_file_hash", "local_hash": "local_file_hash",
+    "local_file_hash": "local_file_hash", "attachment_write": "task_attachment_write",
+    "task_attachment": "task_attachment_write",
+    "task_attachment_write": "task_attachment_write",
+}
+
+
+def normalize_required_worker_capabilities(
+    capabilities: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize and validate explicit worker capability requirements."""
+    if capabilities is None:
+        return None
+    values: Iterable[Any] = capabilities.split(",") if isinstance(capabilities, str) else capabilities
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(f"required worker capability must be a string, got {value!r}")
+        key = value.strip().casefold().replace("-", "_").replace(" ", "_")
+        if not key:
+            continue
+        canonical = _WORKER_CAPABILITY_ALIASES.get(key)
+        if canonical is None:
+            raise ValueError(
+                f"unknown worker capability {value!r}; expected one of "
+                f"{', '.join(sorted(WORKER_CAPABILITY_NAMES))}"
+            )
+        normalized.add(canonical)
+    return sorted(normalized) or None
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -233,6 +274,7 @@ _TICK_ACTIVITY_FIELDS = (
     "timed_out", "auto_blocked", "rate_limited", "auto_assigned_default",
     "respawn_guarded", "skipped_per_profile_capped", "skipped_unassigned",
     "skipped_nonspawnable",
+    "capability_rejections",
 )
 
 
@@ -263,6 +305,12 @@ def _fire_dispatch_tick_hook(
             outcome = "skipped_locked"
         elif not any(getattr(result, f) for f in _TICK_ACTIVITY_FIELDS):
             outcome = "idle"
+        elif result.capability_rejections and not any((
+            result.spawned, result.reclaimed, result.promoted,
+            result.reconciled_orphans, result.crashed, result.stale,
+            result.timed_out, result.auto_blocked, result.rate_limited,
+        )):
+            outcome = "capability_rejected"
         invoke_hook(
             "on_kanban_dispatch_tick", board=board, profile_name=profile_name,
             dry_run=bool(dry_run), outcome=outcome, result=result,
@@ -714,6 +762,7 @@ class Task:
     mutation_scope: Optional[list[str]] = None
     mutation_base_ref: Optional[str] = None
     resource_requirements: Optional[list[str]] = None
+    required_capabilities: Optional[list[str]] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -756,6 +805,13 @@ class Task:
         resource_requirements = (
             [str(item) for item in parsed_resources if item]
             if isinstance(parsed_resources, list) else None)
+        parsed_capabilities = _json_or(g("required_capabilities"))
+        required_capabilities = None
+        if isinstance(parsed_capabilities, list):
+            try:
+                required_capabilities = normalize_required_worker_capabilities(parsed_capabilities)
+            except ValueError:
+                required_capabilities = [str(item) for item in parsed_capabilities if item] or None
         return cls(
             **{col: _lossy_text(row[col]) for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -767,6 +823,7 @@ class Task:
             skills=skills_value,
             mutation_scope=mutation_scope,
             resource_requirements=resource_requirements,
+            required_capabilities=required_capabilities,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
         )
@@ -916,6 +973,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     mutation_scope       TEXT,
     mutation_base_ref    TEXT,
     resource_requirements TEXT,
+    required_capabilities TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1346,6 +1404,7 @@ def create_task(
     mutation_scope: Optional[Iterable[str]] = None,
     mutation_base_ref: Optional[str] = None,
     resource_requirements: Optional[Iterable[str]] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
@@ -1527,6 +1586,8 @@ def create_task(
     normalized_mutation_base_ref = str(mutation_base_ref or "").strip() or None
     normalized_resource_requirements = _odb.normalize_resource_requirements(
         resource_requirements)
+    normalized_required_capabilities = normalize_required_worker_capabilities(
+        required_capabilities)
     if normalized_mutation_scope is not None:
         if not outcome_id:
             raise ValueError("mutation_scope requires outcome_id")
@@ -1558,13 +1619,13 @@ def create_task(
                         branch_name, project_id, outcome_id,
                         conversation_lane_id, topic_target, parent_execution_id,
                         mutation_repository, mutation_scope, mutation_base_ref,
-                        resource_requirements,
+                        resource_requirements, required_capabilities,
                         tenant, idempotency_key,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1577,6 +1638,8 @@ def create_task(
                         normalized_mutation_base_ref,
                         (json.dumps(normalized_resource_requirements)
                          if normalized_resource_requirements else None),
+                        (json.dumps(normalized_required_capabilities)
+                         if normalized_required_capabilities else None),
                         tenant, idempotency_key,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
@@ -1605,6 +1668,7 @@ def create_task(
                         "mutation_scope": normalized_mutation_scope,
                         "mutation_base_ref": normalized_mutation_base_ref,
                         "resource_requirements": normalized_resource_requirements or None,
+                        "required_capabilities": normalized_required_capabilities or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,

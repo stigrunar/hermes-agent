@@ -152,6 +152,8 @@ class DispatchResult:
     """Memory pressure that restricted this tick: ``"critical"`` (no new
     workers), ``"elevated"`` (at most one), ``None`` (no restriction).
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
+    capability_rejections: list[dict[str, Any]] = field(default_factory=list)
+    """Stable pre-claim diagnostics for explicit worker capability misses."""
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -1929,6 +1931,7 @@ def dispatch_once(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1952,6 +1955,7 @@ def dispatch_once(
             board=board,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            worker_toolsets=worker_toolsets,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -1975,15 +1979,21 @@ def dispatch_once(
     return result
 
 
-def _call_spawn_fn(spawn_fn, task: Task, workspace: str, board: Optional[str]) -> Optional[int]:
+def _call_spawn_fn(
+    spawn_fn, task: Task, workspace: str, board: Optional[str],
+    worker_toolsets: Optional[Iterable[str]] = None,
+) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
+        kwargs = {}
         if "board" in sig.parameters:
-            return spawn_fn(task, workspace, board=board)
-        return spawn_fn(task, workspace)
+            kwargs["board"] = board
+        if "worker_toolsets" in sig.parameters:
+            kwargs["worker_toolsets"] = worker_toolsets
+        return spawn_fn(task, workspace, **kwargs)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
 
@@ -2002,12 +2012,23 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
+    worker_toolsets: Optional[Iterable[str]],
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
+    task = _kb.get_task(conn, task_id)
+    diagnostic = (
+        _worker_capabilities_for_task(
+            task, assignee=assignee, toolsets_override=worker_toolsets,
+        ) if task is not None else None
+    )
+    if diagnostic is not None:
+        if not any(item.get("task_id") == task_id for item in result.capability_rejections):
+            result.capability_rejections.append(diagnostic)
+        return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
     # forever. Bucketed apart from skipped_unassigned: the operator cannot fix
@@ -2074,7 +2095,10 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
-        pid = _call_spawn_fn(spawn_fn if spawn_fn is not None else _default_spawn, claimed, str(workspace), board)
+        pid = _call_spawn_fn(
+            spawn_fn if spawn_fn is not None else _default_spawn,
+            claimed, str(workspace), board, worker_toolsets,
+        )
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
@@ -2234,6 +2258,7 @@ def _any_spawnable_review(
     *,
     per_profile_cap: Optional[int] = None,
     per_profile_running: Optional[dict[str, int]] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
 ) -> bool:
     """Mirror review dispatch gates before reserving ready-lane capacity.
 
@@ -2252,6 +2277,11 @@ def _any_spawnable_review(
         if not assignee:
             continue
         if profile_exists is not None and not profile_exists(assignee):
+            continue
+        task = _kb.get_task(conn, row["id"])
+        if task is not None and _worker_capabilities_for_task(
+            task, assignee=assignee, toolsets_override=worker_toolsets,
+        ) is not None:
             continue
         if per_profile_cap is not None and running.get(assignee, 0) >= per_profile_cap:
             continue
@@ -2291,6 +2321,7 @@ def _dispatch_once_locked(
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2341,12 +2372,14 @@ def _dispatch_once_locked(
     if spawn_budget is not None and spawn_budget > 0 and _any_spawnable_review(
         conn, review_rows,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        worker_toolsets=worker_toolsets,
     ):
         ready_budget = max(spawn_budget - 1, 0)
     lane_kwargs: dict[str, Any] = dict(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        worker_toolsets=worker_toolsets,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
@@ -2642,6 +2675,101 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
         return None
 
 
+def _normalize_worker_toolset_override(
+    toolsets: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    if toolsets is None:
+        return None
+    values = toolsets.split(",") if isinstance(toolsets, str) else toolsets
+    return list(dict.fromkeys(str(value or "").strip() for value in values if str(value or "").strip()))
+
+
+def _resolve_worker_capability_tools(
+    assignee: str, *, toolsets_override: Optional[Iterable[str]] = None,
+) -> Optional[set[str]]:
+    toolset_names = _normalize_worker_toolset_override(toolsets_override)
+    if toolset_names is None:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+            profile_home = resolve_profile_env(str(assignee))
+        except Exception:
+            try:
+                from hermes_constants import get_hermes_home
+                root = Path(get_hermes_home())
+                profile_home = str(
+                    root if str(assignee).casefold() == "default"
+                    else root / "profiles" / str(assignee).strip().lower()
+                )
+            except Exception:
+                return None
+        toolset_names = _resolve_worker_cli_toolsets(profile_home)
+        if toolset_names is None:
+            return None
+    try:
+        from toolsets import resolve_toolset
+    except Exception:
+        return None
+    tools: set[str] = set()
+    for name in toolset_names:
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            continue
+        tools.add(normalized_name.casefold())
+        try:
+            tools.update(str(tool).casefold() for tool in resolve_toolset(normalized_name))
+        except Exception:
+            continue
+    return tools
+
+
+def _worker_capabilities_for_task(
+    task: "Task", *, assignee: Optional[str] = None,
+    toolsets_override: Optional[Iterable[str]] = None,
+) -> Optional[dict[str, Any]]:
+    try:
+        required = _kb.normalize_required_worker_capabilities(task.required_capabilities)
+    except ValueError as exc:
+        values = sorted(str(value) for value in (task.required_capabilities or []))
+        return {
+            "task_id": task.id, "assignee": assignee or task.assignee,
+            "reason": "invalid_required_capabilities",
+            "reason_code": "invalid_required_capabilities",
+            "missing_capabilities": values, "required_capabilities": values,
+            "available_capabilities": [], "detail": str(exc),
+        }
+    if not required:
+        return None
+    candidate = str(assignee or task.assignee or "").strip()
+    tools = _resolve_worker_capability_tools(
+        candidate, toolsets_override=toolsets_override,
+    ) if candidate else None
+    if tools is None:
+        return {
+            "task_id": task.id, "assignee": candidate or None,
+            "reason": "missing_capabilities", "reason_code": "worker_toolsets_unresolved",
+            "missing_capabilities": list(required), "required_capabilities": list(required),
+            "available_capabilities": [],
+        }
+    available: set[str] = set()
+    if {"terminal", "process_manage"} & tools:
+        available.update({"terminal", "local_file_hash"})
+    if {"read_file", "search_files"} & tools:
+        available.add("local_file_read")
+    if {"kanban_attach", "kanban_attach_url"} & tools:
+        available.add("task_attachment_write")
+    if task.workspace_kind in _kb.VALID_WORKSPACE_KINDS and (
+        {"terminal", "process_manage", "read_file", "search_files"} & tools
+    ):
+        available.add("workspace_access")
+    missing = sorted(set(required) - available)
+    if not missing:
+        return None
+    return {
+        "task_id": task.id, "assignee": candidate or None,
+        "reason": "missing_capabilities", "reason_code": "missing_worker_capabilities",
+        "missing_capabilities": missing, "required_capabilities": list(required),
+        "available_capabilities": sorted(available),
+    }
 _retagged_workspace_roots: set[str] = set()
 
 
@@ -2670,7 +2798,10 @@ def _retag_legacy_worker_sessions(workspaces_root_path: str) -> None:
         _kb._log.debug("kanban worker: legacy session retag skipped (%s)", exc)
 
 
-def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> list[str]:
+def _worker_argv(
+    task: Task, profile_arg: str, hermes_home: Optional[str],
+    worker_toolsets: Optional[Iterable[str]] = None,
+) -> list[str]:
     """Build the ``hermes -p <profile> --cli ... chat -q ...`` worker command."""
     cmd = [
         *_resolve_hermes_argv(),
@@ -2698,9 +2829,12 @@ def _worker_argv(task: Task, profile_arg: str, hermes_home: Optional[str]) -> li
     # model at a different depth.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(hermes_home)
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    pinned_toolsets = (
+        _normalize_worker_toolset_override(worker_toolsets)
+        if worker_toolsets is not None else _resolve_worker_cli_toolsets(hermes_home)
+    )
+    if pinned_toolsets is not None:
+        cmd.extend(["--toolsets", ",".join(pinned_toolsets)])
     cmd.extend(["chat", "-q", f"work kanban task {task.id}"])
     # goal_mode rides the same `-q` path: cli.py runs the judge loop there too, so the
     # worker log keeps its live tool feed (forcing -Q blanked it).
@@ -2758,7 +2892,10 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
     ).argv
 
 
-def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -> Optional[int]:
+def _default_spawn(
+    task: Task, workspace: str, *, board: Optional[str] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
+) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
     Returns the child's PID so the dispatcher can detect crashes before the
@@ -2867,7 +3004,9 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))
+    cmd = _worker_argv(
+        task, profile_arg, env.get("HERMES_HOME"), worker_toolsets=worker_toolsets,
+    )
     # A worker spawned by a managed systemd gateway must leave the gateway's
     # cgroup before startup; otherwise restarting the service kills the worker
     # that is performing the handoff.
