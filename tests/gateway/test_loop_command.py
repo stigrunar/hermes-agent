@@ -2,7 +2,7 @@
 
 import logging
 import time
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
@@ -129,6 +129,67 @@ async def test_post_turn_loop_completion_completes_inflight_tick(loop_env):
     )
     reloaded = loops.load_loop("sid-gateway-loop")
     assert reloaded.status == "done"
+
+
+@pytest.mark.asyncio
+async def test_post_turn_completion_preserves_requested_interval_floor(loop_env):
+    runner = _make_runner()
+    clock = [100.0]
+    with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+        await GatewayRunner._handle_loop_command(
+            runner, _make_event("/loop 30m poll CI")
+        )
+        mgr = loops.LoopManager(session_id="sid-gateway-loop")
+        assert mgr.fire_tick() is not None
+
+        # Model a quick gateway turn: completion must not make the next
+        # watcher retry legal before the requested 30-minute floor.
+        clock[0] = 105.0
+        await GatewayRunner._post_turn_loop_completion(
+            runner,
+            session_entry=_FakeSessionEntry(),
+            source=None,
+            final_response="still working",
+        )
+
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded is not None
+    assert reloaded.not_before_at == 1900.0
+    assert reloaded.next_due_at == 1905.0
+
+
+@pytest.mark.asyncio
+async def test_gateway_watcher_honors_not_before_on_retry(loop_env):
+    runner = _make_runner()
+    runner._running = True
+    runner._warm_goals_session_db = AsyncMock()
+    state = loops.LoopManager(session_id="sid-gateway-loop").set(
+        "poll CI",
+        interval_seconds=1800,
+        route={"platform": "discord", "chat_id": "chat-loop"},
+    )
+    state.next_due_at = 100.0
+    state.not_before_at = 1900.0
+    loops.save_loop("sid-gateway-loop", state)
+
+    async def stop_after_scan(delay):
+        if delay != 5:
+            runner._running = False
+
+    with (
+        patch("gateway.run.asyncio.sleep", side_effect=stop_after_scan),
+        patch("gateway.run.time.time", return_value=105.0),
+        patch(
+            "hermes_cli.loops.list_active_loops",
+            return_value=[("sid-gateway-loop", state)],
+        ),
+    ):
+        await GatewayRunner._loop_wakeup_watcher(runner, interval=0)
+
+    reloaded = loops.load_loop("sid-gateway-loop")
+    assert reloaded is not None
+    assert reloaded.ticks_fired == 0
+    assert reloaded.awaiting_response is False
 
 
 @pytest.mark.asyncio

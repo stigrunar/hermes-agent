@@ -224,6 +224,7 @@ class TestLoopStateSerde:
             current_delay=300.0,
             times=5,
             until="ci is green",
+            not_before_at=1234.5,
             ticks_fired=2,
             route={"platform": "telegram", "chat_id": "123"},
         )
@@ -232,6 +233,7 @@ class TestLoopStateSerde:
         assert s2.interval_seconds == 300.0
         assert s2.times == 5
         assert s2.until == "ci is green"
+        assert s2.not_before_at == 1234.5
         assert s2.ticks_fired == 2
         assert s2.route == {"platform": "telegram", "chat_id": "123"}
 
@@ -353,6 +355,64 @@ class TestTickLifecycle:
         assert mgr.is_due() is False  # can't double-fire mid-turn
         assert mgr.fire_tick() is None
 
+    def test_requested_interval_is_hard_floor_when_live_delay_is_shorter(
+        self, hermes_home
+    ):
+        from hermes_cli.loops import LoopManager
+
+        clock = [100.0]
+        with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+            mgr = LoopManager(session_id="t3-floor")
+            state = mgr.set("poll", interval_seconds=1800)
+            # Reproduce a stale/adapted live delay on a fixed-cadence row.
+            state.current_delay = 105.0
+
+            assert mgr.fire_tick() is not None
+            assert state.not_before_at == 1900.0
+            assert state.next_due_at == 1900.0
+
+            # A fast completion must not move the next wakeup before the
+            # requested interval from the fired tick.
+            clock[0] = 105.0
+            mgr.complete_tick("still working")
+            assert state.next_due_at >= state.not_before_at
+            assert state.next_due_at == 1905.0
+
+    def test_self_paced_floor_cannot_be_shortened(self, hermes_home):
+        from hermes_cli.loops import LoopManager, self_paced_floor_seconds
+
+        clock = [100.0]
+        with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+            mgr = LoopManager(session_id="t3-self-paced-floor")
+            state = mgr.set("watch", interval_seconds=None)
+            state.current_delay = 10.0
+
+            assert mgr.fire_tick() is not None
+            floor = float(self_paced_floor_seconds())
+            assert state.not_before_at == 100.0 + floor
+            assert state.next_due_at == state.not_before_at
+
+    def test_stale_watcher_abandon_cannot_erase_completion_schedule(
+        self, hermes_home
+    ):
+        from hermes_cli.loops import LoopManager, load_loop
+
+        clock = [100.0]
+        with patch("hermes_cli.loops.time.time", side_effect=lambda: clock[0]):
+            fired = LoopManager(session_id="t3-stale-abandon")
+            state = fired.set("poll", interval_seconds=1800)
+            assert fired.fire_tick() is not None
+
+            # The gateway watcher retains the manager used for fire_tick while
+            # the turn's post-hook completes through a fresh manager.
+            clock[0] = 105.0
+            completed = LoopManager(session_id="t3-stale-abandon")
+            completed.complete_tick("still working")
+            completed_due = load_loop("t3-stale-abandon").next_due_at
+
+            fired.abandon_tick()
+            assert load_loop("t3-stale-abandon").next_due_at == completed_due
+
     def test_slash_prompt_returned_raw(self, hermes_home):
         from hermes_cli.loops import LoopManager
 
@@ -472,18 +532,21 @@ class TestSelfPacedBackoff:
 
         # Tick 2: same response → backoff doubles.
         mgr.state.next_due_at = time.time() - 1
+        mgr.state.not_before_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor * 2
 
         # Tick 3: same again → doubles again.
         mgr.state.next_due_at = time.time() - 1
+        mgr.state.not_before_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 5")
         assert mgr.state.current_delay == floor * 4
 
         # Tick 4: changed response → snaps back to floor.
         mgr.state.next_due_at = time.time() - 1
+        mgr.state.not_before_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("queue depth is 2 — draining")
         assert mgr.state.current_delay == floor
@@ -498,6 +561,7 @@ class TestSelfPacedBackoff:
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:02:33")
         mgr.state.next_due_at = time.time() - 1
+        mgr.state.not_before_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:07:33")
         assert mgr.state.current_delay == floor * 2  # digest ignored the clock

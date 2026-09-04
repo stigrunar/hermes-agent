@@ -208,3 +208,21 @@ def test_tui_tick_noop_when_not_due(server, session):
 
     submit.assert_not_called()
     assert s["running"] is False
+
+
+def test_tui_tick_honors_requested_interval_floor(server, session):
+    sid, session_key, s = session
+    from hermes_cli.loops import LoopManager, save_loop
+
+    mgr = LoopManager(session_key)
+    state = mgr.set("poll", interval_seconds=1800)
+    state.next_due_at = time.time() - 1
+    state.not_before_at = time.time() + 1800
+    save_loop(session_key, state)
+
+    with patch.object(server, "_run_prompt_submit") as submit, \
+         patch.object(server, "_emit"):
+        server._maybe_fire_tui_loop_tick(sid, s)
+
+    submit.assert_not_called()
+    assert LoopManager(session_key).state.ticks_fired == 0

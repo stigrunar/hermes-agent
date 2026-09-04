@@ -24467,7 +24467,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 now = time.time()
                 for sid, state in list_active_loops():
-                    if state.awaiting_response or now < state.next_due_at:
+                    if state.awaiting_response or now < max(
+                        state.next_due_at, getattr(state, "not_before_at", 0.0)
+                    ):
                         continue
                     route = state.route or {}
                     platform_name = route.get("platform", "")
