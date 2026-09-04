@@ -125,6 +125,117 @@ def test_parallel_admission_requires_canonical_allowlist():
         )
 
 
+def test_explicit_worker_capability_rejection_precedes_claim_and_budget(
+    isolated_home, monkeypatch,
+):
+    """A missing terminal capability leaves a ready task completely untouched."""
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "dollyqa"
+    )
+    monkeypatch.setattr(
+        kb,
+        "_resolve_worker_cli_toolsets",
+        lambda _home: ["file", "kanban", "skills_readonly"],
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="QA scratch workspace",
+            assignee="dollyqa",
+            required_capabilities=["workspace", "terminal", "local_file_hash"],
+        )
+        spawn_calls = []
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id) or 101,
+            max_new_spawns=1,
+        )
+        task = kb.get_task(conn, task_id)
+
+        assert result.spawned == []
+        assert spawn_calls == []
+        assert len(result.capability_rejections) == 1
+        diagnostic = result.capability_rejections[0]
+        assert diagnostic["reason"] == "missing_capabilities"
+        assert diagnostic["missing_capabilities"] == [
+            "local_file_hash", "terminal"
+        ]
+        assert task is not None
+        assert task.required_capabilities == [
+            "local_file_hash", "terminal", "workspace_access"
+        ]
+        assert task.status == "ready"
+        assert task.claim_lock is None
+        assert task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0] == 0
+
+        repeated = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id) or 101,
+            max_new_spawns=1,
+        )
+        assert repeated.capability_rejections == result.capability_rejections
+        assert spawn_calls == []
+
+        monkeypatch.setattr(
+            kb,
+            "_resolve_worker_cli_toolsets",
+            lambda _home: ["file", "terminal", "kanban", "skills_readonly"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, workspace: spawn_calls.append(task.id) or 102,
+            max_new_spawns=1,
+        )
+        task = kb.get_task(conn, task_id)
+        assert len(result.spawned) == 1
+        assert spawn_calls == [task_id]
+        assert task is not None and task.status == "running"
+        assert task.current_run_id is not None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id = ? AND kind = 'claimed'",
+            (task_id,),
+        ).fetchone()[0] == 1
+
+
+def test_explicit_local_hash_and_attachment_capabilities_are_named(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr(
+        "hermes_cli.profiles.profile_exists", lambda name: name == "worker"
+    )
+    with kb.connect() as conn:
+        task_id = kb.create_task(
+            conn,
+            title="hash design artifact",
+            assignee="worker",
+            required_capabilities=["local_file_hash", "attachment_write"],
+        )
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args: 103,
+            worker_toolsets=["file_readonly", "skills_readonly"],
+            max_new_spawns=1,
+        )
+        task = kb.get_task(conn, task_id)
+
+        assert result.spawned == []
+        assert result.capability_rejections[0]["missing_capabilities"] == [
+            "local_file_hash", "task_attachment_write"
+        ]
+        assert task is not None and task.status == "ready"
+        assert task.claim_lock is None and task.current_run_id is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_runs WHERE task_id = ?", (task_id,)
+        ).fetchone()[0] == 0
+
+
 @pytest.mark.parametrize("allowlist", [None, [], "alice", [" alice"], ["alice", "alice"]])
 def test_adaptive_allowlist_is_strict_and_nonempty(
     isolated_home, monkeypatch, allowlist,

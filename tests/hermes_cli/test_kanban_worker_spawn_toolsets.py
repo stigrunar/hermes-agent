@@ -94,6 +94,18 @@ agent:
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
 
+    # An explicit dispatcher override must be the same toolset surface that
+    # admission evaluated, rather than only influencing the pre-claim check.
+    pid = kb._default_spawn(
+        _make_task(kb, assignee="elias"),
+        str(workspace),
+        worker_toolsets=["terminal"],
+        scope_config=kb._worker_scope_config({"worker_scope": {"enabled": False}}),
+    )
+    assert pid == 4242
+    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
+    assert pinned == ["terminal"]
+
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
     """The dispatcher's pre-``chat`` model flag must reach ``args.model``.

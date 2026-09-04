@@ -74,6 +74,9 @@ def _task_to_dict(t: kb.Task) -> dict[str, Any]:
         "mutation_scope": list(t.mutation_scope) if t.mutation_scope else [],
         "mutation_base_ref": t.mutation_base_ref,
         "resource_requirements": list(t.resource_requirements) if t.resource_requirements else [],
+        "required_capabilities": (
+            list(t.required_capabilities) if t.required_capabilities else []
+        ),
         "created_by": t.created_by,
         "created_at": t.created_at,
         "started_at": t.started_at,
@@ -399,6 +402,15 @@ def build_parser(parent_subparsers: argparse._SubParsersAction) -> argparse.Argu
     p_create.add_argument("--resource", action="append", default=None, dest="resource_requirements",
                           help="Shared execution resource required before worker start (repeatable), "
                                "for example deploy:private.")
+    p_create.add_argument(
+        "--capability", action="append", default=None,
+        dest="required_capabilities",
+        help=(
+            "Explicit worker capability required for dispatch (repeatable): "
+            "workspace_access, terminal, local_file_read, local_file_hash, "
+            "task_attachment_write."
+        ),
+    )
     p_create.add_argument("--tenant", default=None, help="Tenant namespace")
     p_create.add_argument("--priority", type=int, default=0, help="Priority tiebreaker")
     p_create.add_argument("--triage", action="store_true",
@@ -1713,6 +1725,7 @@ def _cmd_create(args: argparse.Namespace) -> int:
             mutation_scope=getattr(args, "mutation_scope", None),
             mutation_base_ref=getattr(args, "mutation_base_ref", None),
             resource_requirements=getattr(args, "resource_requirements", None),
+            required_capabilities=getattr(args, "required_capabilities", None),
             tenant=args.tenant,
             priority=args.priority,
             parents=tuple(args.parent or ()),
@@ -1909,6 +1922,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
         print(f"  mutation-base: {task.mutation_base_ref}")
     if task.resource_requirements:
         print(f"  resources:  {', '.join(task.resource_requirements)}")
+    if task.required_capabilities:
+        print(f"  capabilities: {', '.join(task.required_capabilities)}")
     if task.skills:
         print(f"  skills:    {', '.join(task.skills)}")
     if task.model_override:
@@ -2861,6 +2876,7 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             "admission_blocked": res.admission_blocked,
             "admission_reason": res.admission_reason,
             "admission_metrics": res.admission_metrics,
+            "capability_rejections": res.capability_rejections,
         }, indent=2))
         return 0
     print(f"Reclaimed:    {res.reclaimed}")
@@ -2895,6 +2911,12 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
             )
     for tid, who in res.skipped_worker_profile_not_allowed:
         print(f"Skipped ({who} is not admitted): {tid}")
+    for diagnostic in res.capability_rejections:
+        missing = ", ".join(diagnostic.get("missing_capabilities", [])) or "unknown"
+        print(
+            f"Skipped ({diagnostic.get('assignee') or '-'} missing worker "
+            f"capabilities: {missing}): {diagnostic.get('task_id')}"
+        )
     if res.skipped_nonspawnable:
         print(
             f"Skipped (non-spawnable assignee — terminal lane, OK): "

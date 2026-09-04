@@ -153,6 +153,73 @@ VALID_BLOCK_KINDS = {
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Explicit worker capabilities are intentionally a small, closed vocabulary.
+# They describe what a dispatched worker can do through its resolved toolsets;
+# they are never inferred from task title/body prose.
+WORKER_CAPABILITY_NAMES = frozenset({
+    "workspace_access",
+    "terminal",
+    "local_file_read",
+    "local_file_hash",
+    "task_attachment_write",
+})
+_WORKER_CAPABILITY_ALIASES = {
+    "workspace": "workspace_access",
+    "workspace_access": "workspace_access",
+    "workspace_materialization": "workspace_access",
+    "terminal": "terminal",
+    "command": "terminal",
+    "command_execution": "terminal",
+    "process_manage": "terminal",
+    "file": "local_file_read",
+    "file_read": "local_file_read",
+    "local_file": "local_file_read",
+    "local_file_read": "local_file_read",
+    "read_file": "local_file_read",
+    "search_files": "local_file_read",
+    "file_hash": "local_file_hash",
+    "local_hash": "local_file_hash",
+    "local_file_hash": "local_file_hash",
+    "attachment_write": "task_attachment_write",
+    "task_attachment": "task_attachment_write",
+    "task_attachment_write": "task_attachment_write",
+}
+
+
+def normalize_required_worker_capabilities(
+    capabilities: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize the explicit capability declarations stored on a task.
+
+    Unknown values and non-string entries are rejected rather than silently
+    becoming an unenforced requirement.  Empty input is represented as
+    ``None`` so legacy tasks and explicitly empty declarations share the
+    historical no-gate behavior.
+    """
+    if capabilities is None:
+        return None
+    if isinstance(capabilities, str):
+        values: Iterable[Any] = capabilities.split(",")
+    else:
+        values = capabilities
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"required worker capability must be a string, got {value!r}"
+            )
+        key = value.strip().casefold().replace("-", "_").replace(" ", "_")
+        if not key:
+            continue
+        canonical = _WORKER_CAPABILITY_ALIASES.get(key)
+        if canonical is None:
+            raise ValueError(
+                f"unknown worker capability {value!r}; expected one of "
+                f"{', '.join(sorted(WORKER_CAPABILITY_NAMES))}"
+            )
+        normalized.add(canonical)
+    return sorted(normalized) or None
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """Normalize a per-task reasoning effort into a storable level.
@@ -363,8 +430,21 @@ def _fire_dispatch_tick_hook(
             result.skipped_per_profile_capped,
             result.skipped_unassigned,
             result.skipped_nonspawnable,
+            result.capability_rejections,
         )):
             outcome = "idle"
+        elif result.capability_rejections and not any((
+            result.spawned,
+            result.reclaimed,
+            result.promoted,
+            result.reconciled_orphans,
+            result.crashed,
+            result.stale,
+            result.timed_out,
+            result.auto_blocked,
+            result.rate_limited,
+        )):
+            outcome = "capability_rejected"
         invoke_hook(
             "on_kanban_dispatch_tick",
             board=board,
@@ -1097,6 +1177,7 @@ class Task:
     mutation_scope: Optional[list[str]] = None
     mutation_base_ref: Optional[str] = None
     resource_requirements: Optional[list[str]] = None
+    required_capabilities: Optional[list[str]] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Unified non-success counter. Incremented on any of:
@@ -1202,6 +1283,24 @@ class Task:
                     ]
             except Exception:
                 resource_requirements_value = None
+        required_capabilities_value: Optional[list[str]] = None
+        if "required_capabilities" in keys and row["required_capabilities"]:
+            try:
+                parsed_capabilities = json.loads(row["required_capabilities"])
+                if isinstance(parsed_capabilities, list):
+                    try:
+                        required_capabilities_value = normalize_required_worker_capabilities(
+                            parsed_capabilities
+                        )
+                    except ValueError:
+                        # Keep malformed legacy rows readable.  Dispatch will
+                        # fail closed for an unknown declaration rather than
+                        # silently treating it as absent.
+                        required_capabilities_value = [
+                            str(item) for item in parsed_capabilities if item
+                        ] or None
+            except Exception:
+                required_capabilities_value = None
         return cls(
             id=row["id"],
             title=row["title"],
@@ -1233,6 +1332,7 @@ class Task:
                 row["mutation_base_ref"] if "mutation_base_ref" in keys else None
             ),
             resource_requirements=resource_requirements_value,
+            required_capabilities=required_capabilities_value,
             claim_lock=row["claim_lock"],
             claim_expires=row["claim_expires"],
             tenant=row["tenant"] if "tenant" in keys else None,
@@ -1487,6 +1587,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     mutation_scope       TEXT,
     mutation_base_ref    TEXT,
     resource_requirements TEXT,
+    -- Explicit worker capability requirements, stored as a JSON array.
+    -- NULL means this is a legacy/unconstrained task.
+    required_capabilities TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -3148,6 +3251,10 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
         _add_column_if_missing(
             conn, "tasks", "resource_requirements", "resource_requirements TEXT"
         )
+    if "required_capabilities" not in cols:
+        _add_column_if_missing(
+            conn, "tasks", "required_capabilities", "required_capabilities TEXT"
+        )
     if "idempotency_key" not in cols:
         _add_column_if_missing(
             conn, "tasks", "idempotency_key", "idempotency_key TEXT"
@@ -3933,6 +4040,7 @@ def create_task(
     mutation_scope: Optional[Iterable[str]] = None,
     mutation_base_ref: Optional[str] = None,
     resource_requirements: Optional[Iterable[str]] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
     execution: Optional[Mapping[str, Any]] = None,
 ) -> str:
@@ -3958,6 +4066,10 @@ def create_task(
     each name to ``hermes --skills ...``. Use this to pin a task to a
     specialist skill (e.g. ``skills=["translation"]`` so the worker loads the
     translation skill regardless of the profile's default config).
+
+    ``required_capabilities`` is an explicit, validated list of worker
+    capabilities. It is persisted independently from shared ``resource``
+    leases and is never inferred from title/body text.
 
     ``model_override`` / ``provider_override`` pin the worker to a specific
     model (and optionally its provider) without touching the profile's
@@ -4320,6 +4432,9 @@ def create_task(
     normalized_resource_requirements = _odb.normalize_resource_requirements(
         resource_requirements
     )
+    normalized_required_capabilities = normalize_required_worker_capabilities(
+        required_capabilities
+    )
     if normalized_resource_requirements and not outcome_id:
         raise ValueError("resource_requirements requires outcome_id")
     if normalized_mutation_scope is not None:
@@ -4404,11 +4519,12 @@ def create_task(
                         branch_name, project_id, outcome_id,
                         conversation_lane_id, topic_target, parent_execution_id,
                         mutation_repository, mutation_scope, mutation_base_ref,
-                        resource_requirements, tenant, idempotency_key, max_runtime_seconds,
+                        resource_requirements, required_capabilities, tenant,
+                        idempotency_key, max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, execution_preflight
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id,
@@ -4432,6 +4548,8 @@ def create_task(
                         normalized_mutation_base_ref,
                         json.dumps(normalized_resource_requirements)
                         if normalized_resource_requirements else None,
+                        json.dumps(normalized_required_capabilities)
+                        if normalized_required_capabilities else None,
                         tenant,
                         idempotency_key,
                         int(max_runtime_seconds) if max_runtime_seconds is not None else None,
@@ -4476,6 +4594,7 @@ def create_task(
                         "mutation_scope": normalized_mutation_scope,
                         "mutation_base_ref": normalized_mutation_base_ref,
                         "resource_requirements": normalized_resource_requirements or None,
+                        "required_capabilities": normalized_required_capabilities or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -10240,6 +10359,8 @@ class DispatchResult:
     """Sanitized prepared-route receipts for remote Codex supervisors."""
     remote_deferred: list[tuple[str, str]] = field(default_factory=list)
     """Eligible tasks deferred because selector/preflight was not safe."""
+    capability_rejections: list[dict[str, Any]] = field(default_factory=list)
+    """Stable pre-claim diagnostics for explicit worker capability misses."""
 
 
 def _record_worker_profile_admission_skip(
@@ -10251,6 +10372,18 @@ def _record_worker_profile_admission_skip(
         result.skipped_worker_profile_not_allowed.append((task_id, assignee))
     else:
         result.skipped_worker_profile_not_allowed_truncated = True
+
+
+def _record_worker_capability_rejection(
+    result: DispatchResult, diagnostic: Optional[Mapping[str, Any]],
+) -> None:
+    """Add one bounded, deterministic capability diagnostic per task/tick."""
+    if not diagnostic:
+        return
+    task_id = str(diagnostic.get("task_id") or "")
+    if any(str(item.get("task_id") or "") == task_id for item in result.capability_rejections):
+        return
+    result.capability_rejections.append(dict(diagnostic))
 
 
 # Bounded registry of recently-reaped worker child exits, populated by the
@@ -13885,6 +14018,7 @@ def _dispatch_preview(
     default_assignee: Optional[str],
     max_in_progress_per_profile: Optional[int],
     allowed_worker_profiles: Optional[Iterable[str]],
+    worker_toolsets: Optional[Iterable[str]] = None,
 ) -> DispatchResult:
     """Build a read-only dispatch preview from a private SQLite snapshot.
 
@@ -13918,6 +14052,7 @@ def _dispatch_preview(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 allowed_worker_profiles=allowed_worker_profiles,
+                worker_toolsets=worker_toolsets,
             )
             return result
         finally:
@@ -13945,6 +14080,7 @@ def _dispatch_preview(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 allowed_worker_profiles=allowed_worker_profiles,
+                worker_toolsets=worker_toolsets,
             )
             return result
         finally:
@@ -13961,6 +14097,7 @@ def _populate_dispatch_preview(
     default_assignee: Optional[str],
     max_in_progress_per_profile: Optional[int],
     allowed_worker_profiles: Optional[Iterable[str]],
+    worker_toolsets: Optional[Iterable[str]] = None,
 ) -> None:
     """Enumerate would-be starts from an already-promoted preview database."""
     if max_in_progress is not None and (
@@ -13978,7 +14115,7 @@ def _populate_dispatch_preview(
         if allowed_worker_profiles is not None else None
     )
     rows = conn.execute(
-        "SELECT id, assignee, status FROM tasks "
+        "SELECT * FROM tasks "
         "WHERE status IN ('ready', 'review') AND claim_lock IS NULL "
         "ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, "
         "priority DESC, created_at ASC"
@@ -14015,6 +14152,15 @@ def _populate_dispatch_preview(
             _record_worker_profile_admission_skip(
                 result, row["id"], assignee
             )
+            continue
+        candidate_task = Task.from_row(row)
+        capability_diagnostic = _worker_capabilities_for_task(
+            candidate_task,
+            assignee=assignee,
+            toolsets_override=worker_toolsets,
+        )
+        if capability_diagnostic is not None:
+            _record_worker_capability_rejection(result, capability_diagnostic)
             continue
         if per_profile_cap is not None:
             current = per_profile_running.get(assignee, 0)
@@ -14293,6 +14439,7 @@ def dispatch_once(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     allowed_worker_profiles: Optional[Iterable[str]] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     effective_config: Optional[Mapping[str, Any]] = None,
     selected_boards: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
@@ -14315,6 +14462,7 @@ def dispatch_once(
     effective_config = _canonical_dispatch_config(
         effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress
     )
+    worker_toolsets = _normalize_worker_toolset_override(worker_toolsets)
     parallel_dispatch = _parallel_dispatch_required(
         effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress
     )
@@ -14359,6 +14507,7 @@ def dispatch_once(
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
             allowed_worker_profiles=allowed_worker_profiles,
+            worker_toolsets=worker_toolsets,
         )
 
     try:
@@ -14380,6 +14529,7 @@ def dispatch_once(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 allowed_worker_profiles=allowed_worker_profiles,
+                worker_toolsets=worker_toolsets,
                 reconcile_orphans=reconcile_orphans,
             )
         _fire_dispatch_tick_hook(result, board=board, dry_run=False)
@@ -14410,6 +14560,7 @@ def dispatch_once(
                         default_assignee=default_assignee,
                         max_in_progress_per_profile=max_in_progress_per_profile,
                         allowed_worker_profiles=allowed_worker_profiles,
+                        worker_toolsets=worker_toolsets,
                         selected_boards=selected_boards,
                         parallel_dispatch=parallel_dispatch,
                         reconcile_orphans=reconcile_orphans,
@@ -14437,6 +14588,7 @@ def _dispatch_once_with_board_lock(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     allowed_worker_profiles: Optional[Iterable[str]] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     selected_boards: Optional[Iterable[str]] = None,
     parallel_dispatch: bool = False,
     reconcile_orphans: bool = True,
@@ -14459,6 +14611,7 @@ def _dispatch_once_with_board_lock(
         default_assignee=default_assignee,
         max_in_progress_per_profile=max_in_progress_per_profile,
         allowed_worker_profiles=allowed_worker_profiles,
+        worker_toolsets=worker_toolsets,
         selected_boards=selected_boards,
         parallel_dispatch=parallel_dispatch,
         reconcile_orphans=reconcile_orphans,
@@ -14481,6 +14634,7 @@ def _dispatch_once_locked(
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
     allowed_worker_profiles: Optional[Iterable[str]] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     selected_boards: Optional[Iterable[str]] = None,
     initial_occupancy: Optional[Mapping[str, Any]] = None,
     parallel_dispatch: Optional[bool] = None,
@@ -14526,6 +14680,7 @@ def _dispatch_once_locked(
     board. When omitted, the current-board resolution chain is used.
     """
     result = _dispatch_result if _dispatch_result is not None else DispatchResult()
+    worker_toolsets = _normalize_worker_toolset_override(worker_toolsets)
     if parallel_dispatch is None:
         parallel_dispatch = _parallel_dispatch_required(
             max_spawn=max_spawn, max_in_progress=max_in_progress
@@ -14680,6 +14835,7 @@ def _dispatch_once_locked(
                 default_assignee=default_assignee,
                 max_in_progress_per_profile=max_in_progress_per_profile,
                 allowed_worker_profiles=allowed_worker_profiles,
+                worker_toolsets=worker_toolsets,
                 selected_boards=selected_boards,
                 initial_occupancy=initial_occupancy,
                 parallel_dispatch=parallel_dispatch,
@@ -14851,6 +15007,35 @@ def _dispatch_once_locked(
         ):
             _per_profile_running[prow["assignee"]] = int(prow["n"])
 
+    capability_cache: dict[tuple[str, str], Optional[dict[str, Any]]] = {}
+
+    def _capability_admitted(row, assignee: Optional[str]) -> bool:
+        """Check one candidate before it can consume a start slot."""
+        candidate = str(assignee or "").strip()
+        key = (str(row["id"]), candidate)
+        if key not in capability_cache:
+            task = get_task(conn, str(row["id"]))
+            diagnostic = (
+                _worker_capabilities_for_task(
+                    task,
+                    assignee=candidate,
+                    toolsets_override=worker_toolsets,
+                )
+                if task is not None else None
+            )
+            capability_cache[key] = diagnostic
+        diagnostic = capability_cache[key]
+        if diagnostic is not None:
+            _record_worker_capability_rejection(result, diagnostic)
+            _log.info(
+                "kanban dispatch: candidate rejected before claim task=%s "
+                "assignee=%s reason=%s missing_capabilities=%s",
+                row["id"], candidate or None, diagnostic.get("reason_code"),
+                ",".join(diagnostic.get("missing_capabilities", [])),
+            )
+            return False
+        return True
+
     # Hold a ready slot only for review work that can actually consume it.
     # These gates intentionally mirror the review loop so an excluded,
     # profile-capped, or respawn-guarded review cannot starve eligible ready
@@ -14867,6 +15052,8 @@ def _dispatch_once_locked(
             if allowed_profiles is not None and assignee not in allowed_profiles:
                 continue
             if _rpe is not None and not _rpe(assignee):
+                continue
+            if not _capability_admitted(review_row, assignee):
                 continue
             if (
                 _per_profile_cap is not None
@@ -14941,6 +15128,8 @@ def _dispatch_once_locked(
         ) -> Optional[str]:
             assignee = _eligible_assignee(row, allow_default=allow_default)
             if assignee is None:
+                return None
+            if not _capability_admitted(row, assignee):
                 return None
             if _per_profile_cap is not None:
                 current = simulated_profile_running.get(assignee, 0)
@@ -15110,6 +15299,8 @@ def _dispatch_once_locked(
             # of human-pulled work.
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if not _capability_admitted(row, row_assignee):
+            continue
         # Per-profile concurrency cap (#21582): even if there's global
         # headroom, refuse to spawn for an assignee that's already at
         # its in-flight cap. Prevents one profile's local model / API
@@ -15192,6 +15383,8 @@ def _dispatch_once_locked(
                 spawn_kwargs = {}
                 if "board" in sig.parameters:
                     spawn_kwargs["board"] = board
+                if "worker_toolsets" in sig.parameters:
+                    spawn_kwargs["worker_toolsets"] = worker_toolsets
                 if "require_scope" in sig.parameters:
                     # Native launches use the effective overlap decision;
                     # arbitrary custom spawn hooks retain the historical
@@ -15303,6 +15496,8 @@ def _dispatch_once_locked(
         if profile_exists is not None and not profile_exists(row["assignee"]):
             result.skipped_nonspawnable.append(row["id"])
             continue
+        if not _capability_admitted(row, row["assignee"]):
+            continue
         if _per_profile_cap is not None:
             current = _per_profile_running.get(row["assignee"], 0)
             if current >= _per_profile_cap:
@@ -15369,6 +15564,8 @@ def _dispatch_once_locked(
                 spawn_kwargs = {}
                 if "board" in sig.parameters:
                     spawn_kwargs["board"] = board
+                if "worker_toolsets" in sig.parameters:
+                    spawn_kwargs["worker_toolsets"] = worker_toolsets
                 if "require_scope" in sig.parameters:
                     spawn_kwargs["require_scope"] = (
                         _native_scope_admission_required()
@@ -15689,6 +15886,151 @@ def _resolve_worker_cli_toolsets(hermes_home: Optional[str]) -> Optional[list[st
             exc,
         )
         return None
+
+
+def _normalize_worker_toolset_override(
+    toolsets: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize an explicit dispatcher toolset override for one launch."""
+    if toolsets is None:
+        return None
+    values = toolsets.split(",") if isinstance(toolsets, str) else toolsets
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        name = str(value or "").strip()
+        if not name or name in seen:
+            continue
+        seen.add(name)
+        normalized.append(name)
+    return normalized
+
+
+def _resolve_worker_capability_tools(
+    assignee: str,
+    *,
+    toolsets_override: Optional[Iterable[str]] = None,
+) -> Optional[set[str]]:
+    """Resolve the concrete tool names available to one worker candidate.
+
+    The profile's ``platform_toolsets.cli`` is the source of truth used by
+    ``_default_spawn``. An explicit dispatch override wins and is resolved by
+    the same ``toolsets.resolve_toolset`` implementation. Returning ``None``
+    means the effective toolset surface could not be resolved; callers fail
+    closed only for tasks that declare requirements.
+    """
+    toolset_names = _normalize_worker_toolset_override(toolsets_override)
+    if toolset_names is None:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+
+            profile_home = resolve_profile_env(str(assignee))
+        except Exception:
+            # Keep test/custom-profile environments useful while preserving a
+            # fail-closed result when the profile config itself is unreadable.
+            try:
+                from hermes_constants import get_hermes_home
+
+                root = Path(get_hermes_home())
+                profile_home = str(
+                    root if str(assignee).casefold() == "default"
+                    else root / "profiles" / str(assignee).strip().lower()
+                )
+            except Exception:
+                return None
+        toolset_names = _resolve_worker_cli_toolsets(profile_home)
+        if toolset_names is None:
+            return None
+
+    try:
+        from toolsets import resolve_toolset
+    except Exception:
+        return None
+    tools: set[str] = set()
+    for name in toolset_names:
+        normalized_name = str(name).strip()
+        if not normalized_name:
+            continue
+        # Explicit tool names are accepted in addition to named bundles. This
+        # keeps the override faithful when a plugin exposes a single tool.
+        tools.add(normalized_name.casefold())
+        try:
+            tools.update(str(tool).casefold() for tool in resolve_toolset(normalized_name))
+        except Exception:
+            continue
+    return tools
+
+
+def _worker_capabilities_for_task(
+    task: Task,
+    *,
+    assignee: Optional[str] = None,
+    toolsets_override: Optional[Iterable[str]] = None,
+) -> Optional[dict[str, Any]]:
+    """Return a stable pre-claim rejection diagnostic, or ``None``.
+
+    ``None`` is the legacy/compatible result. For an explicit requirement,
+    diagnostics always carry sorted canonical names and a machine-readable
+    reason code. No database writes occur here.
+    """
+    try:
+        required = normalize_required_worker_capabilities(task.required_capabilities)
+    except ValueError as exc:
+        return {
+            "task_id": task.id,
+            "assignee": assignee or task.assignee,
+            "reason": "invalid_required_capabilities",
+            "reason_code": "invalid_required_capabilities",
+            "missing_capabilities": sorted(
+                str(value) for value in (task.required_capabilities or [])
+            ),
+            "required_capabilities": sorted(
+                str(value) for value in (task.required_capabilities or [])
+            ),
+            "available_capabilities": [],
+            "detail": str(exc),
+        }
+    if not required:
+        return None
+    candidate = str(assignee or task.assignee or "").strip()
+    tools = _resolve_worker_capability_tools(
+        candidate, toolsets_override=toolsets_override
+    ) if candidate else None
+    if tools is None:
+        return {
+            "task_id": task.id,
+            "assignee": candidate or None,
+            "reason": "missing_capabilities",
+            "reason_code": "worker_toolsets_unresolved",
+            "missing_capabilities": list(required),
+            "required_capabilities": list(required),
+            "available_capabilities": [],
+        }
+
+    available: set[str] = set()
+    if {"terminal", "process_manage"} & tools:
+        available.update({"terminal", "local_file_hash"})
+    if {"read_file", "search_files"} & tools:
+        available.add("local_file_read")
+    if {"kanban_attach", "kanban_attach_url"} & tools:
+        available.add("task_attachment_write")
+    if task.workspace_kind in VALID_WORKSPACE_KINDS and (
+        {"terminal", "process_manage", "read_file", "search_files"} & tools
+    ):
+        available.add("workspace_access")
+
+    missing = sorted(set(required) - available)
+    if not missing:
+        return None
+    return {
+        "task_id": task.id,
+        "assignee": candidate or None,
+        "reason": "missing_capabilities",
+        "reason_code": "missing_worker_capabilities",
+        "missing_capabilities": missing,
+        "required_capabilities": list(required),
+        "available_capabilities": sorted(available),
+    }
 
 
 _retagged_workspace_roots: set[str] = set()
@@ -17200,6 +17542,7 @@ def _default_spawn(
     workspace: str,
     *,
     board: Optional[str] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
     require_scope: bool = False,
     scope_config: Optional[_WorkerScopeConfig] = None,
     launch_intent_fn=None,
@@ -17363,9 +17706,13 @@ def _default_spawn(
     # branch, not a nested one.
     if task.reasoning_effort:
         cmd.extend(["--reasoning", task.reasoning_effort])
-    worker_toolsets = _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
-    if worker_toolsets:
-        cmd.extend(["--toolsets", ",".join(worker_toolsets)])
+    pinned_toolsets = (
+        _normalize_worker_toolset_override(worker_toolsets)
+        if worker_toolsets is not None
+        else _resolve_worker_cli_toolsets(env.get("HERMES_HOME"))
+    )
+    if pinned_toolsets is not None:
+        cmd.extend(["--toolsets", ",".join(pinned_toolsets)])
     cmd.extend([
         "chat",
         "-q", prompt,
