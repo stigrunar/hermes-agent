@@ -1962,6 +1962,30 @@ def _handle_create(args: dict, **kw) -> str:
             "assignee is required — name the profile that should execute this "
             "task (the dispatcher will only spawn tasks with an assignee)"
         )
+    required_capabilities = args.get("required_capabilities")
+    if isinstance(required_capabilities, str):
+        # Preserve the legacy single-value form while keeping the tool's
+        # structured schema array-shaped.
+        required_capabilities = [required_capabilities]
+    if required_capabilities is not None and not isinstance(
+        required_capabilities, (list, tuple)
+    ):
+        return tool_error(
+            "required_capabilities must be a list of capability names, "
+            f"got {type(required_capabilities).__name__}"
+        )
+    if required_capabilities is not None:
+        try:
+            # The DB normalizer is the single capability vocabulary/validation
+            # boundary. Pass the caller's explicit values through unchanged;
+            # create_task performs the canonical persistence normalization.
+            from hermes_cli import kanban_db as capability_kb
+
+            capability_kb.normalize_required_worker_capabilities(
+                required_capabilities
+            )
+        except (TypeError, ValueError) as exc:
+            return tool_error(f"required_capabilities: {exc}")
     body = args.get("body")
     parents = args.get("parents") or []
     tenant = args.get("tenant") or os.environ.get("HERMES_TENANT")
@@ -2124,6 +2148,7 @@ def _handle_create(args: dict, **kw) -> str:
                 mutation_repository=mutation_repository,
                 mutation_scope=mutation_scope,
                 mutation_base_ref=mutation_base_ref,
+                required_capabilities=required_capabilities,
                 project_source_task_id=project_source_task_id,
                 triage=triage,
                 idempotency_key=idempotency_key,
@@ -2863,6 +2888,25 @@ _ROADMAP_BINDING_SCHEMA = {
     ],
 }
 
+
+def _required_capabilities_schema() -> dict[str, Any]:
+    """Build the capability field from Kanban's canonical vocabulary."""
+    from hermes_cli import kanban_db as kb
+
+    return {
+        "type": "array",
+        "items": {
+            "type": "string",
+            "enum": sorted(kb.WORKER_CAPABILITY_NAMES),
+        },
+        "description": (
+            "Explicit worker capabilities required before dispatch. Use only "
+            "the canonical capability names; do not infer requirements from "
+            "task prose."
+        ),
+    }
+
+
 KANBAN_CREATE_SCHEMA = {
     "name": "kanban_create",
     "description": (
@@ -3255,6 +3299,7 @@ KANBAN_CREATE_SCHEMA = {
                     "true. Defaults to the goal-engine default (20)."
                 ),
             },
+            "required_capabilities": _required_capabilities_schema(),
             "model": {
                 "type": "string",
                 "description": (

@@ -443,6 +443,79 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_create_schema_declares_canonical_required_capabilities():
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    capability_schema = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
+        "required_capabilities"
+    ]
+    assert capability_schema["type"] == "array"
+    assert capability_schema["items"]["type"] == "string"
+    assert set(capability_schema["items"]["enum"]) == set(
+        kb.WORKER_CAPABILITY_NAMES
+    )
+
+
+def test_create_forwards_and_persists_required_capabilities(monkeypatch, worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    explicit = ["workspace_access", "terminal"]
+    forwarded = {}
+    create_task = kb.create_task
+
+    def recording_create_task(conn, **kwargs):
+        forwarded["required_capabilities"] = kwargs.get("required_capabilities")
+        return create_task(conn, **kwargs)
+
+    monkeypatch.setattr(kb, "create_task", recording_create_task)
+    result = json.loads(kt._handle_create({
+        "title": "capability child",
+        "assignee": "peer",
+        "required_capabilities": explicit,
+    }))
+
+    assert result["ok"] is True
+    assert forwarded["required_capabilities"] == explicit
+
+    conn = kb.connect()
+    try:
+        child = kb.get_task(conn, result["task_id"])
+        assert child is not None
+        assert child.required_capabilities == ["terminal", "workspace_access"]
+    finally:
+        conn.close()
+
+
+def test_create_rejects_invalid_required_capability_before_creation(worker_env):
+    from hermes_cli import kanban_db as kb
+    from tools import kanban_tools as kt
+
+    conn = kb.connect()
+    try:
+        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+
+    result = json.loads(kt._handle_create({
+        "title": "invalid capability child",
+        "assignee": "peer",
+        "required_capabilities": ["not_a_worker_capability"],
+    }))
+
+    assert "error" in result
+    assert "required_capabilities" in result["error"]
+    assert "not_a_worker_capability" in result["error"]
+
+    conn = kb.connect()
+    try:
+        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+    finally:
+        conn.close()
+    assert after == before
+
+
 def _dollycode_execution_contract():
     return {
         "outcome": "Ship one bounded parser fix",
