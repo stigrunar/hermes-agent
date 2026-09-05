@@ -941,6 +941,9 @@ def get_all_toolsets() -> Dict[str, Dict[str, Any]]:
         toolset = get_toolset(display_name)
         if toolset:
             result[display_name] = toolset
+    # Static names an MCP server also aliases show the merged view get_toolset() resolves.
+    for name in TOOLSETS.keys() & aliases.keys():
+        result[name] = get_toolset(name) or result[name]
     return result
 
 
