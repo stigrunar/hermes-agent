@@ -77,19 +77,31 @@ def _patch_managed_uv(request):
 
 @pytest.fixture(autouse=True)
 def _patch_gateway_discovery():
-    """Keep cmd_update's gateway auto-restart phase off this machine's gateways.
+    """Keep every update test off this machine's gateway/Desktop processes.
 
-    The restart phase used to swallow every exception at debug level, so these
-    end-to-end tests never noticed it touching real gateway discovery. Since
-    the phase is surfaced (#78574: an aborted restart now fails the update),
-    an unmocked ``find_gateway_pids`` on a box with a live gateway reaches the
-    conftest live-system guard and turns into a spurious ``sys.exit(1)``.
-    Discovery returning nothing makes the phase a clean no-op for every test
-    in this module (none of them assert on gateway restarts).
+    The update path plans and verifies the live fleet in addition to its
+    restart phase.  These tests exercise update bookkeeping, not host-process
+    management, so all fleet/Desktop probes are replaced with empty/no-op
+    results.  The module purge is also disabled: it would evict the patched
+    ``hermes_cli.gateway`` module before the restart imports it again.
     """
+    from hermes_cli.update_inventory import UpdatePlan
+
     with patch("hermes_cli.gateway.find_gateway_pids", return_value=[]), \
          patch("hermes_cli.gateway.supports_systemd_services", return_value=False), \
-         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]):
+         patch("hermes_cli.gateway.is_macos", return_value=False), \
+         patch("hermes_cli.gateway.is_windows", return_value=False), \
+         patch("hermes_cli.gateway.find_profile_gateway_processes", return_value=[]), \
+         patch("hermes_cli.gateway._get_service_pids", return_value=set()), \
+         patch("hermes_cli.update_inventory.collect_runtime_inventory", return_value=UpdatePlan()), \
+         patch("hermes_cli.update_receipt.collect_fleet_versions", return_value=[]), \
+         patch("hermes_cli.update_cmd._finish_dashboard_update_cleanup"), \
+         patch("hermes_cli.update_cmd._surviving_pre_update_serve_runtimes", return_value=[]), \
+         patch("hermes_cli.update_cmd._pending_fleet_restart_needed", return_value=False), \
+         patch("hermes_cli.update_cmd._purge_stale_hermes_modules"), \
+         patch("hermes_cli.main._purge_stale_hermes_modules"), \
+         patch("hermes_cli.main._pause_windows_gateways_for_update", return_value=None), \
+         patch("hermes_cli.main._resume_windows_gateways_after_update", return_value=None):
         yield
 
 

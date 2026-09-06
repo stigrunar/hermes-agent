@@ -1061,7 +1061,14 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     runner._begin_session_run_generation = lambda session_key: 1
     runner._is_session_run_current = lambda session_key, generation: True
     runner._invalidate_session_run_generation = lambda *a, **k: 0
-    runner._claim_active_session_slot = lambda session_key, source: (object(), None)
+    # The real pipeline can briefly route a late-arriving event through the
+    # active-slot interruption path while the pre-claimed resume turn drains.
+    # Use a lease-shaped double so that path remains harmless and this test
+    # does not depend on a bare object accidentally standing in for an agent.
+    active_session_lease = MagicMock()
+    runner._claim_active_session_slot = (
+        lambda session_key, source: (active_session_lease, None)
+    )
     runner._active_session_leases = {}
     runner._busy_ack_ts = {}
     runner._post_turn_goal_continuation = AsyncMock()
