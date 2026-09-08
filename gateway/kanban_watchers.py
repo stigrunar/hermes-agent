@@ -143,6 +143,11 @@ class GatewayKanbanWatchersMixin:
         """Undo a claimed notification cursor after send failure."""
         self._kanban_sub_op(board, "rewind_notify_cursor", sub, claimed_cursor=claimed_cursor, old_cursor=old_cursor)
 
+    async def _deliver_outcome_owner_wakes(self, specs: list[dict[str, Any]]) -> None:
+        from gateway.kanban_outcome_owner_wake import deliver_outcome_owner_wakes
+
+        await deliver_outcome_owner_wakes(self, specs)
+
     async def _deliver_kanban_artifacts(self, *, adapter, chat_id: str, metadata: dict, event_payload: Optional[dict], task) -> None:
         """Upload artifact files referenced by a completed kanban task.
 

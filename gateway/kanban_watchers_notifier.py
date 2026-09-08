@@ -732,6 +732,19 @@ class _KanbanNotification:
         return True
 
     async def deliver(self) -> None:
+        from gateway.kanban_outcome_owner_wake import resolve_outcome_owner_wake_spec
+
+        owner_specs = []
+        if self.task is not None and self.task.project_id and self.task.outcome_id:
+            for event in self.d["events"]:
+                spec = await _to_thread_process_service(
+                    resolve_outcome_owner_wake_spec, self.board_slug, self.task, event,
+                )
+                if spec is not None:
+                    owner_specs.append(spec)
+        if any(spec.get("status") == "retry" for spec in owner_specs):
+            await self.rewind()
+            return
         try:
             self.plat = self.platform_cls(self.platform_str)
         except ValueError:
@@ -772,7 +785,8 @@ class _KanbanNotification:
                 self.wake_handoff = self.wake_review_detail = ""
                 for ev in events:
                     self.format_event(ev)
-                self.build_wake_text()
+                if not owner_specs:
+                    self.build_wake_text()
                 if self.wake_kinds:
                     wake_payloads.append((self.synth, self.wake_diagnostic, self.wake_kinds))
             self.d = {**self.d, "events": original_events}
@@ -800,6 +814,8 @@ class _KanbanNotification:
 
         # Delivery complete: advance the cursor (the dedup mechanism).
         await self.advance()
+        if owner_specs:
+            await self.runner._deliver_outcome_owner_wakes(owner_specs)
         if not is_push:
             self.clear_failures()
         # Unsubscribe only on archive; ``done`` is reversible.
