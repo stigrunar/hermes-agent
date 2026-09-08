@@ -2016,6 +2016,8 @@ def _handle_create(args: dict, **kw) -> str:
     workspace_path = args.get("workspace_path")
     project_id = args.get("project") or args.get("project_id")
     outcome_id = args.get("outcome") or args.get("outcome_id")
+    conversation_lane_id = args.get("conversation_lane_id")
+    topic_target = args.get("topic_target")
     mutation_repository = args.get("mutation_repository")
     mutation_scope = args.get("mutation_scope")
     mutation_base_ref = args.get("mutation_base_ref")
@@ -2145,6 +2147,8 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=workspace_path,
                 project_id=project_id,
                 outcome_id=outcome_id,
+                conversation_lane_id=conversation_lane_id,
+                topic_target=topic_target,
                 mutation_repository=mutation_repository,
                 mutation_scope=mutation_scope,
                 mutation_base_ref=mutation_base_ref,
@@ -2177,6 +2181,8 @@ def _handle_create(args: dict, **kw) -> str:
                 workspace_path=new_task.workspace_path if new_task else None,
                 project_id=new_task.project_id if new_task else None,
                 outcome_id=new_task.outcome_id if new_task else None,
+                conversation_lane_id=new_task.conversation_lane_id if new_task else None,
+                topic_target=new_task.topic_target if new_task else None,
                 mutation_repository=new_task.mutation_repository if new_task else None,
                 mutation_scope=new_task.mutation_scope if new_task else None,
                 mutation_base_ref=new_task.mutation_base_ref if new_task else None,
@@ -2939,6 +2945,20 @@ KANBAN_CREATE_SCHEMA = {
                     "Background, evidence, and links. Put the current mutable "
                     "worker mandate in execution_contract; the assigned worker "
                     "reads the rendered contract before this background."
+                ),
+            },
+            "conversation_lane_id": {
+                "type": "string",
+                "description": (
+                    "Existing conversation lane bound to this Project/Outcome. "
+                    "Persist it before subscribing or dispatching; body text is not routing."
+                ),
+            },
+            "topic_target": {
+                "type": "string",
+                "description": (
+                    "Exact delivery target, e.g. telegram:<chat_id>:<thread_id>. "
+                    "Must match the bound lane; overrides the originating DM for notifications."
                 ),
             },
             "execution_contract": {
