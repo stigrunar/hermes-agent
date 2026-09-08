@@ -394,6 +394,7 @@ _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
 _CREATED_FIELDS = (
     "status", "workspace_kind", "workspace_path", "project_id", "outcome_id",
+    "conversation_lane_id", "topic_target",
     "mutation_repository", "mutation_scope", "mutation_base_ref",
 )
 
@@ -1027,6 +1028,8 @@ def _handle_create(args: dict, **kw) -> str:
     # See #67567. ``project=""`` is an explicit "no project" (no ``or`` collapse, #106342).
     project_id = args["project"] if "project" in args else args.get("project_id")
     outcome_id = args["outcome"] if "outcome" in args else args.get("outcome_id")
+    conversation_lane_id = args.get("conversation_lane_id")
+    topic_target = args.get("topic_target")
     mutation_repository = args.get("mutation_repository")
     mutation_scope = args.get("mutation_scope")
     mutation_base_ref = args.get("mutation_base_ref")
@@ -1062,6 +1065,8 @@ def _handle_create(args: dict, **kw) -> str:
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
             outcome_id=outcome_id,
+            conversation_lane_id=conversation_lane_id,
+            topic_target=topic_target,
             mutation_repository=mutation_repository,
             mutation_scope=mutation_scope,
             mutation_base_ref=mutation_base_ref,

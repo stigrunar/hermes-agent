@@ -442,10 +442,20 @@ KANBAN_CREATE_SCHEMA = _schema(
                 "primary repo with a deterministic branch (project slug + "
                 "task id), instead of a random branch."
         )),
+        "project_id": _prop("string", "Alias for project."),
         "outcome": _prop("string", (
                 "Optional Outcome id/key inside the linked Project. A child "
                 "created from a project-linked Kanban worker inherits its "
                 "current Outcome unless explicitly routed elsewhere."
+        )),
+        "outcome_id": _prop("string", "Alias for outcome."),
+        "conversation_lane_id": _prop("string", (
+            "Existing conversation lane bound to this Project/Outcome. Persist it before "
+            "subscribing or dispatching; body text is not routing."
+        )),
+        "topic_target": _prop("string", (
+            "Exact delivery target, for example telegram:<chat_id>:<thread_id>. "
+            "Must match the bound lane."
         )),
         "mutation_repository": _prop("string", (
                 "Canonical repository identity for the Outcome mutation lease. "
