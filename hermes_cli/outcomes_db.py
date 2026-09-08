@@ -190,6 +190,33 @@ CREATE TABLE IF NOT EXISTS visible_events (
     candidate_revision TEXT NOT NULL,
     created_at        INTEGER NOT NULL
 );
+
+-- Durable gateway handoff for a terminal Kanban event to the current
+-- Outcome.visible_owner control lane.  This is deliberately separate from
+-- visible_events and from kanban_notify_subs: both of those are scoped to a
+-- different delivery concern and cannot provide owner exactly-once replay.
+CREATE TABLE IF NOT EXISTS outcome_owner_wakes (
+    claim_key           TEXT PRIMARY KEY,
+    board               TEXT NOT NULL,
+    task_id             TEXT NOT NULL,
+    event_id            TEXT NOT NULL,
+    event_kind          TEXT NOT NULL,
+    project_id          TEXT NOT NULL,
+    outcome_id          TEXT NOT NULL,
+    outcome_revision    TEXT NOT NULL,
+    status              TEXT NOT NULL DEFAULT 'claimed',
+    attempts            INTEGER NOT NULL DEFAULT 1,
+    payload_json        TEXT,
+    last_error          TEXT,
+    claimed_at          INTEGER NOT NULL,
+    delivered_at        INTEGER,
+    processed_at        INTEGER,
+    updated_at          INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_outcome_owner_wakes_pending
+    ON outcome_owner_wakes(status, updated_at);
+CREATE INDEX IF NOT EXISTS idx_outcome_owner_wakes_board_task
+    ON outcome_owner_wakes(board, task_id, event_id);
 """
 
 
@@ -1731,6 +1758,345 @@ def record_visible_event(
             (key, eid, kind, revision, _now()),
         )
     return key, cur.rowcount == 1
+
+
+OWNER_WAKE_RETRYABLE_STATES = frozenset({"claimed", "pending"})
+OWNER_WAKE_TERMINAL_STATES = frozenset({"delivered", "processed", "stale", "noop", "blocker"})
+# A claimed row is an in-flight delivery fence.  A second gateway process may
+# reclaim it only after this lease has aged out; ordinary delivery failures set
+# the row to ``pending`` immediately and therefore do not wait for the lease.
+OWNER_WAKE_CLAIM_LEASE_SECONDS = 5 * 60
+
+
+def outcome_owner_wake_revision(outcome: Outcome) -> str:
+    """Return the stable identity revision used by owner-wake claims.
+
+    Timestamps are intentionally excluded: a harmless write to ``next_action``
+    or an explicit candidate/base/live change should alter the revision, while
+    opening/reading an Outcome must not manufacture a new owner handoff key.
+    """
+    material = {
+        "id": outcome.id,
+        "project_id": outcome.project_id,
+        "outcome_key": outcome.outcome_key,
+        "state": outcome.state,
+        "visible_owner": outcome.visible_owner,
+        "current_base_ref": outcome.current_base_ref,
+        "current_candidate_ref": outcome.current_candidate_ref,
+        "current_live_ref": outcome.current_live_ref,
+        "frozen_acceptance": outcome.frozen_acceptance,
+        "next_action": outcome.next_action,
+        "archived": bool(outcome.archived),
+    }
+    encoded = json.dumps(material, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return "or_" + hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def outcome_owner_wake_idempotency_key(
+    board: str,
+    task_id: str,
+    event_id: Any,
+    event_kind: str,
+    outcome_revision: str,
+) -> str:
+    """Build the root-shared exactly-once identity for one terminal event."""
+    material = "\0".join(
+        [
+            _text(board, field="board", max_chars=128).lower(),
+            _text(task_id, field="task_id", max_chars=256),
+            _text(event_id, field="event_id", max_chars=128),
+            _text(event_kind, field="event_kind", max_chars=128).lower(),
+            _text(outcome_revision, field="outcome_revision", max_chars=256),
+        ]
+    )
+    return "ow_" + hashlib.sha256(material.encode("utf-8")).hexdigest()
+
+
+def _owner_wake_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    payload: Any = None
+    raw_payload = row["payload_json"]
+    if raw_payload:
+        try:
+            payload = json.loads(raw_payload)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            payload = None
+    return {
+        "claim_key": str(row["claim_key"]),
+        "board": str(row["board"]),
+        "task_id": str(row["task_id"]),
+        "event_id": str(row["event_id"]),
+        "event_kind": str(row["event_kind"]),
+        "project_id": str(row["project_id"]),
+        "outcome_id": str(row["outcome_id"]),
+        "outcome_revision": str(row["outcome_revision"]),
+        "status": str(row["status"]),
+        "attempts": int(row["attempts"] or 0),
+        "payload": payload if isinstance(payload, dict) else {},
+        "last_error": row["last_error"],
+        "claimed_at": int(row["claimed_at"]),
+        "delivered_at": int(row["delivered_at"]) if row["delivered_at"] is not None else None,
+        "processed_at": int(row["processed_at"]) if row["processed_at"] is not None else None,
+        "updated_at": int(row["updated_at"]),
+    }
+
+
+def get_outcome_owner_wake(
+    conn: sqlite3.Connection, claim_key: str
+) -> Optional[dict[str, Any]]:
+    token = str(claim_key or "").strip()
+    if not token:
+        return None
+    row = conn.execute(
+        "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (token,)
+    ).fetchone()
+    return _owner_wake_from_row(row) if row is not None else None
+
+
+def list_outcome_owner_wakes(
+    conn: sqlite3.Connection,
+    *,
+    board: Optional[str] = None,
+    statuses: Optional[Iterable[str]] = None,
+) -> list[dict[str, Any]]:
+    clauses: list[str] = []
+    params: list[Any] = []
+    if board is not None:
+        clauses.append("board=?")
+        params.append(str(board).strip().lower())
+    if statuses is not None:
+        normalized = [str(status).strip().lower() for status in statuses if str(status).strip()]
+        if not normalized:
+            return []
+        clauses.append("status IN (" + ",".join("?" for _ in normalized) + ")")
+        params.extend(normalized)
+    where = " WHERE " + " AND ".join(clauses) if clauses else ""
+    rows = conn.execute(
+        "SELECT * FROM outcome_owner_wakes" + where + " ORDER BY claimed_at, claim_key",
+        params,
+    ).fetchall()
+    return [_owner_wake_from_row(row) for row in rows]
+
+
+def claim_outcome_owner_wake(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    task_id: str,
+    event_id: Any,
+    event_kind: str,
+    project_id: str,
+    outcome_id: str,
+    outcome_revision: str,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> Optional[dict[str, Any]]:
+    """Claim one owner wake, or return ``None`` after a terminal receipt.
+
+    ``pending`` rows are immediately reclaimable after a failed adapter
+    attempt. ``claimed`` rows are fenced for a short lease so duplicate
+    subscriptions/concurrent gateways cannot double-deliver; an abandoned
+    claim becomes reclaimable after that lease expires.
+    """
+    normalized_board = _text(board, field="board", max_chars=128).lower()
+    task = _text(task_id, field="task_id", max_chars=256)
+    event = _text(event_id, field="event_id", max_chars=128)
+    kind = _text(event_kind, field="event_kind", max_chars=128).lower()
+    project = _text(project_id, field="project_id", max_chars=256)
+    outcome = _text(outcome_id, field="outcome_id", max_chars=256)
+    revision = _text(outcome_revision, field="outcome_revision", max_chars=256)
+    key = outcome_owner_wake_idempotency_key(
+        normalized_board, task, event, kind, revision
+    )
+    now = _now()
+    payload_json = (
+        json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if isinstance(payload, Mapping)
+        else None
+    )
+    with write_txn(conn):
+        # The revision is part of the claim key so a terminal event is fenced
+        # to the exact Outcome snapshot that produced its wake. Replay,
+        # however, can be resolved after the owner turn has advanced that
+        # snapshot. Do not let the same stable task event create a second
+        # claim under the new revision.
+        prior_event = conn.execute(
+            """SELECT claim_key FROM outcome_owner_wakes
+               WHERE board=? AND task_id=? AND event_id=? AND claim_key<>?
+               ORDER BY claimed_at, claim_key LIMIT 1""",
+            (normalized_board, task, event, key),
+        ).fetchone()
+        if prior_event is not None:
+            return None
+        row = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            conn.execute(
+                """INSERT INTO outcome_owner_wakes
+                   (claim_key, board, task_id, event_id, event_kind, project_id,
+                    outcome_id, outcome_revision, status, attempts, payload_json,
+                    claimed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'claimed', 1, ?, ?, ?)""",
+                (
+                    key, normalized_board, task, event, kind, project, outcome,
+                    revision, payload_json, now, now,
+                ),
+            )
+        else:
+            current = str(row["status"] or "").lower()
+            if current in OWNER_WAKE_TERMINAL_STATES:
+                return None
+            if current == "claimed":
+                claimed_at = int(row["claimed_at"] or 0)
+                if claimed_at and now - claimed_at < OWNER_WAKE_CLAIM_LEASE_SECONDS:
+                    # Another notifier currently owns the pre-ack delivery.
+                    # Do not hand the same prompt to a duplicate subscription
+                    # or a concurrent gateway process.
+                    return None
+            conn.execute(
+                """UPDATE outcome_owner_wakes
+                      SET status='claimed', attempts=attempts+1,
+                          payload_json=COALESCE(?, payload_json),
+                          last_error=NULL, claimed_at=?, updated_at=?
+                    WHERE claim_key=?""",
+                (payload_json, now, now, key),
+            )
+        row = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+    return _owner_wake_from_row(row) if row is not None else None
+
+
+def _update_outcome_owner_wake(
+    conn: sqlite3.Connection,
+    claim_key: str,
+    *,
+    status: str,
+    error: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    key = _text(claim_key, field="claim_key", max_chars=256)
+    normalized_status = _text(status, field="status", max_chars=32).lower()
+    if normalized_status not in OWNER_WAKE_TERMINAL_STATES | OWNER_WAKE_RETRYABLE_STATES:
+        raise OutcomeError(f"invalid owner wake status: {status}")
+    now = _now()
+    with write_txn(conn):
+        row = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+        if row is None:
+            return None
+        # Never rewind an acknowledged or typed no-op receipt on a late retry
+        # (or let a stale observer overwrite a concurrently delivered wake).
+        current = str(row["status"] or "").lower()
+        if current in OWNER_WAKE_TERMINAL_STATES and (
+            normalized_status in OWNER_WAKE_RETRYABLE_STATES
+            or not (current == "delivered" and normalized_status == "processed")
+        ):
+            return _owner_wake_from_row(row)
+        delivered_at = now if normalized_status in {"delivered", "processed"} else row["delivered_at"]
+        processed_at = now if normalized_status == "processed" else row["processed_at"]
+        conn.execute(
+            """UPDATE outcome_owner_wakes
+                  SET status=?, last_error=?, delivered_at=?, processed_at=?, updated_at=?
+                WHERE claim_key=?""",
+            (normalized_status, str(error)[:2048] if error else None,
+             delivered_at, processed_at, now, key),
+        )
+        row = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+    return _owner_wake_from_row(row) if row is not None else None
+
+
+def mark_outcome_owner_wake_delivered(
+    conn: sqlite3.Connection, claim_key: str
+) -> Optional[dict[str, Any]]:
+    return _update_outcome_owner_wake(conn, claim_key, status="delivered")
+
+
+def mark_outcome_owner_wake_processed(
+    conn: sqlite3.Connection, claim_key: str
+) -> Optional[dict[str, Any]]:
+    return _update_outcome_owner_wake(conn, claim_key, status="processed")
+
+
+def mark_outcome_owner_wake_failed(
+    conn: sqlite3.Connection, claim_key: str, error: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    return _update_outcome_owner_wake(conn, claim_key, status="pending", error=error)
+
+
+def mark_outcome_owner_wake_stale(
+    conn: sqlite3.Connection, claim_key: str, error: Optional[str] = None
+) -> Optional[dict[str, Any]]:
+    return _update_outcome_owner_wake(conn, claim_key, status="stale", error=error)
+
+
+def record_outcome_owner_wake_receipt(
+    conn: sqlite3.Connection,
+    *,
+    board: str,
+    task_id: str,
+    event_id: Any,
+    event_kind: str,
+    project_id: str,
+    outcome_id: str,
+    outcome_revision: str,
+    status: str,
+    reason: Optional[str] = None,
+    payload: Optional[Mapping[str, Any]] = None,
+) -> dict[str, Any]:
+    """Persist a typed stale/no-op/blocker receipt without delivering a wake."""
+    key = outcome_owner_wake_idempotency_key(
+        board, task_id, event_id, event_kind, outcome_revision
+    )
+    now = _now()
+    normalized_status = _text(status, field="status", max_chars=32).lower()
+    if normalized_status not in {"stale", "noop", "blocker"}:
+        raise OutcomeError("owner wake receipt must be stale, noop, or blocker")
+    payload_dict = dict(payload or {})
+    if reason:
+        payload_dict.setdefault("reason", str(reason)[:2048])
+    with write_txn(conn):
+        existing = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+        if existing is None:
+            conn.execute(
+                """INSERT INTO outcome_owner_wakes
+                   (claim_key, board, task_id, event_id, event_kind, project_id,
+                    outcome_id, outcome_revision, status, attempts, payload_json,
+                    last_error, claimed_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)""",
+                (
+                    key, str(board).strip().lower(), str(task_id).strip(), str(event_id),
+                    str(event_kind).strip().lower(), str(project_id).strip(),
+                    str(outcome_id).strip(), str(outcome_revision).strip(),
+                    normalized_status,
+                    json.dumps(payload_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":")),
+                    str(reason)[:2048] if reason else None, now, now,
+                ),
+            )
+        else:
+            current = str(existing["status"] or "").lower()
+            if current not in OWNER_WAKE_TERMINAL_STATES:
+                conn.execute(
+                    "UPDATE outcome_owner_wakes SET status=?, last_error=?, payload_json=COALESCE(?, payload_json), updated_at=? WHERE claim_key=?",
+                    (normalized_status, str(reason)[:2048] if reason else None,
+                     json.dumps(payload_dict, ensure_ascii=False, sort_keys=True, separators=(",", ":")), now, key),
+                )
+        row = conn.execute(
+            "SELECT * FROM outcome_owner_wakes WHERE claim_key=?", (key,)
+        ).fetchone()
+    return _owner_wake_from_row(row)
+
+
+# Short aliases keep the coordination primitive discoverable to callers that
+# already use the ``owner_replan`` naming family.
+claim_owner_wake = claim_outcome_owner_wake
+mark_owner_wake_delivered = mark_outcome_owner_wake_delivered
+mark_owner_wake_processed = mark_outcome_owner_wake_processed
+mark_owner_wake_failed = mark_outcome_owner_wake_failed
+mark_owner_wake_stale = mark_outcome_owner_wake_stale
 
 
 def add_outcome_dependency(
