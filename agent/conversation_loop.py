@@ -1106,6 +1106,50 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             )
 
     if stored_prompt and _stored_prompt_matches_runtime(agent, stored_prompt):
+        # Generic prompt-source epoch: ordinary gateway conversations may be
+        # intentionally long-lived, but their persisted system prompt must not
+        # freeze SOUL/skills/toolset/MCP/project-context changes forever. Legacy
+        # prompts without the stamp migrate once; unchanged stamped prompts keep
+        # exact byte reuse. A probe failure fails closed to reuse.
+        _prompt_source_stale = False
+        try:
+            from agent.system_prompt import stored_prompt_source_epoch_needs_refresh
+
+            _prompt_source_stale = stored_prompt_source_epoch_needs_refresh(
+                agent, stored_prompt
+            )
+        except Exception:
+            _prompt_source_stale = False
+        if _prompt_source_stale:
+            logger.info(
+                "Prompt source epoch changed or is missing for session %s; "
+                "rebuilding system prompt once while preserving session history.",
+                agent.session_id,
+            )
+            # A capability refresh must rebuild through the mutable skills index
+            # cache; otherwise a newly installed/removed skill can leave the new
+            # prompt stale even though the epoch correctly detected the change.
+            try:
+                from agent.prompt_builder import clear_skills_system_prompt_cache
+
+                clear_skills_system_prompt_cache(clear_snapshot=True)
+            except Exception:
+                pass
+            agent._cached_system_prompt = agent._build_system_prompt(system_message)
+            agent._prompt_source_refreshed = True
+            if agent._session_db:
+                try:
+                    agent._session_db.update_system_prompt(
+                        agent.session_id, agent._cached_system_prompt
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Session DB update_system_prompt failed after prompt-source "
+                        "refresh (session=%s): %s. The refresh will re-fire next turn.",
+                        agent.session_id, exc,
+                    )
+            return
+
         # Bot Chat capability epoch: an eternal bot session must adopt
         # user-initiated capability changes (skills/toolsets/MCP/SOUL/roster)
         # on the next message, not at /new or compression. The stored prompt

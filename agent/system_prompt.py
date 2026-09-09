@@ -1,8 +1,8 @@
 """System-prompt assembly for :class:`AIAgent`.
 
-The agent's system prompt is built once per session and reused across all
-turns — only context compression triggers a rebuild.  This keeps the
-upstream prefix cache warm.  See ``hermes-agent-dev``'s
+The agent's system prompt is built once per session and reused across turns.
+Context compression and an explicit prompt-source epoch change may trigger a
+one-time rebuild; unchanged turns keep the upstream prefix cache warm.  See ``hermes-agent-dev``'s
 ``references/system-prompt-invariant.md`` for the invariants and
 ``references/self-improvement-loop.md`` for how the background-review
 fork inherits the cached prompt verbatim.
@@ -403,6 +403,134 @@ def _agent_home(agent: Any) -> Optional[Path]:
     except Exception:
         pass
     return None
+
+
+_PROMPT_SOURCE_EPOCH_PREFIX = "<!-- hermes-prompt-source-epoch:"
+_PROMPT_SOURCE_EPOCH_RE = re.compile(
+    r"^<!-- hermes-prompt-source-epoch:([0-9a-f]{12}) -->$",
+    re.MULTILINE,
+)
+
+
+def prompt_source_fingerprint(agent: Any) -> str:
+    """Fingerprint prompt inputs that may legitimately change mid-session.
+
+    This generalizes Bot Chat's epoch *pattern* without running the bot-specific
+    roster/relay probe on every ordinary message.  The profile-owned surface is
+    deliberately cheap and read-only: SOUL bytes, config bytes (toolset/MCP and
+    related prompt config), the skills prompt snapshot/generation markers, plus
+    project context candidates visible from the session cwd. Runtime identity
+    (model/provider/cwd/platform) remains governed separately by
+    ``_stored_prompt_matches_runtime``.
+
+    Supported skill mutations clear/rebuild ``.skills_prompt_snapshot.json``;
+    its presence/mtime therefore gives ordinary sessions a cheap generation
+    signal without walking hundreds of SKILL.md files every turn.
+
+    Returns ``"unavailable"`` on probe failure so restore fails closed to the
+    persisted prompt instead of turning a transient filesystem problem into a
+    rebuild-every-turn cache burner.
+    """
+    import hashlib
+
+    try:
+        home = _agent_home(agent) or get_hermes_home()
+        home = Path(home)
+        # Epoch probing is observational. Do not bootstrap a missing profile
+        # home from this hot path. Real profile homes already exist.
+        if not home.is_dir():
+            return "unavailable"
+
+        profile_rows: List[str] = []
+        for name in ("SOUL.md", "config.yaml"):
+            path = home / name
+            if path.is_file():
+                try:
+                    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                except Exception:
+                    return "unavailable"
+                profile_rows.append(f"{name}:{digest}")
+            else:
+                profile_rows.append(f"{name}:missing")
+
+        # The supported skill mutation paths clear this snapshot. A fresh prompt
+        # build recreates it before the epoch line is emitted, so the next turn
+        # sees the new stable generation instead of rebuilding again.
+        snapshot = home / ".skills_prompt_snapshot.json"
+        try:
+            st = snapshot.stat()
+            profile_rows.append(
+                f"skills_snapshot:{st.st_mtime_ns}:{st.st_size}"
+            )
+        except FileNotFoundError:
+            profile_rows.append("skills_snapshot:missing")
+        except OSError:
+            return "unavailable"
+
+        skills_root = home / "skills"
+        try:
+            st = skills_root.stat()
+            profile_rows.append(f"skills_root:{st.st_mtime_ns}")
+        except FileNotFoundError:
+            profile_rows.append("skills_root:missing")
+        except OSError:
+            return "unavailable"
+
+        project_context = "skipped"
+        if not getattr(agent, "skip_context_files", False):
+            from agent.prompt_builder import context_source_fingerprint
+
+            context_cwd = resolve_context_cwd()
+            if getattr(agent, "_context_cwd_is_launch_artifact", False):
+                context_cwd = None
+            project_context = context_source_fingerprint(
+                cwd=context_cwd,
+                allow_install_tree_fallback=getattr(agent, "platform", None)
+                in ("cli", "tui"),
+            )
+            if project_context == "unavailable":
+                return "unavailable"
+
+        payload = (
+            "v2|"
+            + "|".join(profile_rows)
+            + f"|project={project_context}|"
+            + f"skip_context={bool(getattr(agent, 'skip_context_files', False))}"
+        ).encode("utf-8")
+        return hashlib.sha256(payload).hexdigest()[:12]
+    except Exception:
+        return "unavailable"
+
+
+def prompt_source_epoch_line(agent: Any) -> str:
+    """Return the internal epoch stamp for a freshly built prompt."""
+    fingerprint = prompt_source_fingerprint(agent)
+    if fingerprint == "unavailable":
+        return ""
+    return f"{_PROMPT_SOURCE_EPOCH_PREFIX}{fingerprint} -->"
+
+
+def stored_prompt_source_epoch_needs_refresh(agent: Any, prompt: str) -> bool:
+    """Whether a persisted prompt must be rebuilt for changed prompt inputs.
+
+    Prompts created before this feature have no stamp and are upgraded once on
+    their next turn.  A stamped prompt rebuilds only when the current fingerprint
+    differs.  Probe failure returns False (reuse), preserving cache and history.
+    """
+    try:
+        current = prompt_source_fingerprint(agent)
+        if current == "unavailable":
+            return False
+        matches = _PROMPT_SOURCE_EPOCH_RE.findall(prompt or "")
+        if not matches:
+            # Legacy migration is aimed at persistent gateway conversations.
+            # Short-lived local CLI/TUI sessions historically have no stamp and
+            # do not need a cache-breaking migration merely by being resumed.
+            platform = str(getattr(agent, "platform", "") or "").lower().strip()
+            return bool(platform and platform not in ("cli", "tui"))
+        return matches[-1] != current
+    except Exception:
+        return False
 
 
 def _agent_skills_dir(agent: Any) -> Optional[Path]:
@@ -1026,6 +1154,17 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         timestamp_line += f"\nPlatform: {agent.platform}"
     volatile_parts.append(timestamp_line)
 
+    # Long-lived ordinary gateway sessions preserve their system prompt for
+    # cache efficiency. Stamp the actual prompt-source surface so a later SOUL,
+    # skills/toolset/MCP, or project-context change can rebuild this SAME
+    # session exactly once on its next turn. This is intentionally separate
+    # from Bot Chat's protocol epoch: ordinary sessions never receive Bot Chat
+    # messaging semantics, while Bot Chat keeps its existing roster/protocol
+    # refresh behavior in addition to this generic source stamp.
+    _prompt_epoch = prompt_source_epoch_line(agent)
+    if _prompt_epoch:
+        volatile_parts.append(_prompt_epoch)
+
     return {
         "stable":   "\n\n".join(p.strip() for p in stable_parts   if p and p.strip()),
         "context":  "\n\n".join(p.strip() for p in context_parts  if p and p.strip()),
@@ -1037,9 +1176,9 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     """Assemble the full system prompt from all layers.
 
     Called once per session (cached on ``agent._cached_system_prompt``) and
-    only rebuilt after context compression events. This ensures the system
-    prompt is stable across all turns in a session, maximizing prefix cache
-    hits.
+    rebuilt only at explicit invalidation boundaries such as context compression
+    or a changed prompt-source epoch. Unchanged turns keep the prompt byte-stable
+    and maximize prefix-cache hits.
 
     Layers are ordered cache-friendly: stable identity/guidance first,
     then session-stable context files, then per-call volatile content

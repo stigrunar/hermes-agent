@@ -449,3 +449,126 @@ class TestPerResponseSessionWritePath:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# Long-lived gateway prompt-source epoch
+# ---------------------------------------------------------------------------
+
+
+def _make_epoch_agent(tmp_path, *, platform="telegram", skip_context_files=True):
+    home = tmp_path / ".hermes"
+    home.mkdir(exist_ok=True)
+    (home / "config.yaml").write_text("{}\n", encoding="utf-8")
+    db = MagicMock()
+    db.db_path = home / "state.db"
+    agent = _make_agent(session_db=db)
+    agent.platform = platform
+    agent.skip_context_files = skip_context_files
+    agent._context_cwd_is_launch_artifact = False
+    return home, db, agent
+
+
+def test_legacy_telegram_prompt_migrates_once_without_resetting_history(tmp_path):
+    """An old unstamped Telegram session refreshes once, then reuses bytes."""
+    from agent.system_prompt import prompt_source_epoch_line
+
+    home, db, agent = _make_epoch_agent(tmp_path)
+    (home / "SOUL.md").write_text("# Dolly\nKeep working.\n", encoding="utf-8")
+    new_prompt = "fresh prompt\n" + prompt_source_epoch_line(agent)
+    agent._build_system_prompt = MagicMock(return_value=new_prompt)
+    db.get_session.return_value = {"system_prompt": "legacy prompt without epoch"}
+    history = [{"role": "user", "content": "status?"}]
+    original_history = list(history)
+    original_session_id = agent.session_id
+
+    _restore_or_build_system_prompt(agent, None, history)
+
+    assert agent.session_id == original_session_id
+    assert history == original_history
+    assert agent._cached_system_prompt == new_prompt
+    assert agent._prompt_source_refreshed is True
+    agent._build_system_prompt.assert_called_once_with(None)
+    db.update_system_prompt.assert_called_once_with(original_session_id, new_prompt)
+
+    # The next unchanged gateway turn restores the refreshed bytes verbatim.
+    db.reset_mock()
+    db.get_session.return_value = {"system_prompt": new_prompt}
+    agent2 = _make_agent(session_db=db)
+    agent2.platform = "telegram"
+    agent2.skip_context_files = True
+    agent2._context_cwd_is_launch_artifact = False
+
+    _restore_or_build_system_prompt(agent2, None, history)
+
+    assert agent2.session_id == original_session_id
+    assert history == original_history
+    assert agent2._cached_system_prompt == new_prompt
+    agent2._build_system_prompt.assert_not_called()
+    db.update_system_prompt.assert_not_called()
+
+
+def test_telegram_prompt_refreshes_once_after_soul_change(tmp_path):
+    """SOUL drift invalidates a persisted ordinary gateway prompt once."""
+    from agent.system_prompt import prompt_source_epoch_line
+
+    home, db, agent = _make_epoch_agent(tmp_path)
+    soul = home / "SOUL.md"
+    soul.write_text("# Dolly v1\n", encoding="utf-8")
+    stored = "stored prompt\n" + prompt_source_epoch_line(agent)
+
+    soul.write_text("# Dolly v2\n", encoding="utf-8")
+    refreshed = "refreshed prompt\n" + prompt_source_epoch_line(agent)
+    assert refreshed != stored
+    agent._build_system_prompt = MagicMock(return_value=refreshed)
+    db.get_session.return_value = {"system_prompt": stored}
+
+    _restore_or_build_system_prompt(
+        agent, None, [{"role": "user", "content": "continue"}]
+    )
+
+    assert agent._cached_system_prompt == refreshed
+    agent._build_system_prompt.assert_called_once_with(None)
+    db.update_system_prompt.assert_called_once_with(agent.session_id, refreshed)
+
+    db.reset_mock()
+    db.get_session.return_value = {"system_prompt": refreshed}
+    agent2 = _make_agent(session_db=db)
+    agent2.platform = "telegram"
+    agent2.skip_context_files = True
+    agent2._context_cwd_is_launch_artifact = False
+    _restore_or_build_system_prompt(
+        agent2, None, [{"role": "user", "content": "continue again"}]
+    )
+    agent2._build_system_prompt.assert_not_called()
+    db.update_system_prompt.assert_not_called()
+
+
+def test_project_context_change_invalidates_gateway_prompt_epoch(tmp_path, monkeypatch):
+    """A changed project AGENTS.md is part of the ordinary session epoch."""
+    import agent.system_prompt as system_prompt
+
+    home, _db, agent = _make_epoch_agent(tmp_path, skip_context_files=False)
+    (home / "SOUL.md").write_text("# Stable soul\n", encoding="utf-8")
+    project = tmp_path / "project"
+    project.mkdir()
+    agents_md = project / "AGENTS.md"
+    agents_md.write_text("# Project rule v1\n", encoding="utf-8")
+    monkeypatch.setattr(system_prompt, "resolve_context_cwd", lambda: str(project))
+
+    stored = "prompt\n" + system_prompt.prompt_source_epoch_line(agent)
+    assert not system_prompt.stored_prompt_source_epoch_needs_refresh(agent, stored)
+
+    agents_md.write_text("# Project rule v2\n", encoding="utf-8")
+    assert system_prompt.stored_prompt_source_epoch_needs_refresh(agent, stored)
+
+
+def test_legacy_cli_prompt_does_not_force_gateway_migration(tmp_path):
+    """The one-time legacy migration is scoped away from short-lived CLI/TUI."""
+    import agent.system_prompt as system_prompt
+
+    home, _db, agent = _make_epoch_agent(tmp_path, platform="cli")
+    (home / "SOUL.md").write_text("# CLI soul\n", encoding="utf-8")
+    assert not system_prompt.stored_prompt_source_epoch_needs_refresh(
+        agent, "legacy cli prompt without epoch"
+    )

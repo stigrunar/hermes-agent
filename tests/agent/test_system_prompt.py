@@ -357,6 +357,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
         "SYSTEM_MESSAGE",
         "CONTEXT_FILES",
         "Conversation started: Friday, January 02, 2026",
+        "PROMPT_EPOCH",
     ))
 
     with (
@@ -372,6 +373,7 @@ def test_coding_prompt_preserves_legacy_workspace_order(monkeypatch):
             ),
         ),
         patch("agent.file_safety._resolve_active_profile_name", return_value="default"),
+        patch("agent.system_prompt.prompt_source_epoch_line", return_value="PROMPT_EPOCH"),
         patch("hermes_time.now", return_value=datetime(2026, 1, 2)),
     ):
         prompt = build_system_prompt(agent, system_message="SYSTEM_MESSAGE")

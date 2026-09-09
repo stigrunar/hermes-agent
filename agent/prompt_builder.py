@@ -2401,6 +2401,88 @@ def _load_cursorrules(cwd_path: Path, context_length: Optional[int] = None) -> s
     )
 
 
+def context_source_fingerprint(
+    cwd: Optional[str] = None,
+    *,
+    allow_install_tree_fallback: bool = False,
+) -> str:
+    """Return a compact digest of files that can affect project context.
+
+    This is the cheap invalidation companion to :func:`build_context_files_prompt`.
+    It deliberately fingerprints all context candidates visible to the same
+    discovery rules, not just the current winner.  That can cause one harmless
+    extra rebuild when a lower-priority file changes, but it avoids duplicating
+    the loader's precedence/content-normalization logic and never causes a
+    stale prompt to survive a newly-created higher-priority file.
+
+    The digest is based on path + file bytes.  Missing candidates are represented
+    by absence from the list, so creating/removing a context file changes the
+    digest.  Read failures are represented deterministically; a catastrophic
+    probe failure returns ``"unavailable"`` so callers can fail closed to
+    prompt reuse rather than rebuild every turn.
+    """
+    import hashlib
+
+    try:
+        if cwd is None:
+            cwd_path = Path(os.getcwd()).resolve()
+            cwd_is_fallback = True
+        else:
+            cwd_path = Path(cwd).resolve()
+            cwd_is_fallback = False
+
+        from agent.runtime_cwd import _is_install_tree
+
+        if (
+            cwd_is_fallback
+            and not allow_install_tree_fallback
+            and _is_install_tree(cwd_path)
+        ):
+            candidates: List[Path] = []
+        else:
+            candidates = []
+            hermes_md = _find_hermes_md(cwd_path)
+            if hermes_md is not None:
+                candidates.append(hermes_md)
+
+            for directory in _agents_md_directory_chain(cwd_path):
+                for name in ("AGENTS.override.md", "AGENTS.md", "agents.md"):
+                    candidate = directory / name
+                    if candidate.exists():
+                        candidates.append(candidate)
+
+            for name in ("CLAUDE.md", "claude.md", ".cursorrules"):
+                candidate = cwd_path / name
+                if candidate.exists():
+                    candidates.append(candidate)
+
+            cursor_rules_dir = cwd_path / ".cursor" / "rules"
+            if cursor_rules_dir.is_dir():
+                candidates.extend(sorted(cursor_rules_dir.glob("*.mdc")))
+
+        rows = []
+        seen = set()
+        for candidate in sorted(candidates, key=lambda x: str(x)):
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                resolved = candidate
+            key = str(resolved)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            except Exception as exc:
+                digest = f"read_error:{type(exc).__name__}"
+            rows.append(f"{key}\0{digest}")
+
+        payload = ("\n".join(rows)).encode("utf-8", errors="surrogatepass")
+        return hashlib.sha256(payload).hexdigest()[:12]
+    except Exception:
+        return "unavailable"
+
+
 def build_context_files_prompt(
     cwd: Optional[str] = None,
     skip_soul: bool = False,
