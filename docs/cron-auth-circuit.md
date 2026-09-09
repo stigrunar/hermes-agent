@@ -1,6 +1,41 @@
 # Cron primary-auth circuit — current owner revision
 
-## Current revision: CRON-FRICTION-AUTH-CIRCUIT-R2
+## Current revision: CRON-FRICTION-AUTH-CIRCUIT-R2-REVIEW2
+
+- Classification: `useful_incomplete_patch` — the useful inherited R2 implementation remains, but run 863 produced **no new correction patch**.
+- State: `prepared_not_dispatched`; owner replan only, not execution or release admission.
+- Project `p_155df2bb`; Outcome `o_3b0a9003`; owner Dolly/default; board `hermes`.
+- `continuation_of=t_d8d4dd7f`; terminal run `863`, prior contract `CRON-FRICTION-AUTH-CIRCUIT-R2-REVIEW1` / `r1`, reason `iteration_exhausted`, resume policy `never`.
+- Fingerprint: `07647454531713e76e7ffe828384dd1b4d45d22807b811a7731170e683c95407`.
+- Wake field remains `topic_target=unknown` as supplied. Native task creation and needs_owner_replan events resolve `telegram:-1003951469776:3`, lane `cl_15e90882`; this verified resolution must be used by a future admission.
+
+### Preserved run 863 evidence
+
+Worktree `/home/hermes/.hermes/hermes-agent/.worktrees/t_d8d4dd7f`, branch `hermes-agent/t_d8d4dd7f-cron-auth-review1`, is clean at inherited commit `3780a1e88e37aa48d3641e0bafb3487f61e209a1`, tree `75d738712c3bbc123f82a4d6cac03a4e62f9e4ac`. There is no diff, no new implementation commit, and `git ls-remote origin refs/heads/hermes-agent/t_d8d4dd7f-cron-auth-review1` returned no ref. This is the previously rejected R2 candidate, not a newly completed one.
+
+The worker log at `/home/hermes/.hermes/kanban/boards/hermes/logs/t_d8d4dd7f.log` records repeated discovery, an ambiguous duplicate scheduler hunk, atomic patch rejection with no files changed, then 60/60 iteration exhaustion. No implemented repair or passing correction proof exists. Log text proposing a session resume is historical tool output, not authority to resume the terminal revision.
+
+Owner re-ran the fake-only regression in a temporary HERMES_HOME with canonical venv Python, PYTHONPATH set to the preserved worktree, and `python -m pytest -o addopts= -q /tmp/test_cron_auth_owner_review.py`: **4 failed in 6.26s**. The enclosing diagnostic shell later exited zero because hashes were printed; the pytest result is failing, not green. The three excluded quota/auxiliary/delivery results still open the primary circuit; late automatic failure still steals the manual probe. Prior broad cron evidence remains 1150 passed, 1 failed, 1 skipped; not rerun by this replan.
+
+Preserved file SHA-256 values:
+- `cron/auth_circuit.py`: `0ad312ee637f4f1554fe436ac2d5b7fc33ba8b376d36bac993a79c3e06f6046d`
+- `cron/scheduler.py`: `849b5f38b4da8bd3960105c9bedb4877d811a37e8ed4932297597ef93673faa8`
+- `tests/cron/test_cron_auth_circuit.py`: `c7434c3a5e10ec1689d2379502170982f93c1af2585b7a8e8e5e1741c7635c64`
+- `tests/cron/test_preflight_config.py`: `8d1fff440b38929b2a6a716eae8923cd58e3f2c616f41dee81ca3a2d266de856`
+
+### Frozen continuation and one next action
+
+**One next action:** Dolly/default must prepare and admit one bounded correction execution under this same Outcome from the preserved exact candidate, with the four failing regressions as the first implementation checkpoint and unique-context edits rather than a large ambiguous patch. Before that admission, place the regression fixture in a durable shared evidence path (the worker's separate PrivateTmp namespace could not directly read the owner's `/tmp` path), verify fresh base/ownership and exact route, and supply the settled existing-native credential/provenance evidence instead of sending a leaf back through broad discovery. This one-shot does not dispatch that execution.
+
+All A1–A5 criteria from REVIEW1 remain binding: same-scope suppression across reload and OAuth refresh; correct primary provenance and exclusions; one alert per generation; exclusive manual recovery closed only by genuine primary inference; safe durable state without credentials or secret logging. The first checkpoint does not waive stable OAuth/callable/pool identity or primary-versus-fallback success. Empty output alone is not proof no primary inference occurred. Remaining scope is `cron/`, `tests/cron/`, `docs/cron-auth-circuit.md`; any demonstrated need for provider-core mutation requires a new owner scope decision before edits.
+
+Dependencies remain unchanged: no task parents or children. Source proof, exact committed candidate, independent review, and separate private activation/rollback/actual-target gates remain required. Stig's standing activation approval is retained but does not approve this rejected candidate. No terminal task is unblocked/retried, no same worker/Architect/detached QA/new graph is spawned, and no merge, push, deployment, config/auth/runtime mutation occurs in this replan.
+
+Canonical documentation base was clean `7b23500d33b2d8d1cf673895c8e67573d2f8733e`. The only active same-repo execution observed, `ex_9029812e`, owns four AGENTS/reference files, not this document. This local documentation-only receipt does not alter the preserved candidate or establish remote publication.
+
+## Historical revision: CRON-FRICTION-AUTH-CIRCUIT-R2 (superseded)
+
+The following sections preserve the earlier replan; their next-action wording is historical, not a second current instruction.
 
 - Classification: `useful_incomplete_patch`.
 - State: `prepared_not_dispatched`; this document is a continuation packet, not execution admission.
