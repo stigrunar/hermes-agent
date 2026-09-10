@@ -69,6 +69,8 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
     if is_windows is None:
         is_windows = _IS_WINDOWS
     scrubbed = {}
+    resolved_passthrough = {}
+    denied_passthrough = set()
     # Non-secret HERMES_* vars no allowlist admits are dropped on purpose; a script importing a
     # repo module that reads one would see it silently unset — log the drop, point at the opt-in.
     _dropped_hermes = []
@@ -77,6 +79,9 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             resolved = resolve_passthrough_value(k, v)
             if resolved is not None:
                 scrubbed[k] = resolved
+                resolved_passthrough[k] = resolved
+            else:
+                denied_passthrough.add(k)
             continue
         if any(s in k.upper() for s in _SECRET_SUBSTRINGS):
             continue
@@ -97,20 +102,55 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None):
             "env_passthrough in the skill/config so it passes by explicit opt-in.",
             len(_dropped_hermes), ", ".join(sorted(_dropped_hermes)),
         )
-    # delegate_task children are marked by a ContextVar, not os.environ, and the sandbox crosses
-    # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
-    # passthrough cannot re-grant a delegated child the parent's board mutation capability.
+    # The shared helper carries the worker/delegate write fence across this
+    # process boundary.  It also retains the assigned board's read-location
+    # hints, but those must not bypass scoped passthrough resolution here.
     from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
+        DELEGATED_CHILD_ENV_MARKER, KANBAN_READ_LOCATION_KEYS,
+        delegated_child_subprocess_env,
     )
     scoped = delegated_child_subprocess_env(source_env)
-    # Preserve location only when carrying the descendant fence, not for arbitrary
-    # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
+    # Never let a passthrough name tunnel dispatcher capabilities back into a
+    # child.  Routes are restored only for a fenced worker descendant, and a
+    # DB route must be a local filesystem spelling (not a credential-bearing
+    # URL/DSN that native SQLite cannot consume).
+    for key in list(scrubbed):
+        if key.startswith("HERMES_KANBAN_"):
+            del scrubbed[key]
     if scoped.get(DELEGATED_CHILD_ENV_MARKER):
-        for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD"):
-            if key in scoped:
-                scrubbed[key] = scoped[key]
+        scrubbed[DELEGATED_CHILD_ENV_MARKER] = "1"
+        for key in KANBAN_READ_LOCATION_KEYS:
+            if key not in scoped or key in denied_passthrough:
+                continue
+            value = resolved_passthrough.get(key, scoped[key])
+            if key == "HERMES_KANBAN_DB" and not _is_local_sqlite_location(value):
+                continue
+            scrubbed[key] = value
     return delegated_child_subprocess_env(scrubbed)
+
+
+def _is_local_sqlite_location(value) -> bool:
+    """Whether *value* is a local path suitable for the Kanban SQLite hint."""
+    if not isinstance(value, str):
+        return False
+    value = value.strip()
+    if not value or "://" in value:
+        return False
+    # A DSN commonly has credentials before the first path separator; an @ in
+    # an actual local filename remains valid and is retained.
+    separators = [index for index in (value.find("/"), value.find("\\")) if index >= 0]
+    first_separator = min(separators) if separators else len(value)
+    if "@" in value and value.find("@") < first_separator:
+        return False
+    # Permit Windows drive paths while rejecting URI schemes (including
+    # ``sqlite:``, ``postgres:``, and ``file:``). Other colon-containing local
+    # filenames are valid filesystem spellings and remain unchanged.
+    if ":" in value and not (len(value) >= 3 and value[1] == ":"
+                              and value[2] in "\\/"):
+        scheme = value.split(":", 1)[0].lower()
+        if scheme in {"file", "sqlite", "postgres", "postgresql", "mysql", "mariadb"}:
+            return False
+    return True
 
 
 def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,

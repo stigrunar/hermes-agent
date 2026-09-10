@@ -193,6 +193,70 @@ class TestScrubChildEnvPassthroughInteraction:
         assert "OPENAI_API_KEY" not in scrubbed
 
 
+class TestKanbanDescendantRouting:
+    """execute_code keeps only fenced, local board-routing hints."""
+
+    @pytest.mark.parametrize("db_value, expected", [
+        ("/tmp/assigned.db", "/tmp/assigned.db"),
+        ("postgres://user:password@example.invalid/kanban", None),
+    ])
+    def test_local_db_route_is_restored_only_for_a_valid_path(self, db_value, expected):
+        from agent.delegation_context import delegated_child_context
+
+        source = {
+            "HERMES_KANBAN_TASK": "worker-task",
+            "HERMES_KANBAN_DB": db_value,
+            "HERMES_KANBAN_BOARD": "default",
+            "HERMES_KANBAN_WORKSPACE": "/tmp/assigned-workspace",
+            "HERMES_KANBAN_FUTURE_CAPABILITY": "must-not-leak",
+        }
+        with delegated_child_context():
+            scrubbed = _scrub_child_env(
+                source,
+                is_passthrough=lambda _name: False,
+                is_windows=False,
+            )
+
+        assert scrubbed["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        assert scrubbed.get("HERMES_KANBAN_DB") == expected
+        assert scrubbed["HERMES_KANBAN_BOARD"] == "default"
+        assert scrubbed["HERMES_KANBAN_WORKSPACE"] == "/tmp/assigned-workspace"
+        assert "HERMES_KANBAN_TASK" not in scrubbed
+        assert "HERMES_KANBAN_FUTURE_CAPABILITY" not in scrubbed
+
+    def test_scoped_secret_denial_is_not_replaced_by_raw_route(self, monkeypatch):
+        from agent.delegation_context import delegated_child_context
+
+        source = {
+            "HERMES_KANBAN_TASK": "worker-task",
+            "HERMES_KANBAN_DB": "/tmp/assigned.db",
+            "HERMES_KANBAN_BOARD": "default",
+            "HERMES_KANBAN_WORKSPACE": "/tmp/assigned-workspace",
+        }
+        monkeypatch.setattr(
+            "tools.env_passthrough.resolve_passthrough_value",
+            lambda _name, _fallback: None,
+        )
+        with delegated_child_context():
+            scrubbed = _scrub_child_env(
+                source,
+                is_passthrough=lambda name: name.startswith("HERMES_KANBAN_"),
+                is_windows=False,
+            )
+
+        assert scrubbed["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        assert not any(key.startswith("HERMES_KANBAN_") for key in scrubbed)
+
+    def test_ordinary_helper_keeps_env_none_inheritance_semantics(self, monkeypatch):
+        from agent.delegation_context import delegated_child_subprocess_env
+
+        monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
+        monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
+        assert delegated_child_subprocess_env() is None
+        explicit = {"PATH": "/usr/bin", "HERMES_KANBAN_FUTURE_CAPABILITY": "ordinary"}
+        assert delegated_child_subprocess_env(explicit) == explicit
+
+
 # ``windows_only`` rather than ``skipif(sys.platform != "win32")``: the
 # dedicated Windows CI job selects its files by grepping for the marker, so a
 # bare skipif is invisible to it — the file is never imported there and these

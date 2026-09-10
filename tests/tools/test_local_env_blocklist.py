@@ -8,6 +8,8 @@ See: https://github.com/NousResearch/hermes-agent/issues/1002
 See: https://github.com/NousResearch/hermes-agent/issues/1264
 """
 
+import io
+import json
 import os
 import subprocess
 import sys
@@ -1043,17 +1045,23 @@ class TestPythonpathSelectiveStrip:
         user_b = "/opt/project/lib"
         captured = {}
 
+        def _fake_bind(kernel):
+            # The managed test sandbox denies AF_UNIX bind. Keep this test
+            # focused on child-env composition while providing the kernel's
+            # listener seam; no production transport behavior is changed.
+            kernel.server_sock = MagicMock()
+            kernel.sock_path = None
+            return "fixture-rpc"
+
         def _fake_popen(cmd, **kwargs):
             captured["env"] = kwargs.get("env", {})
             captured["staging"] = os.path.dirname(cmd[1])
             proc = MagicMock()
-            # The kernel's reader threads drain with read1(); a bare MagicMock never returns
-            # EOF there, so the stderr thread spins forever appending mocks (a 1 GB/min leak
-            # that outlived the test and OOM-killed the worker five times).
-            proc.stdout.read.return_value = b""
-            proc.stdout.read1.return_value = b""
-            proc.stderr.read.return_value = b""
-            proc.stderr.read1.return_value = b""
+            # The always-on session kernel consumes read1() and requires real
+            # bounded EOF streams; MagicMock.read1() never returns EOF.
+            proc.stdout = io.BytesIO()
+            proc.stderr = io.BytesIO()
+            proc.stdin = io.BytesIO()
             proc.wait.return_value = 0
             proc.returncode = 0
             proc.poll.return_value = 0
@@ -1065,12 +1073,17 @@ class TestPythonpathSelectiveStrip:
                    side_effect=_mock_handle_function_call), \
              patch("tools.code_execution_env._uses_hermes_python_environment",
                    return_value=same_env), \
+             patch("tools.code_kernel._bind_rpc_socket", side_effect=_fake_bind), \
              patch("subprocess.Popen", side_effect=_fake_popen), \
              patch.dict(os.environ, {
+                 "TEMP": "/tmp",
                  "PYTHONPATH": os.pathsep.join(
                      [hermes_root, venv_sp, user_a, user_b]),
              }):
             execute_code(code="pass", task_id="test-int", enabled_tools=[])
+
+        from tools.code_kernel import shutdown_all_kernels
+        shutdown_all_kernels()
 
         assert "PYTHONPATH" in captured["env"], \
             "execute_code never reached Popen"
@@ -1877,3 +1890,160 @@ class TestHermesInternalDynamicSecrets:
         assert "GATEWAY_RELAY_SECRET" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_DELIVERY_KEY" in _HERMES_PROVIDER_ENV_BLOCKLIST
         assert "GATEWAY_RELAY_ID" in _HERMES_PROVIDER_ENV_BLOCKLIST
+
+
+class TestKanbanNestedSpawnScrub:
+    """Nested subprocesses inherit routing only behind a persistent write fence.
+
+    A dispatcher-owned Kanban worker has HERMES_KANBAN_* in its own env, but a
+    nested ``hermes`` CLI it launches through the terminal tool inherits that
+    env and is accepted as the parent run owner — it can complete/block the
+    parent's card while the real worker is still running (#81508).  Descendant
+    processes retain only board location and an explicit denial marker, never
+    dispatcher capabilities.
+
+    See https://github.com/NousResearch/hermes-agent/issues/81508
+    """
+
+    _WORKER_ENV = {
+        "HERMES_KANBAN_TASK": "t_6229de04",
+        "HERMES_KANBAN_RUN_ID": "71",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-lock-abc",
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
+        "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+        "HERMES_KANBAN_BRANCH": "wt/t_6229de04",
+        "HERMES_KANBAN_GOAL_MODE": "1",
+        "HERMES_KANBAN_GOAL_MAX_TURNS": "12",
+        "HERMES_KANBAN_WORKER_SCOPE": "lifecycle-only",
+        # Drift oracle: a future dispatcher key must be stripped without first
+        # being added to a hand-maintained allow/deny list.
+        "HERMES_KANBAN_FUTURE_CAPABILITY": "must-not-leak",
+    }
+
+    _READ_LOCATION_KEYS = {
+        "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACE",
+    }
+
+    def _assert_descendant_contract(self, env):
+        assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        for key in self._READ_LOCATION_KEYS:
+            assert env[key] == self._WORKER_ENV[key]
+        for key in self._WORKER_ENV:
+            if key not in self._READ_LOCATION_KEYS:
+                assert key not in env, f"{key} leaked into descendant env"
+
+    def test_worker_terminal_foreground_spawn_strips_kanban_env(self):
+        """Foreground terminal children keep routing behind the write fence."""
+        result_env = _run_with_env(extra_os_env=dict(self._WORKER_ENV))
+        self._assert_descendant_contract(result_env)
+
+    def test_worker_terminal_foreground_spawn_keeps_other_env(self):
+        """Non-Kanban vars still flow to the nested subprocess."""
+        result_env = _run_with_env(extra_os_env={**self._WORKER_ENV, "MY_APP_VAR": "keep-me"})
+        assert result_env.get("MY_APP_VAR") == "keep-me"
+
+    def test_worker_terminal_foreground_spawn_carries_descendant_fence(self):
+        """A plain nested spawn carries the denial marker across the fork."""
+        result_env = _run_with_env(extra_os_env=dict(self._WORKER_ENV))
+        self._assert_descendant_contract(result_env)
+
+    def test_worker_terminal_background_spawn_strips_kanban_env(self):
+        """The process_registry (background/PTY) path strips too.
+
+        ``process_registry.spawn_local`` builds its env via
+        ``_sanitize_subprocess_env``, which must scrub the dispatcher identity
+        for every caller — the nested-CLI attack is not foreground-only.
+        """
+        from tools.environments.local import _sanitize_subprocess_env
+
+        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin", **self._WORKER_ENV}, clear=True):
+            env = _sanitize_subprocess_env(dict(os.environ))
+        self._assert_descendant_contract(env)
+
+    def test_worker_terminal_spawn_real_subprocess_sees_no_kanban_env(self):
+        """End-to-end: a REAL spawned child must not see HERMES_KANBAN_*.
+
+        Unlike the mocked-Popen tests above, this spawns an actual
+        subprocess through ``_make_run_env`` and asserts the dispatcher
+        identity never crosses the process boundary (#81508).
+        """
+        import subprocess
+        import sys
+
+        from tools.environments.local import _make_run_env
+
+        with patch.dict(
+            os.environ,
+            {"PATH": "/usr/bin:/bin", "HOME": "/tmp", **self._WORKER_ENV},
+            clear=True,
+        ):
+            run_env = _make_run_env(dict(os.environ))
+
+        probe = (
+            "import json, os;"
+            "keys=['HERMES_KANBAN_TASK','HERMES_KANBAN_RUN_ID',"
+            "'HERMES_KANBAN_CLAIM_LOCK','HERMES_KANBAN_BRANCH',"
+            "'HERMES_KANBAN_GOAL_MODE','HERMES_KANBAN_GOAL_MAX_TURNS',"
+            "'HERMES_KANBAN_WORKER_SCOPE','HERMES_KANBAN_FUTURE_CAPABILITY'];"
+            "print('SCOPE:' + json.dumps({'caps': {k: os.getenv(k) for k in keys},"
+            "'locations': {k: os.getenv(k) for k in ['HERMES_KANBAN_DB',"
+            "'HERMES_KANBAN_BOARD','HERMES_KANBAN_WORKSPACE']},"
+            "'marker': os.getenv('HERMES_DELEGATED_CHILD_CONTEXT')}, sort_keys=True))"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            env=run_env,
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+        assert result.returncode == 0, result.stderr
+        payload = json.loads(next(line.split("SCOPE:", 1)[1]
+                                  for line in result.stdout.splitlines()
+                                  if line.startswith("SCOPE:")))
+        assert payload == {
+            "caps": {key: None for key in (
+                "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID",
+                "HERMES_KANBAN_CLAIM_LOCK", "HERMES_KANBAN_BRANCH",
+                "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+                "HERMES_KANBAN_WORKER_SCOPE", "HERMES_KANBAN_FUTURE_CAPABILITY",
+            )},
+            "locations": {
+                "HERMES_KANBAN_DB": self._WORKER_ENV["HERMES_KANBAN_DB"],
+                "HERMES_KANBAN_BOARD": self._WORKER_ENV["HERMES_KANBAN_BOARD"],
+                "HERMES_KANBAN_WORKSPACE": self._WORKER_ENV["HERMES_KANBAN_WORKSPACE"],
+            },
+            "marker": "1",
+        }
+
+    def test_worker_execute_code_spawn_strips_kanban_env(self):
+        """execute_code sandbox children must not inherit Kanban identity.
+
+        Regression for the sibling subprocess boundary: a worker's
+        execute_code child could otherwise spawn a nested hermes with full
+        board mutation capability (#81508).
+        """
+        from tools.code_execution_env import _scrub_child_env
+
+        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin", **self._WORKER_ENV}, clear=True):
+            env = _scrub_child_env(
+                dict(os.environ),
+                is_passthrough=lambda k: k.startswith("HERMES_KANBAN_"),
+                is_windows=False,
+            )
+        self._assert_descendant_contract(env)
+
+    def test_worker_execute_code_spawn_still_marks_delegated_children(self):
+        """Delegated children keep the lineage marker (existing behavior)."""
+        from agent.delegation_context import delegated_child_context
+        from tools.code_execution_env import _scrub_child_env
+
+        with patch.dict(os.environ, {"PATH": "/usr/bin:/bin", **self._WORKER_ENV}, clear=True):
+            with delegated_child_context():
+                env = _scrub_child_env(
+                    dict(os.environ),
+                    is_passthrough=lambda k: k.startswith("HERMES_KANBAN_"),
+                    is_windows=False,
+                )
+        self._assert_descendant_contract(env)

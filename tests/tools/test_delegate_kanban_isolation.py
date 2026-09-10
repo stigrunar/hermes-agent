@@ -150,8 +150,14 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     monkeypatch.setenv("HERMES_KANBAN_TASK", "t_parent")
     monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "123")
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "kanban.db"))
+    monkeypatch.setenv("HERMES_KANBAN_BOARD", "default")
     monkeypatch.setenv("HERMES_KANBAN_WORKSPACE", str(tmp_path / "parent-workspace"))
     monkeypatch.setenv("HERMES_KANBAN_CLAIM_LOCK", "lock")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MODE", "1")
+    monkeypatch.setenv("HERMES_KANBAN_GOAL_MAX_TURNS", "12")
+    monkeypatch.setenv("HERMES_KANBAN_WORKER_SCOPE", "lifecycle-only")
+    monkeypatch.setenv("HERMES_KANBAN_FUTURE_CAPABILITY", "must-not-leak")
+    monkeypatch.setenv("HERMES_KANBAN_BRANCH", "worker-branch")
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
 
     from agent.delegation_context import delegated_child_context
@@ -172,7 +178,61 @@ def test_delegate_child_execute_code_env_bridges_contextvar_and_scrubs_kanban(
     assert "HERMES_KANBAN_CLAIM_LOCK" not in env
     # Board location and workspace routing ride along with the fence marker.
     assert env["HERMES_KANBAN_DB"] == str(home / "kanban.db")
+    assert env["HERMES_KANBAN_BOARD"] == "default"
     assert env["HERMES_KANBAN_WORKSPACE"] == str(tmp_path / "parent-workspace")
+    for key in (
+        "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+        "HERMES_KANBAN_WORKER_SCOPE", "HERMES_KANBAN_FUTURE_CAPABILITY",
+        "HERMES_KANBAN_BRANCH",
+    ):
+        assert key not in env
+
+
+def test_worker_descendant_fence_survives_task_removal_without_parent_mutation(monkeypatch):
+    """The parent keeps ownership while every explicit child mapping stays fenced."""
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER, delegated_child_subprocess_env,
+        is_dispatcher_owned_worker_context,
+    )
+
+    parent = {
+        "HERMES_KANBAN_TASK": "parent-task",
+        "HERMES_KANBAN_RUN_ID": "run-1",
+        "HERMES_KANBAN_CLAIM_LOCK": "claim-lock",
+        "HERMES_KANBAN_DB": "/tmp/parent.db",
+        "HERMES_KANBAN_BOARD": "default",
+        "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+        "HERMES_KANBAN_WORKER_SCOPE": "lifecycle-only",
+        "HERMES_KANBAN_FUTURE_CAPABILITY": "must-not-leak",
+        "HERMES_KANBAN_GOAL_MODE": "1",
+    }
+    before = dict(os.environ)
+    with monkeypatch.context() as parent_scope:
+        parent_scope.setenv("HERMES_KANBAN_TASK", parent["HERMES_KANBAN_TASK"])
+        parent_scope.delenv(DELEGATED_CHILD_ENV_MARKER, raising=False)
+        child = delegated_child_subprocess_env(parent)
+        assert is_dispatcher_owned_worker_context()
+    assert dict(os.environ) == before
+
+    assert child[DELEGATED_CHILD_ENV_MARKER] == "1"
+    assert child["HERMES_KANBAN_DB"] == parent["HERMES_KANBAN_DB"]
+    assert child["HERMES_KANBAN_BOARD"] == parent["HERMES_KANBAN_BOARD"]
+    assert child["HERMES_KANBAN_WORKSPACE"] == parent["HERMES_KANBAN_WORKSPACE"]
+    assert not any(
+        key.startswith("HERMES_KANBAN_") and key not in {
+            "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD", "HERMES_KANBAN_WORKSPACE",
+        }
+        for key in child
+    )
+
+    child_without_task = dict(child)
+    child_without_task.pop("HERMES_KANBAN_TASK", None)
+    with monkeypatch.context() as child_scope:
+        child_scope.setenv(DELEGATED_CHILD_ENV_MARKER, "1")
+        child_scope.delenv("HERMES_KANBAN_TASK", raising=False)
+        grandchild = delegated_child_subprocess_env(child_without_task)
+        assert not is_dispatcher_owned_worker_context()
+    assert grandchild == child
 
 
 def test_auto_heartbeat_reports_failure_without_mutating_fenced_child_board(

@@ -19,9 +19,32 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatc
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 
+# Read-location hints do not grant task ownership; the marker below is the
+# persistent write fence. Every other HERMES_KANBAN_* name is worker capability
+# and is removed by ``scrub_kanban_env``.
+KANBAN_READ_LOCATION_KEYS: tuple[str, ...] = (
+    "HERMES_KANBAN_DB",
+    "HERMES_KANBAN_BOARD",
+    "HERMES_KANBAN_WORKSPACE",
+)
+
+# Caller contract for the two Kanban env helpers:
+#   * scrub_kanban_env  — delegate_task children: strip + set the lineage
+#     marker so the child process (and ITS subprocesses) are recognized as
+#     delegated and keep the kanban tool fencing.
+#   * strip_kanban_env  — plain nested spawns (terminal tool, execute_code)
+#     that must NOT inherit the parent worker's dispatcher identity, but are
+#     NOT delegated children: strip without the marker (#81508).
+
+# Historical keys remain public for callers/tests that need to enumerate the
+# current contract. Enforcement below is deliberately prefix-based so a newly
+# introduced dispatcher capability cannot leak before this tuple is updated.
 KANBAN_ENV_KEYS: tuple[str, ...] = (
-    "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
-    "HERMES_KANBAN_GOAL_MODE", "HERMES_KANBAN_GOAL_MAX_TURNS",
+    "HERMES_KANBAN_TASK",
+    "HERMES_KANBAN_RUN_ID",
+    "HERMES_KANBAN_CLAIM_LOCK",
+    "HERMES_KANBAN_GOAL_MODE",
+    "HERMES_KANBAN_GOAL_MAX_TURNS",
 )
 
 
@@ -86,7 +109,18 @@ def owned_kanban_task() -> str:
 
 def is_delegated_child_process_context() -> bool:
     """Return True in this process or a subprocess spawned by a child."""
-    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(os.environ.get(DELEGATED_CHILD_ENV_MARKER))
+    return bool(_DELEGATED_CHILD_CONTEXT.get()) or bool(
+        os.environ.get(DELEGATED_CHILD_ENV_MARKER)
+    )
+
+
+def strip_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
+    """Return *env* with dispatcher-only Kanban variables removed (no marker)."""
+    return {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("HERMES_KANBAN_")
+    }
 
 
 def _fenced_kanban_root() -> str:
@@ -100,29 +134,23 @@ def _fenced_kanban_root() -> str:
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
-    """Remove worker identity, retaining board/location and an inherited write fence.
+    """Return *env* with worker capabilities removed and the write fence set.
 
-    TASK absence alone would promote a descendant to an orchestrator. The marker
-    survives later execs, including scripts that remove TASK themselves. This is
-    cooperative runtime scoping, not confinement of code with direct SQLite access.
-
-    The marker's value is the fenced board ROOT, so the fence applies to the lineage's
-    board and not to every Kanban DB the descendant touches: a child running a repro
-    against a temp ``HERMES_HOME`` got a silently read-only board there. An inherited
-    path-valued marker is kept (a grandchild that moved HERMES_HOME must not re-fence
-    onto its scratch root and unfence the real one).
+    Board/database/workspace values are read-location hints only. The explicit
+    allowlist is intentionally independent from ``KANBAN_ENV_KEYS`` so a future
+    dispatcher capability cannot leak before a tuple update.
     """
-    cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
-    inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
-    cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    cleaned = {
+        key: value
+        for key, value in env.items()
+        if not key.startswith("HERMES_KANBAN_") or key in KANBAN_READ_LOCATION_KEYS
+    }
+    cleaned[DELEGATED_CHILD_ENV_MARKER] = "1"
     return cleaned
 
 
 def kanban_path_is_fenced(path: "os.PathLike[str] | str") -> bool:
-    """Whether Kanban mutations at *path* (a board DB or board-metadata root) are denied for this
-    process: always for an in-process delegate child (the parent's own board); for a spawned
-    descendant only when *path* is the dispatcher-pinned ``HERMES_KANBAN_DB`` or lies under the
-    fenced root the marker carries. A legacy ``"1"`` marker fences everything."""
+    """Return whether the delegated lineage fences mutations at *path*."""
     if _DELEGATED_CHILD_CONTEXT.get():
         return True
     marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "")
@@ -155,8 +183,10 @@ def delegated_child_subprocess_env(
 ) -> dict[str, str] | None:
     """Carry worker/delegate descendant denial across a real process spawn.
 
-    Location and credentials are untouched; callers retain their existing secret policy.
-    Dispatcher workers and supervised tool transports grant their own explicit scope.
+    A dispatcher-owned parent must materialize a scrubbed child environment too:
+    merely deleting TASK would otherwise promote that child to an orchestrator.
+    Explicit mappings carrying TASK or the marker are treated the same way.
+    Ordinary ``env=None`` callers retain subprocess inheritance semantics.
     """
     if not (is_delegated_child_process_context() or os.environ.get("HERMES_KANBAN_TASK")
             or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
