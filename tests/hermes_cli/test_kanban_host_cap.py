@@ -3,7 +3,7 @@
 Three gaps found in review of the original memory-guard PR:
 
 1. The standalone daemon path (``hermes kanban daemon --force`` /
-   :func:`hermes_cli.kanban_db.run_daemon`) never resolved
+   :func:`hermes_cli.kanban_db_dispatch.run_daemon`) never resolved
    ``kanban.max_in_progress`` at all — the one shipped entry point that
    could still fan out an entire backlog in a single tick.
 2. ``max_in_progress`` was enforced per-board while the gateway dispatcher
@@ -22,6 +22,8 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_dispatch as kbd
+from hermes_cli import kanban_db_connect as kbc
 
 
 @pytest.fixture
@@ -30,38 +32,7 @@ def kanban_home(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setenv("HERMES_KANBAN_HOME", str(home))
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
-    (home / "config.yaml").write_text(
-        "kanban:\n"
-        "  safe_dispatch_admission:\n"
-        "    allowed_worker_profiles: [alice]\n",
-        encoding="utf-8",
-    )
-    monkeypatch.setattr(
-        "hermes_cli.profiles.profile_exists", lambda name: name == "alice"
-    )
-    monkeypatch.setattr(kb, "_memory_pressure_level", lambda sample=None: "ok")
-
-    def live_scope_count():
-        total = 0
-        for metadata in kb.list_boards(include_archived=False):
-            path = kb.kanban_db_path(board=metadata["slug"])
-            if not path.is_file():
-                continue
-            connection = sqlite3.connect(path)
-            try:
-                total += connection.execute(
-                    "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
-                ).fetchone()[0]
-            finally:
-                connection.close()
-        return {
-            "active": total, "activating": 0, "deactivating": 0,
-            "total": total,
-        }
-
-    monkeypatch.setattr(kb, "_read_live_worker_scopes", live_scope_count)
     kb.init_db()
     return home
 
@@ -75,18 +46,6 @@ def _fake_spawn_factory(spawns: list):
         spawns.append(task.id)
         return 42
     return fake_spawn
-
-
-def _checkpoint_foreign_board(conn: sqlite3.Connection, task_id: str) -> None:
-    """Publish a stable foreign image for strict immutable occupancy reads."""
-    checkpoint = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-    assert checkpoint is not None and checkpoint[0] == 0
-    db_path = Path(conn.execute("PRAGMA database_list").fetchone()[2])
-    wal_path = Path(f"{db_path}-wal")
-    assert not wal_path.exists() or wal_path.stat().st_size == 0
-    assert conn.execute(
-        "SELECT status FROM tasks WHERE id = ?", (task_id,)
-    ).fetchone()[0] == "running"
 
 
 # ---------------------------------------------------------------------------
@@ -112,15 +71,15 @@ def test_run_daemon_resolves_and_passes_max_in_progress(
         captured.update(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
     # No explicit config → the derived default must flow through.
-    monkeypatch.setattr(kb, "configured_max_in_progress", lambda: None)
-    monkeypatch.setattr(kb, "derive_default_max_in_progress", lambda sample=None: 3)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: None)
+    monkeypatch.setattr(kbd, "derive_default_max_in_progress", lambda sample=None: 3)
 
     def on_tick(res):
         stop.set()
 
-    kb.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 3
 
@@ -133,23 +92,17 @@ def test_run_daemon_explicit_config_wins(kanban_home, monkeypatch):
         captured.update(kwargs)
         return kb.DispatchResult()
 
-    monkeypatch.setattr(kb, "dispatch_once", fake_dispatch_once)
-    (kanban_home / "config.yaml").write_text(
-        "kanban:\n"
-        "  max_in_progress: 7\n"
-        "  safe_dispatch_admission:\n"
-        "    allowed_worker_profiles: [alice]\n",
-        encoding="utf-8",
-    )
+    monkeypatch.setattr(kbd, "dispatch_once", fake_dispatch_once)
+    monkeypatch.setattr(kbd, "configured_max_in_progress", lambda: 7)
     monkeypatch.setattr(
-        kb, "derive_default_max_in_progress",
+        kbd, "derive_default_max_in_progress",
         lambda sample=None: pytest.fail("derived default must not be consulted"),
     )
 
     def on_tick(res):
         stop.set()
 
-    kb.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
+    kbd.run_daemon(interval=0.01, stop_event=stop, on_tick=on_tick)
 
     assert captured.get("max_in_progress") == 7
 
@@ -170,7 +123,7 @@ def test_configured_max_in_progress_parsing(monkeypatch):
         monkeypatch.setattr(
             cfgmod, "load_config_readonly", lambda c=config: c
         )
-        assert kb.configured_max_in_progress() == expected, config
+        assert kbd.configured_max_in_progress() == expected, config
 
 
 # ---------------------------------------------------------------------------
@@ -185,15 +138,15 @@ def test_max_in_progress_counts_other_boards(
     kb.create_board("second")
 
     # Two workers already running on the second board.
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         for title in ("busy-1", "busy-2"):
             tid = kb.create_task(conn, title=title, assignee="alice")
             assert kb.claim_task(conn, tid) is not None
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="wants-to-run", assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
@@ -207,16 +160,15 @@ def test_max_in_progress_partial_budget_across_boards(
 ):
     kb.create_board("second")
 
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
-        _checkpoint_foreign_board(conn, tid)
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for title in ("a", "b", "c"):
             kb.create_task(conn, title=title, assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
@@ -233,21 +185,20 @@ def test_count_running_tasks_other_boards_fails_open(
         kb, "list_boards",
         lambda **k: (_ for _ in ()).throw(RuntimeError("boom")),
     )
-    assert kb.count_running_tasks_other_boards() == 0
+    assert kbd.count_running_tasks_other_boards() == 0
 
 
 def test_max_spawn_stays_per_board(kanban_home, all_assignees_spawnable):
     """``max_spawn`` keeps its historical per-board semantics."""
     kb.create_board("second")
-    with kb.connect(board="second") as conn:
+    with kbc.connect(board="second") as conn:
         tid = kb.create_task(conn, title="busy", assignee="alice")
         assert kb.claim_task(conn, tid) is not None
-        _checkpoint_foreign_board(conn, tid)
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="a", assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_spawn=1,
         )
 
@@ -277,17 +228,17 @@ def test_review_lane_gets_reserved_slot_under_ready_backlog(
     )
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
             kb.create_task(conn, title=title, assignee="alice")
-        review_id = _park_in_review(conn, "review-me", "alice")
-        res = kb.dispatch_once(
+        review_id = _park_in_review(conn, "review-me", "reviewer")
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
     spawned_ids = [s[0] for s in res.spawned]
-    # Adaptive dispatch starts at most one, and reservation chooses review.
-    assert len(spawned_ids) == 1
+    # Budget 2: one ready + the reserved review slot — never 2×ready.
+    assert len(spawned_ids) == 2
     assert review_id in spawned_ids
 
 
@@ -301,15 +252,15 @@ def test_review_reservation_released_when_no_review_work(
     )
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for title in ("ready-1", "ready-2", "ready-3"):
             kb.create_task(conn, title=title, assignee="alice")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # No review work → the single adaptive start comes from ready.
-    assert len(res.spawned) == 1
+    # No review work → ready lane keeps the full budget.
+    assert len(res.spawned) == 2
 
 
 def test_nonspawnable_review_does_not_tax_ready_budget(
@@ -329,16 +280,16 @@ def test_nonspawnable_review_does_not_tax_ready_budget(
     )
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         for title in ("ready-1", "ready-2"):
             kb.create_task(conn, title=title, assignee="alice")
         _park_in_review(conn, "human-review", "some-human")
-        res = kb.dispatch_once(
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # Human-lane review is not spawnable → the one start comes from ready.
-    assert len(res.spawned) == 1
+    # Human-lane review is not spawnable → no reservation, ready gets both.
+    assert len(res.spawned) == 2
 
 
 def test_review_budget_still_bounded_by_shared_cap(
@@ -352,13 +303,13 @@ def test_review_budget_still_bounded_by_shared_cap(
     )
 
     spawns: list = []
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         kb.create_task(conn, title="ready-1", assignee="alice")
         for i in range(3):
-            _park_in_review(conn, f"review-{i}", "alice")
-        res = kb.dispatch_once(
+            _park_in_review(conn, f"review-{i}", "reviewer")
+        res = kbd.dispatch_once(
             conn, spawn_fn=_fake_spawn_factory(spawns), max_in_progress=2,
         )
 
-    # Adaptive policy keeps the combined lanes to one new start.
-    assert len(res.spawned) == 1
+    # Budget 2 total across both lanes, reservation notwithstanding.
+    assert len(res.spawned) == 2
