@@ -894,6 +894,7 @@ _LATER_TASK_COLUMNS = (
     ("block_kind", "block_kind TEXT"),
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     ("required_capabilities", "required_capabilities TEXT"),
+    ("execution_preflight", "execution_preflight TEXT"),
 )
 
 _RUN_SCOPE_COLUMNS = {
