@@ -16,6 +16,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi import FastAPI
@@ -1165,6 +1166,59 @@ def test_reclaim_endpoint_releases_running_claim(client):
         assert row["claim_lock"] is None
     finally:
         conn2.close()
+
+
+@pytest.mark.parametrize("cleanup", ["unknown", "failed"])
+def test_dashboard_failed_or_unknown_scope_cleanup_preserves_identity_without_pid_signal(
+    kanban_home, monkeypatch, cleanup,
+):
+    from plugins.kanban.dashboard import plugin_api as dashboard_api
+
+    release_calls = []
+    signals = []
+    monkeypatch.setattr(
+        kb,
+        "_scope_release_result",
+        lambda conn, task_id, run_id: (
+            release_calls.append((task_id, run_id))
+            or SimpleNamespace(
+                can_release=False,
+                cleanup=cleanup,
+                pid_signal_allowed=False,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: signals.append((args, kwargs)),
+    )
+
+    conn = kbc.connect()
+    try:
+        task_id = kb.create_task(conn, title=f"{cleanup} cleanup", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+        kb._set_worker_pid(conn, task_id, 5432)
+        before = kb.get_task(conn, task_id)
+
+        assert not dashboard_api._set_status_direct(conn, task_id, "ready")
+        after = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+    finally:
+        conn.close()
+
+    assert release_calls == [(task_id, run_id)]
+    assert before is not None and after is not None and run is not None
+    assert (after.status, after.current_run_id, after.worker_pid, after.claim_lock) == (
+        before.status,
+        before.current_run_id,
+        before.worker_pid,
+        before.claim_lock,
+    )
+    assert run.ended_at is None
+    assert signals == []
 
 
 def test_reassign_endpoint_switches_profile(client):

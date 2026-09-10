@@ -63,6 +63,14 @@ agent:
     from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # These argv/toolset assertions do not exercise scope capability. Patch
+    # the dispatcher’s late-bound production seam so FakeProc only observes
+    # the worker launch and cannot intercept a real systemd-run probe.
+    monkeypatch.setattr(
+        kbd._kb,
+        "_systemd_scope_argv",
+        lambda cmd, task, **kwargs: (cmd, None, None),
+    )
 
     captured = {}
 
@@ -118,6 +126,11 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     from hermes_cli._parser import build_top_level_parser
 
     monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kbd._kb,
+        "_systemd_scope_argv",
+        lambda cmd, task, **kwargs: (cmd, None, None),
+    )
     captured = {}
 
     class FakeProc:

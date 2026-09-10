@@ -705,6 +705,7 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
     running<->ready) + a ``status`` event. Leaving ``running`` closes the run as 'reclaimed'
     so attempt history isn't orphaned; the worker is killed only AFTER the txn commits."""
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
+    scope_release = None
     effective_status = new_status
     with kanban_db.write_txn(conn):
         prev = conn.execute(
@@ -721,22 +722,37 @@ def _set_status_direct(conn: sqlite3.Connection, task_id: str, new_status: str) 
         if effective_status == "ready" and not kanban_db._parents_satisfied(conn, task_id):
             return False
         was_running = prev["status"] == "running"
+        leaving_running = was_running and effective_status != "running"
+        # A status change may release a worker scope, but only after all
+        # deterministic refusal guards. Unknown or failed cleanup leaves the
+        # task/run identity fenced; confirmed scoped cleanup owns the worker
+        # boundary and therefore suppresses historical PID signaling.
+        if leaving_running and prev["current_run_id"] is not None:
+            scope_release = kanban_db._scope_release_result(
+                conn, task_id, int(prev["current_run_id"]),
+            )
+            if not scope_release.can_release:
+                return False
         reopening_satisfied_parent = prev["status"] in {"done", "archived"} and effective_status not in {"done", "archived"}
         cur = conn.execute(
             "UPDATE tasks SET status = ?, "
             "  claim_lock = CASE WHEN ? = 'running' THEN claim_lock ELSE NULL END, "
             "  claim_expires = CASE WHEN ? = 'running' THEN claim_expires ELSE NULL END, "
-            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END "
-            "WHERE id = ?",
-            (effective_status,) * 4 + (task_id,))
+            "  worker_pid = CASE WHEN ? = 'running' THEN worker_pid ELSE NULL END, "
+            "  worker_started_at = CASE WHEN ? = 'running' THEN worker_started_at ELSE NULL END "
+            "WHERE id = ? AND status = ? AND current_run_id IS ?",
+            (effective_status,) * 5 + (task_id, prev["status"], prev["current_run_id"]))
         if cur.rowcount != 1:
             return False
         run_id = None
-        if was_running and effective_status != "running" and prev["current_run_id"]:
+        if leaving_running and prev["current_run_id"]:
             run_id = kanban_db._end_run(
                 conn, task_id, outcome="reclaimed", status="reclaimed",
                 summary=f"status changed to {effective_status} (dashboard/direct)")
-            terminations.append((prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"]))
+            if scope_release is None or scope_release.pid_signal_allowed:
+                terminations.append((
+                    prev["worker_pid"], prev["claim_lock"], prev["worker_started_at"],
+                ))
         conn.execute(
             "INSERT INTO task_events (task_id, run_id, kind, payload, created_at) VALUES (?, ?, 'status', ?, ?)",
             (task_id, run_id, json.dumps({"status": effective_status, "requested_status": new_status}), int(time.time())))
