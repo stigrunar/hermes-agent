@@ -69,7 +69,7 @@ class HandlerRegistry:
             server.register_method(name, real)
 
 
-_PLUMBING = {"HandlerRegistry", "method", "_profile_scoped", "register", "rebind", "logger"}
+_PLUMBING = {"HandlerRegistry", "method", "_profile_scoped", "register", "rebind", "logger", "_"}
 
 
 def bind_module(module_globals: dict, server, *, skip=()) -> None:

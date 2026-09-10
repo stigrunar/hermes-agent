@@ -1114,10 +1114,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # The count is database connections: the corrupt dispatch attempt plus
-    # one ready probe per tick, and an additional review probe only when the
-    # review lane is explicitly enabled.
-    assert calls["connect"] == (5 if review_dispatch else 3)
+    # ``ready_nonempty`` opens one connection per board and shares it between
+    # the ready/review predicates. A corrupt connect therefore aborts both
+    # predicates together; review_dispatch does not add another connection.
+    assert calls["connect"] == 3
 
 
 # ---------------------------------------------------------------------------
