@@ -918,6 +918,7 @@ _LATER_TASK_COLUMNS = (
     ("block_recurrences", "block_recurrences INTEGER NOT NULL DEFAULT 0"),
     # Spawn-time start fingerprint of worker_pid (PID-reuse guard; NULL = legacy row).
     ("worker_started_at", "worker_started_at INTEGER"),
+    ("execution_preflight", "execution_preflight TEXT"),
 )
 
 _RUN_SCOPE_COLUMNS = {

@@ -8,6 +8,7 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -438,17 +439,51 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
-def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
+def _roadmap_worktree_base(task: Task) -> Optional[str]:
+    """Return the immutable branch start declared by a task binding."""
+    preflight = _kb.parse_execution_preflight(getattr(task, "execution_preflight", None))
+    if not isinstance(preflight, dict):
+        return None
+    binding = preflight.get("roadmap_binding")
+    if not isinstance(binding, dict):
+        return None
+    base_commit = str(binding.get("base_commit") or "").strip()
+    if not re.fullmatch(r"[0-9a-fA-F]{40}", base_commit):
+        raise ValueError("task roadmap binding has an invalid base_commit")
+    return base_commit
+
+
+def _git_ref_descends_from(repo_root: Path, base_commit: str, ref: str) -> bool:
+    try:
+        result = _git(repo_root, "merge-base", "--is-ancestor", base_commit, ref, timeout=30)
+    except Exception:
+        return False
+    return result.returncode == 0
+
+
+def _ensure_git_worktree(
+    repo_root: Path,
+    target: Path,
+    branch_name: str,
+    *,
+    start_point: str = "HEAD",
+) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
     repo_common = _git_common_dir(repo_root)
     if target.exists() and repo_common is not None and _path_key(_git_common_dir(target)) == _path_key(repo_common):
+        if start_point != "HEAD" and not _git_ref_descends_from(target, start_point, "HEAD"):
+            raise RuntimeError(f"existing task worktree {target} is not descended from bound base")
         return
     target.parent.mkdir(parents=True, exist_ok=True)
     if _git_branch_exists(repo_root, branch_name):
+        if start_point != "HEAD" and not _git_ref_descends_from(
+            repo_root, start_point, f"refs/heads/{branch_name}"
+        ):
+            raise RuntimeError(f"existing task branch {branch_name} is not descended from bound base")
         args = ["worktree", "add", str(target), branch_name]
     else:
-        args = ["worktree", "add", "-b", branch_name, str(target), "HEAD"]
+        args = ["worktree", "add", "-b", branch_name, str(target), start_point]
     result = _git(repo_root, *args, timeout=60)
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
@@ -457,10 +492,12 @@ def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> Non
         )
 
 
-def _anchored_worktree(repo_root: Path, task_id: str, branch_name: str) -> tuple[Path, str]:
+def _anchored_worktree(
+    repo_root: Path, task_id: str, branch_name: str, *, start_point: str = "HEAD",
+) -> tuple[Path, str]:
     """Materialize the canonical ``<repo>/.worktrees/<task-id>`` worktree."""
     target = repo_root / ".worktrees" / task_id
-    _ensure_git_worktree(repo_root, target, branch_name)
+    _ensure_git_worktree(repo_root, target, branch_name, start_point=start_point)
     return target, branch_name
 
 
@@ -471,6 +508,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     instead of the dispatcher's incidental CWD (whatever dir the gateway was
     launched from); with no anchor configured we fail loudly rather than guess."""
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+    start_point = _roadmap_worktree_base(task) or "HEAD"
     if not task.workspace_path:
         board_slug = board if board else _kb.get_current_board()
         board_default = (_kb.read_board_metadata(board_slug).get("default_workdir") or "").strip()
@@ -493,7 +531,9 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
                 f"task {task.id} has workspace_kind=worktree but board "
                 f"{board_slug!r} default_workdir {board_default!r} is not inside a git repo"
             )
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        target = repo_root / ".worktrees" / task.id
+        _ensure_git_worktree(repo_root, target, branch_name, start_point=start_point)
+        return target, branch_name
 
     requested = Path(task.workspace_path).expanduser()
     if not requested.is_absolute():
@@ -506,6 +546,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
     if requested.exists() and _is_linked_worktree_checkout(requested):
         actual_branch = _git_current_branch(requested)
         if actual_branch == branch_name:
+            if start_point != "HEAD" and not _git_ref_descends_from(requested, start_point, "HEAD"):
+                raise RuntimeError(f"existing task worktree {requested} is not descended from bound base")
             return requested_resolved, actual_branch
         # The requested path is an existing checkout of a DIFFERENT task's
         # branch (decompose children inherit the root's workspace_path
@@ -516,7 +558,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
-                _ensure_git_worktree(fallback_root, fallback, branch_name)
+                _ensure_git_worktree(fallback_root, fallback, branch_name, start_point=start_point)
                 return fallback.resolve(strict=False), branch_name
         # No repo to anchor a fallback on (or the occupied path IS this task's
         # own canonical worktree): keep the legacy reuse rather than fail dispatch.
@@ -524,7 +566,8 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
 
     repo_root = _git_toplevel(requested)
     if repo_root is not None and _path_key(requested_resolved) == _path_key(repo_root):
-        return _anchored_worktree(repo_root, task.id, branch_name)
+        return _anchored_worktree(
+            repo_root, task.id, branch_name, start_point=start_point)
 
     repo_root = _repo_root_for_worktree_target(requested.parent)
     if repo_root is None:
@@ -532,7 +575,7 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
             f"task {task.id} worktree path {task.workspace_path!r} is not inside a git repo "
             "and does not point at a git repo root"
         )
-    _ensure_git_worktree(repo_root, requested, branch_name)
+    _ensure_git_worktree(repo_root, requested, branch_name, start_point=start_point)
     return requested, branch_name
 
 

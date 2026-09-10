@@ -12,6 +12,7 @@ locks). Schema: tasks, task_links, task_comments, task_events, task_runs, attach
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import re
@@ -20,12 +21,18 @@ import sqlite3
 import subprocess
 import sys
 import logging
+import tempfile
 import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Optional
 
+from hermes_cli.project_execution_policy import (
+    canonical_execution_preflight,
+    parse_execution_preflight,
+    resolve_project_execution_policy,
+)
 from toolsets import get_toolset_names
 
 _log = logging.getLogger(__name__)
@@ -789,6 +796,7 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    execution_preflight: Optional[dict[str, Any]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
@@ -826,6 +834,7 @@ class Task:
             required_capabilities=required_capabilities,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            execution_preflight=parse_execution_preflight(g("execution_preflight")),
         )
 
 
@@ -1100,7 +1109,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    execution_preflight TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1490,6 +1500,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    execution: Optional[Mapping[str, Any]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1587,6 +1598,15 @@ def create_task(
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
+
+    # Resolve the policy against the linked project's actual primary checkout.
+    # ``None`` remains the legacy representation when neither a project policy
+    # nor an explicit execution request exists.
+    execution_preflight = resolve_project_execution_policy(
+        project_repo, execution, project_id=project_id,
+    )
+    execution_preflight_json = canonical_execution_preflight(execution_preflight)
+
     if outcome_id is not None:
         outcome_id = str(outcome_id).strip() or None
     if outcome_id:
@@ -1627,6 +1647,22 @@ def create_task(
         elif topic_target != lane_target:
             raise ValueError("topic_target does not match conversation lane")
     topic_target = _normalize_structured_topic_target(topic_target)
+
+    preflight_binding = (
+        execution_preflight.get("roadmap_binding")
+        if isinstance(execution_preflight, Mapping)
+        and isinstance(execution_preflight.get("roadmap_binding"), Mapping)
+        else None
+    )
+    if outcome_id and mutation_scope is None and preflight_binding is not None:
+        mutation_scope = preflight_binding.get("path_scope")
+    if outcome_id and mutation_repository is None and preflight_binding is not None:
+        mutation_repository = str(preflight_binding.get("implementation_repo") or "").strip() or None
+    if outcome_id and mutation_base_ref is None and preflight_binding is not None:
+        canonical_ref = str(preflight_binding.get("canonical_ref") or "").strip()
+        base_commit = str(preflight_binding.get("base_commit") or "").strip()
+        if canonical_ref and base_commit:
+            mutation_base_ref = f"{canonical_ref}@{base_commit}"
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1710,8 +1746,14 @@ def create_task(
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
-                        goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        goal_mode, goal_max_turns, session_id, completion_contract,
+                        execution_preflight
+                    ) VALUES (
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                        ?, ?, ?, ?, ?, ?, ?
+                    )
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1731,6 +1773,7 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        execution_preflight_json,
                     ),
                 )
                 for pid in parents:
@@ -1759,6 +1802,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "execution_preflight": execution_preflight,
                     },
                 )
                 if task_status == "blocked":
@@ -2920,6 +2964,430 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 
 # --- Claim / complete / block ---
 
+_ROADMAP_BINDING_DRIFT = "roadmap_binding_drift"
+_ROADMAP_BINDING_TIMEOUT_SECONDS = 30
+_OWNER_REPLAN_EVENT_KIND = "needs_owner_replan"
+_OWNER_REPLAN_CONTINUATION_RE = re.compile(
+    r"(?mi)^\s*(?:continuation_of|replaces_task_id|replacement_for)\s*[:=]\s*([A-Za-z0-9_.:-]+)\s*$"
+)
+
+
+def _roadmap_claim_binding(task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    preflight = parse_execution_preflight(task.get("execution_preflight"))
+    if not isinstance(preflight, Mapping):
+        return None
+    binding = preflight.get("roadmap_binding")
+    return dict(binding) if isinstance(binding, Mapping) else None
+
+
+def _roadmap_claim_failure(
+    *, phase: str, binding: Optional[Mapping[str, Any]] = None, detail: str = "",
+    observed_commit: Optional[str] = None, returncode: Optional[int] = None,
+) -> dict[str, Any]:
+    """Build a bounded, non-secret claim failure receipt."""
+    evidence: dict[str, Any] = {"phase": phase}
+    if detail:
+        evidence["detail"] = str(detail)[:240]
+    if observed_commit:
+        evidence["observed_commit"] = str(observed_commit)[:80]
+    if returncode is not None:
+        evidence["returncode"] = int(returncode)
+    return {
+        "reason": _ROADMAP_BINDING_DRIFT,
+        "binding": dict(binding) if isinstance(binding, Mapping) else None,
+        "evidence": evidence,
+    }
+
+
+def _run_roadmap_argv(
+    argv: list[str], *, cwd: str,
+) -> tuple[Optional[subprocess.CompletedProcess[str]], Optional[dict[str, Any]]]:
+    """Run one fixed argv with bounded, no-shell admission policy."""
+    try:
+        completed = subprocess.run(
+            argv, cwd=cwd, capture_output=True, text=True, check=False,
+            shell=False, timeout=_ROADMAP_BINDING_TIMEOUT_SECONDS,
+        )
+        return completed, None
+    except subprocess.TimeoutExpired:
+        return None, _roadmap_claim_failure(
+            phase="timeout", detail="admission command timed out",
+        )
+    except OSError as exc:
+        return None, _roadmap_claim_failure(phase="process", detail=type(exc).__name__)
+
+
+def _refresh_roadmap_binding(task: Mapping[str, Any]) -> Optional[dict[str, Any]]:
+    """Refresh a required binding before opening the ready->running CAS."""
+    preflight = parse_execution_preflight(task.get("execution_preflight"))
+    if not isinstance(preflight, Mapping):
+        return None
+    resolved = preflight.get("resolved")
+    resolved = resolved if isinstance(resolved, Mapping) else {}
+    inputs = preflight.get("inputs")
+    inputs = inputs if isinstance(inputs, Mapping) else {}
+    action = str(resolved.get("action") or inputs.get("action") or "").strip().casefold()
+    if action not in {"build", "restart", "deploy", "migrate", "write", "destructive"}:
+        return None
+    persisted_admission = preflight.get("roadmap_admission")
+    persisted_admission = persisted_admission if isinstance(persisted_admission, Mapping) else None
+    binding = _roadmap_claim_binding(task)
+    project_repo = str(inputs.get("project_repo") or "").strip()
+    try:
+        from hermes_cli.project_execution_policy import roadmap_admission_state
+
+        current_admission = roadmap_admission_state(project_repo or None, binding)
+    except (TypeError, ValueError):
+        current_admission = None
+    if current_admission is None:
+        if persisted_admission is not None and persisted_admission.get("required"):
+            return _roadmap_claim_failure(
+                phase="register", binding=binding,
+                detail="required schema-v2 mutation admission disappeared or became invalid",
+            )
+        return None
+    if not current_admission.get("required"):
+        return None
+    if str(current_admission.get("validator") or "") != "scripts/check_workstream_admission.py":
+        return _roadmap_claim_failure(
+            phase="register", binding=binding,
+            detail="validator is not the approved repo-local checker",
+        )
+    if binding is None:
+        return _roadmap_claim_failure(phase="binding", detail="required binding is missing")
+    try:
+        from hermes_cli.project_execution_policy import validate_roadmap_binding
+
+        binding = validate_roadmap_binding(
+            binding,
+            project_id=str(task.get("project_id") or binding.get("project_id") or ""),
+        )
+    except (TypeError, ValueError) as exc:
+        return _roadmap_claim_failure(phase="binding", binding=binding, detail=str(exc))
+    task_project_id = str(task.get("project_id") or "").strip()
+    if task_project_id and task_project_id != str(binding["project_id"]):
+        return _roadmap_claim_failure(
+            phase="binding", binding=binding,
+            detail="binding project does not match the task project",
+        )
+    repo = project_repo
+    if not os.path.isdir(repo):
+        return _roadmap_claim_failure(
+            phase="repository", binding=binding,
+            detail="linked project primary repository unavailable",
+        )
+    canonical_ref = str(binding["canonical_ref"])
+    remote, separator, branch = canonical_ref.partition("/")
+    if not separator or not remote or not branch:
+        return _roadmap_claim_failure(
+            phase="canonical_ref", binding=binding, detail="remote/branch ref required",
+        )
+    fetched, failure = _run_roadmap_argv(["git", "fetch", remote, branch], cwd=repo)
+    if failure is not None:
+        failure["binding"] = dict(binding)
+        return failure
+    assert fetched is not None
+    if fetched.returncode != 0:
+        return _roadmap_claim_failure(
+            phase="fetch", binding=binding, returncode=fetched.returncode,
+        )
+    tracking_ref = f"refs/remotes/{remote}/{branch}"
+    resolved_ref, failure = _run_roadmap_argv(
+        ["git", "rev-parse", "--verify", f"{tracking_ref}^{{commit}}"], cwd=repo,
+    )
+    if failure is not None:
+        failure["binding"] = dict(binding)
+        return failure
+    assert resolved_ref is not None
+    output = str(resolved_ref.stdout or "").strip()
+    observed_commit = output.splitlines()[0] if output else ""
+    if resolved_ref.returncode != 0 or not re.fullmatch(r"[0-9a-fA-F]{40}", observed_commit):
+        return _roadmap_claim_failure(
+            phase="remote_tracking", binding=binding,
+            detail="remote tracking ref could not be resolved",
+            observed_commit=observed_commit, returncode=resolved_ref.returncode,
+        )
+    binding_file: Optional[str] = None
+    fd: Optional[int] = None
+    try:
+        fd, binding_file = tempfile.mkstemp(
+            prefix="hermes-roadmap-binding-", suffix=".json",
+        )
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            fd = None
+            json.dump(binding, stream, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            stream.write("\n")
+        validated, failure = _run_roadmap_argv(
+            [
+                sys.executable, "scripts/check_workstream_admission.py",
+                "--source-ref", canonical_ref, "--binding-file", binding_file,
+            ], cwd=repo,
+        )
+        if failure is not None:
+            failure["binding"] = dict(binding)
+            return failure
+        assert validated is not None
+        if validated.returncode != 0:
+            return _roadmap_claim_failure(
+                phase="validator", binding=binding,
+                detail="repo-local admission checker rejected binding",
+                returncode=validated.returncode,
+            )
+    except OSError as exc:
+        return _roadmap_claim_failure(
+            phase="binding_file", binding=binding, detail=type(exc).__name__,
+        )
+    finally:
+        if fd is not None:
+            with contextlib.suppress(OSError):
+                os.close(fd)
+        if binding_file:
+            with contextlib.suppress(OSError):
+                os.unlink(binding_file)
+    return None
+
+
+def _row_value(row: Mapping[str, Any], key: str, default: Any = None) -> Any:
+    try:
+        return row[key]
+    except (KeyError, IndexError, TypeError):
+        return default
+
+
+def _owner_replan_body_fields(task: Mapping[str, Any]) -> dict[str, str]:
+    body = str(_row_value(task, "body", "") or "")
+    fields: dict[str, str] = {}
+    for line in body.splitlines():
+        match = re.match(
+            r"^\s*(contract_id|revision|canon_path|project|project_id|hygiene_class|"
+            r"superseded_by|resume_policy|end_reason|needs_user_decision|manual_only|"
+            r"owner_replan_suppressed|continuation_of|topic_target|status)\s*[:=]\s*(.*?)\s*$",
+            line, re.IGNORECASE,
+        )
+        if match:
+            fields[match.group(1).lower()] = match.group(2).strip()
+    return fields
+
+
+def _owner_replan_route(conn: sqlite3.Connection, task_id: str) -> Optional[dict[str, str]]:
+    row = conn.execute(
+        "SELECT platform, chat_id, chat_type, thread_id, user_id, delivery_metadata "
+        "FROM kanban_notify_subs WHERE task_id=? AND notifier_profile='default' "
+        "ORDER BY created_at DESC LIMIT 1", (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    platform = str(row["platform"] or "").strip().lower()
+    chat_id = str(row["chat_id"] or "").strip()
+    if not platform or not chat_id:
+        return None
+    thread_id = str(row["thread_id"] or "").strip()
+    try:
+        metadata = json.loads(row["delivery_metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        metadata = {}
+    if not isinstance(metadata, dict):
+        metadata = {}
+    session_key = str(metadata.get("session_key") or metadata.get("session_id") or "").strip()
+    return {
+        "platform": platform, "chat_id": chat_id,
+        "chat_type": str(row["chat_type"] or "").strip(),
+        "thread_id": thread_id, "user_id": str(row["user_id"] or "").strip(),
+        "notifier_profile": "default", "session_key": session_key,
+        "topic": f"{platform}:{chat_id}" + (f":{thread_id}" if thread_id else ""),
+    }
+
+
+def _owner_replan_identity(task: Mapping[str, Any]) -> tuple[str, str, dict[str, str]]:
+    fields = _owner_replan_body_fields(task)
+    task_id = str(_row_value(task, "id") or "")
+    return fields.get("contract_id") or f"task:{task_id}", fields.get("revision") or "r1", fields
+
+
+def _owner_replan_project_identity(task: Mapping[str, Any], board: str) -> tuple[str, str]:
+    fields = _owner_replan_body_fields(task)
+    project_id = str(_row_value(task, "project_id") or "").strip()
+    if project_id:
+        return project_id, "project_id"
+    body_project = str(fields.get("project_id") or "").strip()
+    if body_project:
+        return body_project, "project_id_body"
+    tenant = str(_row_value(task, "tenant") or fields.get("project") or "").strip()
+    return (tenant, "tenant") if tenant else (board, "board")
+
+
+def _owner_replan_repo_suppression(task: Mapping[str, Any]) -> Optional[str]:
+    fields = _owner_replan_body_fields(task)
+    canon = str(_row_value(task, "canon_path") or fields.get("canon_path") or "").strip()
+    if not canon:
+        return None
+    contract_id, revision, _ = _owner_replan_identity(task)
+    try:
+        text = Path(canon).expanduser().read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return None
+    for match in re.finditer(r"HERMES_EXECUTION_STATE\s+(\{.*?\})\s*-->", text):
+        try:
+            state = json.loads(match.group(1))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if not isinstance(state, dict) or str(state.get("contract_id") or "") != contract_id:
+            continue
+        repo_revision = str(state.get("revision") or "").strip()
+        repo_status = str(state.get("status") or "").strip().casefold()
+        if repo_revision and repo_revision != revision:
+            return "repo_canon_noncurrent"
+        if repo_revision == revision and repo_status in {"done", "superseded", "cancelled", "archived"}:
+            return "repo_canon_complete_or_closed"
+    return None
+
+
+def _owner_replan_active_successor(
+    conn: sqlite3.Connection, task: Mapping[str, Any],
+) -> Optional[str]:
+    task_id = str(_row_value(task, "id") or "")
+    contract_id, revision, _ = _owner_replan_identity(task)
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE id<>? AND status IN ('todo','ready','running','review') "
+        "ORDER BY created_at DESC", (task_id,),
+    ).fetchall()
+    for row in rows:
+        candidate = dict(row)
+        fields = _owner_replan_body_fields(candidate)
+        if str(fields.get("hygiene_class") or "").casefold() in {"obsolete", "superseded"} \
+                or str(fields.get("superseded_by") or "").strip():
+            continue
+        continuation = _OWNER_REPLAN_CONTINUATION_RE.search(str(candidate.get("body") or ""))
+        if continuation and continuation.group(1).strip() == task_id:
+            return str(row["id"])
+        if not contract_id.startswith("task:"):
+            other_contract, other_revision, _ = _owner_replan_identity(candidate)
+            current_match = re.search(r"(?:^|[-_.])r(\d+)$", revision, re.IGNORECASE)
+            other_match = re.search(r"(?:^|[-_.])r(\d+)$", other_revision, re.IGNORECASE)
+            if other_contract == contract_id and current_match is not None and other_match is not None \
+                    and int(other_match.group(1)) > int(current_match.group(1)):
+                return str(row["id"])
+    return None
+
+
+def _owner_replan_fingerprint(payload: Mapping[str, Any]) -> str:
+    identity = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND,
+        "board": str(payload.get("board") or ""),
+        "project_id": str(payload.get("project_id") or payload.get("project") or ""),
+        "task_id": str(payload.get("task_id") or ""),
+        "terminal_run_id": int(payload.get("terminal_run_id") or 0),
+        "contract_id": str(payload.get("contract_id") or ""),
+        "revision": str(payload.get("revision") or ""),
+        "semantic_outcome": str(payload.get("semantic_outcome") or payload.get("end_reason") or ""),
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _ensure_owner_replan_event(
+    conn: sqlite3.Connection, task_snapshot: Mapping[str, Any], *,
+    terminal_run_id: Optional[int], end_reason: str,
+    metadata: Optional[Mapping[str, Any]] = None,
+) -> Optional[str]:
+    """Append one durable owner intent without making the task runnable."""
+    task_id = str(_row_value(task_snapshot, "id") or "")
+    preclaim_drift = str(end_reason or "").casefold() == _ROADMAP_BINDING_DRIFT
+    if not task_id or (terminal_run_id is None and not preclaim_drift):
+        return None
+    expected_status = "ready" if preclaim_drift else "running"
+    if str(_row_value(task_snapshot, "status") or "") != expected_status:
+        return None
+    current_run_id = _row_value(task_snapshot, "current_run_id")
+    if preclaim_drift and current_run_id is not None:
+        return None
+    if not preclaim_drift and int(current_run_id or 0) != int(terminal_run_id):
+        return None
+    fields = _owner_replan_body_fields(task_snapshot)
+    if str(fields.get("hygiene_class") or "").casefold() in {"obsolete", "superseded"} \
+            or str(fields.get("superseded_by") or "").strip():
+        return None
+    if str(end_reason or "").casefold() in {"needs_user_decision", "user_decision", "manual"}:
+        return None
+    if str(fields.get("resume_policy") or "").casefold() == "manual":
+        return None
+    if any(str(fields.get(name) or "").strip().casefold() in {
+        "1", "true", "yes", "on", "needs_user_decision", "manual",
+    } for name in ("needs_user_decision", "manual_only", "owner_replan_suppressed")):
+        return None
+    if str(fields.get("status") or "").casefold() in {"superseded", "obsolete", "cancelled", "archived"}:
+        return None
+    if _owner_replan_repo_suppression(task_snapshot) or _owner_replan_active_successor(conn, task_snapshot):
+        return None
+    route = _owner_replan_route(conn, task_id)
+    if route is None:
+        return None
+    board = _board_slug_for_connection(conn)
+    project, project_source = _owner_replan_project_identity(task_snapshot, board)
+    contract_id, revision, _ = _owner_replan_identity(task_snapshot)
+    payload: dict[str, Any] = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND, "owner": "default",
+        "project": project, "project_source": project_source, "board": board,
+        "topic": route["topic"], "task_id": task_id,
+        "terminal_run_id": int(terminal_run_id) if terminal_run_id is not None else None,
+        "contract_id": contract_id, "revision": revision, "end_reason": str(end_reason),
+        "worktree": str(_row_value(task_snapshot, "workspace_path") or ""),
+        "branch": str(_row_value(task_snapshot, "branch_name") or ""),
+        "artifact_state": "unknown", "resume_policy": "never", "retryable": False,
+        "route": route,
+    }
+    if preclaim_drift:
+        payload.update({
+            "source_status": "ready", "reason": _ROADMAP_BINDING_DRIFT,
+            "owner_replan": {
+                "owner": "default",
+                "action": "refresh the roadmap binding and create a new runnable task",
+                "authority": "agent_internal", "needs_user_decision": False,
+            },
+            "evidence": dict(metadata or {}),
+        })
+    payload["fingerprint"] = _owner_replan_fingerprint(payload)
+    fingerprint = str(payload["fingerprint"])
+    for row in conn.execute(
+        "SELECT payload FROM task_events WHERE task_id=? AND kind=?",
+        (task_id, _OWNER_REPLAN_EVENT_KIND),
+    ).fetchall():
+        try:
+            existing = json.loads(row["payload"] or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(existing, dict) and existing.get("fingerprint") == fingerprint:
+            return fingerprint
+    _append_event(
+        conn, task_id, _OWNER_REPLAN_EVENT_KIND, payload,
+        run_id=(int(terminal_run_id) if terminal_run_id is not None else None),
+    )
+    return fingerprint
+
+
+def _record_roadmap_binding_drift(
+    conn: sqlite3.Connection, task_id: str, failure: Mapping[str, Any],
+) -> None:
+    """Atomically block pre-claim drift and emit one owner-replan intent."""
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None or row["status"] != "ready" or row["current_run_id"] is not None:
+            return
+        payload = dict(failure)
+        payload["reason"] = _ROADMAP_BINDING_DRIFT
+        _ensure_owner_replan_event(
+            conn, dict(row), terminal_run_id=None,
+            end_reason=_ROADMAP_BINDING_DRIFT, metadata=payload,
+        )
+        conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind=?, max_retries=0, "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "current_run_id=NULL, consecutive_failures=0, block_recurrences=0 "
+            "WHERE id=? AND status='ready' AND current_run_id IS NULL",
+            (_ROADMAP_BINDING_DRIFT, task_id),
+        )
+        _append_event(conn, task_id, _ROADMAP_BINDING_DRIFT, payload)
+
 def _parents_satisfied(conn: sqlite3.Connection, task_id: str) -> bool:
     """Return whether every direct parent is terminal for dependency gating."""
     return conn.execute(
@@ -3000,6 +3468,19 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    # Refresh canonical roadmap identity before opening the claim transaction.
+    # Every ready retry re-fetches and re-runs the project-owned admission
+    # checker; drift is recorded in a separate atomic block transaction.
+    snapshot = conn.execute(
+        "SELECT * FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL",
+        (task_id,),
+    ).fetchone()
+    if snapshot is not None:
+        roadmap_failure = _refresh_roadmap_binding(dict(snapshot))
+        if roadmap_failure is not None:
+            _record_roadmap_binding_drift(conn, task_id, roadmap_failure)
+            return None
+
     projection_snapshot = conn.execute(
         "SELECT * FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL",
         (task_id,),
@@ -5114,6 +5595,31 @@ def _ctx_header(lines: list[str], task: Task) -> None:
             lines.append(f"Terminal timeout: {effective_terminal_timeout}s")
     if task.branch_name:
         lines.append(f"Branch:   {task.branch_name}")
+    if task.execution_preflight:
+        preflight = task.execution_preflight
+        resolved = preflight.get("resolved") or {}
+        lines.append("## Execution preflight")
+        binding = preflight.get("roadmap_binding")
+        if isinstance(binding, Mapping):
+            lines.append(
+                "Roadmap binding: "
+                f"project={binding.get('project_id')} "
+                f"lane={binding.get('lane_id')} "
+                f"revision={binding.get('roadmap_revision')} "
+                f"canonical_ref={binding.get('canonical_ref')} "
+                f"base_commit={binding.get('base_commit')} "
+                f"acceptance_ref={binding.get('acceptance_ref')} "
+                f"implementation_repo={binding.get('implementation_repo')} "
+                f"path_scope={','.join(str(p) for p in binding.get('path_scope', []))} "
+                f"dependency_pins={','.join(str(p) for p in binding.get('dependency_pins', []))}"
+            )
+        lines.append(f"Effective environment: {resolved.get('environment') or '(unspecified)'}")
+        lines.append(f"Mode: {resolved.get('quality_mode') or 'FEATURE'}")
+        lines.append(f"Risk: {resolved.get('risk_tier') or 'R3'}")
+        lines.append(
+            f"Continuity proof: {resolved.get('continuity_proof') or 'rollback'}"
+        )
+        lines.append("")
     lines.append("")
     if task.body and task.body.strip():
         lines.append("## Body")
@@ -5674,6 +6180,8 @@ _PLUGIN_COMPAT_LAZY = {
     'repair_db': ('hermes_cli.kanban_db_connect', 'repair_db'),
     'resolve_max_in_progress': ('hermes_cli.kanban_db_dispatch', 'resolve_max_in_progress'),
     'resolve_workspace': ('hermes_cli.kanban_db_workspace', 'resolve_workspace'),
+    '_ensure_git_worktree': ('hermes_cli.kanban_db_workspace', '_ensure_git_worktree'),
+    '_roadmap_worktree_base': ('hermes_cli.kanban_db_workspace', '_roadmap_worktree_base'),
     'review_dispatch_enabled': ('hermes_cli.kanban_db_dispatch', 'review_dispatch_enabled'),
     'rewind_notify_cursor': ('hermes_cli.kanban_db_notify', 'rewind_notify_cursor'),
     'run_daemon': ('hermes_cli.kanban_db_dispatch', 'run_daemon'),
