@@ -173,6 +173,24 @@ def test_semantic_completion_keeps_passive_notice_but_suppresses_generic_wake(
     finally:
         conn.close()
 
+    adapter = RecordingAdapter()
+    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
+    assert len(adapter.sent) == 1
+    assert len(adapter.handled) == 1
+    prompt = adapter.handled[0].text
+    assert "action: inspect the preserved patch" in prompt
+    assert f"continuation_of={tid}" in prompt
+    assert "project_id=adopted-project" in prompt
+    assert "topic_target=telegram:-1001:87" in prompt
+    assert "Do not unblock or retry" in prompt
+
+    conn = kbc.connect()
+    try:
+        assert len(_control(conn, tid, "owner_replan_delivered")) == 1
+        assert _control(conn, tid, "owner_replan_wake_claimed")
+    finally:
+        conn.close()
+
 
 def test_pending_semantic_replan_survives_cursor_claim_without_new_events(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "semantic-recovery.db"))
@@ -192,25 +210,6 @@ def test_pending_semantic_replan_survives_cursor_claim_without_new_events(tmp_pa
     assert first is not None and first["events"]
     assert second is not None and second["events"] == []
     assert second["owner_replan"]
-
-    adapter = RecordingAdapter()
-    asyncio.run(_one_tick(monkeypatch, _runner(adapter)))
-    assert len(adapter.sent) == 1
-    assert len(adapter.handled) == 1
-    prompt = adapter.handled[0].text
-    assert "action: inspect the preserved patch" in prompt
-    assert f"continuation_of={tid}" in prompt
-    assert "project_id=adopted-project" in prompt
-    assert "topic_target=telegram:-1001:87" in prompt
-    assert "Do not unblock or retry" in prompt
-
-    conn = kbc.connect()
-    try:
-        assert len(_control(conn, tid, "owner_replan_delivered")) == 1
-        assert _control(conn, tid, "owner_replan_wake_claimed")
-    finally:
-        conn.close()
-
 
 def test_owner_replan_wake_failure_is_manual_only(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", str(tmp_path / "owner-fail.db"))
