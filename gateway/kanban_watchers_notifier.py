@@ -33,7 +33,7 @@ def _kbn():
 # "status" covers dashboard drag-drop and `_set_status_direct()`.
 # ``review_requested`` wakes the origin like a block but is not one;
 # the task is not archived so later review cycles keep notifying.
-TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
+TERMINAL_KINDS = ("completed", "blocked", "gave_up", "crashed", "timed_out", "iteration_exhausted", "status", "archived", "unblocked", "block_loop_detected", "review_requested", "changes_requested")
 # Kinds that hand a decision back to the origin, which must take a turn.
 # status/archived/unblocked are bookkeeping.
 _WAKE_KINDS = ("completed", "gave_up", "crashed", "timed_out", "blocked", "review_requested", "changes_requested", "block_loop_detected")
@@ -345,9 +345,27 @@ class _Collector:
         if not events:
             return None
         task = self.kb.get_task(conn, sub["task_id"])
+        owner_replan = None
+        try:
+            owner_replan = self.kb.claim_owner_replan_for_route(
+                conn,
+                task_id=sub["task_id"],
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                claim=False,
+            )
+        except AttributeError:
+            # The owner-replan ledger is optional for legacy databases.
+            owner_replan = None
         logger.debug("kanban notifier: claimed %d event(s) for %s on board %s cursor %s→%s",
                      len(events), sub["task_id"], slug, old_cursor, cursor)
-        return {"sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events, "task": task, "board": slug}
+        if not events and owner_replan is None:
+            return None
+        return {
+            "sub": sub, "old_cursor": old_cursor, "cursor": cursor, "events": events,
+            "task": task, "board": slug, "owner_replan": owner_replan,
+        }
 
     def collect_board(self, slug: str) -> None:
         """Claim events on one board, appending delivery dicts to ``deliveries``."""
@@ -454,6 +472,17 @@ def _fmt_changes_requested(ev, n) -> tuple:
     return msg, None, reason_text
 
 
+def _fmt_iteration_exhausted(ev, n) -> tuple:
+    payload = ev.payload if isinstance(ev.payload, dict) else {}
+    used, maximum = payload.get("budget_used"), payload.get("budget_max")
+    budget = f" ({used}/{maximum} iterations)" if used is not None and maximum is not None else ""
+    return (
+        f"⏹ {n.head} exhausted its bounded iteration budget{budget}; owner replan required",
+        None,
+        None,
+    )
+
+
 def _fmt_block_loop_detected(ev, n) -> tuple:
     """Re-blocked for the same cause past the limit and routed to `triage`.
 
@@ -492,8 +521,6 @@ def _fmt_timed_out(ev, n) -> tuple:
     minutes = max(1, round(limit / 60)) if limit else 0
     span = f"its {minutes}-minute limit" if minutes else "its time limit"
     return f"⏱ {n.head} ran past {span} and was stopped; it will be retried automatically.", None, None
-
-
 # archived / unblocked are claimed (so the cursor advances past them) but
 # intentionally silent (no formatter), and excluded from _WAKE_KINDS so they
 # never wake the creator.
@@ -508,6 +535,7 @@ _EVENT_FORMATTERS: dict[str, Callable[[Any, "_KanbanNotification"], tuple]] = {
     "status": lambda ev, n: (f"🔄 {n.head} → {_payload(ev, 'status') or ''}", None, None),
     "review_requested": _fmt_review_requested,
     "changes_requested": _fmt_changes_requested,
+    "iteration_exhausted": _fmt_iteration_exhausted,
     "block_loop_detected": _fmt_block_loop_detected,
 }
 
@@ -544,6 +572,10 @@ class _KanbanNotification:
         mode = sub.get("delivery_mode") or "notify"
         self.wake_agent = mode in ("notify+wake", "wake")
         self.send_passive = mode != "wake"
+        # Bound Outcome owner wakes and terminal owner-replan intents are the
+        # sole agent wake for this event.  Passive origin text remains intact,
+        # but the generic creator-session wake must not duplicate it.
+        self.suppress_generic_wake = bool(d.get("owner_wakes") or d.get("owner_replan"))
         # Worker handoff carried into the synthetic wake turn so the woken
         # creator doesn't re-decompose work already on the board.
         self.wake_handoff = self.wake_review_detail = self.session_key = self.synth = ""
@@ -601,8 +633,15 @@ class _KanbanNotification:
     def build_wake_text(self) -> None:
         """Set ``wake_kinds`` / ``session_key`` / ``synth`` for the wake paths."""
         task, sub = self.task, self.sub
-        self.wake_kinds = {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS} if self.wake_agent else set()
-        self.wake_diagnostic = all(diagnostic_event(ev) for ev in self.d["events"] if ev.kind in self.wake_kinds)
+        self.wake_kinds = (
+            {ev.kind for ev in self.d["events"] if ev.kind in _WAKE_KINDS}
+            if self.wake_agent and not self.suppress_generic_wake else set()
+        )
+        self.wake_diagnostic = all(
+            diagnostic_event(ev)
+            for ev in self.d["events"]
+            if ev.kind in self.wake_kinds
+        )
         if not self.wake_kinds:
             return
         if self.is_push_adapter:

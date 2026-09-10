@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from functools import partial
 from pathlib import Path
 from typing import Any, Optional
 
@@ -25,6 +26,11 @@ from gateway.kanban_watchers_common import (
     logger,
 )
 from gateway.kanban_watchers_notifier import _KanbanNotification, _notifier_collect
+from gateway.kanban_watchers_owner import (
+    GatewayKanbanOwnerMixin,
+    _resolve_outcome_owner_wake_spec,
+    _owner_wake_prompt,
+)
 from gateway.kanban_watchers_dispatcher import (
     _KanbanDispatcher,
     _log_spawn_results,
@@ -37,7 +43,7 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
-class GatewayKanbanWatchersMixin:
+class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
     def _owns_kanban_dispatcher_lock(self) -> bool:
@@ -58,6 +64,33 @@ class GatewayKanbanWatchersMixin:
             slept += 1.0
 
     async def _kanban_notifier_watcher(self, interval: float = 5.0) -> None:
+        """Elect one profile-owned notifier loop and keep one polling flow."""
+        try:
+            from hermes_cli import kanban_db as _kb
+        except Exception:
+            logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
+            return
+        profile = self._active_profile_name()
+        lock_path = _kb.kanban_home() / "kanban" / f".notifier-{profile}.lock"
+        retry_delay = min(1.0, max(0.1, float(interval)))
+        while getattr(self, "_running", False):
+            handle, state = _acquire_singleton_lock(lock_path)
+            if state == "held":
+                try:
+                    await self._kanban_notifier_owner_loop(interval=interval)
+                finally:
+                    _release_singleton_lock(handle)
+                return
+            if state == "unavailable":
+                logger.warning(
+                    "kanban notifier: profile %s lock unavailable; falling back to config-only ownership",
+                    profile,
+                )
+                await self._kanban_notifier_owner_loop(interval=interval)
+                return
+            await asyncio.sleep(retry_delay)
+
+    async def _kanban_notifier_owner_loop(self, interval: float = 5.0) -> None:
         """Poll ``kanban_notify_subs`` and deliver terminal events to users.
 
         Per subscription, claims ``task_events`` newer than the stored cursor
@@ -108,14 +141,44 @@ class GatewayKanbanWatchersMixin:
                     _gc_next_at = time.monotonic() + _GC_INTERVAL_SECONDS
                     _retention = _gc_retention_days()
 
-                deliveries = await asyncio.to_thread(
+                deliveries = await asyncio.to_thread(partial(
                     _notifier_collect, self, _kb,
                     notifier_profile=notifier_profile, gc_due=_gc_due, gc_retention_days=_retention,
-                )
+                ))
+                # Resolve bound Outcome events after Kanban collection (the
+                # root Outcomes store must not be opened from the collector's
+                # SQLite worker).  Owner delivery is independent of the origin
+                # adapter and therefore precedes the generic notification.
                 for d in deliveries:
+                    task = d.get("task")
+                    owner_wakes = list(d.get("owner_wakes") or [])
+                    if task is not None and getattr(task, "project_id", None) and getattr(task, "outcome_id", None):
+                        for event in d.get("events") or []:
+                            spec = await _to_thread_process_service(
+                                _resolve_outcome_owner_wake_spec, d.get("board"), task, event,
+                            )
+                            if spec is not None:
+                                owner_wakes.append(spec)
+                    d["owner_wakes"] = owner_wakes
+                    if any(spec.get("status") == "retry" for spec in owner_wakes):
+                        sub = d.get("sub")
+                        if sub is not None:
+                            await _to_thread_process_service(
+                                self._kanban_rewind, sub, d.get("cursor", 0), d.get("old_cursor", 0), d.get("board"),
+                            )
+                        continue
+                    if owner_wakes:
+                        await self._deliver_outcome_owner_wakes(owner_wakes)
                     await _KanbanNotification(
                         self, d, platform_cls=_Platform, sub_fail_counts=sub_fail_counts,
                     ).deliver()
+                    if d.get("owner_replan") and d.get("sub") is not None:
+                        await self._deliver_owner_replan(
+                            d.get("board"), d["sub"], d.get("task"), d["owner_replan"],
+                        )
+                pending = await _to_thread_process_service(self._pending_outcome_owner_wakes, _kb)
+                if pending:
+                    await self._deliver_outcome_owner_wakes(pending)
             except Exception as exc:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)

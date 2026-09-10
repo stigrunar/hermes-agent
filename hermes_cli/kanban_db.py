@@ -2279,6 +2279,7 @@ def add_comment(conn: sqlite3.Connection, task_id: str, author: str, body: str) 
             "VALUES (?, ?, ?, ?)", (task_id, author.strip(), body.strip(), now),
         )
         _append_event(conn, task_id, "commented", {"author": author, "len": len(body)})
+        _acknowledge_owner_replan_in_txn(conn, task_id, author=author, body=body)
         return int(cur.lastrowid or 0)
 
 
@@ -2967,6 +2968,14 @@ def recompute_ready(conn: sqlite3.Connection, failure_limit: int = None) -> int:
 _ROADMAP_BINDING_DRIFT = "roadmap_binding_drift"
 _ROADMAP_BINDING_TIMEOUT_SECONDS = 30
 _OWNER_REPLAN_EVENT_KIND = "needs_owner_replan"
+_OWNER_REPLAN_LEGACY_OUTCOMES = frozenset({"rolled_back", "changes_requested"})
+_OWNER_REPLAN_FORBIDDEN_GATE_RE = re.compile(
+    r"\b(?:human|auth(?:entication|orization)?|live|customer|public|financial|destructive|safety|external|production)\b",
+    re.IGNORECASE,
+)
+_OWNER_REPLAN_MANUAL_NEXT_STEP_RE = re.compile(r"\bmanual(?:[-_\s]+(?:only|action))\b", re.IGNORECASE)
+_OWNER_REPLAN_TOPIC_TARGET_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]*:[^:\s]+(?::[^:\s]+)?$")
+_OWNER_REPLAN_ACK_RE = re.compile(r"(?mi)^\s*owner_replan_ack\s*:\s*([0-9a-f]{64})\s*$")
 _OWNER_REPLAN_CONTINUATION_RE = re.compile(
     r"(?mi)^\s*(?:continuation_of|replaces_task_id|replacement_for)\s*[:=]\s*([A-Za-z0-9_.:-]+)\s*$"
 )
@@ -3205,11 +3214,15 @@ def _owner_replan_identity(task: Mapping[str, Any]) -> tuple[str, str, dict[str,
     return fields.get("contract_id") or f"task:{task_id}", fields.get("revision") or "r1", fields
 
 
-def _owner_replan_project_identity(task: Mapping[str, Any], board: str) -> tuple[str, str]:
+def _owner_replan_project_identity(
+    task: Mapping[str, Any], board: str, *, require_explicit: bool = False,
+) -> tuple[str, str]:
     fields = _owner_replan_body_fields(task)
     project_id = str(_row_value(task, "project_id") or "").strip()
     if project_id:
         return project_id, "project_id"
+    if require_explicit:
+        return "", "missing"
     body_project = str(fields.get("project_id") or "").strip()
     if body_project:
         return body_project, "project_id_body"
@@ -3284,6 +3297,278 @@ def _owner_replan_fingerprint(payload: Mapping[str, Any]) -> str:
         "semantic_outcome": str(payload.get("semantic_outcome") or payload.get("end_reason") or ""),
     }
     return hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+
+
+def _owner_replan_gate_text(metadata: Mapping[str, Any]) -> str:
+    values: list[str] = []
+    for key in (
+        "next_step", "next_owner", "authority", "action", "risk", "gate", "approval",
+        "safety_gate", "external_action", "auth_required", "live_required", "requires_human", "scope",
+    ):
+        value = metadata.get(key)
+        if isinstance(value, str):
+            values.append(value)
+    envelope = metadata.get("owner_replan")
+    if isinstance(envelope, Mapping):
+        for key in (
+            "owner", "action", "authority", "risk", "gate", "approval", "safety_gate",
+            "external_action", "auth_required", "live_required", "requires_human", "scope",
+        ):
+            value = envelope.get(key)
+            if isinstance(value, str):
+                values.append(value)
+    return "\n".join(values)
+
+
+def _owner_replan_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    return str(value or "").strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _owner_replan_has_gate_flag(metadata: Mapping[str, Any]) -> bool:
+    keys = ("auth_required", "live_required", "requires_human", "external_action", "safety_gate")
+    if any(_owner_replan_truthy(metadata.get(key)) for key in keys):
+        return True
+    envelope = metadata.get("owner_replan")
+    return isinstance(envelope, Mapping) and any(_owner_replan_truthy(envelope.get(key)) for key in keys)
+
+
+def _normalize_completion_owner_replan(metadata: Any) -> Optional[dict[str, Any]]:
+    """Accept only an explicit, agent-internal owner continuation envelope."""
+    if not isinstance(metadata, Mapping):
+        return None
+    envelope = metadata.get("owner_replan")
+    raw_outcome = str(metadata.get("outcome") or "").strip().casefold()
+    if isinstance(envelope, Mapping):
+        owner = str(envelope.get("owner") or "").strip().casefold()
+        authority = str(envelope.get("authority") or "").strip().casefold()
+        action = str(envelope.get("action") or "").strip()
+        if owner != "default" or authority != "agent_internal" or not action:
+            return None
+        if envelope.get("needs_user_decision") is not False:
+            return None
+        if metadata.get("needs_user_decision") is not None and metadata.get("needs_user_decision") is not False:
+            return None
+        if metadata.get("manual_only") is not None and metadata.get("manual_only") is not False:
+            return None
+        if _owner_replan_truthy(metadata.get("owner_replan_suppressed")) or _owner_replan_has_gate_flag(metadata):
+            return None
+        if str(metadata.get("resume_policy") or "").strip().casefold() == "manual":
+            return None
+        semantic_outcome = raw_outcome or str(envelope.get("outcome") or "completed").strip().casefold()
+        if semantic_outcome not in {"completed", *_OWNER_REPLAN_LEGACY_OUTCOMES}:
+            return None
+        if _OWNER_REPLAN_FORBIDDEN_GATE_RE.search(_owner_replan_gate_text(metadata)):
+            return None
+        return {
+            "semantic_outcome": semantic_outcome, "action": action,
+            "owner_replan": {
+                "owner": "default", "action": action,
+                "authority": "agent_internal", "needs_user_decision": False,
+            },
+            "topic_target": str(metadata.get("topic_target") or envelope.get("topic_target") or "").strip(),
+        }
+    next_step = str(metadata.get("next_step") or "").strip()
+    if raw_outcome not in _OWNER_REPLAN_LEGACY_OUTCOMES or not next_step:
+        return None
+    if _OWNER_REPLAN_MANUAL_NEXT_STEP_RE.search(next_step):
+        return None
+    next_owner = str(metadata.get("next_owner") or "").strip().casefold()
+    anchored_default = bool(re.search(r"\b(?:dolly\s*/\s*default|default\s+owner|dolly\s+owner)\b", next_step, re.IGNORECASE))
+    if next_owner and next_owner != "default":
+        return None
+    if not next_owner and not anchored_default:
+        return None
+    if metadata.get("needs_user_decision") is not None and metadata.get("needs_user_decision") is not False:
+        return None
+    if metadata.get("manual_only") is not None and metadata.get("manual_only") is not False:
+        return None
+    if _owner_replan_truthy(metadata.get("owner_replan_suppressed")) or _owner_replan_has_gate_flag(metadata):
+        return None
+    if str(metadata.get("resume_policy") or "").strip().casefold() == "manual":
+        return None
+    if _OWNER_REPLAN_FORBIDDEN_GATE_RE.search(_owner_replan_gate_text(metadata)):
+        return None
+    return {
+        "semantic_outcome": raw_outcome, "action": next_step,
+        "owner_replan": {
+            "owner": "default", "action": next_step,
+            "authority": "agent_internal", "needs_user_decision": False,
+        },
+        "topic_target": str(metadata.get("topic_target") or "").strip(),
+    }
+
+
+def _owner_replan_topic_target(task: Mapping[str, Any], normalized: Mapping[str, Any]) -> Optional[str]:
+    fields = _owner_replan_body_fields(task)
+    candidates = [str(fields.get("topic_target") or "").strip(), str(normalized.get("topic_target") or "").strip()]
+    candidates = [value for value in candidates if value]
+    if not candidates or len(set(candidates)) != 1 or not _OWNER_REPLAN_TOPIC_TARGET_RE.fullmatch(candidates[0]):
+        return None
+    return candidates[0]
+
+
+def _completion_owner_replan_from_run(conn: sqlite3.Connection, terminal_run_id: Optional[int]) -> Optional[dict[str, Any]]:
+    if terminal_run_id is None:
+        return None
+    row = conn.execute("SELECT outcome, metadata FROM task_runs WHERE id=?", (int(terminal_run_id),)).fetchone()
+    if row is None or str(row["outcome"] or "").casefold() != "completed":
+        return None
+    try:
+        metadata = json.loads(row["metadata"] or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    return _normalize_completion_owner_replan(metadata)
+
+
+def _ensure_semantic_owner_replan_event(
+    conn: sqlite3.Connection, task_snapshot: Mapping[str, Any], *, terminal_run_id: Optional[int],
+) -> Optional[str]:
+    """Append one safe semantic completion intent in the close transaction."""
+    task_id = str(_row_value(task_snapshot, "id") or "").strip()
+    if not task_id or terminal_run_id is None:
+        return None
+    current_run_id = _row_value(task_snapshot, "current_run_id")
+    if current_run_id is not None and int(current_run_id) != int(terminal_run_id):
+        return None
+    if str(_row_value(task_snapshot, "status") or "").casefold() not in {"running", "ready", "blocked", "review"}:
+        return None
+    fields = _owner_replan_body_fields(task_snapshot)
+    hygiene = str(_row_value(task_snapshot, "hygiene_class") or fields.get("hygiene_class") or "").strip().casefold()
+    if hygiene in {"obsolete", "superseded", "cancelled", "archived"} or str(_row_value(task_snapshot, "superseded_by") or fields.get("superseded_by") or "").strip():
+        return None
+    if _owner_replan_repo_suppression(task_snapshot):
+        return None
+    normalized = _completion_owner_replan_from_run(conn, terminal_run_id)
+    if normalized is None:
+        return None
+    board = _board_slug_for_connection(conn)
+    project_id, project_source = _owner_replan_project_identity(task_snapshot, board, require_explicit=True)
+    if not project_id:
+        return None
+    topic_target = _owner_replan_topic_target(task_snapshot, normalized)
+    if topic_target is None or _owner_replan_active_successor(conn, task_snapshot):
+        return None
+    route = _owner_replan_route(conn, task_id)
+    if route is None:
+        return None
+    contract_id, revision, _ = _owner_replan_identity(task_snapshot)
+    semantic_outcome = str(normalized["semantic_outcome"])
+    payload: dict[str, Any] = {
+        "event_type": _OWNER_REPLAN_EVENT_KIND, "owner": "default",
+        "project": project_id, "project_id": project_id, "project_source": project_source,
+        "board": board, "topic_target": topic_target, "task_id": task_id,
+        "continuation_of": task_id, "terminal_run_id": int(terminal_run_id),
+        "contract_id": contract_id, "revision": revision,
+        "semantic_outcome": semantic_outcome, "end_reason": semantic_outcome,
+        "action": str(normalized["action"]), "owner_replan": normalized["owner_replan"],
+        "worktree": str(_row_value(task_snapshot, "workspace_path") or ""),
+        "branch": str(_row_value(task_snapshot, "branch_name") or ""),
+        "artifact_state": "unknown", "resume_policy": "never", "retryable": False,
+        "route": route, "owner_route": route,
+    }
+    payload["fingerprint"] = _owner_replan_fingerprint(payload)
+    for row in conn.execute("SELECT payload FROM task_events WHERE task_id=? AND kind=?", (task_id, _OWNER_REPLAN_EVENT_KIND)).fetchall():
+        if _json_dict(row["payload"]).get("fingerprint") == payload["fingerprint"]:
+            return str(payload["fingerprint"])
+    _append_event(conn, task_id, _OWNER_REPLAN_EVENT_KIND, payload, run_id=int(terminal_run_id))
+    return str(payload["fingerprint"])
+
+
+def _owner_replan_control(conn: sqlite3.Connection, task_id: str, fingerprint: str) -> Optional[str]:
+    rows = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? AND kind IN (?,?,?,?,?) ORDER BY id DESC",
+        (task_id, "owner_replan_wake_claimed", "owner_replan_delivered", "owner_replan_acknowledged", "owner_replan_failed", "owner_replan_suppressed"),
+    ).fetchall()
+    for row in rows:
+        if _json_dict(row["payload"]).get("fingerprint") == fingerprint:
+            return str(row["kind"])
+    return None
+
+
+def claim_owner_replan_for_route(
+    conn: sqlite3.Connection, *, task_id: str, platform: str, chat_id: str,
+    thread_id: Optional[str] = None, claim: bool = True,
+) -> Optional[dict[str, Any]]:
+    """Peek or atomically claim the exact default-owner route."""
+    txn = write_txn(conn) if claim else contextlib.nullcontext(conn)
+    with txn:
+        rows = conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC", (task_id, _OWNER_REPLAN_EVENT_KIND)).fetchall()
+        for row in rows:
+            payload = _json_dict(row["payload"])
+            route = payload.get("route") if isinstance(payload.get("route"), dict) else {}
+            if str(route.get("platform") or "").casefold() != str(platform or "").casefold() or str(route.get("chat_id") or "") != str(chat_id or "") or str(route.get("thread_id") or "") != str(thread_id or ""):
+                continue
+            fingerprint = str(payload.get("fingerprint") or "")
+            if not fingerprint:
+                continue
+            control = _owner_replan_control(conn, task_id, fingerprint)
+            if control:
+                if not claim and control == "owner_replan_wake_claimed":
+                    interrupted = dict(payload); interrupted.update({"replan_event_id": int(row["id"]), "interrupted_claim": True}); return interrupted
+                continue
+            task = get_task(conn, task_id)
+            if task is None:
+                return None
+            task_map = task.__dict__
+            fields = _owner_replan_body_fields(task_map)
+            hygiene = str(fields.get("hygiene_class") or "").casefold()
+            reason = None
+            if hygiene in {"obsolete", "superseded"} or task_map.get("superseded_by"):
+                reason = "superseded_or_obsolete"
+            else:
+                reason = _owner_replan_repo_suppression(task_map)
+                if reason is None:
+                    successor = _owner_replan_active_successor(conn, task_map)
+                    if successor:
+                        reason = f"active_successor:{successor}"
+            if reason:
+                if claim:
+                    _append_event(conn, task_id, "owner_replan_suppressed", {"fingerprint": fingerprint, "replan_event_id": int(row["id"]), "reason": reason}, run_id=payload.get("terminal_run_id"))
+                return None
+            claimed = dict(payload); claimed["replan_event_id"] = int(row["id"])
+            if claim:
+                _append_event(conn, task_id, "owner_replan_wake_claimed", {"fingerprint": fingerprint, "replan_event_id": int(row["id"]), "owner": "default"}, run_id=payload.get("terminal_run_id"))
+            return claimed
+    return None
+
+
+def mark_owner_replan_delivered(conn: sqlite3.Connection, task_id: str, *, fingerprint: str, replan_event_id: int) -> bool:
+    with write_txn(conn):
+        if _owner_replan_control(conn, task_id, fingerprint) in {"owner_replan_delivered", "owner_replan_acknowledged", "owner_replan_failed"}:
+            return False
+        _append_event(conn, task_id, "owner_replan_delivered", {"fingerprint": fingerprint, "replan_event_id": int(replan_event_id), "owner": "default"})
+    return True
+
+
+def mark_owner_replan_failed(conn: sqlite3.Connection, task_id: str, *, fingerprint: str, replan_event_id: int, error: str) -> bool:
+    with write_txn(conn):
+        if _owner_replan_control(conn, task_id, fingerprint) in {"owner_replan_failed", "owner_replan_delivered", "owner_replan_acknowledged"}:
+            return False
+        _append_event(conn, task_id, "owner_replan_failed", {"fingerprint": fingerprint, "replan_event_id": int(replan_event_id), "owner": "default", "resume_policy": "manual", "retryable": False, "error": str(error)[:500]})
+    return True
+
+
+def _acknowledge_owner_replan_in_txn(conn: sqlite3.Connection, task_id: str, *, author: str, body: str) -> bool:
+    if str(author or "").strip().casefold() != "default":
+        return False
+    match = _OWNER_REPLAN_ACK_RE.search(str(body or ""))
+    if not match:
+        return False
+    fingerprint = match.group(1)
+    for row in conn.execute("SELECT id, payload FROM task_events WHERE task_id=? AND kind=? ORDER BY id DESC", (task_id, _OWNER_REPLAN_EVENT_KIND)).fetchall():
+        payload = _json_dict(row["payload"])
+        if payload.get("fingerprint") != fingerprint or _owner_replan_control(conn, task_id, fingerprint) == "owner_replan_acknowledged":
+            continue
+        _append_event(conn, task_id, "owner_replan_acknowledged", {"fingerprint": fingerprint, "replan_event_id": int(row["id"]), "owner": "default"}, run_id=payload.get("terminal_run_id"))
+        return True
+    return False
+
+
+def acknowledge_owner_replan_from_comment(conn: sqlite3.Connection, task_id: str, *, author: str, body: str) -> bool:
+    with write_txn(conn):
+        return _acknowledge_owner_replan_in_txn(conn, task_id, author=author, body=body)
 
 
 def _ensure_owner_replan_event(
@@ -4117,6 +4402,10 @@ def _finalize_iteration_exhaustion_immediately(
             },
             run_id=closed_run_id,
         )
+        _ensure_owner_replan_event(
+            conn, dict(row), terminal_run_id=closed_run_id,
+            end_reason="iteration_exhausted",
+        )
         return closed_run_id
 
 
@@ -4189,15 +4478,14 @@ def complete_task(
             return False
         if acceptance is not None and not record_acceptance(conn, task_id, acceptance):
             return False
-        trow = conn.execute(
-            "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
-            (task_id,),
+        prior_row = conn.execute(
+            "SELECT * FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
-        prior_status = trow["status"] if trow else None
+        prior_status = prior_row["status"] if prior_row else None
         # Refuse to close a LIVE worker's run without proof of ownership
         # (expected_run_id) or an explicit human override (force=True); see
         # _claim_is_live for what "live" means.
-        if expected_run_id is None and not force and trow and _claim_is_live(trow):
+        if expected_run_id is None and not force and prior_row and _claim_is_live(prior_row):
             raise LiveClaimError(task_id)
         sql = """
                 UPDATE tasks
@@ -4241,6 +4529,10 @@ def complete_task(
             _completed_event_payload(result, event_summary, verified_cards, metadata),
             run_id=run_id,
         )
+        if prior_row is not None:
+            _ensure_semantic_owner_replan_event(
+                conn, dict(prior_row), terminal_run_id=run_id,
+            )
     _flag_phantom_prose_refs(conn, task_id, run_id, summary, result, verified_cards)
     _terminalize_task_execution_projection(
         task_id,
@@ -5051,6 +5343,13 @@ def promote_task(
     if cur_status is None:
         return False, f"task {task_id} not found"
 
+    if cur_status == "blocked":
+        blocked_row = conn.execute(
+            "SELECT block_kind FROM tasks WHERE id = ?", (task_id,),
+        ).fetchone()
+        if blocked_row and blocked_row["block_kind"] == "iteration_exhausted":
+            return False, "iteration-exhausted task requires owner replan; promotion is disabled"
+
     if cur_status not in ("todo", "blocked"):
         return False, (
             f"task {task_id} is {cur_status!r}; promote only applies to "
@@ -5122,6 +5421,11 @@ def _landing_status_after_parents(conn: sqlite3.Connection, task_id: str) -> str
 def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
+    current = conn.execute(
+        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+    ).fetchone()
+    if current and current["status"] == "blocked" and current["block_kind"] == "iteration_exhausted":
+        return False
     now = int(time.time())
     with write_txn(conn):
         resume_status = (
@@ -6195,6 +6499,50 @@ _PLUGIN_COMPAT_LAZY = {
     'unseen_events_for_sub': ('hermes_cli.kanban_db_notify', 'unseen_events_for_sub'),
     'worker_log_rotation_config': ('hermes_cli.kanban_db_dispatch', 'worker_log_rotation_config'),
 }
+
+
+# The native dispatcher keeps the implementation in ``kanban_db_dispatch``;
+# this facade preserves the accepted terminal-finalizer call shape without
+# widening that module's frozen scope.
+_record_task_failure_dispatch = _record_task_failure
+
+
+def _record_task_failure(
+    conn: sqlite3.Connection,
+    task_id: str,
+    error: str,
+    *,
+    outcome: str,
+    failure_limit: int = None,
+    force_trip: bool = False,
+    release_claim: bool = False,
+    end_run: bool = False,
+    event_payload_extra: Optional[dict] = None,
+    expected_run_id: Optional[int] = None,
+) -> bool:
+    """Route budget-exhaustion failures through the terminal owner ledger."""
+    if (
+        outcome == "timed_out"
+        and isinstance(event_payload_extra, dict)
+        and "budget_used" in event_payload_extra
+        and "budget_max" in event_payload_extra
+    ):
+        return _record_iteration_exhaustion(
+            conn, task_id,
+            budget_used=int(event_payload_extra["budget_used"]),
+            budget_max=int(event_payload_extra["budget_max"]),
+            error=error,
+            expected_run_id=expected_run_id,
+        ) is not None
+    return _record_task_failure_dispatch(
+        conn, task_id, error,
+        outcome=outcome,
+        failure_limit=failure_limit,
+        force_trip=force_trip,
+        release_claim=release_claim,
+        end_run=end_run,
+        event_payload_extra=event_payload_extra,
+    )
 
 
 def __getattr__(name):  # PEP 562 — lazy so no import cycles
