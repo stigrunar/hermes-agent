@@ -1222,6 +1222,7 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     delivery_metadata TEXT,
     created_at    INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL DEFAULT 0,
+    baseline_event_id INTEGER NOT NULL DEFAULT 0,
     last_ping_event_id INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
@@ -3995,7 +3996,8 @@ def _extend_run_claim(conn: sqlite3.Connection, task_id: str, expires: int) -> O
 def release_stale_claims(
     conn: sqlite3.Connection, *, signal_fn=None, failure_limit: Optional[int] = None,
 ) -> int:
-    """Reclaim ``running`` tasks whose claim expired; returns the count reclaimed.
+    """Reclaim expired ``running`` tasks and retained ``ready`` handoff claims.
+    Returns the count reclaimed.
 
     Every reclaim that actually releases a claim is a non-success attempt and
     is booked through ``_record_task_failure`` (#111306): a claim that expired
@@ -4025,11 +4027,11 @@ def release_stale_claims(
     reclaimed = 0
     host_prefix = _host_prefix()
     stale = conn.execute(
-        "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
+        "SELECT id, status, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
         "       assignee, current_run_id "
         "FROM tasks "
-        "WHERE status = 'running' AND claim_expires IS NOT NULL "
-        "  AND claim_expires < ?", (now,),
+        "WHERE (status = 'running' AND claim_expires IS NOT NULL AND claim_expires < ?) "
+        "   OR (status = 'ready' AND claim_lock IS NOT NULL)", (now,),
     ).fetchall()
     for row in stale:
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
@@ -4052,7 +4054,8 @@ def release_stale_claims(
             and _worker_alive(row["worker_pid"], started_at)
             and not heartbeat_stale
         ):
-            _extend_live_stale_claim(conn, row, now)
+            if row["status"] == "running":
+                _extend_live_stale_claim(conn, row, now)
             continue
         termination = (
             _termination_metadata_without_pid_signal(row["worker_pid"], scope_release)
@@ -4074,8 +4077,8 @@ def release_stale_claims(
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-                "WHERE id = ? AND status = 'running' AND claim_lock IS ? "
-                "AND claim_expires IS NOT NULL AND claim_expires < ?",
+                "WHERE id = ? AND status IN ('running', 'ready') AND claim_lock IS ? "
+                "AND (status = 'ready' OR (claim_expires IS NOT NULL AND claim_expires < ?))",
                 (retry_status, row["id"], row["claim_lock"], now),
             )
             if cur.rowcount != 1:
@@ -4086,7 +4089,7 @@ def release_stale_claims(
                 payload={
                     "stale_lock": row["claim_lock"],
                     "worker_pid": _opt_int(row["worker_pid"]),
-                    "claim_expires": int(row["claim_expires"]),
+                    "claim_expires": _opt_int(row["claim_expires"]),
                     "last_heartbeat_at": _opt_int(row["last_heartbeat_at"]),
                     "now": now,
                     "host_local": host_local,
@@ -5277,7 +5280,9 @@ def request_changes(
 
     with write_txn(conn):
         task_row = conn.execute(
-            "SELECT status, assignee, current_run_id FROM tasks WHERE id = ?", (task_id,),
+            "SELECT status, assignee, current_run_id, claim_lock, claim_expires, "
+            "worker_pid, worker_started_at "
+            "FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
         if task_row is None:
             return False, "task not found"
@@ -5301,16 +5306,28 @@ def request_changes(
         reviewer = _canonical_assignee(_nonblank_str(task_row["assignee"]))
 
         new_status = _landing_status_after_parents(conn, task_id)
+        # A reviewer process may still be alive when its run is handed back to
+        # the implementer. Preserve that claim until stale-claim release has
+        # confirmed termination; otherwise the replacement can run alongside
+        # the live reviewer. Dead/no-PID claims retain the ordinary handoff.
+        preserve_claim = bool(
+            task_row["claim_lock"]
+            and task_row["worker_pid"]
+            and _worker_alive(task_row["worker_pid"], task_row["worker_started_at"])
+        )
+        claim_reset = "" if preserve_claim else (
+            ",\n                   claim_lock = NULL,"
+            "\n                   claim_expires = NULL,"
+            "\n                   worker_pid = NULL,"
+            "\n                   worker_started_at = NULL"
+        )
         # consecutive_failures deliberately PRESERVED: a review transition is
         # not evidence the pathology cleared; only complete_task resets it.
         cur = conn.execute(
-            """
+            f"""
             UPDATE tasks
                SET status = ?,
-                   assignee = COALESCE(?, assignee),
-                   claim_lock = NULL,
-                   claim_expires = NULL,
-                   worker_pid = NULL, worker_started_at = NULL
+                   assignee = COALESCE(?, assignee){claim_reset}
              WHERE id = ? AND status = 'running' AND current_run_id = ?
             """,
             (new_status, implementer, task_id, int(current_run_id)),
@@ -6508,6 +6525,13 @@ _PLUGIN_COMPAT_LAZY = {
 # this facade preserves the accepted terminal-finalizer call shape without
 # widening that module's frozen scope.
 _record_task_failure_dispatch = _record_task_failure
+
+
+def _baseline_legacy_notify_subs(conn: sqlite3.Connection) -> None:
+    """Facade export for the one-time notification migration baseline."""
+    from hermes_cli.kanban_db_notify import _baseline_legacy_notify_subs as _baseline
+
+    _baseline(conn)
 
 
 def _record_task_failure(

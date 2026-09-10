@@ -945,6 +945,7 @@ _RUN_SCOPE_COLUMNS = {
 
 _NOTIFY_SUB_COLUMNS = (
     ("last_ping_event_id", "last_ping_event_id INTEGER NOT NULL DEFAULT 0"),
+    ("baseline_event_id", "baseline_event_id INTEGER NOT NULL DEFAULT 0"),
     ("notifier_profile", "notifier_profile TEXT"),
     ("delivery_mode", "delivery_mode TEXT NOT NULL DEFAULT 'notify'"),
     ("chat_type", "chat_type TEXT"),
@@ -974,6 +975,7 @@ def _table_exists(conn: sqlite3.Connection, table: str) -> bool:
 
 def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     """Add columns introduced after v1 to legacy DBs (called via ``init_db``)."""
+    baseline_notify_subs = False
     cols = _column_names(conn, "tasks")
     for name, ddl in _BASE_TASK_COLUMNS + _EARLY_TASK_COLUMNS:
         if name not in cols:
@@ -1021,6 +1023,8 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
             if name in notify_cols:
                 continue
             _add_column_if_missing(conn, "kanban_notify_subs", name, ddl)
+            if name == "baseline_event_id":
+                baseline_notify_subs = True
             if name == "delivery_mode":
                 # Backfill ONLY on first-add: pre-column gateway subscriptions
                 # had de facto active wake; defaulting them to 'notify' would
@@ -1051,7 +1055,16 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     ):
         conn.execute("UPDATE task_events SET kind = ? WHERE kind = ?", (new, old))
 
+    baseline_notify_subs = baseline_notify_subs or (
+        _table_exists(conn, "kanban_notify_subs")
+        and _table_has_drifted(conn, "kanban_notify_subs")
+    )
     _rebuild_drifted_tables(conn)
+    # Legacy subscriptions must start at the current task boundary exactly
+    # once, so an upgrade never replays historical terminal events. Keep the
+    # helper in the notification sibling and expose it through the facade.
+    if baseline_notify_subs:
+        _kb._baseline_legacy_notify_subs(conn)
 
 
 def _backfill_legacy_inflight_runs(conn: sqlite3.Connection) -> None:
@@ -1164,6 +1177,7 @@ _REBUILD_SPECS = {
         " notifier_profile TEXT, delivery_mode TEXT NOT NULL DEFAULT 'notify',"
         " delivery_metadata TEXT, created_at INTEGER NOT NULL,"
         " last_event_id INTEGER NOT NULL DEFAULT 0,"
+        " baseline_event_id INTEGER NOT NULL DEFAULT 0,"
         " last_ping_event_id INTEGER NOT NULL DEFAULT 0,"
         " PRIMARY KEY (task_id, platform, chat_id, thread_id))",
         ("CREATE INDEX idx_notify_task ON kanban_notify_subs(task_id)",),

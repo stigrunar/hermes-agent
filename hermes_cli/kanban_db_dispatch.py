@@ -3323,6 +3323,8 @@ def _dispatch_preview(
         for row in rows:
             if max_new_spawns is not None and len(result.spawned) >= max_new_spawns:
                 break
+            if max_in_progress is not None and running + len(result.spawned) >= max_in_progress:
+                break
             if max_spawn is not None and running + len(result.spawned) >= max_spawn:
                 break
             assignee = row["assignee"] or default
@@ -3349,7 +3351,9 @@ def _dispatch_preview(
             lane = "review" if row["status"] == "review" else "ready"
             if lane == "review" and not review_dispatch_enabled():
                 continue
-            if check_respawn_guard(preview, row["id"], lane=lane) is not None:
+            guard_reason = check_respawn_guard(preview, row["id"], lane=lane)
+            if guard_reason is not None:
+                result.respawn_guarded.append((row["id"], guard_reason))
                 continue
             result.spawned.append((row["id"], assignee, ""))
             per_profile[assignee] = per_profile.get(assignee, 0) + 1

@@ -109,6 +109,25 @@ class GatewayGoalsMixin:
         source = dataclasses.replace(source, message_id=None) if getattr(source, "message_id", None) else source
         return MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=internal)
 
+    @staticmethod
+    def _dedupe_loop_wakeup_candidates(candidates):
+        """Keep one due loop for each route/timestamp pair.
+
+        Compression/session rotations can leave duplicate persisted loop rows
+        pointing at the same destination.  The newest session id is the
+        deterministic owner of that wakeup; the other rows remain persisted
+        for their own lifecycle and are considered on a later scan.
+        """
+        selected = {}
+        for sid, state in candidates:
+            route = getattr(state, "route", None) or {}
+            route_key = tuple(sorted((str(key), str(value)) for key, value in route.items()))
+            key = (route_key, float(getattr(state, "next_due_at", 0.0) or 0.0))
+            prior = selected.get(key)
+            if prior is None or str(sid) > str(prior[0]):
+                selected[key] = (sid, state)
+        return sorted(selected.values(), key=lambda item: str(item[0]))
+
     def _register_heartbeat_watch(self, quick_key: str, source: Any, session_id: str) -> None:
         """Track the canonical route and start the restart-recoverable poller."""
         watch = getattr(self, "_heartbeat_watch", None)
@@ -452,16 +471,20 @@ class GatewayGoalsMixin:
             session_key = self._session_key_for_source(source)
         if session_key and session_key in self._running_agents:
             return  # busy — stays due, next scan retries
-        if goal_blocks_loop_tick(sid):
-            return
+        def _claim_wakeup():
+            from hermes_cli.loops import LoopManager, goal_blocks_loop_tick
 
-        mgr = LoopManager(session_id=sid)
-        if not mgr.is_due(now):
-            return
-        # fire_tick()/complete_tick() are writes (BEGIN IMMEDIATE) taking the SessionDB writer lock; a slow
-        # writer elsewhere holding it while the loop thread blocked froze the gateway until the watchdog
-        # fired. The context-preserving executor keeps the profile HERMES_HOME override under multiplex.
-        wakeup = await self._run_in_executor_with_context(mgr.fire_tick)
+            # LoopManager construction, goal ownership checks, and fire_tick
+            # all touch SessionDB. Keep the entire read/claim sequence off the
+            # event loop; only transport delivery returns to this coroutine.
+            if goal_blocks_loop_tick(sid):
+                return None, None
+            mgr = LoopManager(session_id=sid)
+            if not mgr.is_due(now):
+                return None, None
+            return mgr, mgr.fire_tick()
+
+        mgr, wakeup = await self._run_in_executor_with_context(_claim_wakeup)
         if not wakeup:
             return
         # #85957: after the parent turn's event.complete the CLIENT owns the next turn on this stateless

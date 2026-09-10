@@ -1026,8 +1026,9 @@ def test_cli_daemon_help_marks_deprecated():
 
 
 @pytest.mark.parametrize("corrupt_exc", ["sqlite", "guard"])
+@pytest.mark.parametrize("review_dispatch", [False, True])
 def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
-    monkeypatch, tmp_path, caplog, corrupt_exc
+    monkeypatch, tmp_path, caplog, corrupt_exc, review_dispatch
 ):
     """Corrupt board DBs log one actionable error and stop retrying per tick."""
     import asyncio
@@ -1052,6 +1053,7 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
             "kanban": {
                 "dispatch_in_gateway": True,
                 "dispatch_interval_seconds": 1,
+                "review_dispatch": review_dispatch,
             }
         },
     )
@@ -1112,13 +1114,10 @@ def test_gateway_dispatcher_disables_corrupt_board_without_traceback(
     assert sum("not a valid SQLite database" in msg for msg in messages) == 1
     assert not any("tick failed on board" in msg for msg in messages)
     assert not any(record.exc_info for record in caplog.records)
-    # First tick connect (dispatch) + two probes per `_has_ready_work` call
-    # (ready then review, both via _kbc.connect). The second dispatch tick
-    # skips the dispatch connect because the corrupt board fingerprint is
-    # disabled, but the ready/review probes still each connect. PR f55d94a1e
-    # added the review-column probe alongside the existing ready-column
-    # probe, bumping this from 3 → 5.
-    assert calls["connect"] == 5
+    # The count is database connections: the corrupt dispatch attempt plus
+    # one ready probe per tick, and an additional review probe only when the
+    # review lane is explicitly enabled.
+    assert calls["connect"] == (5 if review_dispatch else 3)
 
 
 # ---------------------------------------------------------------------------

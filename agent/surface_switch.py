@@ -30,10 +30,17 @@ _NOTE_SCAN_TAIL = 200
 
 def split_runtime_boundary(prompt: str) -> tuple:
     """``(identity, runtime_marker, runtime)`` of a persisted prompt.  Legacy prose may quote
-    the runtime heading, but only the new renderer ENDS in the boundary; when the marker is
-    empty the whole prompt is identity."""
+    the runtime heading, but only the new renderer owns the marked block; source-epoch trailers
+    may follow its end marker. When the marker is absent the whole prompt is identity."""
     identity, runtime_marker, runtime = prompt.rpartition(f"\n\n{RUNTIME_ENVIRONMENT_HEADING}\n\n")
-    return (identity, runtime_marker, runtime) if prompt.endswith(RUNTIME_ENVIRONMENT_END) else (prompt, "", "")
+    if not runtime_marker:
+        return prompt, "", ""
+    # The source-epoch trailer is stamped after the renderer-owned runtime block,
+    # so the boundary is not necessarily the final bytes of a persisted prompt.
+    end = runtime.find(RUNTIME_ENVIRONMENT_END)
+    if end < 0:
+        return prompt, "", ""
+    return identity, runtime_marker, runtime[:end]
 
 
 def identity_line_value(prompt: str, label: str) -> str:

@@ -174,6 +174,43 @@ def add_notify_sub(
             )
 
 
+def _baseline_legacy_notify_subs(conn: sqlite3.Connection) -> None:
+    """Baseline pre-migration subscriptions without replaying old events.
+
+    ``baseline_event_id`` is a durable one-time marker. A zero cursor is
+    advanced to the task's current event boundary; a nonzero cursor is kept
+    intact while the baseline still suppresses any older history.
+    """
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(kanban_notify_subs)")}
+    if "baseline_event_id" not in columns:
+        return
+    rows = conn.execute(
+        "SELECT task_id, platform, chat_id, thread_id, last_event_id, baseline_event_id "
+        "FROM kanban_notify_subs WHERE baseline_event_id = 0"
+    ).fetchall()
+    for row in rows:
+        boundary = int(
+            conn.execute(
+                "SELECT COALESCE(MAX(id), 0) FROM task_events WHERE task_id = ?",
+                (row["task_id"],),
+            ).fetchone()[0]
+            or 0
+        )
+        key = (row["task_id"], row["platform"], row["chat_id"], row["thread_id"] or "")
+        with _kb.write_txn(conn):
+            if int(row["last_event_id"] or 0) == 0:
+                conn.execute(
+                    "UPDATE kanban_notify_subs SET last_event_id = ?, baseline_event_id = ? "
+                    + _SUB_KEY_WHERE,
+                    (boundary, boundary, *key),
+                )
+            else:
+                conn.execute(
+                    "UPDATE kanban_notify_subs SET baseline_event_id = ? " + _SUB_KEY_WHERE,
+                    (boundary, *key),
+                )
+
+
 def _notify_profile_filter(
     notifier_profiles: Optional[Iterable[str]],
     *,
@@ -346,10 +383,10 @@ def _notify_cursor(
 ) -> Optional[int]:
     """``last_event_id`` of one subscription row, or ``None`` when unsubscribed."""
     row = conn.execute(
-        "SELECT last_event_id FROM kanban_notify_subs " + _SUB_KEY_WHERE,
+        "SELECT MAX(last_event_id, baseline_event_id) AS cursor FROM kanban_notify_subs " + _SUB_KEY_WHERE,
         _sub_key(task_id, platform, chat_id, thread_id),
     ).fetchone()
-    return None if row is None else int(row["last_event_id"])
+    return None if row is None else int(row["cursor"] or 0)
 
 
 def unseen_events_for_sub(

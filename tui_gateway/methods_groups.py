@@ -268,7 +268,7 @@ def _room_method(
 
 
 @method("groups.capabilities")
-def _(rid, params: dict, _catalog=_local_catalog, _methods=_METHODS) -> dict:
+def _(rid, params: dict, _catalog=_local_catalog) -> dict:
     """Describe the hosted-room protocol implemented by this gateway."""
     from gateway.hosted_rooms import MAX_LOG_LIMIT, PROTOCOL_VERSION, local_authority_gateway_id
     service = get_hosted_room_service()
