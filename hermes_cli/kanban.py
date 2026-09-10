@@ -29,7 +29,8 @@ from hermes_cli.kanban_output import (
 )
 from hermes_cli.kanban_boards import _dispatch_boards
 from hermes_cli.kanban_ops import (
-    _cmd_daemon, _kanban_config, _cmd_dispatch, _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
+    _cmd_daemon as _ops_cmd_daemon, _kanban_config, _cmd_dispatch as _ops_cmd_dispatch,
+    _cmd_gc, _cmd_repair, _cmd_tail, _cmd_watch,
 )
 from hermes_cli.kanban_parser import build_parser  # noqa: F401  (re-exported: hermes_cli.main, run_slash)
 
@@ -133,6 +134,124 @@ def _check_dispatcher_presence(hermes_home: Optional[Path] = None) -> tuple[bool
             "the gateway comes up.")
 
 
+def _cli_dispatch_admission(args: argparse.Namespace) -> tuple[dict, object, Optional[str],
+                                                                  Optional[int], Optional[int], Optional[int]]:
+    """Validate dispatch policy before any database connection or auto-init."""
+    cached = getattr(args, "_dispatch_admission", None)
+    if cached is not None:
+        return cached
+    from hermes_cli.config import load_config
+
+    cfg = load_config()
+    section = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+    if not isinstance(section, dict):
+        raise ValueError("kanban config must be a mapping")
+    default_assignee = (section.get("default_assignee") or "").strip() or None
+    max_in_progress = kbd.resolve_max_in_progress(
+        kbd._positive_dispatch_cap(section.get("max_in_progress"), "kanban.max_in_progress")
+    )
+    cli_max = getattr(args, "max", None)
+    max_spawn = cli_max if cli_max is not None else kbd._positive_dispatch_cap(
+        section.get("max_spawn"), "kanban.max_spawn"
+    )
+    per_profile = kbd._positive_dispatch_cap(
+        section.get("max_in_progress_per_profile"), "kanban.max_in_progress_per_profile"
+    )
+    prepared = kb.prepare_dispatch_admission(
+        cfg,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=per_profile,
+    )
+    cached = (cfg, prepared, default_assignee, max_spawn, max_in_progress, per_profile)
+    setattr(args, "_dispatch_admission", cached)
+    return cached
+
+
+def _cmd_dispatch(args: argparse.Namespace) -> int:
+    """Run one dispatch tick after policy admission and before DB open."""
+    _, effective_config, default_assignee, max_spawn, max_in_progress, per_profile = \
+        _cli_dispatch_admission(args)
+    max_new_spawns = getattr(args, "spawn_budget", None)
+    connector = (kbc.connect_readonly_closing if bool(getattr(args, "dry_run", False))
+                 else kbc.connect_closing)
+    dispatch_fn = kb.dispatch_once
+    # Native split tests historically patch either facade or sibling binding;
+    # preserve both seams while production resolves to the facade.
+    if (getattr(dispatch_fn, "__module__", None) == kbd.__name__
+            and kbd.dispatch_once is not dispatch_fn):
+        dispatch_fn = kbd.dispatch_once
+    with connector() as conn:
+        # Keep the facade seam: gateway/tests can replace the admitted
+        # dispatcher without changing this CLI module's binding.
+        res = dispatch_fn(
+            conn,
+            dry_run=bool(getattr(args, "dry_run", False)),
+            max_spawn=max_spawn,
+            max_new_spawns=max_new_spawns,
+            max_in_progress=max_in_progress,
+            failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=per_profile,
+            effective_config=effective_config,
+        )
+    if getattr(args, "json", False):
+        _print_json({
+            **{k: getattr(res, k) for k in (
+                "reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted",
+            )},
+            "spawned": [
+                {"task_id": tid, "assignee": who, "workspace": ws}
+                for (tid, who, ws) in res.spawned
+            ],
+            "skipped_unassigned": res.skipped_unassigned,
+            "skipped_nonspawnable": res.skipped_nonspawnable,
+            "skipped_per_profile_capped": [
+                {"task_id": tid, "assignee": who, "current": current}
+                for (tid, who, current) in res.skipped_per_profile_capped
+            ],
+            "auto_assigned_default": res.auto_assigned_default,
+        }, ascii=True)
+        return 0
+    print(f"Reclaimed:    {res.reclaimed}")
+    for label, items in (
+        ("Crashed:     ", res.crashed),
+        ("Timed out:   ", res.timed_out),
+        ("Stale:       ", res.stale),
+        ("Auto-blocked:", res.auto_blocked),
+    ):
+        print(f"{label} {len(items)}")
+        if items:
+            print(f"  {', '.join(items)}")
+    print(f"Promoted:     {res.promoted}")
+    print(f"Spawned:      {len(res.spawned)}")
+    tag = " (dry)" if getattr(args, "dry_run", False) else ""
+    for tid, who, ws in res.spawned:
+        print(f"  - {tid}  ->  {who}  @ {ws or '-'}{tag}")
+    if res.auto_assigned_default:
+        print(
+            f"Auto-assigned to kanban.default_assignee={default_assignee!r}: "
+            f"{', '.join(res.auto_assigned_default)}"
+        )
+    if res.skipped_unassigned:
+        print(f"Skipped (unassigned): {', '.join(res.skipped_unassigned)}")
+    for tid, who, current in res.skipped_per_profile_capped:
+        print(f"Deferred ({who} at per-profile cap, {current} running): {tid}")
+    if res.skipped_nonspawnable:
+        print(
+            "Skipped (non-spawnable assignee — terminal lane, OK): "
+            f"{', '.join(res.skipped_nonspawnable)}"
+        )
+    return 0
+
+
+def _cmd_daemon(args: argparse.Namespace) -> int:
+    """Admission wrapper for the legacy forced standalone daemon."""
+    if getattr(args, "force", False):
+        _cli_dispatch_admission(args)
+    return _ops_cmd_daemon(args)
+
+
 # --- Command dispatch ---
 
 def kanban_command(args: argparse.Namespace) -> int:
@@ -151,6 +270,15 @@ def kanban_command(args: argparse.Namespace) -> int:
     # import DB mutators directly.
     if _is_delegated_child_cli_mutation(args):
         return _err("kanban: delegate_task child contexts cannot mutate Kanban tasks via the CLI")
+
+    # Dispatch policy is a shared-root trust boundary.  Validate it before
+    # board routing or auto-init can create SQLite files/sidecars.  The handler
+    # caches this exact snapshot on ``args`` for the subsequent DB operation.
+    if action == "dispatch" or (action == "daemon" and getattr(args, "force", False)):
+        try:
+            _cli_dispatch_admission(args)
+        except (ValueError, RuntimeError, PermissionError) as exc:
+            return _err(f"kanban: {exc}")
 
     # `boards …` manages board metadata and the current-board pointer itself, so it must ignore
     # the `--board` routing override (else `--board beta boards show` reports beta).
