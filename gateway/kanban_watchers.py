@@ -19,6 +19,7 @@ from typing import Any, Optional
 from gateway.kanban_watchers_common import (
     _acquire_singleton_lock,
     _kanban_dispatch_allowed,
+    _profile_notifier_lock_path,
     _release_singleton_lock,
     _resolve_auto_decompose_settings,
     _gc_retention_days,
@@ -67,11 +68,12 @@ class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
         """Elect one profile-owned notifier loop and keep one polling flow."""
         try:
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_db_dispatch as _kbd
         except Exception:
             logger.warning("kanban notifier: kanban_db not importable; notifier disabled")
             return
         profile = self._active_profile_name()
-        lock_path = _kb.kanban_home() / "kanban" / f".notifier-{profile}.lock"
+        lock_path = _profile_notifier_lock_path(_kb.kanban_home(), profile)
         retry_delay = min(1.0, max(0.1, float(interval)))
         while getattr(self, "_running", False):
             handle, state = _acquire_singleton_lock(lock_path)
@@ -314,13 +316,43 @@ class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
             logger.warning("kanban dispatcher: cannot load config (%s); disabled", exc)
             return None
         kanban_cfg = cfg.get("kanban", {}) if isinstance(cfg, dict) else {}
+        if not isinstance(kanban_cfg, dict):
+            logger.error("kanban dispatcher: kanban config must be a mapping")
+            return None
         if not kanban_cfg.get("dispatch_in_gateway", True):
             logger.info("kanban dispatcher: disabled via config kanban.dispatch_in_gateway=false")
             return None
         try:
             from hermes_cli import kanban_db as _kb
+            from hermes_cli import kanban_db_dispatch as _kbd
         except Exception:
             logger.warning("kanban dispatcher: kanban_db not importable; dispatcher disabled")
+            return None
+
+        # Resolve the immutable shared-root admission snapshot before the
+        # singleton lock, settings side effects, or any board DB is opened.
+        # Every board in this watcher receives the same prepared object.
+        try:
+            requested_spawn, requested_progress = _kbd.resolve_dispatch_caps(cfg)
+            requested_progress = _kbd.resolve_max_in_progress(requested_progress)
+            effective_config = _kbd.prepare_dispatch_admission(
+                cfg,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+                max_in_progress_per_profile=kanban_cfg.get("max_in_progress_per_profile"),
+            )
+            max_spawn, max_in_progress = _kbd.resolve_dispatch_caps(
+                effective_config,
+                max_spawn=requested_spawn,
+                max_in_progress=requested_progress,
+            )
+            allowed_worker_profiles = _kbd.resolve_worker_profile_admission(
+                effective_config,
+                max_spawn=max_spawn,
+                max_in_progress=max_in_progress,
+            )
+        except (TypeError, ValueError) as exc:
+            logger.error("kanban dispatcher: admission policy invalid: %s", exc)
             return None
 
         # Single-dispatcher backstop (see _acquire_singleton_lock). The lock
@@ -338,7 +370,15 @@ class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
         else:
             logger.warning("kanban dispatcher: advisory lock unavailable at %s; proceeding "
                            "on config control alone.", _lock_path)
-        return _load_config, _kb, kanban_cfg
+        return (
+            _load_config,
+            _kb,
+            kanban_cfg,
+            max_spawn,
+            max_in_progress,
+            allowed_worker_profiles,
+            effective_config,
+        )
 
     async def _kanban_dispatcher_watcher(self) -> None:
         """Embedded kanban dispatcher — one tick every `dispatch_interval_seconds`.
@@ -352,8 +392,23 @@ class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
         boot = self._kanban_dispatcher_boot()
         if boot is None:
             return
-        _load_config, _kb, kanban_cfg = boot
-        settings = _resolve_dispatcher_settings(kanban_cfg, _kb)
+        (
+            _load_config,
+            _kb,
+            kanban_cfg,
+            max_spawn,
+            max_in_progress,
+            allowed_worker_profiles,
+            effective_config,
+        ) = boot
+        settings = _resolve_dispatcher_settings(
+            kanban_cfg,
+            _kb,
+            max_spawn=max_spawn,
+            max_in_progress=max_in_progress,
+            allowed_worker_profiles=allowed_worker_profiles,
+            effective_config=effective_config,
+        )
         interval = settings.interval
 
         # Initial delay so adapters are wired before workers spawn (matches the notifier).

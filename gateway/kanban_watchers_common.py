@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import hashlib
 import logging
 from contextvars import Context
 from pathlib import Path
@@ -44,6 +45,12 @@ def _list_boards(kb: Any) -> list:
 
 def _board_slugs(kb: Any) -> list:
     return [b.get("slug") or kb.DEFAULT_BOARD for b in _list_boards(kb)]
+
+
+def _profile_notifier_lock_path(kanban_home: Path, profile: str) -> Path:
+    """Return the stable, profile-isolated notifier ownership lock path."""
+    digest = hashlib.sha256(profile.encode("utf-8")).hexdigest()[:20]
+    return kanban_home / "kanban" / f".notifier-{digest}.lock"
 
 
 def _positive_int_setting(kanban_cfg: dict, key: str) -> Optional[int]:

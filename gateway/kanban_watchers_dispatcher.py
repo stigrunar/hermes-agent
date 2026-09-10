@@ -11,9 +11,9 @@ import contextlib
 import os
 import sqlite3
 import time
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 from gateway.kanban_watchers_common import _board_slugs, _positive_int_setting, logger
 
@@ -42,9 +42,22 @@ class _DispatcherSettings:
     reconcile_orphans: bool
     default_assignee: Optional[str]
     max_in_progress_per_profile: Optional[int]
+    allowed_worker_profiles: Optional[list[str]]
+    effective_config: Optional[Mapping[str, Any]]
 
 
-def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettings:
+_UNSET = object()
+
+
+def _resolve_dispatcher_settings(
+    kanban_cfg: dict,
+    kb: Any,
+    *,
+    max_spawn: Any = _UNSET,
+    max_in_progress: Any = _UNSET,
+    allowed_worker_profiles: Optional[list[str]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
+) -> _DispatcherSettings:
     """Parse and log the dispatcher settings in their established order."""
     try:
         interval = float(kanban_cfg.get("dispatch_interval_seconds", 60) or 60)
@@ -54,15 +67,19 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         interval = 60.0
     interval = max(interval, 1.0)  # sanity floor — tighter than this is a footgun
 
-    max_spawn = kanban_cfg.get("max_spawn")
+    if max_spawn is _UNSET:
+        max_spawn = kanban_cfg.get("max_spawn")
     if max_spawn is not None:
         logger.info("kanban dispatcher: max_spawn=%s", max_spawn)
 
     # Cap simultaneously running tasks so slow workers don't pile up and time
     # out. Explicit config wins; otherwise a memory-derived default (unbounded
     # fan-out swap-thrashes small hosts), or None where total memory can't be read.
-    max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
-    effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
+    if max_in_progress is _UNSET:
+        max_in_progress = _positive_int_setting(kanban_cfg, "max_in_progress")
+        effective_max_in_progress = _kbd().resolve_max_in_progress(max_in_progress)
+    else:
+        effective_max_in_progress = max_in_progress
     if max_in_progress is None and effective_max_in_progress is not None:
         logger.info(
             "kanban dispatcher: kanban.max_in_progress unset; using "
@@ -115,6 +132,8 @@ def _resolve_dispatcher_settings(kanban_cfg: dict, kb: Any) -> _DispatcherSettin
         # Per-profile concurrency cap: no single profile's local model / API
         # quota / browser pool gets overwhelmed by a fan-out.
         max_in_progress_per_profile=_positive_int_setting(kanban_cfg, "max_in_progress_per_profile"),
+        allowed_worker_profiles=allowed_worker_profiles,
+        effective_config=effective_config,
     )
 
 
@@ -181,7 +200,18 @@ class _KanbanDispatcher:
         fingerprint = self.board_db_fingerprint(slug)
         if not self._quarantine_lifted(slug, fingerprint):
             return None
-        kwargs = {k: v for k, v in asdict(self.settings).items() if k != "interval"}
+        settings = self.settings
+        kwargs = {
+            "max_spawn": settings.max_spawn,
+            "max_in_progress": settings.max_in_progress,
+            "failure_limit": settings.failure_limit,
+            "stale_timeout_seconds": settings.stale_timeout_seconds,
+            "default_assignee": settings.default_assignee,
+            "max_in_progress_per_profile": settings.max_in_progress_per_profile,
+            "allowed_worker_profiles": settings.allowed_worker_profiles,
+            "effective_config": settings.effective_config,
+            "reconcile_orphans": settings.reconcile_orphans,
+        }
         try:
             # No explicit init_db(): connect() runs the migration once per
             # process (see the matching note in the notifier collector).

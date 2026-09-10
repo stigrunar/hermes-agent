@@ -117,20 +117,16 @@ class TestReconcileOrphanedRunning:
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
 
-    def test_live_worker_pid_defers_reconcile(self, conn):
+    def test_live_worker_pid_defers_reconcile(self, conn, monkeypatch):
         """If the orphan row still records a live PID on this host, don't
         requeue beside a possibly-alive worker — defer to the next tick."""
+        monkeypatch.setattr(kb, "_pid_alive", lambda _pid: True)
         tid = kb.create_task(conn, title="maybe-alive", assignee="w")
-        sleeper = subprocess.Popen(["sleep", "30"])
-        try:
-            _orphan_running(conn, tid, worker_pid=sleeper.pid)
-            assert kbd.reconcile_orphaned_running(conn) == []
-            assert conn.execute(
-                "SELECT status FROM tasks WHERE id=?", (tid,)
-            ).fetchone()["status"] == "running"
-        finally:
-            sleeper.terminate()
-            sleeper.wait()
+        _orphan_running(conn, tid, worker_pid=12345)
+        assert kbd.reconcile_orphaned_running(conn) == []
+        assert conn.execute(
+            "SELECT status FROM tasks WHERE id=?", (tid,)
+        ).fetchone()["status"] == "running"
 
     def test_dead_worker_pid_orphan_requeued(self, conn):
         """Orphan with a recorded but dead PID is reconciled."""
@@ -158,7 +154,7 @@ class TestDispatchOnceReconciles:
         _orphan_running(conn, tid)
 
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
-                                  dry_run=True)
+                                  max_new_spawns=0)
 
         assert tid in result.reconciled_orphans
         assert conn.execute(
@@ -172,9 +168,35 @@ class TestDispatchOnceReconciles:
         _orphan_running(conn, tid)
 
         result = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: (True, ""),
-                                  dry_run=True, reconcile_orphans=False)
+                                  max_new_spawns=0, reconcile_orphans=False)
 
         assert result.reconciled_orphans == []
         assert conn.execute(
             "SELECT status FROM tasks WHERE id=?", (tid,)
         ).fetchone()["status"] == "running"
+
+    def test_dispatch_once_dry_run_is_select_only(self, conn):
+        """Preview must not reconcile or otherwise mutate source bookkeeping."""
+        tid = kb.create_task(conn, title="preview-zombie", assignee="w")
+        _orphan_running(conn, tid)
+        before_events = [(event.id, event.kind, event.payload) for event in kb.list_events(conn, tid)]
+        spawned = []
+
+        result = kbd.dispatch_once(
+            conn,
+            spawn_fn=lambda *a, **k: spawned.append((a, k)) or (True, ""),
+            dry_run=True,
+        )
+
+        assert result.reconciled_orphans == []
+        assert spawned == []
+        row = conn.execute(
+            "SELECT status, claim_lock, claim_expires, worker_pid FROM tasks WHERE id=?",
+            (tid,),
+        ).fetchone()
+        assert row["status"] == "running"
+        assert row["claim_lock"] is None
+        assert row["claim_expires"] is None
+        assert row["worker_pid"] is None
+        after_events = [(event.id, event.kind, event.payload) for event in kb.list_events(conn, tid)]
+        assert after_events == before_events
