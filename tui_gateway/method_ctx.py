@@ -101,6 +101,7 @@ def bind_module(module_globals: dict, server, *, skip=()) -> None:
         if (name.startswith("__") or name in _PLUMBING or name in skip
                 or isinstance(obj, (types.ModuleType, HandlerRegistry))):
             continue
+        own_function = isinstance(obj, types.FunctionType) and obj.__module__ == mod_name
         if isinstance(obj, types.FunctionType):
             if obj.__module__ == mod_name:
                 obj = rebind(obj, g, seen)
@@ -123,6 +124,11 @@ def bind_module(module_globals: dict, server, *, skip=()) -> None:
                 raise RuntimeError(
                     f"split-module name collision: {mod_name}.{name} would overwrite {owner}.{name}"
                 )
+            obj._hermes_split_module = mod_name
+        elif isinstance(obj, types.FunctionType) and own_function:
+            # Record ownership on the first publication as well as on a
+            # replacement.  Without this marker a later split module could
+            # silently overwrite the original helper.
             obj._hermes_split_module = mod_name
         setattr(server, name, obj)
     registry = module_globals.get("_registry")

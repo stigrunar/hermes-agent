@@ -52,6 +52,12 @@ def _record_kanban_budget_exhausted(
     This is a bounded fallback (#87096): if another path already closed the run,
     the run-fenced transition is a no-op.
     """
+    # ``HERMES_KANBAN_*`` identity is inherited by in-process cron and delegated
+    # children.  Those contexts must never open the parent's DB or record a
+    # terminal transition.  Keep this gate ahead of the import/connect boundary.
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if not is_dispatcher_owned_worker_context():
+        return
     try:
         from hermes_cli import kanban_db as _kb
         _conn = _kb.connect()
@@ -162,7 +168,12 @@ def _resolve_budget_fallback(
 
     # A kanban worker must record a terminal outcome whether or not a fallback path
     # was eligible, so the dispatcher learns the worker could not complete.
-    _kanban_task = os.environ.get("HERMES_KANBAN_TASK") if budget_exhausted else None
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    _kanban_task = (
+        os.environ.get("HERMES_KANBAN_TASK")
+        if budget_exhausted and is_dispatcher_owned_worker_context()
+        else None
+    )
     # If running as a kanban worker, signal the dispatcher that the worker could not complete (rather than
     # treating it as a protocol violation). This applies whether the user-facing fallback came from the
     # summary call or an explicitly pending continuation; both exhausted the task budget and must advance

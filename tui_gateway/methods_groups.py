@@ -4,7 +4,7 @@ same-gateway Discussion driver; ``groups.capabilities`` keeps that boundary mach
 Handlers are rebound onto server.py's globals at install (method_ctx.py); module-private
 helpers reach them through keyword defaults. ``_room_method`` is the shared envelope."""
 
-from .method_ctx import HandlerRegistry
+from .method_ctx import HandlerRegistry, bind_module
 
 import contextlib
 import importlib
@@ -49,6 +49,10 @@ def bind_server(server) -> None:
     """Bind the fully initialized server module without starting a worker."""
     global _bound_server
     _bound_server = server
+    # HandlerRegistry rebinds function globals onto ``server``.  Mirror the
+    # bound-owner pointer there as well so those handlers resolve the same
+    # profile/service context instead of the split module's initial ``None``.
+    server._bound_server = server
     server._profile_execution_policy = _profile_execution_policy
 
 
@@ -253,12 +257,14 @@ def _room_error_class(replica_only: bool) -> type:
 def _room_method(
     name: str, *, code: int, room_code: int | None = None, replica_only: bool = False,
     with_reason: bool = True, service_code: int | None = None,
-    service_message: str = _DRIVER_UNAVAILABLE, db: bool = False):
+    service_message: str = _DRIVER_UNAVAILABLE, db: bool = False,
+    value_code: int | None = None):
     """Register ``fn`` under ``name`` with the shared hosted-room error envelope.
     ``service_code``: the live service is required (else that error) and passed as a third
     argument; ``db``: the default room db path follows. ``room_code`` maps ``HostedRoomError``
     (only ``ReplicaError`` when ``replica_only``) to a client error with ``{"reason"}`` data
-    when ``with_reason``; anything else maps to ``code``."""
+    when ``with_reason``; ``value_code`` optionally gives plain ``ValueError`` validation its
+    own client code; anything else maps to ``code``."""
     error_class = _room_error_class  # closure cell: handlers run under server.py globals
 
     def dec(fn):
@@ -278,6 +284,8 @@ def _room_method(
                 if room_code is not None and isinstance(exc, error_class(replica_only)):
                     reason = getattr(exc, "reason", None) if with_reason else None
                     return _err(rid, room_code, str(exc), {"reason": reason} if reason else None)
+                if value_code is not None and isinstance(exc, ValueError):
+                    return _err(rid, value_code, str(exc))
                 return _err(rid, code, str(exc))
         handler.__doc__ = fn.__doc__
         return method(name)(handler)
@@ -359,8 +367,8 @@ def _(rid, params: dict, _catalog=_local_catalog) -> dict:
     )
 
 
-@method("groups.peer.invite")
-def _(rid, params: dict) -> dict:
+@_room_method("groups.peer.invite", code=5111, value_code=4120, db=True)
+def _(rid, params: dict, db_path, _expiry=_grant_expiry, _catalog=_local_catalog) -> dict:
     """Mint one target-issued room/profile grant for a prospective home."""
     from gateway.hosted_room_peer import (
         decode_room_grant, gateway_room_grant_secret, issue_room_grant)
@@ -642,8 +650,8 @@ def _(rid, params: dict) -> dict:
         return _err(rid, 5117, str(exc))
 
 
-@method("groups.disband")
-def _(rid, params: dict) -> dict:
+@_room_method("groups.disband", code=5114, room_code=4113, service_code=4115, db=True)
+def _(rid, params: dict, service, db_path) -> dict:
     """Permanently tombstone a hosted room id."""
     from gateway.hosted_rooms import (
         AuthorityConflictError, RoomHistoryExpiredError, disband_room, local_authority_gateway_id,
@@ -655,13 +663,13 @@ def _(rid, params: dict) -> dict:
         if state is not None and str(state["authority_gateway_id"]) != local_gateway_id:
             raise AuthorityConflictError("This Group Chat is managed by another gateway.")
         tombstone = disband_room(
-            service.db_path, room_id=params.get("room_id"),
+            db_path, room_id=params.get("room_id"),
             expected_gateway_id=str(local_gateway_id),
             expected_epoch=int(state["authority_epoch"] if state is not None else 1))
         return _ok(rid, {"tombstone": tombstone})
     try:
         existing = room_state(
-            service.db_path, room_id=params.get("room_id"), include_disbanded=True)
+            db_path, room_id=params.get("room_id"), include_disbanded=True)
     except RoomHistoryExpiredError:
         return disband_with_state()
     if existing.get("disbanded_at") is not None:
@@ -770,4 +778,12 @@ _passthrough(
 
 
 def register(server) -> None:
-    _registry.install(server)
+    bind_module(globals(), server, skip=("_",))
+    # methods_bot_relay publishes these lifecycle/profile helpers before this
+    # module's handlers are installed.  Keep their module-owned state (service,
+    # bound server and profile scope) intact while the handlers themselves use
+    # the server namespace for ordinary split helpers.
+    for name in (
+        "get_hosted_room_service", "_WORKER_UNAVAILABLE", "_profile_name",
+        "_requested_profile", "_api_server_key", "_room_link_run_storage_durable"):
+        setattr(server, name, globals()[name])
