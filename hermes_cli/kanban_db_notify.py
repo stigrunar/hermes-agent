@@ -89,6 +89,23 @@ def add_notify_sub(
     to ``"notify"``. New subs start caught up (``last_event_id`` =
     ``MAX(task_events.id)``) so the notifier never replays history at boot.
     """
+    # A task bound to a structured conversation lane has one exact delivery
+    # authority.  Callers may still carry the originating DM subscription;
+    # project/outcome routing wins and stale origins are removed atomically.
+    lane_row = conn.execute(
+        "SELECT conversation_lane_id, topic_target FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if lane_row is not None and lane_row["conversation_lane_id"] and lane_row["topic_target"]:
+        try:
+            lane_platform, lane_chat, lane_thread = _kb.parse_structured_topic_target(
+                str(lane_row["topic_target"]),
+            )
+        except ValueError:
+            lane_platform = lane_chat = lane_thread = None
+        if lane_platform is not None:
+            platform, chat_id, thread_id = lane_platform, lane_chat, lane_thread
+            chat_type = "group"
     valid_mode = delivery_mode if delivery_mode in _NOTIFY_DELIVERY_MODES else None
     # api_server is stateless: the adapter has no send(), the wake self-post IS
     # the delivery. A plain 'notify' default would leave those subs with no
@@ -97,6 +114,12 @@ def add_notify_sub(
     metadata_json = _encode_notify_delivery_metadata(delivery_metadata)
     key = _sub_key(task_id, platform, chat_id, thread_id)
     with _kb.write_txn(conn):
+        if lane_row is not None and lane_row["conversation_lane_id"] and lane_row["topic_target"]:
+            conn.execute(
+                "DELETE FROM kanban_notify_subs WHERE task_id = ? "
+                "AND NOT (platform = ? AND chat_id = ? AND thread_id = ?)",
+                (task_id, *key[1:]),
+            )
         conn.execute(
             """
             INSERT OR IGNORE INTO kanban_notify_subs

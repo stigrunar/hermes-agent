@@ -24,7 +24,7 @@ import time
 from contextvars import ContextVar, Token
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Mapping, Optional
 
 from toolsets import get_toolset_names
 
@@ -177,6 +177,27 @@ def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
 KNOWN_TOOLSET_NAMES = frozenset(name.casefold() for name in get_toolset_names())
 _IS_WINDOWS = sys.platform == "win32"
 KANBAN_ATTACHMENT_MAX_BYTES = 25 * 1024 * 1024  # one cap for dashboard, tools and CLI
+
+_STRUCTURED_TOPIC_TARGET_RE = re.compile(
+    r"^[A-Za-z][A-Za-z0-9_-]*:[^:\\s]+(?::[^:\\s]+)?$"
+)
+
+
+def _normalize_structured_topic_target(value: Optional[str]) -> Optional[str]:
+    target = str(value or "").strip() or None
+    if target is None:
+        return None
+    if not _STRUCTURED_TOPIC_TARGET_RE.fullmatch(target):
+        raise ValueError("topic_target must use exact native form platform:chat_id[:thread_id]")
+    return target
+
+
+def parse_structured_topic_target(value: str) -> tuple[str, str, Optional[str]]:
+    target = _normalize_structured_topic_target(value)
+    if target is None:
+        raise ValueError("topic_target is required")
+    parts = target.split(":", 2)
+    return parts[0].lower(), parts[1], parts[2] if len(parts) == 3 and parts[2] else None
 
 
 def _assert_not_delegated_child_mutation() -> None:
@@ -750,6 +771,14 @@ class Task:
     tenant: Optional[str]
     branch_name: Optional[str] = None
     project_id: Optional[str] = None
+    outcome_id: Optional[str] = None
+    conversation_lane_id: Optional[str] = None
+    topic_target: Optional[str] = None
+    parent_execution_id: Optional[str] = None
+    mutation_repository: Optional[str] = None
+    mutation_scope: Optional[list[str]] = None
+    mutation_base_ref: Optional[str] = None
+    resource_requirements: Optional[list[str]] = None
     result: Optional[str] = None
     idempotency_key: Optional[str] = None
     # Column semantics: see SCHEMA_SQL.
@@ -783,6 +812,16 @@ class Task:
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        mutation_scope_value = _json_or(g("mutation_scope"))
+        if not isinstance(mutation_scope_value, list):
+            mutation_scope_value = None
+        else:
+            mutation_scope_value = [str(item) for item in mutation_scope_value if item]
+        resource_requirements_value = _json_or(g("resource_requirements"))
+        if not isinstance(resource_requirements_value, list):
+            resource_requirements_value = None
+        else:
+            resource_requirements_value = [str(item) for item in resource_requirements_value if item]
         raw_capabilities = _json_or(g("required_capabilities"))
         capabilities_value: Optional[list[str]] = None
         if isinstance(raw_capabilities, list):
@@ -801,6 +840,8 @@ class Task:
             consecutive_failures=g("consecutive_failures", g("spawn_failures", 0)),
             last_failure_error=g("last_failure_error", g("last_spawn_error")),
             skills=skills_value,
+            mutation_scope=mutation_scope_value,
+            resource_requirements=resource_requirements_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
             required_capabilities=capabilities_value,
@@ -817,6 +858,8 @@ _TASK_OPTIONAL_COLUMNS = (
     "branch_name", "project_id", "tenant", "result", "idempotency_key", "worker_pid",
     "max_runtime_seconds", "last_heartbeat_at", "current_run_id", "workflow_template_id",
     "current_step_key", "max_retries", "session_id", "completion_contract",
+    "outcome_id", "conversation_lane_id", "topic_target", "parent_execution_id",
+    "mutation_repository", "mutation_base_ref",
 )
 # Text columns where "" is stored/read as "not set".
 _TASK_EMPTY_IS_NULL_COLUMNS = (
@@ -983,6 +1026,16 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- the task's worktree is anchored under the project's primary repo with a
     -- deterministic branch name instead of a random wt/<task-id> fallback.
     project_id           TEXT,
+    -- Optional material Outcome and structured conversation identity. These
+    -- are root-shared coordination references, not board-derived metadata.
+    outcome_id           TEXT,
+    conversation_lane_id TEXT,
+    topic_target         TEXT,
+    parent_execution_id  TEXT,
+    mutation_repository  TEXT,
+    mutation_scope       TEXT,
+    mutation_base_ref    TEXT,
+    resource_requirements TEXT,
     claim_lock           TEXT,
     claim_expires        INTEGER,
     tenant               TEXT,
@@ -1201,6 +1254,28 @@ def _claimer_id() -> str:
     return f"{host}:{os.getpid()}"
 
 
+def _board_slug_for_connection(conn: sqlite3.Connection) -> str:
+    """Derive a board slug from the owning SQLite file, never ambient state."""
+    try:
+        row = conn.execute("PRAGMA database_list").fetchone()
+        path = Path(str(row[2])).expanduser() if row and row[2] else None
+    except Exception:
+        path = None
+    if path is not None and path.name == "kanban.db":
+        if path.parent.parent.name == "boards" and path.parent.name:
+            return str(path.parent.name)
+    return DEFAULT_BOARD
+
+
+def kanban_execution_id(task_id: str, *, board: Optional[str] = None) -> str:
+    """Stable root-shared execution identity for one Kanban task."""
+    token = str(task_id or "").strip()
+    if not token:
+        raise ValueError("task_id is required")
+    board_slug = _normalize_board_slug(board) if board is not None else None
+    return f"kanban:{board_slug or DEFAULT_BOARD}:{token}"
+
+
 def _host_prefix() -> str:
     """``"<host>:"`` prefix shared by every claim lock issued from this host."""
     return f"{_claimer_id().split(':', 1)[0]}:"
@@ -1365,6 +1440,11 @@ def create_task(
     provider_override: Optional[str] = None, reasoning_effort: Optional[str] = None,
     goal_mode: bool = False, goal_max_turns: Optional[int] = None, initial_status: str = "running",
     session_id: Optional[str] = None, board: Optional[str] = None, project_id: Optional[str] = None,
+    outcome_id: Optional[str] = None, conversation_lane_id: Optional[str] = None,
+    topic_target: Optional[str] = None, parent_execution_id: Optional[str] = None,
+    mutation_repository: Optional[str] = None, mutation_scope: Optional[Iterable[str]] = None,
+    mutation_base_ref: Optional[str] = None,
+    resource_requirements: Optional[Iterable[str]] = None,
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
@@ -1421,10 +1501,101 @@ def create_task(
     if branch_name and workspace_kind != "worktree":
         raise ValueError("branch_name is only valid for worktree workspaces")
 
+    parents = tuple(p for p in parents if p)
+    parent_tasks = [get_task(conn, pid) for pid in parents]
+    if any(task is None for task in parent_tasks):
+        missing = [pid for pid, task in zip(parents, parent_tasks) if task is None]
+        raise ValueError(f"unknown parent task(s): {', '.join(missing)}")
+    parent_tasks = [task for task in parent_tasks if task is not None]
+
+    def _inherit_identity(name: str, explicit: Optional[str]) -> Optional[str]:
+        values = {str(getattr(task, name)).strip() for task in parent_tasks if getattr(task, name, None)}
+        if explicit is not None:
+            normalized = str(explicit).strip() or None
+            if normalized is not None and values and any(value != normalized for value in values):
+                raise ValueError(f"{name} conflicts with parent task binding")
+            return normalized
+        if len(values) > 1:
+            raise ValueError(f"parent tasks disagree on {name}")
+        return next(iter(values), None)
+
+    if project_id is None:
+        project_id = _inherit_identity("project_id", None)
+    outcome_id = _inherit_identity("outcome_id", outcome_id)
+    conversation_lane_id = _inherit_identity("conversation_lane_id", conversation_lane_id)
+    topic_target = _inherit_identity("topic_target", topic_target)
+    if parent_execution_id is None and len(parent_tasks) == 1:
+        parent_execution_id = kanban_execution_id(
+            parent_tasks[0].id, board=board or _board_slug_for_connection(conn)
+        )
+    parent_execution_id = str(parent_execution_id or "").strip() or None
+    topic_target = _normalize_structured_topic_target(topic_target)
+    if project_source_task_id is None and parent_tasks and project_id:
+        for parent_task in parent_tasks:
+            if parent_task.project_id == project_id:
+                project_source_task_id = parent_task.id
+                break
+
     project_id, project_obj, project_repo, workspace_kind = _resolve_project_link(
         conn, project_id, project_source_task_id, workspace_kind, workspace_path
     )
-    parents = tuple(p for p in parents if p)
+
+    if outcome_id is not None:
+        outcome_id = str(outcome_id).strip() or None
+    if outcome_id:
+        if not project_id:
+            raise ValueError("outcome_id requires a valid linked project")
+        from hermes_cli import outcomes_db as _odb
+        with _odb.connect_closing() as _oconn:
+            outcome = _odb.get_outcome(_oconn, outcome_id, project_id=project_id)
+        if outcome is None:
+            raise ValueError("outcome_id does not resolve inside the linked project")
+        outcome_id = outcome.id
+
+    if conversation_lane_id is not None:
+        conversation_lane_id = str(conversation_lane_id).strip() or None
+    if conversation_lane_id:
+        if not project_id:
+            raise ValueError("conversation_lane_id requires a valid linked project")
+        from hermes_cli import outcomes_db as _odb
+        with _odb.connect_closing() as _oconn:
+            lane_row = _oconn.execute(
+                "SELECT * FROM conversation_lanes WHERE id=?", (conversation_lane_id,)
+            ).fetchone()
+            if lane_row is None:
+                raise ValueError("conversation_lane_id does not resolve")
+            lane = _odb._lane_from_row(lane_row)
+            if lane.project_id != project_id:
+                raise ValueError("conversation lane belongs to a different project")
+            if outcome_id and lane.outcome_id and lane.outcome_id != outcome_id:
+                raise ValueError("conversation lane belongs to a different outcome")
+            lane_target = _odb.conversation_lane_target(lane)
+        if topic_target is None:
+            topic_target = lane_target
+        elif topic_target != lane_target:
+            raise ValueError("topic_target does not match conversation lane")
+    topic_target = _normalize_structured_topic_target(topic_target)
+
+    from hermes_cli import outcomes_db as _odb
+    normalized_mutation_scope = (
+        _odb.normalize_scope(mutation_scope) if mutation_scope is not None else None
+    )
+    if mutation_repository is None and project_repo and outcome_id:
+        mutation_repository = _git_out(Path(project_repo), "config", "--get", "remote.origin.url", timeout=3)
+        mutation_repository = mutation_repository or str(project_repo)
+    normalized_mutation_repository = (
+        _odb._normalize_repository(mutation_repository) if mutation_repository else None
+    )
+    normalized_mutation_base_ref = str(mutation_base_ref or "").strip() or None
+    normalized_resource_requirements = _odb.normalize_resource_requirements(resource_requirements)
+    if normalized_resource_requirements and not outcome_id:
+        raise ValueError("resource_requirements requires outcome_id")
+    if normalized_mutation_scope is not None:
+        if not outcome_id:
+            raise ValueError("mutation_scope requires outcome_id")
+        if not normalized_mutation_repository:
+            raise ValueError("mutation_scope requires mutation_repository or linked project repo")
+
     skills_list = _normalize_task_skills(skills)
 
     # Idempotency check BEFORE the write txn (no lock held); a concurrent-create
@@ -1469,17 +1640,25 @@ def create_task(
                         id, title, body, assignee, status, priority,
                         created_by, created_at, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
+                        outcome_id, conversation_lane_id, topic_target, parent_execution_id,
+                        mutation_repository, mutation_scope, mutation_base_ref,
+                        resource_requirements,
                         max_runtime_seconds,
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
                         , required_capabilities
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
                         created_by, now, workspace_kind, workspace_path,
                         branch_name, project_id, tenant, idempotency_key,
+                        outcome_id, conversation_lane_id, topic_target, parent_execution_id,
+                        normalized_mutation_repository,
+                        json.dumps(normalized_mutation_scope) if normalized_mutation_scope is not None else None,
+                        normalized_mutation_base_ref,
+                        json.dumps(normalized_resource_requirements) if normalized_resource_requirements else None,
                         _opt_int(max_runtime_seconds),
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
@@ -1504,6 +1683,14 @@ def create_task(
                         "workspace_path": workspace_path,
                         "branch_name": branch_name,
                         "project_id": project_id,
+                        "outcome_id": outcome_id,
+                        "conversation_lane_id": conversation_lane_id,
+                        "topic_target": topic_target,
+                        "parent_execution_id": parent_execution_id,
+                        "mutation_repository": normalized_mutation_repository,
+                        "mutation_scope": normalized_mutation_scope,
+                        "mutation_base_ref": normalized_mutation_base_ref,
+                        "resource_requirements": normalized_resource_requirements or None,
                         "skills": list(skills_list) if skills_list else None,
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
@@ -1604,6 +1791,93 @@ def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
     _ensure_required_capabilities_column(conn)
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
+
+
+def rebind_task_conversation(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    conversation_lane_id: str,
+    topic_target: Optional[str] = None,
+) -> bool:
+    """Rebind a task to an exact project conversation lane and target."""
+    task = get_task(conn, task_id)
+    if task is None:
+        return False
+    if not task.project_id:
+        raise ValueError("conversation rebinding requires a project-linked task")
+    from hermes_cli import outcomes_db as _odb
+
+    with _odb.connect_closing() as oconn:
+        lane_row = oconn.execute(
+            "SELECT * FROM conversation_lanes WHERE id = ?",
+            (str(conversation_lane_id).strip(),),
+        ).fetchone()
+        if lane_row is None:
+            raise ValueError("conversation_lane_id does not resolve")
+        lane = _odb._lane_from_row(lane_row)
+        if lane.project_id != task.project_id:
+            raise ValueError("conversation lane belongs to a different project")
+        if task.outcome_id and lane.outcome_id and lane.outcome_id != task.outcome_id:
+            raise ValueError("conversation lane belongs to a different outcome")
+        exact_target = _odb.conversation_lane_target(lane)
+    normalized_target = _normalize_structured_topic_target(topic_target or exact_target)
+    if normalized_target != exact_target:
+        raise ValueError("topic_target does not match conversation lane")
+
+    prior_sub = conn.execute(
+        "SELECT * FROM kanban_notify_subs WHERE task_id = ? "
+        "ORDER BY created_at, rowid LIMIT 1", (task_id,),
+    ).fetchone()
+    with write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET conversation_lane_id = ?, topic_target = ? WHERE id = ?",
+            (lane.id, normalized_target, task_id),
+        )
+        if cur.rowcount != 1:
+            return False
+        _append_event(
+            conn, task_id, "conversation_rebound",
+            {"conversation_lane_id": lane.id, "topic_target": normalized_target},
+        )
+
+    # Re-submit the prior subscription through the canonicalizer. This keeps
+    # delivery metadata while replacing any origin-DM key with the lane target.
+    if prior_sub is not None:
+        from hermes_cli.kanban_db_notify import (
+            _decode_notify_delivery_metadata,
+            add_notify_sub,
+        )
+        add_notify_sub(
+            conn,
+            task_id=task_id,
+            platform=str(prior_sub["platform"]),
+            chat_id=str(prior_sub["chat_id"]),
+            thread_id=str(prior_sub["thread_id"] or "") or None,
+            user_id=prior_sub["user_id"],
+            user_id_alt=prior_sub["user_id_alt"],
+            chat_type=prior_sub["chat_type"],
+            notifier_profile=prior_sub["notifier_profile"],
+            delivery_mode=prior_sub["delivery_mode"],
+            delivery_metadata=_decode_notify_delivery_metadata(prior_sub["delivery_metadata"]),
+        )
+    try:
+        with _odb.connect_closing() as oconn:
+            execution_id = kanban_execution_id(
+                task_id, board=_board_slug_for_connection(conn),
+            )
+            if _odb.get_execution(oconn, execution_id) is not None:
+                _odb.update_execution(
+                    oconn, execution_id,
+                    conversation_lane_id=lane.id,
+                    delivery_target=normalized_target,
+                )
+    except Exception as exc:
+        _log.warning(
+            "execution projection conversation rebind failed for %s: %s",
+            task_id, type(exc).__name__,
+        )
+    return True
 
 
 # Canonical sort-order mappings for ``hermes kanban list --sort``.
@@ -2008,6 +2282,168 @@ def _append_event(
     )
 
 
+def _mutation_lease_owner(task_id: str, *, board: Optional[str] = None) -> str:
+    return kanban_execution_id(task_id, board=board)
+
+
+def _task_projection_payload(
+    task: Mapping[str, Any], *, board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    project_id = str(task.get("project_id") or "").strip()
+    outcome_id = str(task.get("outcome_id") or "").strip()
+    if not project_id or not outcome_id:
+        return None
+    raw_scope = task.get("mutation_scope")
+    if isinstance(raw_scope, str):
+        raw_scope = _json_or(raw_scope)
+    mutation_scope = raw_scope if isinstance(raw_scope, list) and raw_scope else None
+    raw_resources = task.get("resource_requirements")
+    if isinstance(raw_resources, str):
+        raw_resources = _json_or(raw_resources)
+    resources = [str(item) for item in raw_resources if item] if isinstance(raw_resources, list) else []
+    return {
+        "execution_id": kanban_execution_id(str(task.get("id") or ""), board=board),
+        "project_id": project_id,
+        "outcome_id": outcome_id,
+        "execution_mode": "kanban",
+        "backend_id": str(task.get("id") or "").strip(),
+        "owner": str(task.get("assignee") or "default").strip() or "default",
+        "mutating": bool(mutation_scope),
+        "conversation_lane_id": str(task.get("conversation_lane_id") or "").strip() or None,
+        "delivery_target": str(task.get("topic_target") or "").strip() or None,
+        "repository": str(task.get("mutation_repository") or "").strip() or None,
+        "mutation_scope": mutation_scope,
+        "base_ref": str(task.get("mutation_base_ref") or "").strip() or None,
+        "resource_requirements": resources,
+    }
+
+
+def _admit_task_execution_projection(
+    task: Mapping[str, Any], *, board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    payload = _task_projection_payload(task, board=board)
+    if payload is None:
+        return None
+    from hermes_cli import outcomes_db as _odb
+
+    with _odb.connect_closing() as oconn:
+        _odb.create_execution(oconn, state="queued", **payload)
+        return _odb.admit_execution(oconn, payload["execution_id"])
+
+
+def _rollback_task_execution_admission(
+    task_id: str, *, board: Optional[str] = None, reason: str,
+) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    execution_id = kanban_execution_id(task_id, board=board)
+    try:
+        with _odb.connect_closing() as oconn:
+            execution = _odb.get_execution(oconn, execution_id)
+            if execution is None or execution["state"] in _odb.TERMINAL_EXECUTION_STATES:
+                return
+            try:
+                _odb.release_mutation_lease(oconn, owner_execution_id=execution_id, reason=reason)
+            except _odb.OutcomeError:
+                pass
+            try:
+                _odb.release_resource_lease(oconn, owner_execution_id=execution_id, reason=reason)
+            except _odb.OutcomeError:
+                pass
+            _odb.update_execution(oconn, execution_id, state="queued")
+    except Exception as exc:
+        _log.warning("execution admission rollback failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _set_task_execution_projection_state(
+    task_id: str, *, state: str, board: Optional[str] = None,
+) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as oconn:
+            execution_id = kanban_execution_id(task_id, board=board)
+            if _odb.get_execution(oconn, execution_id) is None:
+                return
+            if state in _odb.TERMINAL_EXECUTION_STATES:
+                _odb.terminalize_execution(oconn, execution_id, state=state, reason=state)
+            else:
+                # A task outside an active run must not retain scarce root
+                # admission.  Requeue/block transitions can be retried later
+                # through the normal claim path.
+                try:
+                    _odb.release_mutation_lease(
+                        oconn, owner_execution_id=execution_id, reason=state,
+                    )
+                except _odb.OutcomeError:
+                    pass
+                try:
+                    _odb.release_resource_lease(
+                        oconn, owner_execution_id=execution_id, reason=state,
+                    )
+                except _odb.OutcomeError:
+                    pass
+                _odb.update_execution(oconn, execution_id, state=state)
+    except Exception as exc:
+        _log.warning("execution projection state update failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _heartbeat_task_execution_projection(task_id: str, *, board: Optional[str] = None) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as oconn:
+            _odb.heartbeat_execution(oconn, kanban_execution_id(task_id, board=board))
+    except Exception as exc:
+        _log.warning("execution projection heartbeat failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _terminalize_task_execution_projection(
+    task_id: str, *, state: str, reason: str, board: Optional[str] = None,
+    receipt_uri: Optional[str] = None,
+) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as oconn:
+            execution_id = kanban_execution_id(task_id, board=board)
+            if _odb.get_execution(oconn, execution_id) is None:
+                return
+            _odb.terminalize_execution(
+                oconn, execution_id, state=state, reason=reason, receipt_uri=receipt_uri,
+            )
+    except Exception as exc:
+        _log.warning("execution projection terminalization failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _record_mutation_lease_conflict(
+    conn: sqlite3.Connection, task_id: str, conflict: Mapping[str, Any],
+) -> None:
+    conflicting = conflict.get("conflicting") if isinstance(conflict, Mapping) else None
+    if not isinstance(conflicting, Mapping):
+        return
+    lease_id = str(conflicting.get("id") or "")
+    last = conn.execute(
+        "SELECT kind, payload FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    if last is not None and last["kind"] == "mutation_lease_conflict":
+        payload = _json_dict(last["payload"])
+        if str(payload.get("conflicting_lease_id") or "") == lease_id:
+            return
+    with write_txn(conn):
+        _append_event(
+            conn, task_id, "mutation_lease_conflict",
+            {
+                "conflicting_lease_id": lease_id or None,
+                "conflicting_owner": conflicting.get("owner_execution_id"),
+                "conflicting_project_id": conflicting.get("project_id"),
+                "conflicting_outcome_id": conflicting.get("outcome_id"),
+                "repository": conflicting.get("repository"),
+                "path_scope": conflicting.get("path_scope"),
+            },
+        )
+
+
 def _end_run(
     conn: sqlite3.Connection, task_id: str, *, outcome: str, summary: Optional[str] = None,
     error: Optional[str] = None, metadata: Optional[dict] = None, status: Optional[str] = None,
@@ -2036,6 +2472,15 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
+    # Keep the root execution projection aligned with the board lifecycle.
+    # Completion terminalizes after workspace cleanup; all other run endings
+    # release admission immediately so a retry can compete fairly.
+    if outcome != "completed":
+        _set_task_execution_projection_state(
+            task_id,
+            state="blocked" if outcome in {"blocked", "dependency_wait", "iteration_exhausted", "gave_up"} else "queued",
+            board=_board_slug_for_connection(conn),
+        )
     return run_id
 
 
@@ -2292,6 +2737,38 @@ def claim_task(
     Returns the claimed ``Task`` on success, ``None`` if the task was
     already claimed (or is not in ``ready`` status).
     """
+    projection_snapshot = conn.execute(
+        "SELECT * FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL", (task_id,)
+    ).fetchone()
+    projection_admitted = False
+    projection_board = _board_slug_for_connection(conn)
+    if projection_snapshot is not None:
+        task_payload = dict(projection_snapshot)
+        from hermes_cli import outcomes_db as _odb
+        if _odb.cross_project_orchestration_enabled() and _task_projection_payload(
+            task_payload, board=projection_board
+        ) is not None:
+            try:
+                projection_admitted = _admit_task_execution_projection(
+                    task_payload, board=projection_board
+                ) is not None
+            except _odb.MutationLeaseConflict as exc:
+                _record_mutation_lease_conflict(
+                    conn, task_id, {"conflicting": exc.conflicting, "requested": exc.requested}
+                )
+                return None
+            except _odb.ExecutionAdmissionBlocked as exc:
+                with write_txn(conn):
+                    _append_event(
+                        conn, task_id, "execution_admission_blocked",
+                        {"reason": exc.reason, "execution_id": kanban_execution_id(task_id, board=projection_board), "counts": exc.counts},
+                    )
+                return None
+            except Exception as exc:
+                with write_txn(conn):
+                    _append_event(conn, task_id, "execution_projection_error", {"error_type": type(exc).__name__})
+                return None
+
     now = int(time.time())
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
@@ -2305,6 +2782,8 @@ def claim_task(
                 "WHERE id = ? AND status = 'ready'", (task_id,),
             )
             _append_event(conn, task_id, "claim_rejected", {"reason": "parents_not_done"})
+            if projection_admitted:
+                _rollback_task_execution_admission(task_id, board=projection_board, reason="parents_not_done")
             return None
         # Close a leaked prior run so the CAS below doesn't strand it.
         _reclaim_dangling_run(
@@ -2312,6 +2791,8 @@ def claim_task(
         )
         run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
         if run_id is None:
+            if projection_admitted:
+                _rollback_task_execution_admission(task_id, board=projection_board, reason="claim_lost")
             return None
         claimed = get_task(conn, task_id)
     _fire_task_hook("kanban_task_claimed", claimed, task_id, run_id)
@@ -2418,6 +2899,9 @@ def heartbeat_claim(
         if cur.rowcount != 1:
             return False
         _extend_run_claim(conn, task_id, expires)
+        _heartbeat_task_execution_projection(
+            task_id, board=_board_slug_for_connection(conn),
+        )
         return True
 
 
@@ -2889,6 +3373,13 @@ def complete_task(
     _clear_failure_counter(conn, task_id)
     recompute_ready(conn)  # separate txn so children see ``done``
     _cleanup_workspace(conn, task_id)
+    _terminalize_task_execution_projection(
+        task_id,
+        state="completed",
+        reason="completed",
+        board=_board_slug_for_connection(conn),
+        receipt_uri=f"kanban:{_hook_profile_name()}:{task_id}",
+    )
     _done_task = get_task(conn, task_id)
     if fire_lifecycle_hook:
         _fire_task_hook("kanban_task_completed", _done_task, task_id, run_id, summary=handoff_summary)
