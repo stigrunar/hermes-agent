@@ -3342,5 +3342,13 @@ for _m in (
     _methods_config_set, _methods_complete, _methods_tools, _methods_profiles, _methods_images,
     _methods_bot_relay, _prompt_turn, _billing_view, _methods_projects, _methods_session_foreign,
     _methods_session_control, _methods_subagents, _methods_vault, _methods_free_tier, _methods_connectors):
-    _m.register(sys.modules[__name__])
+    if _m is _methods_session:
+        # ``change_watcher`` owns the shared pet-selection helper.  The session
+        # split keeps a private copy for its local source view, but publishing
+        # both names would make the native split collision guard reject the
+        # otherwise valid server assembly.  Bind the session handlers without
+        # replacing the canonical helper.
+        _m.bind_module(vars(_m), sys.modules[__name__], skip=("_", "_active_pet"))
+    else:
+        _m.register(sys.modules[__name__])
 del _m

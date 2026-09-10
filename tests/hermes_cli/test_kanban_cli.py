@@ -7,6 +7,7 @@ import json
 import os
 import threading
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -211,6 +212,26 @@ def test_board_override_is_isolated_per_concurrent_call(kanban_home, monkeypatch
 
     assert alpha_titles == ["alpha-task"]
     assert beta_titles == ["beta-task"]
+
+
+def test_dispatch_fails_closed_when_db_identity_resolution_fails(kanban_home, monkeypatch):
+    """A resolver failure must not fall through to a tick or WAL maintenance."""
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    tick = MagicMock(wraps=dispatch._dispatch_once_locked)
+    hook = MagicMock(wraps=kb._fire_dispatch_tick_hook)
+    monkeypatch.setattr(dispatch, "_dispatch_once_locked", tick)
+    monkeypatch.setattr(kb, "_fire_dispatch_tick_hook", hook)
+    with kbc.connect_closing() as conn:
+        monkeypatch.setattr(kb, "kanban_db_path", lambda **_kwargs: (_ for _ in ()).throw(OSError("identity unavailable")))
+        result = dispatch.dispatch_once(
+            conn, spawn_fn=lambda *_args, **_kwargs: pytest.fail("spawn must not run"),
+        )
+
+    assert result.admission_blocked is True
+    assert result.admission_reason == "db_path_unavailable"
+    tick.assert_not_called()
+    hook.assert_called_once()
 
 
 # ---------------------------------------------------------------------------

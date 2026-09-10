@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import json
 import os
 import re
 import signal
@@ -164,6 +165,8 @@ class DispatchResult:
     skipped_worker_profile_not_allowed: list[tuple[str, str]] = field(default_factory=list)
     skipped_worker_profile_not_allowed_total: int = 0
     skipped_worker_profile_not_allowed_truncated: bool = False
+    remote_routed: list[dict[str, Any]] = field(default_factory=list)
+    remote_deferred: list[tuple[str, str]] = field(default_factory=list)
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -751,7 +754,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
-        "       t.max_runtime_seconds, t.claim_lock "
+        "       t.max_runtime_seconds, t.claim_lock, r.launch_mode "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running' AND t.max_runtime_seconds IS NOT NULL "
@@ -771,6 +774,10 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         pid = int(row["worker_pid"])
         tid = row["id"]
+        if row["launch_mode"] == "remote-codex-supervisor":
+            _fence_remote_dispatch(conn, tid, int(_kb._current_run_id(conn, tid)), "remote_supervisor_timeout")
+            timed_out.append(tid)
+            continue
         started_at = _kb._row_get(row, "worker_started_at")
         current_run = _kb._current_run_id(conn, tid)
         scope_release = _kb._scope_release_result(
@@ -1624,7 +1631,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
     control_group = getattr(pid, "control_group", None)
     if type(pid) is bool or not isinstance(pid, int) or int(pid) <= 0:
         raise ValueError("worker PID must be a positive integer")
-    if launch_mode not in {"direct", "systemd-user-scope"}:
+    if launch_mode not in {"direct", "systemd-user-scope", "remote-codex-supervisor"}:
         raise RuntimeError(f"unknown worker launch mode: {launch_mode!r}")
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
@@ -1656,6 +1663,15 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
                 )
             ):
                 raise RuntimeError("refusing to persist an unauthenticated worker scope receipt")
+        elif launch_mode == "remote-codex-supervisor":
+            if verification_status not in {"remote-prepared", "remote-running"}:
+                raise RuntimeError("remote worker launch has no prepared receipt")
+            if any(value is not None for value in (
+                scope_unit, manager_kind, manager_uid, launch_acknowledged,
+                scope_slice, memory_high, memory_max, memory_swap_max,
+                tasks_max, oom_policy, control_group,
+            )):
+                raise RuntimeError("remote worker launch carried scoped identity fields")
         elif any(value is not None for value in (
             scope_unit, manager_kind, manager_uid, launch_acknowledged,
             scope_slice, memory_high, memory_max, memory_swap_max,
@@ -2891,10 +2907,13 @@ def dispatch_once(
         else:
             try:
                 db_path = _kb.kanban_db_path(board=board)
-            except Exception:
-                # Must not lose the tick — fall through to an unguarded dispatch.
-                result = _locked_tick(
-                    native_admission_held=native_admission_held,
+            except Exception as exc:
+                # DB identity is an admission prerequisite.  Never tick or
+                # spawn against an unverified path, and do not checkpoint WAL.
+                result = DispatchResult(
+                    admission_blocked=True,
+                    admission_reason="db_path_unavailable",
+                    admission_metrics={"error": f"{type(exc).__name__}: {exc}"},
                 )
                 _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
                 return result
@@ -3108,6 +3127,208 @@ def _dispatch_lane_task(
         ):
             result.auto_blocked.append(claimed.id)
         return False
+
+
+def _connection_db_path(conn: sqlite3.Connection, board: Optional[str]) -> Path:
+    """Resolve the already-open connection's canonical file for a supervisor."""
+    for row in conn.execute("PRAGMA database_list").fetchall():
+        if row[1] == "main" and row[2]:
+            return Path(row[2]).expanduser()
+    return _kb.kanban_db_path(board=board)
+
+
+def _try_remote_codex_when_full(
+    conn: sqlite3.Connection,
+    ready_rows: Iterable[sqlite3.Row],
+    result: DispatchResult,
+    *,
+    effective_config: Optional[Mapping[str, Any]],
+    board: Optional[str],
+) -> None:
+    """Attempt bounded remote Codex admission after local capacity is full."""
+    try:
+        from hermes_cli.kanban_codex_host import (
+            load_host_router_config, prepare_route, select_route,
+            launch_supervisor, task_is_eligible,
+        )
+        cfg = load_host_router_config(effective_config)
+    except Exception:
+        if effective_config is not None:
+            result.remote_deferred.append(("*", "router_config_invalid"))
+        return
+    if not cfg.enabled:
+        return
+
+    active_remote = count_active_remote_supervisors(conn)
+    routed = 0
+    for row in ready_rows:
+        if routed >= cfg.max_routes_per_tick or active_remote >= cfg.max_total_routes:
+            break
+        task = _kb.get_task(conn, row["id"])
+        if task is None or not task_is_eligible(task, cfg):
+            continue
+        selection = select_route(cfg, task_id=task.id, assignee=task.assignee or "")
+        route = selection.get("route")
+        if route in {"local_codex", "defer"}:
+            if route == "defer":
+                result.remote_deferred.append(
+                    (task.id, str(selection.get("reason", "defer"))[:160])
+                )
+            continue
+
+        workspace: Optional[Path] = None
+        branch: Optional[str] = None
+        prepared = None
+        claimed = None
+        try:
+            workspace, branch = _kbw._resolve_worktree_workspace(task, board=board)
+            prepared = prepare_route(task, workspace, cfg, selection)
+            claimed = _kb.claim_task(conn, task.id)
+            if claimed is None:
+                cleaned = bool(prepared.cleanup(cfg, allow="no_mutation"))
+                if not cleaned:
+                    _fence_unclaimed_remote(conn, task.id, "claim_lost_cleanup_unproven")
+                if workspace is not None:
+                    _kbw._cleanup_worktree_workspace(task.id, str(workspace), branch)
+                result.remote_deferred.append((task.id, "claim_lost"))
+                continue
+
+            _kbw.set_workspace_path(conn, claimed.id, str(workspace))
+            if claimed.branch_name != branch:
+                _kbw.set_branch_name(conn, claimed.id, branch or "")
+            run_id = int(claimed.current_run_id)
+            receipt = prepared.receipt(run_id=run_id)
+            _mark_remote_launching(conn, claimed.id, run_id, receipt)
+            pid = launch_supervisor(
+                claimed, workspace, prepared, cfg=cfg,
+                db_path=_connection_db_path(conn, board), board=board,
+                claim_lock=str(claimed.claim_lock),
+            )
+            _set_worker_pid(conn, claimed.id, pid)
+            with _kb.write_txn(conn):
+                _kb._append_event(
+                    conn, claimed.id, "remote_route_prepared", receipt, run_id=run_id,
+                )
+            result.remote_routed.append(receipt)
+            result.spawned.append((claimed.id, claimed.assignee or "", str(workspace)))
+            routed += 1
+            active_remote += 1
+        except Exception as exc:
+            if claimed is None:
+                if workspace is not None:
+                    _kbw._cleanup_worktree_workspace(task.id, str(workspace), branch)
+                cleanup_proven = bool(getattr(exc, "cleanup_proven", True))
+                if ((prepared is not None and not prepared.cleanup(cfg, allow="no_mutation"))
+                        or not cleanup_proven):
+                    _fence_unclaimed_remote(conn, task.id, "preclaim_cleanup_unproven")
+            else:
+                cleaned = prepared is not None and prepared.cleanup(cfg, allow="no_mutation")
+                run_id = int(claimed.current_run_id)
+                if cleaned:
+                    _mark_remote_direct(conn, claimed.id, run_id)
+                    _kb._record_task_failure(
+                        conn, claimed.id, "remote supervisor launch failed",
+                        outcome="spawn_failed", release_claim=True, end_run=True,
+                        expected_run_id=run_id,
+                    )
+                else:
+                    _fence_remote_dispatch(
+                        conn, claimed.id, run_id, "launch_failure_cleanup_unproven",
+                    )
+            result.remote_deferred.append((task.id, type(exc).__name__))
+
+
+def _active_remote_supervisors(conn: sqlite3.Connection) -> int:
+    return int(conn.execute(
+        "SELECT COUNT(*) FROM task_runs "
+        "WHERE launch_mode='remote-codex-supervisor' AND ended_at IS NULL"
+    ).fetchone()[0])
+
+
+def count_active_remote_supervisors(conn: sqlite3.Connection) -> int:
+    """Count active remote supervisors independently of local capacity."""
+    return _active_remote_supervisors(conn)
+
+
+def _mark_remote_launching(
+    conn: sqlite3.Connection, task_id: str, run_id: int, receipt: Mapping[str, Any],
+) -> None:
+    encoded = json.dumps(dict(receipt), separators=(",", ":"), sort_keys=True)
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE task_runs SET launch_mode='remote-codex-supervisor', "
+            "verification_status='remote-prepared', metadata=? "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (encoded, run_id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("remote run launch fence lost")
+
+
+def _mark_remote_direct(conn: sqlite3.Connection, task_id: str, run_id: int) -> None:
+    with _kb.write_txn(conn):
+        conn.execute(
+            "UPDATE task_runs SET launch_mode='direct', verification_status='not-applicable' "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (run_id, task_id),
+        )
+
+
+def _fence_unclaimed_remote(conn: sqlite3.Connection, task_id: str, reason: str) -> None:
+    current = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,)
+    ).fetchone()
+    if current and current["status"] == "running" and current["current_run_id"] is not None:
+        _fence_remote_dispatch(conn, task_id, int(current["current_run_id"]), reason)
+        return
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='capability', "
+            "claim_lock=NULL, claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status IN ('ready','todo') AND current_run_id IS NULL",
+            (task_id,),
+        )
+        if cur.rowcount:
+            _kb._append_event(conn, task_id, "blocked", {
+                "reason": reason[:120], "kind": "capability", "source_status": "ready",
+                "remote_fence": True,
+            })
+            _kb._append_event(conn, task_id, "remote_route_fenced", {
+                "contract": "KANBAN-CODEX-HOST-ROUTER-R1:v1",
+                "reason": reason[:120], "mutation_state": "ambiguous",
+            })
+
+
+def _fence_remote_dispatch(
+    conn: sqlite3.Connection, task_id: str, run_id: int, reason: str,
+) -> None:
+    """Persist a durable remote mutation fence and prevent local retry."""
+    marker = f"remote-fence:{run_id}"
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='capability', claim_lock=?, "
+            "claim_expires=NULL, worker_pid=NULL "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (marker, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            return
+        closed = _kb._end_run(
+            conn, task_id, outcome="blocked", status="blocked",
+            summary="remote mutation fenced",
+            metadata={
+                "contract": "KANBAN-CODEX-HOST-ROUTER-R1:v1",
+                "reason": reason[:120], "mutation_state": "ambiguous",
+            },
+        )
+        _kb._append_event(conn, task_id, "blocked", {
+            "reason": reason[:120], "kind": "capability", "source_status": "running",
+            "remote_fence": True,
+        }, run_id=closed or run_id)
+        _kb._append_event(conn, task_id, "remote_mutation_fenced", {
+            "contract": "KANBAN-CODEX-HOST-ROUTER-R1:v1",
+            "reason": reason[:120], "mutation_state": "ambiguous", "fence": marker,
+        }, run_id=closed or run_id)
 
 
 def _apply_default_assignee(

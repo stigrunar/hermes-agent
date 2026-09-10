@@ -55,6 +55,12 @@ def _record_kanban_budget_exhausted(
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
     from multiple exit paths.
     """
+    # ``HERMES_KANBAN_*`` identity is inherited by in-process cron and delegated
+    # children.  Those contexts must never open the parent's DB or record a
+    # terminal transition.  Keep this gate ahead of the import/connect boundary.
+    from agent.delegation_context import is_dispatcher_owned_worker_context
+    if not is_dispatcher_owned_worker_context():
+        return
     try:
         from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_connect as _kbc

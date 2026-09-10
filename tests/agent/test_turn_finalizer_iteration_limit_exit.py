@@ -196,6 +196,22 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
     )
 
 
+def test_non_dispatcher_context_does_not_open_parent_kanban_db(monkeypatch):
+    """Inherited task identity in cron/delegated contexts is not terminal authority."""
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "task-inherited")
+    connect = MagicMock(side_effect=AssertionError("parent DB must not open"))
+    monkeypatch.setattr("hermes_cli.kanban_db.connect", connect)
+    agent = _LimitAgent()
+
+    with non_dispatcher_owned_context():
+        _finalize(agent, final_response=None, exit_reason="unknown")
+
+    connect.assert_not_called()
+
+
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
     """When budget exhaustion preserves a verification candidate that is
     already the tail assistant message, the finalizer must NOT append a

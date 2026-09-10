@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
+import random
 import re
 import sqlite3
 import threading
@@ -197,11 +199,17 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_pid INTEGER,
             owner_started_at INTEGER,
             last_error TEXT,
-            adapter_profile TEXT
+            adapter_profile TEXT,
+            retry_not_before REAL
         )"""
     )
-    if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}
+    if "adapter_profile" not in columns:
         add_column_if_missing(conn, "delivery_obligations", "adapter_profile", "adapter_profile TEXT")
+    if "retry_not_before" not in columns:
+        add_column_if_missing(
+            conn, "delivery_obligations", "retry_not_before", "retry_not_before REAL"
+        )
 
 
 def _transaction():
@@ -316,9 +324,16 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
     with _DB_LOCK, _transaction() as conn:
         conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
+               SET state=?, updated_at=?, last_error=?,
+                   retry_not_before=CASE
+                       WHEN ? IN ('delivered', 'failed', 'abandoned') THEN NULL
+                       ELSE retry_not_before END
                WHERE obligation_id=?""",
-            (state, time.time(), error[:500] if error else None, obligation_id))
+            (state, time.time(), error[:500] if error else None, state, obligation_id))
+
+
+def _normalized_profile(profile: Optional[str]) -> str:
+    return "default" if not profile or profile == "default" else str(profile)
 
 
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
@@ -335,6 +350,99 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
             **({"marker": marker} if needs_marker and marker else {}), "profile": profile,
             **({"runtime_recovery": True} if runtime else {}),
             **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
+
+
+def claim_due_deferred(
+    *, profile: Optional[str] = None, now: Optional[float] = None,
+) -> Optional[Dict[str, Any]]:
+    """Atomically claim the first due deferred Telegram obligation for one profile."""
+    current = time.time() if now is None else float(now)
+    expected_profile = _normalized_profile(profile)
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        in_flight = conn.execute(
+            "SELECT owner_pid, owner_started_at FROM delivery_obligations "
+            "WHERE platform='telegram' AND adapter_profile=? "
+            "AND retry_not_before IS NOT NULL AND state='attempting'",
+            (expected_profile,),
+        ).fetchall()
+        if any(_owner_alive(owner_pid, owner_started_at) for owner_pid, owner_started_at in in_flight):
+            return None
+        rows = conn.execute(
+            "SELECT obligation_id, session_key, chat_id, thread_id, content, attempts, "
+            "created_at, owner_pid, owner_started_at, retry_not_before, state "
+            "FROM delivery_obligations WHERE platform='telegram' AND adapter_profile=? "
+            "AND retry_not_before IS NOT NULL AND retry_not_before <= ? "
+            "AND state IN ('deferred','attempting') "
+            "ORDER BY retry_not_before, created_at, obligation_id",
+            (expected_profile, current),
+        ).fetchall()
+        for (oid, session_key, chat_id, thread_id, content, attempts, created_at,
+             owner_pid, owner_started_at, due, state) in rows:
+            owner_is_current = owner_pid == pid and owner_started_at == started
+            if state == "attempting" and owner_is_current:
+                continue
+            if _owner_alive(owner_pid, owner_started_at) and not owner_is_current:
+                continue
+            if attempts >= MAX_ATTEMPTS or current - created_at > STALE_AFTER_SECONDS:
+                conn.execute(
+                    "UPDATE delivery_obligations SET state='abandoned', retry_not_before=NULL, updated_at=? "
+                    "WHERE obligation_id=? AND state=? AND owner_pid IS ? AND owner_started_at IS ?",
+                    (current, oid, state, owner_pid, owner_started_at),
+                )
+                continue
+            cursor = conn.execute(
+                "UPDATE delivery_obligations SET state='attempting', owner_pid=?, owner_started_at=?, "
+                "attempts=attempts+1, updated_at=? WHERE obligation_id=? AND state=? "
+                "AND owner_pid IS ? AND owner_started_at IS ?",
+                (pid, started, current, oid, state, owner_pid, owner_started_at),
+            )
+            if cursor.rowcount:
+                return {
+                    "obligation_id": oid, "session_key": session_key, "platform": "telegram",
+                    "chat_id": chat_id, "thread_id": thread_id, "content": content,
+                    "profile": expected_profile, "attempts": attempts + 1,
+                    "retry_not_before": due,
+                }
+    return None
+
+
+def next_deferred_due(
+    *, profile: Optional[str] = None, now: Optional[float] = None,
+) -> Optional[float]:
+    """Return the next schedulable deferred Telegram deadline for one profile."""
+    current = time.time() if now is None else float(now)
+    expected_profile = _normalized_profile(profile)
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        rows = conn.execute(
+            "SELECT retry_not_before, state, owner_pid, owner_started_at "
+            "FROM delivery_obligations WHERE platform='telegram' AND adapter_profile=? "
+            "AND retry_not_before IS NOT NULL AND state IN ('deferred','attempting') "
+            "ORDER BY retry_not_before, created_at, obligation_id",
+            (expected_profile,),
+        ).fetchall()
+    for due, state, owner_pid, owner_started_at in rows:
+        if state == "attempting" and owner_pid == pid and owner_started_at == started:
+            continue
+        if _owner_alive(owner_pid, owner_started_at) and not (owner_pid == pid and owner_started_at == started):
+            continue
+        return max(current, float(due))
+    return None
+
+
+def release_deferred_claim(obligation_id: str) -> bool:
+    """Return a claimed deferred row without spending its attempt."""
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            "UPDATE delivery_obligations SET state='deferred', attempts=CASE "
+            "WHEN attempts > 0 THEN attempts - 1 ELSE 0 END, updated_at=? "
+            "WHERE obligation_id=? AND state='attempting' AND retry_not_before IS NOT NULL "
+            "AND owner_pid IS ? AND owner_started_at IS ?",
+            (time.time(), obligation_id, pid, started),
+        )
+    return bool(cursor.rowcount)
 
 
 def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Optional[set] = None,

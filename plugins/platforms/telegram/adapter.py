@@ -176,7 +176,14 @@ _TELEGRAM_CHAT_OUTBOUND_BUDGET_SECS = 1.0
 
 def _flood_cap_result(wait: float) -> "SendResult":
     """The shared fail-closed SendResult for an over-cap flood wait."""
-    return SendResult(success=False, error=f"flood_control:{wait}", retry_after=float(wait))
+    return SendResult(
+        success=False,
+        error=f"flood_control:{wait}",
+        retry_after=float(wait),
+        retryable=False,
+        error_kind="rate_limited",
+        raw_response={"delivery_state": "deferred"},
+    )
 
 
 _TELEGRAM_IMAGE_MIME_TO_EXT = {"image/png": ".png", "image/jpeg": ".jpg", "image/jpg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
@@ -1512,9 +1519,17 @@ class TelegramAdapter(BasePlatformAdapter):
         caller must NOT legacy-resend); retry semantics mirror legacy send()."""
         safe_error = _redact_telegram_error_text(exc)
         logger.warning("[%s] %s transient failure (no legacy resend): %s", self.name, what, safe_error)
+        try:
+            flood_wait = float(retry_after) if retry_after is not None else None
+        except (TypeError, ValueError):
+            flood_wait = None
+        if flood_wait is not None and flood_wait > _FLOOD_INLINE_WAIT_CAP_SECS:
+            return _flood_cap_result(flood_wait)
         return SendResult(
             success=False, error=safe_error,
-            retryable=(self._looks_like_connect_timeout(exc) or not self._is_timed_out(exc)), retry_after=retry_after)
+            retryable=(self._looks_like_connect_timeout(exc) or not self._is_timed_out(exc)),
+            retry_after=retry_after,
+            error_kind="rate_limited" if flood_wait is not None else None)
 
     @staticmethod
     def _record_rich_sent(chat_id: Any, message_id: Any, content: str) -> None:

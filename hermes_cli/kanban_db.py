@@ -4039,6 +4039,18 @@ def release_stale_claims(
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
+        remote_run = conn.execute(
+            "SELECT launch_mode FROM task_runs WHERE id = ? AND ended_at IS NULL",
+            (row["current_run_id"],),
+        ).fetchone() if row["current_run_id"] is not None else None
+        if remote_run and remote_run["launch_mode"] == "remote-codex-supervisor":
+            # Remote mutation state is not observable from this process. Fence
+            # directly rather than routing this mode through native scope
+            # classification (which intentionally knows only local scopes).
+            _fence_remote_dispatch(
+                conn, row["id"], int(row["current_run_id"]), "remote_supervisor_stale"
+            )
+            continue
         scope_release = _scope_release_result(
             conn,
             row["id"],
@@ -5442,9 +5454,11 @@ def unblock_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """``blocked``/``scheduled`` -> its resumable phase (parent re-gated; ``review``
     when that is where it left off), closing any leaked run first."""
     current = conn.execute(
-        "SELECT status, block_kind FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, block_kind, claim_lock FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if current and current["status"] == "blocked" and current["block_kind"] == "iteration_exhausted":
+        return False
+    if current and current["status"] == "blocked" and str(current["claim_lock"] or "").startswith("remote-fence:"):
         return False
     now = int(time.time())
     with write_txn(conn):
@@ -6382,6 +6396,12 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _resolve_worker_cli_toolsets,
     _worker_capabilities_for_task,
     _dispatch_lane_task,
+    _try_remote_codex_when_full,
+    count_active_remote_supervisors,
+    _mark_remote_launching,
+    _mark_remote_direct,
+    _fence_unclaimed_remote,
+    _fence_remote_dispatch,
     _dispatch_once_locked,
     dispatch_once,
     observe_running_tasks_other_boards,
