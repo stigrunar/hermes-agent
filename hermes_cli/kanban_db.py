@@ -97,6 +97,67 @@ VALID_BLOCK_KINDS = {"dependency", "needs_input", "capability", "transient"}
 BLOCK_RECURRENCE_LIMIT = 2
 VALID_WORKSPACE_KINDS = {"scratch", "worktree", "dir"}
 
+# Explicit worker capabilities are a closed vocabulary.  They describe the
+# concrete tool surface a dispatcher-spawned worker must have; they are never
+# inferred from task prose.
+WORKER_CAPABILITY_NAMES = frozenset({
+    "workspace_access",
+    "terminal",
+    "local_file_read",
+    "local_file_hash",
+    "task_attachment_write",
+})
+_WORKER_CAPABILITY_ALIASES = {
+    "workspace": "workspace_access",
+    "workspace_access": "workspace_access",
+    "workspace_materialization": "workspace_access",
+    "terminal": "terminal",
+    "command": "terminal",
+    "command_execution": "terminal",
+    "process_manage": "terminal",
+    "file": "local_file_read",
+    "file_read": "local_file_read",
+    "local_file": "local_file_read",
+    "local_file_read": "local_file_read",
+    "read_file": "local_file_read",
+    "search_files": "local_file_read",
+    "file_hash": "local_file_hash",
+    "local_hash": "local_file_hash",
+    "local_file_hash": "local_file_hash",
+    "attachment_write": "task_attachment_write",
+    "task_attachment": "task_attachment_write",
+    "task_attachment_write": "task_attachment_write",
+}
+
+
+def normalize_required_worker_capabilities(
+    capabilities: Optional[Iterable[str]],
+) -> Optional[list[str]]:
+    """Normalize explicit worker capability declarations for persistence."""
+    if capabilities is None:
+        return None
+    if isinstance(capabilities, str):
+        values: Iterable[Any] = capabilities.split(",")
+    else:
+        values = capabilities
+    normalized: set[str] = set()
+    for value in values:
+        if not isinstance(value, str):
+            raise ValueError(
+                f"required worker capability must be a string, got {value!r}"
+            )
+        key = value.strip().casefold().replace("-", "_").replace(" ", "_")
+        if not key:
+            continue
+        canonical = _WORKER_CAPABILITY_ALIASES.get(key)
+        if canonical is None:
+            raise ValueError(
+                f"unknown worker capability {value!r}; expected one of "
+                f"{', '.join(sorted(WORKER_CAPABILITY_NAMES))}"
+            )
+        normalized.add(canonical)
+    return sorted(normalized) or None
+
 
 def normalize_reasoning_effort(effort: Optional[str]) -> Optional[str]:
     """``VALID_REASONING_EFFORTS`` or ``"none"`` (thinking off), case-insensitive;
@@ -715,12 +776,22 @@ class Task:
     block_kind: Optional[str] = None
     block_recurrences: int = 0               # unblock-loop counter, see BLOCK_RECURRENCE_LIMIT
     completion_contract: Optional[str] = None
+    required_capabilities: Optional[list[str]] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Task":
         g = lambda col, default=None: _row_get(row, col, default)  # noqa: E731
         parsed = _json_or(g("skills"))
         skills_value = [str(s) for s in parsed if s] if isinstance(parsed, list) else None
+        raw_capabilities = _json_or(g("required_capabilities"))
+        capabilities_value: Optional[list[str]] = None
+        if isinstance(raw_capabilities, list):
+            try:
+                capabilities_value = normalize_required_worker_capabilities(raw_capabilities)
+            except ValueError:
+                # Keep malformed legacy rows readable; dispatch fails closed
+                # rather than silently treating an invalid declaration as absent.
+                capabilities_value = [str(item) for item in raw_capabilities if item] or None
         return cls(
             **{col: row[col] for col in _TASK_REQUIRED_COLUMNS},
             **{col: g(col) for col in _TASK_OPTIONAL_COLUMNS},
@@ -732,6 +803,7 @@ class Task:
             skills=skills_value,
             goal_mode=bool(g("goal_mode")),
             block_recurrences=int(g("block_recurrences") or 0),
+            required_capabilities=capabilities_value,
         )
 
 
@@ -941,7 +1013,8 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ``blocked`` so a cron can't spin it forever. Reset to 0 only on a
     -- successful completion — NOT on unblock (resetting on unblock is exactly
     -- the amnesia that let the loop run unbounded).
-    block_recurrences    INTEGER NOT NULL DEFAULT 0
+    block_recurrences    INTEGER NOT NULL DEFAULT 0,
+    required_capabilities TEXT
 );
 
 CREATE TABLE IF NOT EXISTS task_links (
@@ -1232,6 +1305,7 @@ def create_task(
     project_source_task_id: Optional[str] = None,
     creator_task_id: Optional[str] = None,
     completion_contract: Optional[str] = None,
+    required_capabilities: Optional[Iterable[str]] = None,
 ) -> str:
     """Create a task (optionally under ``parents``); returns its id.
 
@@ -1251,7 +1325,11 @@ def create_task(
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    _ensure_required_capabilities_column(conn)
     completion_contract = validate_contract(completion_contract)
+    normalized_required_capabilities = normalize_required_worker_capabilities(
+        required_capabilities
+    )
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1332,7 +1410,8 @@ def create_task(
                         skills, max_retries, model_override, provider_override,
                         reasoning_effort,
                         goal_mode, goal_max_turns, session_id, completion_contract
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        , required_capabilities
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         task_id, title.strip(), body, assignee, task_status, priority,
@@ -1342,6 +1421,8 @@ def create_task(
                         json.dumps(skills_list) if skills_list is not None else None,
                         _opt_int(max_retries), model_override, provider_override, reasoning_effort,
                         1 if goal_mode else 0, _opt_int(goal_max_turns), session_id, completion_contract,
+                        json.dumps(normalized_required_capabilities)
+                        if normalized_required_capabilities else None,
                     ),
                 )
                 for pid in parents:
@@ -1364,6 +1445,7 @@ def create_task(
                         "goal_mode": bool(goal_mode) or None,
                         "model_override": model_override,
                         "provider_override": provider_override,
+                        "required_capabilities": normalized_required_capabilities,
                     },
                 )
                 # ACK-edge: the originating channel hears a child BLOCK, not just the fan-in.
@@ -1445,7 +1527,18 @@ def _inherit_notify_subs(
     )
 
 
+def _ensure_required_capabilities_column(conn: sqlite3.Connection) -> None:
+    """Add the capability column to a pre-R5 board without rebuilding it."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "required_capabilities" in columns:
+        return
+    conn.execute("ALTER TABLE tasks ADD COLUMN required_capabilities TEXT")
+    if not conn.in_transaction:
+        conn.commit()
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+    _ensure_required_capabilities_column(conn)
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
@@ -4029,6 +4122,8 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
+    _dispatch_tick_lock,
+    connect,
     init_db,
     write_txn,
 )
@@ -4048,7 +4143,57 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _terminate_reclaimed_worker,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    _CanonicalAdmissionSnapshot,
+    _OtherBoardsRunningObservation,
+    _allocation_lock,
+    _canonical_dispatch_config,
+    _capability_admitted,
+    _default_spawn,
+    _memory_pressure_level,
+    _parallel_dispatch_required,
+    _read_live_worker_scopes,
+    reconcile_worker_scope_terminals,
+    _record_worker_capability_rejection,
+    _resolve_worker_capability_tools,
+    _resolve_worker_cli_toolsets,
+    _systemd_scope_preflight,
+    _worker_capabilities_for_task,
+    _dispatch_lane_task,
+    _dispatch_once_locked,
+    dispatch_once,
+    observe_running_tasks_other_boards,
+    prepare_dispatch_admission,
+    resolve_dispatch_caps,
+    resolve_worker_profile_admission,
 )
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(*, db_path: Optional[Path] = None, board: Optional[str] = None):
+    """Open a board database read-only without creating WAL sidecars."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    sidecars: dict[Path, tuple[bytes, int]] = {}
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecars[sidecar] = (sidecar.read_bytes(), sidecar.stat().st_mtime_ns)
+    uri = path.expanduser().resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+        known_sidecars = set(sidecars)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar not in known_sidecars:
+                with contextlib.suppress(OSError):
+                    sidecar.unlink()
+        for sidecar, (content, mtime_ns) in sidecars.items():
+            with contextlib.suppress(OSError):
+                sidecar.write_bytes(content)
+                os.utime(sidecar, ns=(mtime_ns, mtime_ns))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
