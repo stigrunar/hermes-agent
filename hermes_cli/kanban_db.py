@@ -3214,18 +3214,22 @@ def release_stale_claims(
         # Backstop: a heartbeat older than the max-stale threshold means no
         # observable progress — reclaim even if the PID is alive (logic loop).
         heartbeat_stale = hb is not None and (now - int(hb)) > DEFAULT_CLAIM_HEARTBEAT_MAX_STALE_SECONDS
-        started_at = _row_get(row, "worker_started_at")
-        if (host_local and row["worker_pid"] and _worker_alive(row["worker_pid"], started_at)
-                and not heartbeat_stale):
-            _extend_live_stale_claim(conn, row, now)
-            continue
-
         scope_release = _scope_release_result(
             conn,
             row["id"],
             int(row["current_run_id"]) if row["current_run_id"] is not None else None,
         )
         if not scope_release.can_release:
+            continue
+        started_at = _row_get(row, "worker_started_at")
+        if (
+            scope_release.pid_signal_allowed
+            and host_local
+            and row["worker_pid"]
+            and _worker_alive(row["worker_pid"], started_at)
+            and not heartbeat_stale
+        ):
+            _extend_live_stale_claim(conn, row, now)
             continue
         termination = (
             _termination_metadata_without_pid_signal(row["worker_pid"], scope_release)
@@ -3527,6 +3531,14 @@ def _finalize_iteration_exhaustion_immediately(
         if expected_run_id is not None and run_id != int(expected_run_id):
             return None
         if row["status"] != "running" or run_id is None:
+            if run_id is None:
+                latest = conn.execute(
+                    "SELECT id, outcome FROM task_runs WHERE task_id=? "
+                    "ORDER BY id DESC LIMIT 1",
+                    (task_id,),
+                ).fetchone()
+                if latest and latest["outcome"] == "iteration_exhausted":
+                    return int(latest["id"])
             return None
         failures = int(row["consecutive_failures"] or 0) + 1
         cur = conn.execute(
@@ -3548,6 +3560,7 @@ def _finalize_iteration_exhaustion_immediately(
                 "budget_used": max(0, int(budget_used)),
                 "budget_max": max(0, int(budget_max)),
                 "checkpoint_required": True,
+                "workspace_path": row["workspace_path"] or "",
                 "retryable": False,
                 "resume_policy": "never",
             },
@@ -3556,7 +3569,17 @@ def _finalize_iteration_exhaustion_immediately(
             conn,
             task_id,
             "iteration_exhausted",
-            {"error": message, "budget_used": int(budget_used), "budget_max": int(budget_max)},
+            {
+                "error": message,
+                "budget_used": int(budget_used),
+                "budget_max": int(budget_max),
+                "blocker_type": "iteration_exhausted",
+                "resume_policy": "never",
+                "retryable": False,
+                "checkpoint_required": True,
+                "workspace_path": row["workspace_path"] or "",
+                "terminal_run_id": closed_run_id,
+            },
             run_id=closed_run_id,
         )
         return closed_run_id
@@ -4664,14 +4687,15 @@ def invalidate_descendants_for_parent_reopen(
     now = int(time.time())
     invalidated: list[dict[str, Any]] = []
     terminations: list[tuple[Optional[int], Optional[str], Optional[int]]] = []
-    with write_txn(conn, allow_nested=True):
-        rows = conn.execute(
+    scope_releases: dict[str, Any] = {}
+
+    def _descendant_rows():
+        return conn.execute(
             """
             WITH RECURSIVE descendants(id) AS (
                 SELECT child_id FROM task_links WHERE parent_id = ?
                 UNION
-                SELECT l.child_id
-                FROM task_links l
+                SELECT l.child_id FROM task_links l
                 JOIN descendants d ON d.id = l.parent_id
             )
             SELECT t.id, t.status, t.current_run_id, t.worker_pid, t.claim_lock, t.worker_started_at
@@ -4681,23 +4705,51 @@ def invalidate_descendants_for_parent_reopen(
             """,
             (task_id,),
         ).fetchall()
+
+    eligible = {"ready", "review", "running", "done"}
+    preflight_rows = [row for row in _descendant_rows() if row["status"] in eligible]
+    scope_snapshots: dict[str, tuple[str, Optional[int]]] = {}
+    for row in preflight_rows:
+        run_id = int(row["current_run_id"]) if row["current_run_id"] is not None else None
+        if run_id is not None:
+            release = _scope_release_result(conn, row["id"], run_id)
+            if not release.can_release:
+                raise RuntimeError(
+                    f"cannot invalidate descendant {row['id']}: exact worker scope cleanup was not confirmed"
+                )
+            scope_releases[row["id"]] = release
+        scope_snapshots[row["id"]] = (str(row["status"]), run_id)
+
+    with write_txn(conn, allow_nested=True):
+        rows = _descendant_rows()
+        current_snapshots = {
+            row["id"]: (
+                str(row["status"]),
+                int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+            )
+            for row in rows if row["status"] in eligible
+        }
+        if current_snapshots != scope_snapshots:
+            raise RuntimeError(
+                "descendant state changed while exact worker scopes were being reaped; invalidation was not applied"
+            )
         for row in rows:
             previous_status = row["status"]
-            if previous_status not in {"ready", "review", "running", "done"}:
+            if previous_status not in eligible:
                 continue
-            resume_status = "ready"
+            resume_status = "review" if previous_status == "review" else "ready"
             run_id = None
-            if previous_status == "review":
-                resume_status = "review"
-            elif previous_status == "running":
+            if previous_status == "running":
                 resume_status = _retry_status_for_run(conn, row["id"], row["current_run_id"])
-                terminations.append((row["worker_pid"], row["claim_lock"], row["worker_started_at"]))
+                release = scope_releases.get(row["id"])
+                if release is None or release.pid_signal_allowed:
+                    terminations.append((
+                        row["worker_pid"], row["claim_lock"], row["worker_started_at"],
+                    ))
                 run_id = _end_run(
                     conn, row["id"], outcome="reclaimed", status="todo",
                     summary=f"ancestor {task_id} reopened",
                 )
-            # consecutive_failures = 0: deliberate operator reset — see
-            # docstring for why this diverges from reopen_review_task.
             conn.execute(
                 "UPDATE tasks SET status = 'todo', completed_at = NULL, "
                 "claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL, "
@@ -4712,8 +4764,6 @@ def invalidate_descendants_for_parent_reopen(
                 {"ancestor": task_id, **{k: v for k, v in entry.items() if k != "id"}},
                 run_id=run_id,
             )
-            # Legacy 'status' event so existing live-feed consumers still see
-            # the move without learning the new event kind.
             _append_event(
                 conn, row["id"], "status",
                 {
@@ -4723,9 +4773,9 @@ def invalidate_descendants_for_parent_reopen(
                 run_id=run_id,
             )
             _insert_comment(
-                conn, row["id"], author, f"Invalidated: ancestor {task_id} was reopened; "
-                f"retracted from '{previous_status}' to 'todo' "
-                f"(will resume via '{resume_status}').", now,
+                conn, row["id"], author,
+                f"Invalidated: ancestor {task_id} was reopened; retracted from '{previous_status}' to 'todo' (will resume via '{resume_status}').",
+                now,
             )
             invalidated.append(entry)
     if not caller_owns_txn:
@@ -4807,6 +4857,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
     termination outcome lands as its own ``archive_worker_termination`` event so
     the ``archived`` event stays atomic with the status flip.
     """
+    snapshot = _prepare_task_scope_release(conn, task_id)
+    if snapshot is None or snapshot[0] == "archived":
+        return False
+    previous_status, previous_run_id = snapshot
+    scope_release = _scope_release_result(conn, task_id, previous_run_id)
+    if not scope_release.can_release:
+        return False
     with write_txn(conn):
         row = conn.execute(
             "SELECT status, claim_lock, worker_pid, worker_started_at FROM tasks WHERE id = ?",
@@ -4819,7 +4876,8 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         cur = conn.execute(
             "UPDATE tasks SET status = 'archived', "
             "    claim_lock = NULL, claim_expires = NULL, worker_pid = NULL, worker_started_at = NULL "
-            "WHERE id = ? AND status != 'archived'", (task_id,),
+            "WHERE id = ? AND status = ? AND current_run_id IS ?",
+            (task_id, previous_status, previous_run_id),
         )
         if cur.rowcount != 1:
             return False
@@ -4830,7 +4888,13 @@ def archive_task(conn: sqlite3.Connection, task_id: str, *, signal_fn=None) -> b
         )
         _append_event(conn, task_id, "archived", None, run_id=run_id)
     if was_running:
-        termination = _terminate_reclaimed_worker(prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started)
+        termination = (
+            _terminate_reclaimed_worker(
+                prev_pid, prev_lock, signal_fn=signal_fn, started_at=prev_started,
+            )
+            if scope_release.pid_signal_allowed
+            else _termination_metadata_without_pid_signal(prev_pid, scope_release)
+        )
         with write_txn(conn):
             _append_event(conn, task_id, "archive_worker_termination", termination, run_id=run_id)
     # ``archived`` parents no longer block children; promote them now.
@@ -4850,18 +4914,37 @@ def _delete_task_relations(conn: sqlite3.Connection, task_id: str) -> None:
 def delete_archived_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete an ARCHIVED task (+ related rows); anything else must be
     archived first so data loss takes two deliberate actions."""
+    snapshot = _prepare_task_scope_release(
+        conn, task_id, allowed_statuses={"archived"},
+    )
+    if snapshot is None:
+        return False
+    previous_status, previous_run_id = snapshot
     with write_txn(conn):
-        if _task_status(conn, task_id) != "archived":
+        if conn.execute(
+            "SELECT 1 FROM tasks WHERE id=? AND status=? AND current_run_id IS ?",
+            (task_id, previous_status, previous_run_id),
+        ).fetchone() is None:
             return False
         _delete_task_relations(conn, task_id)
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND status = ? AND current_run_id IS ?",
+            (task_id, previous_status, previous_run_id),
+        )
         return cur.rowcount == 1
 
 
 def delete_task(conn: sqlite3.Connection, task_id: str) -> bool:
     """Hard-delete a task and its related rows in one txn; False when not found."""
+    snapshot = _prepare_task_scope_release(conn, task_id)
+    if snapshot is None:
+        return False
+    previous_status, previous_run_id = snapshot
     with write_txn(conn):
-        cur = conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        cur = conn.execute(
+            "DELETE FROM tasks WHERE id = ? AND status = ? AND current_run_id IS ?",
+            (task_id, previous_status, previous_run_id),
+        )
         if cur.rowcount != 1:
             return False
         _delete_task_relations(conn, task_id)
@@ -4875,8 +4958,17 @@ def schedule_task(
 ) -> bool:
     """Park in ``scheduled`` (waiting on time, not a human; not dispatchable)
     until ``unblock_task`` re-gates it."""
+    snapshot = _prepare_task_scope_release(
+        conn,
+        task_id,
+        allowed_statuses={"todo", "ready", "running", "blocked"},
+        expected_run_id=expected_run_id,
+    )
+    if snapshot is None:
+        return False
+    previous_status, previous_run_id = snapshot
     with write_txn(conn):
-        params: list[Any] = [task_id]
+        params: list[Any] = [task_id, previous_status, previous_run_id]
         sql = """
             UPDATE tasks
                SET status       = 'scheduled',
@@ -4884,11 +4976,9 @@ def schedule_task(
                    claim_expires= NULL,
                    worker_pid   = NULL
              WHERE id = ?
-               AND status IN ('todo', 'ready', 'running', 'blocked')
+               AND status = ?
+               AND current_run_id IS ?
         """
-        if expected_run_id is not None:
-            sql += " AND current_run_id = ?"
-            params.append(int(expected_run_id))
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
@@ -5378,6 +5468,11 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     DEFAULT_RATE_LIMIT_COOLDOWN_SECONDS,
     DispatchResult,
     _clear_failure_counter,
+    _classify_worker_exit,
+    _record_task_failure,
+    _record_iteration_exhaustion,
+    _record_worker_exit,
+    reap_worker_zombies,
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
@@ -5389,6 +5484,9 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _CanonicalAdmissionSnapshot,
     _OtherBoardsRunningObservation,
     _allocation_lock,
+    _native_admission_lock,
+    _native_admission_lock_identity_matches,
+    _native_admission_lock_path_is_usable,
     _canonical_dispatch_config,
     _capability_admitted,
     _default_spawn,
@@ -5432,9 +5530,11 @@ from hermes_cli.kanban_db_worker_scope import (  # noqa: E402
     _ensure_worker_launch_identity,
     _mark_worker_launch_cleanup_pending,
     _persisted_worker_scope,
+    _prepare_task_scope_release,
     _process_cgroup_path,
     _process_command_argv,
     _process_command_matches,
+    reconcile_worker_scope_terminals,
     _request_scoped_terminal_transition,
     _scope_absence_confirmed,
     _scope_release_result,

@@ -290,6 +290,65 @@ def _worker_log_exit_code(task_id: str, board: Optional[str] = None) -> Optional
     return int(matches[-1]) if matches else None
 
 
+def _record_iteration_exhaustion(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    error: Optional[str] = None,
+    expected_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """Record the accepted non-retryable iteration-exhaustion transition.
+
+    Direct and legacy untracked workers keep the immediate terminal path.  A
+    scoped worker first persists terminal intent; the scope reconciler then
+    stops and proves the exact cgroup is absent before finalizing the run.
+    """
+    used = max(0, int(budget_used))
+    maximum = max(0, int(budget_max))
+    message = str(
+        error
+        or f"Iteration budget exhausted ({used}/{maximum}) — task could not complete within the allowed iterations"
+    )[:500]
+    row = conn.execute(
+        "SELECT status, current_run_id FROM tasks WHERE id = ?", (task_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+    if expected_run_id is not None:
+        try:
+            if run_id != int(expected_run_id):
+                return None
+        except (TypeError, ValueError):
+            return None
+    if row["status"] == "running" and run_id is not None:
+        deferred = _kb._request_scoped_terminal_transition(
+            conn,
+            task_id,
+            action="iteration_exhausted",
+            payload={
+                "budget_used": used,
+                "budget_max": maximum,
+                "error": message,
+            },
+            expected_run_id=run_id,
+        )
+        if deferred is True:
+            return run_id
+        if deferred is False:
+            return None
+    return _kb._finalize_iteration_exhaustion_immediately(
+        conn,
+        task_id,
+        budget_used=used,
+        budget_max=maximum,
+        error=message,
+        expected_run_id=expected_run_id,
+    )
+
+
 def reap_worker_zombies() -> "list[int]":
     """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
     every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
@@ -546,6 +605,26 @@ def reap_terminal_workers(conn: sqlite3.Connection, *, signal_fn=None) -> list[s
 def _reap_terminal_worker_row(conn, row, host_prefix: str, signal_fn, reaped: list[str]) -> None:
     pid, fingerprint = int(row["worker_pid"]), row["worker_started_at"]
     if pid == os.getpid() or not str(row["claim_lock"] or "").startswith(host_prefix):
+        return
+    scope_release = _kb._scope_release_result(conn, row["task_id"], int(row["id"]))
+    if not scope_release.can_release:
+        return
+    if not scope_release.pid_signal_allowed:
+        termination = _kb._termination_metadata_without_pid_signal(pid, scope_release)
+        with _kb.write_txn(conn):
+            conn.execute(
+                "UPDATE task_runs SET worker_pid = NULL, worker_started_at = NULL "
+                "WHERE id = ? AND worker_pid = ? AND worker_started_at = ?",
+                (row["id"], pid, fingerprint),
+            )
+            _kb._append_event(
+                conn,
+                row["task_id"],
+                "terminal_worker_reaped",
+                {"pid": pid, "worker_started_at": fingerprint, **termination},
+                run_id=row["id"],
+            )
+        reaped.append(row["task_id"])
         return
     if fingerprint == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
         return  # unproven identity: never signalled; its evidence is cleared once the pid is gone
@@ -904,7 +983,20 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     for row in rows:
         tid = row["id"]
         pid = row["worker_pid"]
-        if pid and _worker_alive(pid, _kb._row_get(row, "worker_started_at")):
+        run_id = _kb._current_run_id(conn, tid)
+        pid_signal_allowed = True
+        if run_id is not None:
+            scope_release = _kb._scope_release_result(conn, tid, int(run_id))
+            if not scope_release.can_release:
+                # Exact scoped occupancy is authoritative; do not probe or
+                # signal a reused host PID while its boundary is active/unknown.
+                continue
+            pid_signal_allowed = scope_release.pid_signal_allowed
+        if (
+            pid
+            and pid_signal_allowed
+            and _worker_alive(pid, _kb._row_get(row, "worker_started_at"))
+        ):
             # Never requeue beside a live process. Retry next tick.
             _kb._log.debug(
                 "kanban reconcile: task %s has broken claim bookkeeping but "
@@ -1196,9 +1288,6 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             started_at = _kb._row_get(row, "started_at")
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
-            if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
-                continue
-
             run_id = row["current_run_id"]
             scope_release = _kb._scope_release_result(
                 conn, row["id"], int(run_id) if run_id is not None else None,
@@ -1206,6 +1295,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if not scope_release.can_release:
                 # Unknown/active scoped occupancy remains fenced; a host PID
                 # being dead does not prove descendants are gone.
+                continue
+
+            if (
+                scope_release.pid_signal_allowed
+                and _worker_alive(
+                    row["worker_pid"], _kb._row_get(row, "worker_started_at")
+                )
+            ):
                 continue
 
             pid = int(row["worker_pid"])
@@ -2047,6 +2144,82 @@ _ADMISSION_ARGUMENT_MISSING = object()
 _CANONICAL_PARALLEL_DISPATCH_KEY = "_canonical_parallel_dispatch"
 MAX_ADMISSION_SKIP_DETAILS = 32
 _ALLOCATION_THREAD_LOCK = threading.Lock()
+_NATIVE_ADMISSION_THREAD_LOCK = threading.Lock()
+
+
+def _native_admission_lock_identity_matches(lock_path: Path, handle: object) -> bool:
+    """Verify that the locked descriptor still names the lock path itself."""
+    try:
+        path_info = lock_path.lstat()
+        fd_info = os.fstat(handle.fileno())  # type: ignore[union-attr]
+    except (OSError, ValueError, AttributeError):
+        return False
+    return (
+        stat.S_ISREG(path_info.st_mode)
+        and stat.S_ISREG(fd_info.st_mode)
+        and path_info.st_dev == fd_info.st_dev
+        and path_info.st_ino == fd_info.st_ino
+    )
+
+
+def _native_admission_lock_path_is_usable(lock_path: Path) -> bool:
+    """Reject a symlink or non-regular admission lock before opening it."""
+    try:
+        path_info = lock_path.lstat()
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError):
+        return False
+    return stat.S_ISREG(path_info.st_mode)
+
+
+@contextlib.contextmanager
+def _native_admission_lock():
+    """Serialize native host occupancy observation and claim/launch admission."""
+    if not _NATIVE_ADMISSION_THREAD_LOCK.acquire(blocking=False):
+        yield False
+        return
+    handle = None
+    acquired = False
+    admissible = False
+    try:
+        lock_path = _kb.kanban_home() / "kanban" / ".native-admission.lock"
+        try:
+            lock_path.parent.mkdir(parents=True, exist_ok=True)
+            if _native_admission_lock_path_is_usable(lock_path):
+                handle = lock_path.open("a+b")
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+        except (OSError, AttributeError, ValueError):
+            acquired = False
+        if acquired:
+            admissible = _native_admission_lock_identity_matches(lock_path, handle)
+        yield bool(acquired and admissible)
+    finally:
+        try:
+            if acquired and handle is not None:
+                if os.name == "nt":
+                    import msvcrt
+
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        except (OSError, AttributeError, ValueError):
+            pass
+        if handle is not None:
+            handle.close()
+        _NATIVE_ADMISSION_THREAD_LOCK.release()
 
 
 @contextlib.contextmanager
@@ -2679,10 +2852,17 @@ def dispatch_once(
         # Dry-run previews never claim/spawn work, but terminal worker cleanup
         # is lifecycle maintenance rather than dispatch mutation and remains
         # active just as it did on the pre-admission path.
+        _kb.reconcile_worker_scope_terminals(conn)
         result.reaped_terminal_workers = reap_terminal_workers(conn)
         return result
 
-    def _locked_tick() -> DispatchResult:
+    native_spawn = (
+        spawn_fn is None
+        or spawn_fn is _default_spawn
+        or spawn_fn is _kb._default_spawn
+    )
+
+    def _locked_tick(*, native_admission_held: bool) -> DispatchResult:
         return _dispatch_once_locked(
             conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
             max_spawn=max_spawn, max_new_spawns=max_new_spawns,
@@ -2694,26 +2874,46 @@ def dispatch_once(
             worker_toolsets=worker_toolsets, selected_boards=selected_boards,
             effective_config=effective_config, parallel_dispatch=parallel_dispatch,
             reconcile_orphans=reconcile_orphans,
+            _native_admission_held=native_admission_held,
         )
 
-    try:
-        db_path = _kb.kanban_db_path(board=board)
-    except Exception:
-        # Must not lose the tick — fall through to an unguarded dispatch.
-        result = _locked_tick()
-        _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
-        return result
-    allocation_scope = _kb._allocation_lock(required=True) if parallel_dispatch else contextlib.nullcontext(True)
-    with allocation_scope as allocation_held:
-        if not allocation_held:
-            result = DispatchResult(skipped_locked=True)
+    native_scope = (
+        _kb._native_admission_lock()
+        if native_spawn
+        else contextlib.nullcontext(True)
+    )
+    with native_scope as native_admission_held:
+        if not native_admission_held:
+            result = DispatchResult(
+                admission_blocked=True,
+                admission_reason="native_admission_lock_unavailable",
+            )
         else:
-            with _kbc._dispatch_tick_lock(db_path) as held:
-                if not held:
+            try:
+                db_path = _kb.kanban_db_path(board=board)
+            except Exception:
+                # Must not lose the tick — fall through to an unguarded dispatch.
+                result = _locked_tick(
+                    native_admission_held=native_admission_held,
+                )
+                _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
+                return result
+            allocation_scope = (
+                _kb._allocation_lock(required=True)
+                if parallel_dispatch else contextlib.nullcontext(True)
+            )
+            with allocation_scope as allocation_held:
+                if not allocation_held:
                     result = DispatchResult(skipped_locked=True)
                 else:
-                    result = _locked_tick()
-                    _kbc._maybe_checkpoint_wal(conn, db_path)
+                    with _kbc._dispatch_tick_lock(db_path) as held:
+                        if not held:
+                            result = DispatchResult(skipped_locked=True)
+                        else:
+                            result = _locked_tick(
+                                native_admission_held=native_admission_held,
+                            )
+                            _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -2869,7 +3069,15 @@ def _dispatch_lane_task(
             ) if launch_config is not None else None,
         )
         if pid:
-            _set_worker_pid(conn, claimed.id, pid)
+            # Custom spawn hooks may return a verified scoped receipt without
+            # calling the native launch-intent callback.  Backfill the exact
+            # launching fence before promoting the receipt so a persistence
+            # failure can never fall back to host-PID termination.
+            _kb._ensure_worker_launch_identity(conn, claimed.id, pid)
+            # Persist through the facade seam so host callers can fence the
+            # launch receipt atomically (and a failed receipt cannot fall
+            # back to host-PID cleanup).
+            _kb._set_worker_pid(conn, claimed.id, pid)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -2886,6 +3094,13 @@ def _dispatch_lane_task(
         infrastructure = isinstance(exc, RestartSafeScopeUnavailable)
         if infrastructure:
             _kb._log.warning("kanban dispatcher: spawn of %s deferred, host cannot place the worker: %s", claimed.id, exc)
+        if pid is None and isinstance(exc, _kb._WorkerScopeLaunchError):
+            pid = exc.launch
+        if pid is not None and not _kb._abort_unpersisted_worker_launch(pid):
+            _kb._mark_worker_launch_cleanup_pending(
+                conn, claimed.id, pid, str(exc),
+            )
+            return False
         if _record_task_failure(
             conn, claimed.id, str(exc),
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
@@ -2937,6 +3152,7 @@ def _run_reclaim_phase(
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
+    _kb.reconcile_worker_scope_terminals(conn)
     result.reaped_terminal_workers = reap_terminal_workers(conn)
     result.reclaimed = _kb.release_stale_claims(conn, failure_limit=failure_limit)
     if reconcile_orphans:
@@ -3332,6 +3548,10 @@ def _dispatch_once_locked(
     selected_boards: Optional[Iterable[str]] = None,
     parallel_dispatch: bool = False,
     reconcile_orphans: bool = True,
+    _native_admission_held: bool = False,
+    _skip_maintenance: bool = False,
+    _dispatch_result: Optional[DispatchResult] = None,
+    _native_scope_snapshot: Optional[_WorkerScopeConfig] = None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -3349,11 +3569,44 @@ def _dispatch_once_locked(
             allowed_worker_profiles=allowed_worker_profiles,
             worker_toolsets=worker_toolsets, reconcile_orphans=reconcile_orphans,
         )
-    result = DispatchResult()
-    _run_reclaim_phase(
-        conn, result, stale_timeout_seconds=stale_timeout_seconds,
-        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,
+    result = _dispatch_result if _dispatch_result is not None else DispatchResult()
+    native_spawn = (
+        spawn_fn is None
+        or spawn_fn is _default_spawn
+        or spawn_fn is _kb._default_spawn
     )
+    native_scope_config = _native_scope_snapshot
+    if native_spawn and not dry_run and native_scope_config is None:
+        native_scope_config = _kb._worker_scope_config()
+
+    # A required scope is an admission prerequisite.  Do this before any
+    # reclaim/recompute mutation so an unavailable required manager cannot
+    # change task identity while the dispatcher is unable to launch safely.
+    if (
+        native_spawn
+        and not dry_run
+        and not _skip_maintenance
+        and native_scope_config is not None
+        and native_scope_config.required
+    ):
+        capable, reason, _target = _kb._systemd_scope_preflight(
+            require_scope=True,
+            force_probe=True,
+            scope_config=native_scope_config,
+        )
+        if not capable:
+            _kb._log.warning(
+                "kanban dispatch: native worker scope preflight failed; deferring claim (%s)",
+                reason,
+            )
+            return result
+
+    if not _skip_maintenance:
+        _run_reclaim_phase(
+            conn, result, stale_timeout_seconds=stale_timeout_seconds,
+            failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+            board=board,
+        )
     may_spawn, spawn_budget = _tick_spawn_budget(
         conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
     )
@@ -3364,6 +3617,98 @@ def _dispatch_once_locked(
     # Review rows are enumerated up front so the budget split can see whether
     # review work exists at all.
     review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    if native_spawn and not dry_run and (ready_rows or review_rows):
+        # The native admission lock is held by dispatch_once for the complete
+        # observation -> claim -> launch transition.  A direct call into this
+        # private helper still fails closed instead of silently bypassing it.
+        if not _native_admission_held:
+            return result
+        strict_other = _kb.observe_running_tasks_other_boards(board)
+        if strict_other is None:
+            result.admission_blocked = True
+            result.admission_reason = "foreign_occupancy_unavailable"
+            return result
+
+        running_count = count_running_tasks(conn)
+        if max_in_progress is not None:
+            total_running = running_count + strict_other.running_count
+            if total_running >= max_in_progress:
+                return result
+            remaining = max_in_progress - total_running
+            if spawn_budget is None or spawn_budget > remaining:
+                spawn_budget = remaining
+        per_profile_counts: dict[str, int] = {}
+        if max_in_progress_per_profile is not None:
+            for prow in conn.execute(
+                "SELECT assignee, COUNT(*) FROM tasks "
+                "WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"
+            ):
+                per_profile_counts[str(prow[0])] = int(prow[1])
+            for profile, count in strict_other.per_profile_running.items():
+                per_profile_counts[str(profile)] = (
+                    per_profile_counts.get(str(profile), 0) + int(count)
+                )
+
+        default_name = _resolve_default_assignee(default_assignee)
+        profile_exists = _profile_exists_fn()
+        candidate_count = 0
+        seen_by_profile: dict[str, int] = {}
+        rows_with_lanes = [("ready", row) for row in ready_rows] + [
+            ("review", row) for row in review_rows
+        ]
+        for lane, row in rows_with_lanes:
+            assignee = row["assignee"] or (
+                default_name if lane == "ready" else None
+            )
+            if not assignee:
+                continue
+            if profile_exists is not None and not profile_exists(assignee):
+                continue
+            if (
+                max_in_progress_per_profile is not None
+                and per_profile_counts.get(str(assignee), 0)
+                + seen_by_profile.get(str(assignee), 0)
+                >= max_in_progress_per_profile
+            ):
+                continue
+            if check_respawn_guard(conn, row["id"], lane=lane) is not None:
+                continue
+            candidate_count += 1
+            seen_by_profile[str(assignee)] = seen_by_profile.get(str(assignee), 0) + 1
+            if max_spawn is not None and running_count + candidate_count >= max_spawn:
+                break
+            if max_in_progress is not None and (
+                running_count + strict_other.running_count + candidate_count
+                >= max_in_progress
+            ):
+                break
+            if max_new_spawns is not None and candidate_count >= max_new_spawns:
+                break
+
+        native_scope_required = bool(
+            native_scope_config is not None
+            and native_scope_config.required
+        ) or (
+            candidate_count != 1
+            or running_count > 0
+            or strict_other.running_count > 0
+            or strict_other.has_independent_db
+        )
+        if native_scope_required:
+            capable, reason, _target = _kb._systemd_scope_preflight(
+                require_scope=True,
+                force_probe=True,
+                scope_config=native_scope_config,
+            )
+            if not capable:
+                _kb._log.warning(
+                    "kanban dispatch: native worker scope preflight failed; deferring claim (%s)",
+                    reason,
+                )
+                return result
+        require_scope = native_scope_required
+    else:
+        require_scope = False
     # Per-profile cap. Deferred tasks go to skipped_per_profile_capped, not
     # skipped_unassigned — "busy, retry later" differs from "needs routing".
     # Resolved BEFORE the review reservation so the reservation can see which
@@ -3399,6 +3744,8 @@ def _dispatch_once_locked(
         dry_run=dry_run, ttl_seconds=ttl_seconds, board=board,
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        require_scope=require_scope,
+        scope_config=native_scope_config if native_spawn else None,
         worker_toolsets=worker_toolsets,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
@@ -4209,6 +4556,7 @@ from hermes_cli.kanban_db_worker_scope import (  # noqa: E402
     _ensure_worker_launch_identity,
     _mark_worker_launch_cleanup_pending,
     _persisted_worker_scope,
+    _prepare_task_scope_release,
     _process_cgroup_path,
     _process_command_argv,
     _process_command_matches,
@@ -4231,6 +4579,7 @@ from hermes_cli.kanban_db_worker_scope import (  # noqa: E402
     _systemd_user_manager_reachable,
     _systemd_user_manager_target_for_cgroup,
     _systemd_user_manager_target_for_uid,
+    _termination_metadata_without_pid_signal,
     _valid_scope_resource_receipt,
     _verify_systemd_scope_worker_pid,
     _worker_scope_config,
