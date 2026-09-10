@@ -582,6 +582,7 @@ def test_create_happy_path(worker_env):
 
 def test_create_schema_and_persistence_include_required_capabilities(worker_env):
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     capability_schema = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
@@ -594,7 +595,7 @@ def test_create_schema_and_persistence_include_required_capabilities(worker_env)
         "required_capabilities": ["workspace_access", "terminal"],
     }))
     assert result["ok"] is True
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, result["task_id"])
         assert child is not None
@@ -612,6 +613,23 @@ def test_create_rejects_invalid_required_capability(worker_env):
         "required_capabilities": ["not_a_worker_capability"],
     }))
     assert "required_capabilities" in result["error"]
+
+
+def test_registered_create_rejects_missing_role_contract_before_persistence(worker_env):
+    """The public registry route enforces role admission before opening a write."""
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    with kbc.connect_closing() as conn:
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    properties = registry.get_entry("kanban_create").schema["parameters"]["properties"]
+    assert {"execution_contract", "review_contract", "design_intake", "architect_routing"} <= set(properties)
+    result = json.loads(registry.dispatch("kanban_create", {
+        "title": "missing execution packet", "assignee": "dollycode",
+    }))
+    assert "execution_contract is required" in result["error"]
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
 
 
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])

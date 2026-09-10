@@ -21,7 +21,8 @@ def context(tmp_path, monkeypatch):
     for key in ('HERMES_KANBAN_TASK', 'HERMES_SESSION_ID', 'HERMES_KANBAN_BOARD', 'HERMES_KANBAN_HOME'):
         monkeypatch.delenv(key, raising=False)
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
-    from hermes_cli import kanban_db as kb, outcomes_db as odb, projects_db as pdb
+    from hermes_cli import kanban_db as kb, kanban_db_connect as kbc
+    from hermes_cli import outcomes_db as odb, projects_db as pdb
     from tools import kanban_tools as kt
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
@@ -36,7 +37,7 @@ def context(tmp_path, monkeypatch):
         outcome = odb.create_outcome(conn, project_id=project, outcome_key='TEST', name='Test', visible_owner='default')
         lane = odb.bind_conversation_lane(conn, project_id=project, outcome_id=outcome, platform='telegram', chat_id='-1000000000001', thread_id='3', label='project', lane_kind='control')
     monkeypatch.setattr(kt, 'load_config', lambda: {'kanban': {'auto_subscribe_on_create': True}})
-    return {'kb': kb, 'kt': kt, 'project': project, 'other': other, 'outcome': outcome,
+    return {'kb': kb, 'kbc': kbc, 'kt': kt, 'project': project, 'other': other, 'outcome': outcome,
             'lane': lane, 'target': 'telegram:-1000000000001:3', 'workspace': str(workspace)}
 
 
@@ -66,11 +67,22 @@ def test_handler_persists_and_returns_exact_identity(context, use_aliases):
     assert result.get('ok') is True, result
     assert result.get('conversation_lane_id') == context['lane']
     assert result.get('topic_target') == context['target']
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         task = context['kb'].get_task(conn, result['task_id'])
     assert (task.project_id, task.outcome_id, task.conversation_lane_id, task.topic_target) == (
         context['project'], context['outcome'], context['lane'], context['target'])
     assert task.status == 'triage'
+
+
+def test_registry_handler_roundtrips_structured_identity(context):
+    from tools.registry import registry
+
+    result = json.loads(registry.dispatch("kanban_create", payload(context)))
+    assert result.get("ok") is True, result
+    assert result["project_id"] == context["project"]
+    assert result["outcome_id"] == context["outcome"]
+    assert result["conversation_lane_id"] == context["lane"]
+    assert result["topic_target"] == context["target"]
 
 
 @pytest.mark.parametrize('origin_chat,origin_thread', [('555000', ''), ('-1000000000001', '3')])
@@ -82,26 +94,26 @@ def test_dm_or_project_origin_subscribes_only_to_exact_project(context, monkeypa
     monkeypatch.setattr(session_context, 'get_session_env', lambda key, default='': env.get(key, default))
     result = json.loads(context['kt']._handle_create(payload(context)))
     assert result.get('ok') is True, result
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         rows = conn.execute('SELECT chat_id, thread_id FROM kanban_notify_subs WHERE task_id=?', (result['task_id'],)).fetchall()
     assert {(str(row['chat_id']), str(row['thread_id'])) for row in rows} == {('-1000000000001', '3')}
 
 
 def test_wrong_project_lane_is_rejected_without_persisting(context):
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
     result = json.loads(context['kt']._handle_create(payload(context, project_id=context['other'], outcome_id=None)))
     assert result.get('error'), result
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
 
 
 def test_target_mismatch_is_rejected_without_persisting(context):
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         before = conn.execute('SELECT count(*) FROM tasks').fetchone()[0]
     result = json.loads(context['kt']._handle_create(payload(context, topic_target='telegram:-1000000000002:4')))
     assert result.get('error'), result
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         assert conn.execute('SELECT count(*) FROM tasks').fetchone()[0] == before
 
 
@@ -140,7 +152,7 @@ def test_child_inherits_exact_parent_route(context):
 def test_native_terminal_readback_retains_structured_target(context):
     result = json.loads(context['kt']._handle_create(payload(context, triage=False)))
     assert result.get('ok'), result
-    with context['kb'].connect() as conn:
+    with context['kbc'].connect() as conn:
         assert context['kb'].complete_task(conn, result['task_id'], summary='read-only synthetic complete', fire_lifecycle_hook=False)
         task = context['kb'].get_task(conn, result['task_id'])
     assert task.status == 'done'

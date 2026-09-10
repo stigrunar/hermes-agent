@@ -11,6 +11,7 @@ import functools
 import json
 import logging
 import os
+import re
 import time
 from contextlib import contextmanager
 from typing import Any, Callable, Optional
@@ -30,6 +31,503 @@ logger = logging.getLogger(__name__)
 
 KANBAN_LIST_DEFAULT_LIMIT = 50
 KANBAN_LIST_MAX_LIMIT = 200
+
+_DOLLYCODE_ASSIGNEES = {"dollycode"}
+_DOLLYQA_ASSIGNEES = {"dollyqa"}
+_DOLLYDESIGN_ASSIGNEES = {"dollydesign"}
+_DOLLYARCHITECT_ASSIGNEES = {"dollyarchitect"}
+_EXECUTION_CONTRACT_LIST_FIELDS = (
+    "frozen_acceptance", "mutation_scope", "will_not_do", "verification",
+    "authority", "stop_when",
+)
+
+
+def _compact_contract_text(value: Any) -> str:
+    """Render one contract value as a single injection-safe line."""
+    return " ".join(str(value or "").split())
+
+
+def _prepare_execution_contract(*, assignee: Any, triage: bool, contract: Any,
+                                body: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative DollyCode execution packet."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYCODE_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "execution_contract is required for runnable DollyCode tasks. "
+                "Provide outcome, frozen_acceptance, repo_workspace_base_revision, "
+                "mutation_scope, will_not_do, verification, authority, quality_mode, "
+                "qa_boundary, and stop_when; or create the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, f"execution_contract must be an object, got {type(contract).__name__}"
+    missing = [
+        field for field in ("outcome", "repo_workspace_base_revision", "quality_mode", "qa_boundary")
+        if not _compact_contract_text(contract.get(field))
+    ]
+    for field in _EXECUTION_CONTRACT_LIST_FIELDS:
+        value = contract.get(field)
+        if not isinstance(value, list) or not any(_compact_contract_text(item) for item in value):
+            missing.append(field)
+    if missing:
+        return None, "execution_contract has missing or empty field(s): " + ", ".join(missing)
+    quality_mode = _compact_contract_text(contract["quality_mode"]).upper()
+    if quality_mode not in {"SPIKE", "FEATURE", "RELEASE"}:
+        return None, "execution_contract.quality_mode must be SPIKE, FEATURE, or RELEASE"
+    authority = [_compact_contract_text(item).casefold() for item in contract["authority"]
+                 if _compact_contract_text(item)]
+    invalid_authority = sorted(set(authority) - {"inspect", "edit", "commit", "push", "integrate", "deploy"})
+    if invalid_authority:
+        return None, "execution_contract.authority contains unsupported value(s): " + ", ".join(invalid_authority)
+
+    def bullets(field: str) -> list[str]:
+        return [f"- {_compact_contract_text(item)}" for item in contract[field]
+                if _compact_contract_text(item)]
+
+    lines = [
+        "## Execution contract (authoritative)",
+        f"Outcome: {_compact_contract_text(contract['outcome'])}",
+        "Frozen acceptance:", *bullets("frozen_acceptance"),
+        "Repo/workspace + base revision: " + _compact_contract_text(contract["repo_workspace_base_revision"]),
+        "Mutation scope:", *bullets("mutation_scope"),
+        "Will not do:", *bullets("will_not_do"),
+        "Verification:", *bullets("verification"),
+        f"Authority: {', '.join(authority)}",
+        f"Quality mode: {quality_mode}",
+        f"QA boundary: {_compact_contract_text(contract['qa_boundary'])}",
+        "Stop when:", *bullets("stop_when"),
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_review_contract(*, assignee: Any, triage: bool, contract: Any,
+                             body: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative detached-review packet."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYQA_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "review_contract is required for runnable DollyQA tasks. Provide "
+                "outcome, candidates, parent_receipt, frozen_criteria, auth_fixture_state, "
+                "owner, verification, qa_boundary, will_not_do, and stop_when; or create "
+                "the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, f"review_contract must be an object, got {type(contract).__name__}"
+    allowed_contract_fields = {
+        "outcome", "candidates", "parent_receipt", "frozen_criteria", "auth_fixture_state",
+        "owner", "verification", "qa_boundary", "will_not_do", "stop_when",
+    }
+    unknown = sorted(set(contract) - allowed_contract_fields)
+    if unknown:
+        return None, "review_contract has unknown field(s): " + ", ".join(unknown)
+    missing = [field for field in ("outcome", "parent_receipt", "auth_fixture_state", "owner", "qa_boundary")
+               if not _compact_contract_text(contract.get(field))]
+    for field in ("frozen_criteria", "verification", "will_not_do", "stop_when"):
+        value = contract.get(field)
+        if not isinstance(value, list) or not any(_compact_contract_text(item) for item in value):
+            missing.append(field)
+    candidates = contract.get("candidates")
+    if not isinstance(candidates, list) or not candidates:
+        missing.append("candidates")
+    if missing:
+        return None, "review_contract has missing or empty field(s): " + ", ".join(missing)
+
+    normalized_candidates: list[dict[str, str]] = []
+    sha40 = re.compile(r"^[0-9a-fA-F]{40}$")
+    sha256 = re.compile(r"^[0-9a-fA-F]{64}$")
+    allowed_candidate_fields = {
+        "label", "source", "source_base", "workspace_or_url", "commit", "tree", "artifact_sha256",
+        "state", "pushed_remote_ref", "pushed_remote_commit", "clean_worktree_receipt",
+        "proof_commit", "proof_tree",
+    }
+    for index, candidate in enumerate(candidates, start=1):
+        if not isinstance(candidate, dict):
+            return None, f"review_contract.candidates[{index}] must be an object"
+        unknown_candidate = sorted(set(candidate) - allowed_candidate_fields)
+        if unknown_candidate:
+            return None, f"review_contract.candidates[{index}] has unknown field(s): " + ", ".join(unknown_candidate)
+        candidate_missing = [field for field in ("label", "source", "source_base", "workspace_or_url")
+                            if not _compact_contract_text(candidate.get(field))]
+        if candidate_missing:
+            return None, (
+                f"review_contract.candidates[{index}] has missing or empty field(s): "
+                + ", ".join(candidate_missing)
+            )
+        commit = _compact_contract_text(candidate.get("commit"))
+        tree = _compact_contract_text(candidate.get("tree"))
+        artifact_sha256 = _compact_contract_text(candidate.get("artifact_sha256"))
+        has_git_identity = bool(commit or tree)
+        if has_git_identity:
+            if not sha40.fullmatch(commit) or not sha40.fullmatch(tree):
+                return None, f"review_contract.candidates[{index}] commit and tree must both be full 40-character hexadecimal Git identities"
+        elif not sha256.fullmatch(artifact_sha256):
+            return None, f"review_contract.candidates[{index}] requires either full commit+tree or a 64-character artifact_sha256"
+        state = _compact_contract_text(candidate.get("state")).casefold()
+        if state in {"reviewable", "integration_ready"}:
+            if not has_git_identity:
+                return None, f"review_contract.candidates[{index}] {state} requires immutable commit and tree identities"
+            pushed_ref = _compact_contract_text(candidate.get("pushed_remote_ref"))
+            pushed_commit = _compact_contract_text(candidate.get("pushed_remote_commit"))
+            clean_text = _compact_contract_text(candidate.get("clean_worktree_receipt"))
+            proof_commit = _compact_contract_text(candidate.get("proof_commit"))
+            proof_tree = _compact_contract_text(candidate.get("proof_tree"))
+            if not pushed_ref or not sha40.fullmatch(pushed_commit):
+                return None, f"review_contract.candidates[{index}] {state} requires pushed remote ref readback identity"
+            if pushed_commit.casefold() != commit.casefold():
+                return None, f"review_contract.candidates[{index}] pushed remote identity must match commit"
+            marker = clean_text.casefold()
+            if (not clean_text or marker in {"false", "0", "no"}
+                    or re.search(r"\b(?:dirty|uncommitted|not clean)\b", marker)):
+                return None, f"review_contract.candidates[{index}] {state} requires a clean worktree receipt"
+            if proof_commit.casefold() != commit.casefold() or proof_tree.casefold() != tree.casefold():
+                return None, f"review_contract.candidates[{index}] {state} requires proof bound to the exact commit/tree"
+        normalized_candidates.append({
+            "label": _compact_contract_text(candidate["label"]),
+            "source": _compact_contract_text(candidate["source"]),
+            "source_base": _compact_contract_text(candidate["source_base"]),
+            "workspace_or_url": _compact_contract_text(candidate["workspace_or_url"]),
+            "identity": f"commit {commit} / tree {tree}" if has_git_identity else f"artifact sha256 {artifact_sha256.lower()}",
+            "state": state,
+            "pushed_remote_ref": _compact_contract_text(candidate.get("pushed_remote_ref")),
+            "pushed_remote_commit": _compact_contract_text(candidate.get("pushed_remote_commit")),
+            "clean_worktree_receipt": _compact_contract_text(candidate.get("clean_worktree_receipt")),
+            "proof_commit": _compact_contract_text(candidate.get("proof_commit")),
+            "proof_tree": _compact_contract_text(candidate.get("proof_tree")),
+        })
+
+    def bullets(field: str) -> list[str]:
+        return [f"- {_compact_contract_text(item)}" for item in contract[field]
+                if _compact_contract_text(item)]
+
+    lines = ["## Review contract (authoritative)", f"Outcome: {_compact_contract_text(contract['outcome'])}", "Candidates:"]
+    for candidate in normalized_candidates:
+        lines.extend([
+            f"- {candidate['label']}: {candidate['identity']}",
+            f"  Source/base: {candidate['source']} @ {candidate['source_base']}",
+            f"  Workspace/URL: {candidate['workspace_or_url']}",
+        ])
+        if candidate["state"]:
+            lines.append(f"  State: {candidate['state']}")
+        if candidate["pushed_remote_ref"]:
+            lines.append(f"  Pushed remote readback: {candidate['pushed_remote_ref']} @ {candidate['pushed_remote_commit']}")
+        if candidate["clean_worktree_receipt"]:
+            lines.append(f"  Clean worktree receipt: {candidate['clean_worktree_receipt']}")
+        if candidate["proof_commit"]:
+            lines.append(f"  Proof identity: commit {candidate['proof_commit']} / tree {candidate['proof_tree']}")
+    lines.extend([
+        f"Parent receipt: {_compact_contract_text(contract['parent_receipt'])}",
+        "Frozen criteria:", *bullets("frozen_criteria"),
+        f"Auth/fixture state: {_compact_contract_text(contract['auth_fixture_state'])}",
+        f"Owner: {_compact_contract_text(contract['owner'])}",
+        "Verification:", *bullets("verification"),
+        f"QA boundary: {_compact_contract_text(contract['qa_boundary'])}",
+        "Will not do:", *bullets("will_not_do"),
+        "Stop when:", *bullets("stop_when"),
+    ])
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_design_intake(*, assignee: Any, triage: bool, contract: Any,
+                           body: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the authoritative DollyDesign intake packet."""
+    assignee_name = _compact_contract_text(assignee).casefold()
+    required = assignee_name in _DOLLYDESIGN_ASSIGNEES and not triage
+    if contract is None:
+        if required:
+            return None, (
+                "design_intake is required for runnable DollyDesign tasks. Provide user_job, "
+                "target_surface, design_mode, source_of_truth, repo_workspace_revision, "
+                "frozen_decisions, open_decisions, evidence_available, acceptance, and "
+                "authority_and_exclusions; or create the card with triage=true."
+            )
+        return (str(body) if body is not None else None), None
+    if not isinstance(contract, dict):
+        return None, f"design_intake must be an object, got {type(contract).__name__}"
+    allowed = {"user_job", "target_surface", "design_mode", "source_of_truth", "repo_workspace_revision",
+               "frozen_decisions", "open_decisions", "evidence_available", "acceptance", "authority_and_exclusions"}
+    unknown = sorted(set(contract) - allowed)
+    if unknown:
+        return None, "design_intake has unknown field(s): " + ", ".join(unknown)
+    missing = [field for field in ("user_job", "target_surface", "design_mode", "source_of_truth", "repo_workspace_revision")
+               if not _compact_contract_text(contract.get(field))]
+    for field in ("frozen_decisions", "open_decisions", "evidence_available"):
+        if not isinstance(contract.get(field), list):
+            missing.append(field)
+    acceptance = contract.get("acceptance")
+    if not isinstance(acceptance, list) or not any(_compact_contract_text(item) for item in acceptance):
+        missing.append("acceptance")
+    authority_contract = contract.get("authority_and_exclusions")
+    if not isinstance(authority_contract, dict):
+        missing.append("authority_and_exclusions")
+    if missing:
+        return None, "design_intake has missing or empty field(s): " + ", ".join(missing)
+    design_mode = _compact_contract_text(contract["design_mode"]).casefold()
+    if design_mode not in {"direction", "review", "handoff", "sign_off"}:
+        return None, "design_intake.design_mode must be direction, review, handoff, or sign_off"
+    unknown_authority = sorted(set(authority_contract) - {"owner", "authority", "exclusions"})
+    if unknown_authority:
+        return None, "design_intake.authority_and_exclusions has unknown field(s): " + ", ".join(unknown_authority)
+    owner = _compact_contract_text(authority_contract.get("owner"))
+    authority = authority_contract.get("authority")
+    exclusions = authority_contract.get("exclusions")
+    if not owner or not isinstance(authority, list) or not any(_compact_contract_text(item) for item in authority) \
+            or not isinstance(exclusions, list) or not any(_compact_contract_text(item) for item in exclusions):
+        return None, "design_intake.authority_and_exclusions requires non-empty owner, authority, and exclusions"
+    normalized_authority = [_compact_contract_text(item).casefold() for item in authority if _compact_contract_text(item)]
+    invalid = sorted(set(normalized_authority) - {"inspect", "propose", "design_direction", "design_review", "design_handoff", "design_sign_off"})
+    if invalid:
+        return None, "design_intake.authority_and_exclusions.authority contains unsupported value(s): " + ", ".join(invalid)
+
+    def bullets(field: str, *, allow_empty: bool = False) -> list[str]:
+        values = [f"- {_compact_contract_text(item)}" for item in contract[field] if _compact_contract_text(item)]
+        return values or (["- None declared"] if allow_empty else [])
+
+    lines = [
+        "## Design intake (authoritative)", f"User job: {_compact_contract_text(contract['user_job'])}",
+        f"Target surface: {_compact_contract_text(contract['target_surface'])}", f"Design mode: {design_mode}",
+        f"Source of truth: {_compact_contract_text(contract['source_of_truth'])}",
+        "Repo/workspace + revision: " + _compact_contract_text(contract["repo_workspace_revision"]),
+        "Frozen decisions:", *bullets("frozen_decisions", allow_empty=True),
+        "Open decisions:", *bullets("open_decisions", allow_empty=True),
+        "Evidence available:", *bullets("evidence_available", allow_empty=True),
+        "Acceptance:", *bullets("acceptance"), f"Outcome owner: {owner}",
+        f"Authority: {', '.join(normalized_authority)}", "Exclusions:",
+        *[f"- {_compact_contract_text(item)}" for item in exclusions if _compact_contract_text(item)],
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and evidence\n" + background
+    return rendered, None
+
+
+def _prepare_architect_routing(*, assignee: Any, contract: Any,
+                               body: Any) -> tuple[Optional[str], Optional[str]]:
+    """Validate and prepend the outcome-first DollyArchitect routing packet."""
+    is_architect = _compact_contract_text(assignee).casefold() in _DOLLYARCHITECT_ASSIGNEES
+    if contract is None:
+        if is_architect:
+            return None, (
+                "architect_routing is required for DollyArchitect tasks. Provide invariant_outcome, "
+                "observed_evidence, exact_source_authority, material_architecture_question, "
+                "frozen_constraints_non_goals, unresolved_owner_decisions, and implementation_authority. "
+                "Route contract-shaping triage to Dolly/default instead."
+            )
+        return (str(body) if body is not None else None), None
+    if not is_architect:
+        return None, "architect_routing is only valid for assignee=dollyarchitect"
+    if not isinstance(contract, dict):
+        return None, f"architect_routing must be an object, got {type(contract).__name__}"
+    allowed = {"invariant_outcome", "observed_evidence", "exact_source_authority", "material_architecture_question",
+               "frozen_constraints_non_goals", "unresolved_owner_decisions", "implementation_authority"}
+    unknown = sorted(set(contract) - allowed)
+    if unknown:
+        return None, "architect_routing has unknown field(s): " + ", ".join(unknown)
+    missing = [field for field in ("invariant_outcome", "exact_source_authority", "material_architecture_question", "implementation_authority")
+               if not _compact_contract_text(contract.get(field))]
+    evidence = contract.get("observed_evidence")
+    if not isinstance(evidence, list) or not any(_compact_contract_text(item) for item in evidence):
+        missing.append("observed_evidence")
+    for field in ("frozen_constraints_non_goals", "unresolved_owner_decisions"):
+        if not isinstance(contract.get(field), list):
+            missing.append(field)
+    if missing:
+        return None, "architect_routing has missing or empty field(s): " + ", ".join(missing)
+    implementation_authority = _compact_contract_text(contract["implementation_authority"]).casefold()
+    if implementation_authority not in {"none", "prepare", "authorized"}:
+        return None, "architect_routing.implementation_authority must be none, prepare, or authorized"
+
+    def bullets(field: str, *, allow_empty: bool = False) -> list[str]:
+        values = [f"- {_compact_contract_text(item)}" for item in contract[field] if _compact_contract_text(item)]
+        return values or (["- None declared"] if allow_empty else [])
+
+    lines = [
+        "## Architect routing (authoritative)", f"Invariant outcome: {_compact_contract_text(contract['invariant_outcome'])}",
+        "Exact source authority: " + _compact_contract_text(contract["exact_source_authority"]),
+        "Material architecture question: " + _compact_contract_text(contract["material_architecture_question"]),
+        f"Implementation authority: {implementation_authority}", "Observed evidence:", *bullets("observed_evidence"),
+        "Frozen constraints and non-goals:", *bullets("frozen_constraints_non_goals", allow_empty=True),
+        "Unresolved owner decisions:", *bullets("unresolved_owner_decisions", allow_empty=True),
+    ]
+    rendered = "\n".join(lines)
+    background = str(body or "").strip()
+    if background:
+        rendered += "\n\n## Background and secondary evidence\n" + background
+    return rendered, None
+
+
+def _augment_create_schema() -> None:
+    """Add the persisted routing/contract surface to the shared create schema.
+
+    The schema module is shared with the registry and intentionally remains a
+    model-facing data-only module.  Keeping this small augmentation here lets
+    the handler and schema evolve together without adding a second tool or a
+    parallel schema source.
+    """
+    properties = KANBAN_CREATE_SCHEMA["parameters"]["properties"]
+    properties.update({
+        "project_id": {"type": "string", "description": "Project id or slug; alias for project."},
+        "outcome": {"type": "string", "description": "Outcome id/key inside the linked Project."},
+        "outcome_id": {"type": "string", "description": "Outcome id; alias for outcome."},
+        "conversation_lane_id": {
+            "type": "string",
+            "description": "Existing conversation lane bound to this Project/Outcome.",
+        },
+        "topic_target": {
+            "type": "string",
+            "description": "Exact delivery target, e.g. telegram:<chat_id>:<thread_id>; must match the lane.",
+        },
+        "parent_execution_id": {"type": "string", "description": "Explicit parent execution identity."},
+        "resource_requirements": {
+            "type": "array", "items": {"type": "string"},
+            "description": "Explicit shared-resource requirements; never inferred by the tool.",
+        },
+        "mutation_repository": {"type": "string", "description": "Canonical repository identity for the mutation lease."},
+        "mutation_scope": {
+            "type": "array", "items": {"type": "string"}, "minItems": 1,
+            "description": "Repository-relative files/globs this execution may mutate.",
+        },
+        "mutation_base_ref": {"type": "string", "description": "Exact source/base identity used by the mutation lease."},
+        "required_capabilities": {
+            "type": "array",
+            "items": {"type": "string", "enum": [
+                "local_file_hash", "local_file_read", "task_attachment_write",
+                "terminal", "workspace_access",
+            ]},
+            "description": "Explicit canonical worker capabilities required before dispatch.",
+        },
+        "execution_contract": {
+            "type": "object",
+            "description": "Compact authoritative DollyCode execution packet; required for runnable DollyCode cards.",
+            "properties": {
+                "outcome": {"type": "string"},
+                "frozen_acceptance": {"type": "array", "items": {"type": "string"}},
+                "repo_workspace_base_revision": {"type": "string"},
+                "mutation_scope": {"type": "array", "items": {"type": "string"}},
+                "will_not_do": {"type": "array", "items": {"type": "string"}},
+                "verification": {"type": "array", "items": {"type": "string"}},
+                "authority": {"type": "array", "items": {"type": "string", "enum": ["inspect", "edit", "commit", "push", "integrate", "deploy"]}},
+                "quality_mode": {"type": "string", "enum": ["SPIKE", "FEATURE", "RELEASE"]},
+                "qa_boundary": {"type": "string"},
+                "stop_when": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+            "required": ["outcome", "frozen_acceptance", "repo_workspace_base_revision", "mutation_scope", "will_not_do", "verification", "authority", "quality_mode", "qa_boundary", "stop_when"],
+        },
+        "review_contract": {
+            "type": "object",
+            "description": "Compact authoritative DollyQA review packet; candidates bind exact source/base/workspace and immutable proof.",
+            "properties": {
+                "outcome": {"type": "string"},
+                "candidates": {
+                    "type": "array", "items": {
+                        "type": "object",
+                        "properties": {
+                            "label": {"type": "string"}, "source": {"type": "string"},
+                            "source_base": {"type": "string"}, "workspace_or_url": {"type": "string"},
+                            "commit": {"type": "string"}, "tree": {"type": "string"},
+                            "artifact_sha256": {"type": "string"},
+                            "state": {"type": "string", "enum": ["reviewable", "integration_ready"]},
+                            "pushed_remote_ref": {"type": "string"}, "pushed_remote_commit": {"type": "string"},
+                            "clean_worktree_receipt": {"type": "string"}, "proof_commit": {"type": "string"},
+                            "proof_tree": {"type": "string"},
+                        },
+                        "additionalProperties": False,
+                        "required": ["label", "source", "source_base", "workspace_or_url"],
+                    },
+                },
+                "parent_receipt": {"type": "string"}, "frozen_criteria": {"type": "array", "items": {"type": "string"}},
+                "auth_fixture_state": {"type": "string"}, "owner": {"type": "string"},
+                "verification": {"type": "array", "items": {"type": "string"}}, "qa_boundary": {"type": "string"},
+                "will_not_do": {"type": "array", "items": {"type": "string"}}, "stop_when": {"type": "array", "items": {"type": "string"}},
+            },
+            "additionalProperties": False,
+            "required": ["outcome", "candidates", "parent_receipt", "frozen_criteria", "auth_fixture_state", "owner", "verification", "qa_boundary", "will_not_do", "stop_when"],
+        },
+        "design_intake": {
+            "type": "object", "description": "Compact authoritative DollyDesign intake packet.",
+            "properties": {
+                "user_job": {"type": "string"}, "target_surface": {"type": "string"},
+                "design_mode": {"type": "string", "enum": ["direction", "review", "handoff", "sign_off"]},
+                "source_of_truth": {"type": "string"}, "repo_workspace_revision": {"type": "string"},
+                "frozen_decisions": {"type": "array", "items": {"type": "string"}},
+                "open_decisions": {"type": "array", "items": {"type": "string"}},
+                "evidence_available": {"type": "array", "items": {"type": "string"}},
+                "acceptance": {"type": "array", "items": {"type": "string"}},
+                "authority_and_exclusions": {
+                    "type": "object", "properties": {
+                        "owner": {"type": "string"},
+                        "authority": {"type": "array", "items": {"type": "string", "enum": ["inspect", "propose", "design_direction", "design_review", "design_handoff", "design_sign_off"]}},
+                        "exclusions": {"type": "array", "items": {"type": "string"}},
+                    }, "additionalProperties": False, "required": ["owner", "authority", "exclusions"],
+                },
+            },
+            "additionalProperties": False,
+            "required": ["user_job", "target_surface", "design_mode", "source_of_truth", "repo_workspace_revision", "frozen_decisions", "open_decisions", "evidence_available", "acceptance", "authority_and_exclusions"],
+        },
+        "architect_routing": {
+            "type": "object", "description": "Outcome-first DollyArchitect routing and authority packet.",
+            "properties": {
+                "invariant_outcome": {"type": "string"}, "observed_evidence": {"type": "array", "items": {"type": "string"}},
+                "exact_source_authority": {"type": "string"}, "material_architecture_question": {"type": "string"},
+                "frozen_constraints_non_goals": {"type": "array", "items": {"type": "string"}},
+                "unresolved_owner_decisions": {"type": "array", "items": {"type": "string"}},
+                "implementation_authority": {"type": "string", "enum": ["none", "prepare", "authorized"]},
+            },
+            "additionalProperties": False,
+            "required": ["invariant_outcome", "observed_evidence", "exact_source_authority", "material_architecture_question", "frozen_constraints_non_goals", "unresolved_owner_decisions", "implementation_authority"],
+        },
+        "execution": {
+            "type": "object",
+            "description": "Optional repository execution preflight; the native resolver validates and persists it.",
+            "properties": {
+                "environment": {"type": "string"},
+                "action": {"type": "string", "enum": ["inspect", "test", "build", "restart", "deploy", "migrate", "write", "destructive"]},
+                "quality_mode": {"type": "string", "enum": ["SPIKE", "FEATURE", "RELEASE"]},
+                "risk_tier": {"type": "string", "enum": ["R0", "R1", "R2", "R3"]},
+            },
+            "additionalProperties": False,
+            "required": ["environment", "action"],
+        },
+        "roadmap_binding": {
+            "type": "object", "description": "Strict project/lane admission identity.",
+            "properties": {
+                "project_id": {"type": "string"}, "lane_id": {"type": "string"}, "roadmap_revision": {"type": "string"},
+                "canonical_ref": {"type": "string"}, "base_commit": {"type": "string"}, "acceptance_ref": {"type": "string"},
+                "implementation_repo": {"type": "string"}, "path_scope": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "dependency_pins": {"type": "array", "minItems": 1, "items": {
+                    "type": "object",
+                    "properties": {
+                        "project": {"type": "string"}, "commit": {"type": "string"},
+                        "path": {"type": "string"}, "blob": {"type": "string"}, "repo": {"type": "string"},
+                    },
+                    "additionalProperties": False,
+                    "required": ["project", "commit", "path", "blob"],
+                }},
+            },
+            "additionalProperties": False,
+            "required": ["project_id", "lane_id", "roadmap_revision", "canonical_ref", "base_commit", "acceptance_ref", "implementation_repo", "path_scope", "dependency_pins"],
+        },
+    })
+    execution = properties.get("execution")
+    if isinstance(execution, dict):
+        execution.setdefault("properties", {})["roadmap_binding"] = properties["roadmap_binding"]
+
+
+_augment_create_schema()
 
 
 # --- Gating ---
@@ -382,11 +880,16 @@ def _opt_int(value: Any, default: Optional[int] = None) -> Optional[int]:
 _TASK_FIELDS = tuple(
     "id title body assignee status tenant priority workspace_kind workspace_path created_by "
     "created_at started_at completed_at result current_run_id model_override "
-    "provider_override completion_contract last_failure_error".split())
+    "provider_override completion_contract last_failure_error project_id outcome_id "
+    "conversation_lane_id topic_target parent_execution_id mutation_repository "
+    "mutation_scope mutation_base_ref resource_requirements required_capabilities "
+    "execution_preflight".split())
 _TASK_SUMMARY_FIELDS = tuple(
-    "id title assignee status priority tenant workspace_kind workspace_path project_id outcome_id "
-    "mutation_repository mutation_scope mutation_base_ref created_by "
-    "created_at started_at completed_at current_run_id model_override provider_override".split())
+    "id title assignee status priority tenant workspace_kind workspace_path project_id created_by "
+    "outcome_id conversation_lane_id topic_target parent_execution_id mutation_repository "
+    "mutation_scope mutation_base_ref resource_requirements required_capabilities "
+    "execution_preflight created_at started_at completed_at current_run_id model_override "
+    "provider_override".split())
 _RUN_FIELDS = tuple("id profile status outcome summary error metadata started_at ended_at".split())
 _COMMENT_FIELDS = ("author", "body", "created_at")
 _EVENT_FIELDS = ("kind", "payload", "created_at", "run_id")
@@ -394,8 +897,9 @@ _ATTACHMENT_FIELDS = tuple(
     "id filename content_type size uploaded_by stored_path created_at".split())
 _CREATED_FIELDS = (
     "status", "workspace_kind", "workspace_path", "project_id", "outcome_id",
-    "conversation_lane_id", "topic_target",
+    "conversation_lane_id", "topic_target", "parent_execution_id",
     "mutation_repository", "mutation_scope", "mutation_base_ref",
+    "resource_requirements", "required_capabilities", "execution_preflight",
 )
 
 
@@ -1030,6 +1534,8 @@ def _handle_create(args: dict, **kw) -> str:
     outcome_id = args["outcome"] if "outcome" in args else args.get("outcome_id")
     conversation_lane_id = args.get("conversation_lane_id")
     topic_target = args.get("topic_target")
+    parent_execution_id = args.get("parent_execution_id")
+    resource_requirements = args.get("resource_requirements")
     mutation_repository = args.get("mutation_repository")
     mutation_scope = args.get("mutation_scope")
     mutation_base_ref = args.get("mutation_base_ref")
@@ -1040,6 +1546,54 @@ def _handle_create(args: dict, **kw) -> str:
     model_override, provider_override = args.get("model"), args.get("provider")
     _check(model_override or not provider_override, "'provider' requires 'model' to be set as well")
     parents = _coerce_str_list(args.get("parents") or [], "parents", "task ids")
+    required_capabilities = args.get("required_capabilities")
+    if isinstance(required_capabilities, str):
+        required_capabilities = [required_capabilities]
+    if required_capabilities is not None:
+        _check(isinstance(required_capabilities, (list, tuple)),
+               "required_capabilities must be a list of capability names, "
+               f"got {type(required_capabilities).__name__}")
+        try:
+            from hermes_cli import kanban_db as capability_kb
+            capability_kb.normalize_required_worker_capabilities(required_capabilities)
+        except (TypeError, ValueError) as exc:
+            raise _Reject(f"required_capabilities: {exc}")
+
+    body = args.get("body")
+    execution_contract = args.get("execution_contract")
+    body, contract_error = _prepare_execution_contract(
+        assignee=assignee, triage=triage, contract=execution_contract, body=body)
+    _check(not contract_error, contract_error or "")
+    # Scope/base inference is deliberately limited to an explicit Outcome
+    # execution packet. Repository ownership remains a native DB/policy concern.
+    if isinstance(execution_contract, dict) and outcome_id:
+        if mutation_scope is None:
+            mutation_scope = execution_contract.get("mutation_scope")
+        if mutation_base_ref is None:
+            mutation_base_ref = execution_contract.get("repo_workspace_base_revision")
+    body, contract_error = _prepare_review_contract(
+        assignee=assignee, triage=triage, contract=args.get("review_contract"), body=body)
+    _check(not contract_error, contract_error or "")
+    body, contract_error = _prepare_design_intake(
+        assignee=assignee, triage=triage, contract=args.get("design_intake"), body=body)
+    _check(not contract_error, contract_error or "")
+    body, contract_error = _prepare_architect_routing(
+        assignee=assignee, contract=args.get("architect_routing"), body=body)
+    _check(not contract_error, contract_error or "")
+
+    execution = args.get("execution")
+    top_level_binding = args.get("roadmap_binding")
+    if top_level_binding is not None:
+        _check(execution is not None, "roadmap_binding requires an execution object")
+        _check(isinstance(execution, dict), f"execution must be an object, got {type(execution).__name__}")
+        if "roadmap_binding" in execution and execution["roadmap_binding"] != top_level_binding:
+            raise _Reject("roadmap_binding was supplied twice with different values")
+        execution = dict(execution)
+        execution["roadmap_binding"] = top_level_binding
+    if execution is not None:
+        _check(isinstance(execution, dict), f"execution must be an object, got {type(execution).__name__}")
+        _check(all(str(execution.get(field) or "").strip() for field in ("environment", "action")),
+               "execution requires non-empty environment and action")
     with _board(args.get("board")) as (kb, conn):
         from gateway.session_context import get_session_env
         from tools.async_delegation import _current_origin_session_id
@@ -1060,17 +1614,15 @@ def _handle_create(args: dict, **kw) -> str:
                 if outcome_id is None and self_task.outcome_id:
                     outcome_id = self_task.outcome_id
         new_tid = kb.create_task(
-            conn, title=str(title).strip(), body=args.get("body"), assignee=str(assignee),
+            conn, title=str(title).strip(), body=body, assignee=str(assignee),
             parents=tuple(parents), tenant=args.get("tenant") or os.environ.get("HERMES_TENANT"),
             priority=_opt_int(args.get("priority"), 0),
             workspace_kind=workspace_kind, workspace_path=workspace_path, project_id=project_id,
-            outcome_id=outcome_id,
-            conversation_lane_id=conversation_lane_id,
-            topic_target=topic_target,
-            mutation_repository=mutation_repository,
-            mutation_scope=mutation_scope,
-            mutation_base_ref=mutation_base_ref,
-            required_capabilities=required_capabilities,
+            outcome_id=outcome_id, conversation_lane_id=conversation_lane_id,
+            topic_target=topic_target, parent_execution_id=parent_execution_id,
+            mutation_repository=mutation_repository, mutation_scope=mutation_scope,
+            mutation_base_ref=mutation_base_ref, resource_requirements=resource_requirements,
+            required_capabilities=required_capabilities, execution=execution,
             # Board-project inheritance must read the board this call opened, not the
             # session's current board.
             board=args.get("board"),
@@ -1150,13 +1702,35 @@ def _maybe_auto_subscribe(conn: Any, task_id: str) -> bool:
         target = _resolve_notify_target()
         if target is None:
             return False  # CLI / cron / test — no persistent channel
+        # A persisted Project/Outcome lane is the delivery authority.  Resolve
+        # it before touching subscriptions so a child created from a DM cannot
+        # leave a second subscription on the originating chat.
+        from hermes_cli import kanban_db as _kb
         from hermes_cli import kanban_db_notify as _kbn
-        # Inheritance and explicit subscriptions already encode the delivery policy.
-        # Auto-subscribe must not turn a passive destination into an agent wake.
+        task = _kb.get_task(conn, task_id)
+        if task is not None and task.conversation_lane_id and task.topic_target:
+            platform, chat_id, thread_id = _kb.parse_structured_topic_target(task.topic_target)
+            target = {
+                **target,
+                "platform": platform,
+                "chat_id": chat_id,
+                "thread_id": thread_id,
+                "chat_type": "group",
+                "delivery_metadata": {
+                    **(target.get("delivery_metadata") or {}),
+                    "thread_id": thread_id or "",
+                    "chat_type": "group",
+                },
+            }
+        # Preserve an inherited passive subscription when it is already on the
+        # resolved target.  Only call the canonicalizer when it must replace a
+        # stale origin or create the first row.
         if any(sub["platform"] == target["platform"] and sub["chat_id"] == target["chat_id"]
                and (sub["thread_id"] or "") == (target["thread_id"] or "")
                for sub in _kbn.list_notify_subs(conn, task_id)):
             return True
+        # add_notify_sub is the canonical idempotent route and removes stale
+        # origin subscriptions whenever a task carries a structured lane.
         _kbn.add_notify_sub(conn, task_id=task_id, **target)
         return True
     except Exception as _exc:
