@@ -558,10 +558,28 @@ def _resolve_worktree_workspace(task: Task, *, board: Optional[str] = None) -> t
         if fallback_root is not None:
             fallback = fallback_root / ".worktrees" / task.id
             if _path_key(fallback.resolve(strict=False)) != _path_key(requested_resolved):
+                if (
+                    start_point != "HEAD"
+                    and fallback.exists()
+                    and _is_linked_worktree_checkout(fallback)
+                    and _git_current_branch(fallback) != branch_name
+                ):
+                    raise RuntimeError(
+                        f"bound task worktree fallback {fallback} is occupied by a "
+                        "different task branch"
+                    )
                 _ensure_git_worktree(fallback_root, fallback, branch_name, start_point=start_point)
                 return fallback.resolve(strict=False), branch_name
-        # No repo to anchor a fallback on (or the occupied path IS this task's
-        # own canonical worktree): keep the legacy reuse rather than fail dispatch.
+        if start_point != "HEAD":
+            # A bound task must never reuse an occupied path when its own
+            # canonical fallback cannot be materialized. The occupied checkout
+            # belongs to another task; changing its branch or history is unsafe.
+            raise RuntimeError(
+                f"bound task worktree {requested} is occupied by a different task "
+                "branch and no safe fallback worktree can be made"
+            )
+        # Unbound tasks retain the historical reuse behavior when no fallback
+        # repository is available (or the occupied path is canonical).
         return requested_resolved, actual_branch or branch_name
 
     repo_root = _git_toplevel(requested)

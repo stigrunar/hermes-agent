@@ -3255,8 +3255,9 @@ def _owner_replan_active_successor(
     for row in rows:
         candidate = dict(row)
         fields = _owner_replan_body_fields(candidate)
-        if str(fields.get("hygiene_class") or "").casefold() in {"obsolete", "superseded"} \
-                or str(fields.get("superseded_by") or "").strip():
+        if str(_row_value(candidate, "hygiene_class") or fields.get("hygiene_class") or "").casefold() in {
+            "obsolete", "superseded",
+        } or str(_row_value(candidate, "superseded_by") or fields.get("superseded_by") or "").strip():
             continue
         continuation = _OWNER_REPLAN_CONTINUATION_RE.search(str(candidate.get("body") or ""))
         if continuation and continuation.group(1).strip() == task_id:
@@ -3304,8 +3305,12 @@ def _ensure_owner_replan_event(
     if not preclaim_drift and int(current_run_id or 0) != int(terminal_run_id):
         return None
     fields = _owner_replan_body_fields(task_snapshot)
-    if str(fields.get("hygiene_class") or "").casefold() in {"obsolete", "superseded"} \
-            or str(fields.get("superseded_by") or "").strip():
+    hygiene = str(
+        _row_value(task_snapshot, "hygiene_class") or fields.get("hygiene_class") or ""
+    ).casefold()
+    if hygiene in {"obsolete", "superseded"} or str(
+        _row_value(task_snapshot, "superseded_by") or fields.get("superseded_by") or ""
+    ).strip():
         return None
     if str(end_reason or "").casefold() in {"needs_user_decision", "user_decision", "manual"}:
         return None
