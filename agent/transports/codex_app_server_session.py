@@ -278,6 +278,12 @@ class CodexAppServerSession:
         codex_bin: str = "codex",
         codex_home: Optional[str] = None,
         permission_profile: Optional[str] = None,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        developer_instructions: Optional[str] = None,
+        config_overrides: Optional[dict[str, Any]] = None,
+        resume_thread_id: Optional[str] = None,
+        on_thread_ready: Optional[Callable[[str], None]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
@@ -286,6 +292,12 @@ class CodexAppServerSession:
         self._cwd = cwd or os.getcwd()
         self._codex_bin = codex_bin
         self._codex_home = codex_home
+        self._model = model
+        self._reasoning_effort = reasoning_effort
+        self._developer_instructions = developer_instructions
+        self._config_overrides = dict(config_overrides or {})
+        self._resume_thread_id = resume_thread_id
+        self._on_thread_ready = on_thread_ready
         self._permission_profile = (
             permission_profile or _HERMES_TO_CODEX_PERMISSION_PROFILE.get(
                 os.environ.get("HERMES_TERMINAL_SECURITY_MODE", "auto"),
@@ -343,7 +355,23 @@ class CodexAppServerSession:
         # Users who want a write-capable profile configure it in their
         # ~/.codex/config.toml the same way they would for any codex usage.
         params: dict[str, Any] = {"cwd": self._cwd}
-        result = self._client.request("thread/start", params, timeout=15)
+        config = dict(self._config_overrides)
+        if self._model:
+            params["model"] = self._model
+        if self._reasoning_effort:
+            config["model_reasoning_effort"] = self._reasoning_effort
+        if self._developer_instructions:
+            # Add Hermes' rendered role/worker contract without replacing
+            # Codex's native harness instructions or tools.
+            params["developerInstructions"] = self._developer_instructions
+        if config:
+            params["config"] = config
+        method = "thread/start"
+        if self._resume_thread_id:
+            method = "thread/resume"
+            params["threadId"] = self._resume_thread_id
+        # A failed resume must not silently start a fresh writer.
+        result = self._client.request(method, params, timeout=15)
         # Cross-fill thread.id/sessionId — different codex versions have
         # serialized this under either key. Mirrors openclaw beta.8's
         # tolerance fix so future codex drops/renames don't KeyError us
@@ -363,6 +391,9 @@ class CodexAppServerSession:
                     f"(payload keys: {sorted(result.keys())})"
                 ),
             )
+        if self._on_thread_ready is not None:
+            # Persist the binding before accepting this thread for model work.
+            self._on_thread_ready(thread_id)
         self._thread_id = thread_id
         logger.info(
             "codex app-server thread started: id=%s profile=%s cwd=%s",
@@ -471,6 +502,8 @@ class CodexAppServerSession:
         self,
         user_input: Any,
         *,
+        model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
         turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25,
         post_tool_quiet_timeout: float = 90.0,
@@ -519,14 +552,17 @@ class CodexAppServerSession:
         # Send turn/start with the user input. Text-only for now (codex
         # supports rich content but Hermes' text path is the common case).
         try:
-            ts = self._client.request(
-                "turn/start",
-                {
-                    "threadId": self._thread_id,
-                    "input": [{"type": "text", "text": user_input_text}],
-                },
-                timeout=10,
-            )
+            params: dict[str, Any] = {
+                "threadId": self._thread_id,
+                "input": [{"type": "text", "text": user_input_text}],
+            }
+            selected_model = model or self._model
+            selected_effort = reasoning_effort or self._reasoning_effort
+            if selected_model:
+                params["model"] = selected_model
+            if selected_effort:
+                params["effort"] = selected_effort
+            ts = self._client.request("turn/start", params, timeout=10)
         except CodexAppServerError as exc:
             # Classify auth/refresh failures so the user gets a clear
             # `codex login` pointer instead of a raw RPC error string.

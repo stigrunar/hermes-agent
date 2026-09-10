@@ -112,6 +112,7 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 EXPOSED_TOOLS: tuple[str, ...] = (
     "web_search",
     "web_extract",
+    "browser_exec",
     "browser_navigate",
     "browser_click",
     "browser_type",
@@ -141,6 +142,8 @@ EXPOSED_TOOLS: tuple[str, ...] = (
     "kanban_heartbeat",
     "kanban_show",
     "kanban_list",
+    "kanban_attachments",
+    "kanban_attach",
     # NOTE: kanban_create / kanban_unblock / kanban_link are orchestrator-
     # only — the kanban tool gates them on HERMES_KANBAN_TASK being unset.
     # They're exposed here for orchestrator agents running on the codex
@@ -185,7 +188,7 @@ def _build_server() -> Any:
     # MCP clients see the same parameter docs Hermes gives the model.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 

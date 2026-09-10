@@ -680,6 +680,103 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     return on_event
 
 
+def _codex_runtime_contract(agent, messages, cwd):
+    """Bind the selected Hermes runtime to Codex without global config writes."""
+    import os
+    from pathlib import Path
+    from hermes_cli.config import load_config
+    from hermes_cli.codex_runtime_plugin_migration import _build_hermes_tools_mcp_entry
+
+    cfg = load_config()
+    model = getattr(agent, "model", None)
+    reasoning = getattr(agent, "reasoning_config", None)
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    prompt = getattr(agent, "_cached_system_prompt", None)
+    if not isinstance(prompt, str):
+        prompt = "\n\n".join(
+            m["content"] for m in messages
+            if m.get("role") in {"system", "developer"}
+            and isinstance(m.get("content"), str)
+        )
+    if prompt:
+        prompt += (
+            "\n\nCodex runtime tool mapping: use Codex native shell, apply_patch, "
+            "update_plan and native subagents. Hermes delegate_task, memory, "
+            "session_search and todo are not available in this runtime. "
+            "Use the hermes-tools MCP callback for available Hermes tools. "
+            "Preserve the assigned scope, permissions, task identity and owner."
+        )
+    callback = _build_hermes_tools_mcp_entry()
+    # Stdio MCP clients need explicit non-secret worker identity forwarding;
+    # relying on ambient environment inheritance can hide all Kanban tools.
+    from agent.transports.codex_app_server import hermes_subprocess_env
+    scope_env = hermes_subprocess_env(inherit_credentials=False)
+    for key in (
+        "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_BOARD",
+        "HERMES_KANBAN_DB", "HERMES_KANBAN_WORKSPACE", "HERMES_KANBAN_WORKSPACES_ROOT",
+        "HERMES_KANBAN_ROOT", "HERMES_KANBAN_CLAIM_LOCK", "HERMES_PROFILE",
+        "HERMES_SESSION_ID", "HERMES_SESSION_SOURCE", "HERMES_DELEGATED_CHILD_CONTEXT",
+    ):
+        if scope_env.get(key):
+            callback.setdefault("env", {})[key] = scope_env[key]
+    callback.setdefault("env", {})["PYTHONPATH"] = os.pathsep.join(
+        dict.fromkeys(filter(None, [
+            str(Path(__file__).resolve().parent.parent),
+            os.environ.get("PYTHONPATH", ""),
+        ]))
+    )
+    # This entry is thread-local. Never migrate a worker's HERMES_HOME into
+    # the shared ~/.codex/config.toml or change unrelated Codex sessions.
+    overrides = {"mcp_servers.hermes-tools": callback}
+    profile_runtime = cfg.get("codex_app_server", {})
+    if isinstance(profile_runtime, dict):
+        for key in ("default_subagent_model", "default_subagent_reasoning_effort"):
+            value = profile_runtime.get(key)
+            if isinstance(value, str) and value.strip():
+                overrides[f"agents.{key}"] = value.strip()
+        if profile_runtime.get("default_subagent_model"):
+            overrides["agents.max_concurrent_threads_per_session"] = 2
+    try:
+        timeout = float(cfg.get("agent", {}).get("gateway_timeout", 600))
+    except (TypeError, ValueError):
+        timeout = 600.0
+    timeout = max(1.0, timeout - min(60.0, timeout / 10))
+    return dict(model=model, reasoning_effort=effort,
+                developer_instructions=prompt or None,
+                config_overrides=overrides), timeout
+
+
+def _codex_thread_binding(agent, cwd):
+    """Resume only the exact thread bound to this Hermes session and workspace."""
+    import json
+    import os
+    from pathlib import Path
+
+    db = getattr(agent, "_session_db", None)
+    sid = getattr(agent, "session_id", None)
+    if db is None or not isinstance(sid, str) or not sid:
+        return None, None
+    key = "codex_app_server.thread:" + sid
+    identity = {
+        "cwd": str(Path(cwd).resolve()),
+        "codex_home": str(Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser().resolve()),
+    }
+    saved = db.get_meta(key)
+    thread_id = None
+    if isinstance(saved, str) and saved:
+        record = json.loads(saved)
+        if not isinstance(record, dict) or any(record.get(k) != v for k, v in identity.items()):
+            raise ValueError("Codex thread binding does not match this workspace/CODEX_HOME")
+        thread_id = record.get("thread_id")
+        if not isinstance(thread_id, str) or not thread_id:
+            raise ValueError("Codex thread binding has no valid thread_id")
+
+    def persist(thread_id):
+        db.set_meta(key, json.dumps({**identity, "thread_id": thread_id}, sort_keys=True))
+
+    return thread_id, persist
+
+
 def run_codex_app_server_turn(
     agent,
     *,
@@ -759,8 +856,13 @@ def run_codex_app_server_turn(
         # users see no live tool-progress or interim commentary while
         # codex_app_server is running — only the final answer (#33200).
         # Supersedes the narrower item/started-only bridge from #38835.
+        contract, _ = _codex_runtime_contract(agent, messages, cwd)
+        resume_thread_id, on_thread_ready = _codex_thread_binding(agent, cwd)
         agent._codex_session = CodexAppServerSession(
             cwd=cwd,
+            **contract,
+            resume_thread_id=resume_thread_id,
+            on_thread_ready=on_thread_ready,
             approval_callback=approval_callback,
             request_routing=_ServerRequestRouting(
                 auto_approve_exec=auto_approve_requests,
@@ -774,7 +876,15 @@ def run_codex_app_server_turn(
     # return reaches us. Do NOT append again — that would duplicate.
 
     try:
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        from agent.runtime_cwd import resolve_agent_cwd
+        cwd = getattr(agent, "session_cwd", None) or str(resolve_agent_cwd())
+        contract, turn_timeout = _codex_runtime_contract(agent, messages, cwd)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message,
+            model=contract["model"],
+            reasoning_effort=contract["reasoning_effort"],
+            turn_timeout=turn_timeout,
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         # Crash → unconditionally drop the session so the next turn
