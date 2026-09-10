@@ -1570,6 +1570,52 @@ def test_dashboard_running_noop_does_not_cleanup_or_mutate_identity(
     )
 
 
+@pytest.mark.parametrize("cleanup", ["unknown", "failed"])
+def test_dashboard_failed_or_unknown_scope_cleanup_preserves_identity_without_pid_signal(
+    isolated_scope_home, monkeypatch, cleanup,
+):
+    from plugins.kanban.dashboard import plugin_api as dashboard_api
+
+    release_calls = []
+    signals = []
+    monkeypatch.setattr(
+        kb,
+        "_scope_release_result",
+        lambda conn, task_id, run_id: (
+            release_calls.append((task_id, run_id))
+            or SimpleNamespace(can_release=False, cleanup=cleanup, pid_signal_allowed=False)
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: signals.append((args, kwargs)),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"{cleanup} cleanup", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+        kb._set_worker_pid(conn, task_id, 5432)
+        before = kb.get_task(conn, task_id)
+
+        assert not dashboard_api._set_status_direct(conn, task_id, "ready")
+        after = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+
+    assert release_calls == [(task_id, run_id)]
+    assert before is not None and after is not None and run is not None
+    assert (after.status, after.current_run_id, after.worker_pid, after.claim_lock) == (
+        before.status,
+        before.current_run_id,
+        before.worker_pid,
+        before.claim_lock,
+    )
+    assert run.ended_at is None
+    assert signals == []
+
+
 def test_dashboard_actual_running_to_ready_direct_keeps_pid_signal(
     isolated_scope_home, monkeypatch,
 ):
