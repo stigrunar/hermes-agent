@@ -460,6 +460,12 @@ def _codex_developer_instructions(agent) -> str:
     return developer_instructions
 
 
+def _codex_reasoning_effort(agent) -> str | None:
+    config = getattr(agent, "reasoning_config", None)
+    effort = config.get("effort") if isinstance(config, dict) else None
+    return str(effort).strip() if effort else None
+
+
 # Durable codex thread binding: ``sessions.model_config.codex_thread_id`` (hermes_state), written after the
 # turn's projected rows were committed, read by the next AIAgent built for the same Hermes session so an
 # API-server restart (or the per-request agents of /api/sessions/{id}/chat) resumes the model-side thread
@@ -552,13 +558,24 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
     if str(getattr(agent, "provider", "") or "").strip().lower() == "custom":
         from hermes_cli.runtime_provider_custom import codex_model_provider_id
         model_provider = codex_model_provider_id(str(getattr(agent, "requested_provider", "") or ""))
+    runtime_config = load_config()
+    codex_config = runtime_config.get("codex_app_server", {}) if isinstance(runtime_config, dict) else {}
+    config_overrides = {}
+    if isinstance(codex_config, dict):
+        for key in ("default_subagent_model", "default_subagent_reasoning_effort"):
+            value = codex_config.get(key)
+            if isinstance(value, str) and value.strip():
+                config_overrides[f"agents.{key}"] = value.strip()
+        if codex_config.get("default_subagent_model"):
+            config_overrides["agents.max_concurrent_threads_per_session"] = 2
     agent._codex_session = CodexAppServerSession(
         cwd=getattr(agent, "session_cwd", None) or str(resolve_agent_cwd()), approval_callback=approval_callback,
         codex_bin=get_configured_codex_binary(load_config()),
         request_routing=_ServerRequestRouting(auto_approve_exec=auto_approve_requests, auto_approve_apply_patch=auto_approve_requests),
         on_event=make_codex_app_server_event_bridge(agent),
         developer_instructions=developer_instructions or None,
-        model=getattr(agent, "model", None) if model_provider else None, model_provider=model_provider,
+        model=getattr(agent, "model", None), model_provider=model_provider,
+        reasoning_effort=_codex_reasoning_effort(agent), config_overrides=config_overrides,
         resume_thread_id=resume_thread_id, history_seed=history_seed,
     )
 
@@ -635,7 +652,10 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     _ensure_codex_session(agent, messages)
     try:
         _start_codex_thread(agent)
-        turn = agent._codex_session.run_turn(user_input=user_message)
+        turn = agent._codex_session.run_turn(
+            user_input=user_message, model=getattr(agent, "model", None),
+            reasoning_effort=_codex_reasoning_effort(agent),
+        )
     except Exception as exc:
         logger.exception("codex app-server turn failed")
         _close_codex_session(agent)

@@ -45,14 +45,14 @@ def _signature_from_schema(schema: dict | None) -> tuple[inspect.Signature, dict
 # NOT exposed: terminal/file/search/process/clarify (codex built-ins + its own approval UI);
 # delegate_task/memory/session_search/todo (need the running AIAgent context).
 EXPOSED_TOOLS: tuple[str, ...] = (
-    "web_search", "web_extract",
+    "web_search", "web_extract", "browser_exec",
     "browser_navigate", "browser_click", "browser_type", "browser_press", "browser_snapshot", "browser_scroll",
     "browser_back", "browser_get_images", "browser_console", "browser_vision",
     "vision_analyze", "image_generate", "skill_view", "skills_list", "text_to_speech",
     # Kanban handoff tools: stateless (read HERMES_KANBAN_TASK, write kanban.db).
     # Without them a codex-runtime worker can't report completion and hangs.
     "kanban_complete", "kanban_block", "kanban_request_review", "kanban_request_changes", "kanban_comment",
-    "kanban_heartbeat", "kanban_show", "kanban_list",
+    "kanban_heartbeat", "kanban_show", "kanban_list", "kanban_attachments", "kanban_attach",
     # Orchestrator-only (the kanban tool gates them on HERMES_KANBAN_TASK unset).
     "kanban_create", "kanban_unblock", "kanban_link",
 )
@@ -82,7 +82,7 @@ def _build_server() -> Any:
     # Authoritative Hermes schemas so MCP clients see the same parameter docs the model does.
     all_defs = {
         td["function"]["name"]: td["function"]
-        for td in (get_tool_definitions(quiet_mode=True) or [])
+        for td in (get_tool_definitions(quiet_mode=True, skip_tool_search_assembly=True) or [])
         if isinstance(td, dict) and td.get("type") == "function"
     }
 

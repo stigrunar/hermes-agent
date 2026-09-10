@@ -216,6 +216,8 @@ class CodexAppServerSession:
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         model: Optional[str] = None, model_provider: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
+        config_overrides: Optional[dict[str, Any]] = None,
         developer_instructions: Optional[str] = None, resume_thread_id: Optional[str] = None,
         history_seed: Optional[str] = None,
     ) -> None:
@@ -229,6 +231,8 @@ class CodexAppServerSession:
         # ``[model_providers.<id>]`` table. Only the id travels; codex reads base_url/env_key itself.
         self._model = (model or "").strip() or None
         self._model_provider = (model_provider or "").strip() or None
+        self._reasoning_effort = (reasoning_effort or "").strip() or None
+        self._config_overrides = dict(config_overrides or {})
         # Hermes' composed system prompt (SOUL.md, memory, channel overrides). Sent ONCE per thread as
         # ``thread/start.developerInstructions``: codex keeps its own base instructions (tool guidance) and
         # inserts this as the first developer message of every model request. ``baseInstructions`` would
@@ -275,6 +279,11 @@ class CodexAppServerSession:
             params["modelProvider"] = self._model_provider
         if self._model:
             params["model"] = self._model
+        config = dict(self._config_overrides)
+        if self._reasoning_effort:
+            config["model_reasoning_effort"] = self._reasoning_effort
+        if config:
+            params["config"] = config
         if self._resume_thread_id:
             wanted, self._resume_thread_id = self._resume_thread_id, None  # one attempt per stored id
             thread_id = self._resume_thread(wanted, params)
@@ -444,7 +453,8 @@ class CodexAppServerSession:
         return projection, aborted
 
     def run_turn(
-        self, user_input: Any, *, turn_timeout: float = 600.0,
+        self, user_input: Any, *, model: Optional[str] = None,
+        reasoning_effort: Optional[str] = None, turn_timeout: float = 600.0,
         notification_poll_timeout: float = 0.25, post_tool_quiet_timeout: float = 90.0,
     ) -> TurnResult:
         """Send a user message and block until turn/completed, bridging approvals and projecting items.
@@ -463,9 +473,16 @@ class CodexAppServerSession:
                 result.interrupted = True
             else:
                 input_items, result.submitted_user_text = _build_turn_input(user_input)
+                turn_params: dict[str, Any] = {
+                    "threadId": self._thread_id, "input": input_items,
+                }
+                if model or self._model:
+                    turn_params["model"] = model or self._model
+                if reasoning_effort or self._reasoning_effort:
+                    turn_params["effort"] = reasoning_effort or self._reasoning_effort
                 ts = self._request_for(
                     result, "turn/start",
-                    {"threadId": self._thread_id, "input": input_items},
+                    turn_params,
                     "turn/start",
                 )
                 if ts is not None:
