@@ -469,6 +469,23 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
+def test_registered_create_rejects_missing_role_contract_before_persistence(worker_env):
+    """The public registry route enforces role admission before opening a write."""
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
+
+    with kbc.connect_closing() as conn:
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    properties = registry.get_entry("kanban_create").schema["parameters"]["properties"]
+    assert {"execution_contract", "review_contract", "design_intake", "architect_routing"} <= set(properties)
+    result = json.loads(registry.dispatch("kanban_create", {
+        "title": "missing execution packet", "assignee": "dollycode",
+    }))
+    assert "execution_contract is required" in result["error"]
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
