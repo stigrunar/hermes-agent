@@ -1244,14 +1244,48 @@ def get_task_log(task_id: str, tail: Optional[int] = Query(None, ge=1, le=2_000_
 
 
 @router.post("/dispatch")
-def dispatch(dry_run: bool = Query(False), max_n: int = Query(8, alias="max"), board: Optional[str] = Query(None)):
+def dispatch(
+    dry_run: bool = Query(False),
+    max_n: Optional[int] = Query(None, alias="max", ge=1),
+    board: Optional[str] = Query(None),
+):
     """Dispatch nudge so the UI doesn't wait out the 60 s dispatcher tick."""
-    with _board_conn(board) as (board, conn):
-        result = kbd.dispatch_once(conn, dry_run=dry_run, max_spawn=max_n, board=board)
-        try:
-            return asdict(result)  # DispatchResult is a dataclass
-        except TypeError:
-            return {"result": str(result)}
+    board = _resolve_board(board)
+    try:
+        from hermes_cli.config import load_config
+
+        cfg = load_config()
+        if not isinstance(cfg, dict):
+            raise ValueError("effective Hermes config must be a mapping")
+        admission_config = kanban_db.prepare_dispatch_admission(
+            cfg,
+            max_spawn=max_n,
+        )
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)[:512]) from exc
+    connection_scope = (
+        kanban_db.connect_readonly_closing(board=board)
+        if dry_run
+        else closing(_conn(board=board))
+    )
+    try:
+        with connection_scope as conn:
+            result = kanban_db.dispatch_once(
+                conn,
+                dry_run=dry_run,
+                max_spawn=max_n,
+                effective_config=admission_config,
+                board=board,
+            )
+            try:
+                return asdict(result)
+            except TypeError:
+                return {"result": str(result)}
+    except sqlite3.OperationalError as exc:
+        raise HTTPException(
+            status_code=404,
+            detail=(f"kanban board is unavailable for read-only preview: {exc}")[:512],
+        ) from exc
 
 
 @router.get("/model-options")
