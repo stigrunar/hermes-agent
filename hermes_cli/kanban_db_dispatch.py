@@ -8,12 +8,15 @@ late-bound via ``_kb`` (import-cycle breaking) so monkeypatching
 from __future__ import annotations
 
 import contextlib
+import copy
 import os
 import re
 import signal
 import sqlite3
+import stat
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from dataclasses import field
@@ -24,6 +27,7 @@ from typing import Iterable
 from typing import Mapping
 from typing import Optional
 from typing import TYPE_CHECKING
+from types import MappingProxyType
 
 from hermes_cli.quiet_single_query import KANBAN_WORKER_EXIT_TRAILER
 
@@ -154,6 +158,12 @@ class DispatchResult:
     Reclaim/promotion bookkeeping still ran; deferred tasks stay queued."""
     capability_rejections: list[dict[str, Any]] = field(default_factory=list)
     """Stable pre-claim diagnostics for explicit worker capability misses."""
+    admission_blocked: bool = False
+    admission_reason: Optional[str] = None
+    admission_metrics: dict[str, Any] = field(default_factory=dict)
+    skipped_worker_profile_not_allowed: list[tuple[str, str]] = field(default_factory=list)
+    skipped_worker_profile_not_allowed_total: int = 0
+    skipped_worker_profile_not_allowed_truncated: bool = False
 
 
 def describe_suppression(results: Iterable[Optional["DispatchResult"]]) -> str:
@@ -1918,6 +1928,492 @@ def _memory_pressure_level(sample: Optional[Mapping[str, Any]] = None) -> str:
         return "unknown"
 
 
+_ADMISSION_ARGUMENT_MISSING = object()
+_CANONICAL_PARALLEL_DISPATCH_KEY = "_canonical_parallel_dispatch"
+MAX_ADMISSION_SKIP_DETAILS = 32
+_ALLOCATION_THREAD_LOCK = threading.Lock()
+
+
+@contextlib.contextmanager
+def _allocation_lock(*, required: bool = False):
+    """Serialize host-wide adaptive occupancy observation and claims."""
+    if not _ALLOCATION_THREAD_LOCK.acquire(blocking=False):
+        yield False
+        return
+    handle = None
+    acquired = False
+    try:
+        path = _kb.kanban_home() / "kanban" / ".allocation.lock"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        handle = path.open("a+b")
+        if os.name == "nt":
+            import msvcrt
+            handle.seek(0)
+            msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        acquired = True
+        yield True
+    except (OSError, AttributeError, ValueError):
+        yield bool(acquired and not required)
+    finally:
+        if acquired and handle is not None:
+            with contextlib.suppress(OSError, AttributeError, ValueError):
+                if os.name == "nt":
+                    import msvcrt
+                    handle.seek(0)
+                    msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        if handle is not None:
+            handle.close()
+        _ALLOCATION_THREAD_LOCK.release()
+
+
+@dataclass(frozen=True)
+class _OtherBoardsRunningObservation:
+    running_count: int
+    has_independent_db: bool
+    per_profile_running: Mapping[str, int] = field(default_factory=dict, compare=False)
+
+
+def observe_running_tasks_other_boards(
+    board: Optional[str] = None,
+) -> Optional[_OtherBoardsRunningObservation]:
+    """Read immutable foreign-board occupancy without creating SQLite sidecars."""
+    try:
+        current = _kb.kanban_db_path(board=board).expanduser().resolve(strict=True)
+        boards = _kb.list_boards(include_archived=False)
+    except Exception:
+        return None
+    total = 0
+    per_profile: dict[str, int] = {}
+    independent = False
+    seen: set[Path] = set()
+    for metadata in boards:
+        try:
+            slug = metadata.get("slug") or "default"
+            path = _kb.kanban_db_path(board=slug).expanduser().resolve(strict=True)
+            if path == current or path in seen:
+                continue
+            seen.add(path)
+            independent = True
+            other = sqlite3.connect(path.as_uri() + "?immutable=1", uri=True, timeout=0.5)
+            try:
+                rows = other.execute(
+                    "SELECT assignee, COUNT(*) FROM tasks "
+                    "WHERE status = 'running' GROUP BY assignee"
+                ).fetchall()
+            finally:
+                other.close()
+            for assignee, count in rows:
+                if type(count) is not int or count < 0:
+                    return None
+                total += count
+                if assignee:
+                    per_profile[str(assignee)] = per_profile.get(str(assignee), 0) + count
+        except (OSError, sqlite3.Error, ValueError, TypeError):
+            return None
+    return _OtherBoardsRunningObservation(
+        total, independent, MappingProxyType(dict(per_profile))
+    )
+
+
+def _read_live_worker_scopes() -> dict[str, int]:
+    """Read systemd worker-scope occupancy for adaptive admission."""
+    states = ("active", "activating", "deactivating")
+    proc = subprocess.run(
+        ["systemctl", "--user", "list-units", "hermes-kanban-worker-*.scope",
+         "--type=scope", f"--state={','.join(states)}", "--plain", "--no-legend", "--no-pager"],
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        timeout=3, check=False,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError("could not list live worker scopes")
+    counts = {state: 0 for state in states}
+    for line in (proc.stdout or "").splitlines():
+        fields = line.split()
+        if not fields:
+            continue
+        if len(fields) < 3 or not fields[0].startswith("hermes-kanban-worker-"):
+            raise RuntimeError("live worker scope telemetry was malformed")
+        state = fields[2]
+        if state not in counts:
+            raise RuntimeError("live worker scope telemetry was malformed")
+        counts[state] += 1
+    counts["total"] = sum(counts.values())
+    return counts
+
+
+def reconcile_worker_scope_terminals(_conn: sqlite3.Connection) -> list[str]:
+    """Compatibility hook for native scope cleanup; no-op without scope state."""
+    return []
+
+
+def _systemd_scope_preflight(**_kwargs: Any) -> tuple[bool, Optional[str], Optional[str]]:
+    """Return the local scope capability used by adaptive native admission."""
+    return True, None, "systemd-run"
+
+
+def _normalize_worker_toolset_override(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
+    if toolsets is None:
+        return None
+    if isinstance(toolsets, str):
+        toolsets = toolsets.split(",")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for value in toolsets:
+        name = str(value or "").strip()
+        if name and name.casefold() not in seen:
+            normalized.append(name)
+            seen.add(name.casefold())
+    return normalized
+
+
+def _positive_dispatch_cap(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if type(value) is not int or value < 1:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def resolve_dispatch_caps(
+    config: Optional[Mapping[str, Any]] = None, *, max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> tuple[Optional[int], Optional[int]]:
+    configured_spawn = configured_progress = None
+    if config is not None:
+        if not isinstance(config, Mapping):
+            raise ValueError("effective Hermes config must be a mapping")
+        section = config.get("kanban", {}) or {}
+        if not isinstance(section, Mapping):
+            raise ValueError("kanban config must be a mapping")
+        configured_spawn = _positive_dispatch_cap(section.get("max_spawn"), "kanban.max_spawn")
+        configured_progress = _positive_dispatch_cap(section.get("max_in_progress"), "kanban.max_in_progress")
+    explicit_spawn = _positive_dispatch_cap(max_spawn, "max_spawn") if max_spawn is not None else None
+    explicit_progress = _positive_dispatch_cap(max_in_progress, "max_in_progress") if max_in_progress is not None else None
+    return (
+        min(configured_spawn, explicit_spawn) if configured_spawn is not None and explicit_spawn is not None
+        else explicit_spawn if explicit_spawn is not None else configured_spawn,
+        min(configured_progress, explicit_progress) if configured_progress is not None and explicit_progress is not None
+        else explicit_progress if explicit_progress is not None else configured_progress,
+    )
+
+
+def _parallel_dispatch_required(
+    config: Optional[Mapping[str, Any]] = None, *, max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> bool:
+    section = config.get("kanban", {}) if isinstance(config, Mapping) else {}
+    canonical = isinstance(section, Mapping) and section.get(_CANONICAL_PARALLEL_DISPATCH_KEY) is True
+    configured_progress = resolve_dispatch_caps(config)[1]
+    explicit_progress = _positive_dispatch_cap(max_in_progress, "max_in_progress") if max_in_progress is not None else None
+    return bool(canonical or (configured_progress is not None and configured_progress > 1) or (explicit_progress is not None and explicit_progress > 1))
+
+
+def validate_allowed_worker_profiles(value: Any) -> Optional[list[str]]:
+    if value is None:
+        return None
+    if type(value) is not list or not value:
+        raise ValueError("kanban.safe_dispatch_admission.allowed_worker_profiles must be a non-empty list")
+    try:
+        from hermes_cli.profiles import profile_exists, validate_profile_name
+    except Exception as exc:
+        raise ValueError("could not validate allowed worker profiles") from exc
+    profiles: list[str] = []
+    seen: set[str] = set()
+    for index, item in enumerate(value):
+        if type(item) is not str or not item or item != item.strip():
+            raise ValueError(f"kanban.safe_dispatch_admission.allowed_worker_profiles [{index}] must be a canonical profile name")
+        try:
+            validate_profile_name(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"kanban.safe_dispatch_admission.allowed_worker_profiles [{index}] is invalid: {exc}") from exc
+        if item in seen:
+            raise ValueError(f"kanban.safe_dispatch_admission.allowed_worker_profiles must not contain duplicates: {item!r}")
+        if not profile_exists(item):
+            raise ValueError(f"kanban.safe_dispatch_admission.allowed_worker_profiles names missing profile {item!r}")
+        profiles.append(item)
+        seen.add(item)
+    return profiles
+
+
+def _admission_section(config: Mapping[str, Any]) -> Mapping[str, Any]:
+    section = config.get("kanban", {}) or {}
+    if not isinstance(section, Mapping):
+        raise ValueError("kanban config must be a mapping")
+    return section
+
+
+def _admission_allowlist(config: Mapping[str, Any]) -> Any:
+    section = _admission_section(config)
+    if "safe_dispatch_admission" not in section:
+        return _ADMISSION_ARGUMENT_MISSING
+    policy = section["safe_dispatch_admission"]
+    if not isinstance(policy, Mapping):
+        raise ValueError("kanban.safe_dispatch_admission must be a mapping")
+    return policy.get("allowed_worker_profiles", _ADMISSION_ARGUMENT_MISSING)
+
+
+def _admission_snapshot(config: Mapping[str, Any]) -> dict[str, Any]:
+    section = _admission_section(config)
+    snapshot: dict[str, Any] = {}
+    for key in ("max_spawn", "max_in_progress", "max_in_progress_per_profile", _CANONICAL_PARALLEL_DISPATCH_KEY, "codex_host_router"):
+        if key in section:
+            snapshot[key] = copy.deepcopy(section[key])
+    policy = section.get("safe_dispatch_admission", _ADMISSION_ARGUMENT_MISSING)
+    if policy is not _ADMISSION_ARGUMENT_MISSING:
+        if not isinstance(policy, Mapping):
+            raise ValueError("kanban.safe_dispatch_admission must be a mapping")
+        snapshot["safe_dispatch_admission"] = {}
+        if "allowed_worker_profiles" in policy:
+            snapshot["safe_dispatch_admission"]["allowed_worker_profiles"] = copy.deepcopy(policy["allowed_worker_profiles"])
+    return {"kanban": snapshot}
+
+
+@dataclass(frozen=True)
+class _CanonicalAdmissionSnapshot(Mapping[str, Any]):
+    _config: Mapping[str, Any]
+
+    def __getitem__(self, key: str) -> Any:
+        return self._config[key]
+
+    def __iter__(self):
+        return iter(self._config)
+
+    def __len__(self) -> int:
+        return len(self._config)
+
+
+def _freeze_admission_config(config: Mapping[str, Any]) -> _CanonicalAdmissionSnapshot:
+    section = dict(_admission_section(config))
+    policy = section.get("safe_dispatch_admission")
+    if isinstance(policy, Mapping):
+        policy = dict(policy)
+        if isinstance(policy.get("allowed_worker_profiles"), list):
+            policy["allowed_worker_profiles"] = tuple(policy["allowed_worker_profiles"])
+        section["safe_dispatch_admission"] = MappingProxyType(policy)
+    return _CanonicalAdmissionSnapshot(MappingProxyType({"kanban": MappingProxyType(section)}))
+
+
+def _canonical_dispatch_config(
+    effective_config: Optional[Mapping[str, Any]], *, max_spawn: Any = None,
+    max_in_progress: Any = None,
+) -> Optional[Mapping[str, Any]]:
+    if isinstance(effective_config, _CanonicalAdmissionSnapshot):
+        return effective_config
+    if effective_config is not None and not isinstance(effective_config, Mapping):
+        raise ValueError("effective Hermes config must be a mapping")
+    explicit_arg_progress = _positive_dispatch_cap(max_in_progress, "max_in_progress") if max_in_progress is not None else None
+    config_path = _kb.kanban_home() / "config.yaml"
+    try:
+        info = config_path.lstat()
+    except FileNotFoundError:
+        info = None
+    except OSError as exc:
+        raise ValueError("could not access canonical Hermes config") from exc
+    if info is None:
+        explicit = _admission_snapshot(effective_config) if effective_config is not None else None
+        _spawn, progress = resolve_dispatch_caps(explicit)
+        if (explicit_arg_progress is not None and explicit_arg_progress > 1) or (progress is not None and progress > 1) or (explicit is not None and _admission_allowlist(explicit) is not _ADMISSION_ARGUMENT_MISSING):
+            raise ValueError("canonical Hermes config is required for adaptive or parallel-capable Kanban dispatch")
+        return _freeze_admission_config(explicit) if explicit is not None else None
+    if not stat.S_ISREG(info.st_mode) or config_path.is_symlink() or not os.access(config_path, os.R_OK):
+        raise ValueError("canonical Hermes config is not a regular file")
+    fingerprint = (int(info.st_dev), int(info.st_ino), int(info.st_mode), int(info.st_size), int(info.st_mtime_ns))
+    try:
+        from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+        token = set_hermes_home_override(_kb.kanban_home())
+        try:
+            canonical_raw = load_config_readonly()
+            import hermes_cli.config as config_module
+            marker = (str(config_path), info.st_mtime_ns, info.st_size)
+            if marker in getattr(config_module, "_CONFIG_PARSE_WARNED", set()):
+                raise ValueError("canonical Hermes config could not be parsed")
+        finally:
+            reset_hermes_home_override(token)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError("could not load canonical Hermes config") from exc
+    try:
+        post = config_path.lstat()
+    except OSError as exc:
+        raise ValueError("canonical Hermes config changed while loading") from exc
+    post_fingerprint = (int(post.st_dev), int(post.st_ino), int(post.st_mode), int(post.st_size), int(post.st_mtime_ns))
+    if post_fingerprint != fingerprint or not stat.S_ISREG(post.st_mode) or config_path.is_symlink():
+        raise ValueError("canonical Hermes config changed while loading")
+    if not isinstance(canonical_raw, Mapping):
+        raise ValueError("effective Hermes config must be a mapping")
+    canonical = _admission_snapshot(canonical_raw)
+    canonical_spawn, canonical_progress = resolve_dispatch_caps(canonical)
+    section = dict(_admission_section(canonical))
+    canonical_per_profile = _positive_dispatch_cap(section.get("max_in_progress_per_profile"), "kanban.max_in_progress_per_profile")
+    value = _admission_allowlist(canonical)
+    allowed = validate_allowed_worker_profiles(value) if value is not _ADMISSION_ARGUMENT_MISSING else None
+    policy_present = "safe_dispatch_admission" in section
+    if policy_present and canonical_progress is None:
+        canonical_progress = _kb.resolve_max_in_progress(None)
+        if canonical_progress is not None:
+            section["max_in_progress"] = canonical_progress
+    authorized = bool(policy_present or (canonical_progress is not None and canonical_progress > 1))
+    if authorized and allowed is None:
+        raise ValueError("canonical kanban.safe_dispatch_admission.allowed_worker_profiles is required when parallel dispatch safety is active")
+    section[_CANONICAL_PARALLEL_DISPATCH_KEY] = authorized
+    canonical["kanban"] = section
+    if effective_config is None:
+        if not authorized and explicit_arg_progress is not None and explicit_arg_progress > 1:
+            raise ValueError("effective_config cannot enable adaptive or parallel-capable Kanban dispatch without canonical shared-root policy")
+        return _freeze_admission_config(canonical)
+    explicit = _admission_snapshot(effective_config)
+    explicit_spawn, explicit_progress = resolve_dispatch_caps(explicit)
+    explicit_section = _admission_section(explicit)
+    explicit_per_profile = _positive_dispatch_cap(explicit_section.get("max_in_progress_per_profile"), "kanban.max_in_progress_per_profile")
+    explicit_value = _admission_allowlist(explicit)
+    if not authorized and ((explicit_arg_progress is not None and explicit_arg_progress > 1) or (explicit_progress is not None and explicit_progress > 1) or "safe_dispatch_admission" in explicit_section):
+        raise ValueError("effective_config cannot enable adaptive or parallel-capable Kanban dispatch without canonical shared-root policy")
+    explicit_allowed = validate_allowed_worker_profiles(explicit_value) if explicit_value is not _ADMISSION_ARGUMENT_MISSING else None
+    if allowed is not None and explicit_allowed is not None:
+        widened = sorted(set(explicit_allowed) - set(allowed))
+        if widened:
+            raise ValueError(f"effective_config cannot widen canonical kanban.safe_dispatch_admission policy: {widened}")
+    resolved = {"kanban": dict(section)}
+    for key, canonical_value, explicit_value in (("max_spawn", canonical_spawn, explicit_spawn), ("max_in_progress", canonical_progress, explicit_progress), ("max_in_progress_per_profile", canonical_per_profile, explicit_per_profile)):
+        value = min(canonical_value, explicit_value) if canonical_value is not None and explicit_value is not None else explicit_value if explicit_value is not None else canonical_value
+        if value is not None:
+            resolved["kanban"][key] = value
+    if allowed is not None or explicit_allowed is not None:
+        resolved["kanban"]["safe_dispatch_admission"] = {"allowed_worker_profiles": explicit_allowed if explicit_allowed is not None else allowed}
+    return _freeze_admission_config(resolved)
+
+
+def resolve_worker_profile_admission(
+    config: Optional[Mapping[str, Any]] = None, *, max_spawn: Any = None,
+    max_in_progress: Any = None, allowed_worker_profiles: Any = _ADMISSION_ARGUMENT_MISSING,
+) -> Optional[list[str]]:
+    configured_value = _admission_allowlist(config) if isinstance(config, Mapping) else _ADMISSION_ARGUMENT_MISSING
+    canonical_snapshot = isinstance(config, _CanonicalAdmissionSnapshot) and _admission_section(config).get(_CANONICAL_PARALLEL_DISPATCH_KEY) is True
+    if (configured_value is not _ADMISSION_ARGUMENT_MISSING and not canonical_snapshot) or (allowed_worker_profiles is not _ADMISSION_ARGUMENT_MISSING and allowed_worker_profiles is not None and not canonical_snapshot):
+        raise ValueError("worker-profile admission cannot enable adaptive or parallel-capable Kanban dispatch without canonical policy")
+    configured = validate_allowed_worker_profiles(list(configured_value) if isinstance(configured_value, tuple) else configured_value) if configured_value is not _ADMISSION_ARGUMENT_MISSING else None
+    explicit = validate_allowed_worker_profiles(allowed_worker_profiles) if allowed_worker_profiles is not _ADMISSION_ARGUMENT_MISSING and allowed_worker_profiles is not None else None
+    if configured is not None and explicit is not None:
+        widened = sorted(set(explicit) - set(configured))
+        if widened:
+            raise ValueError(f"explicit allowed_worker_profiles cannot widen configured kanban.safe_dispatch_admission policy: {widened}")
+        profiles = explicit
+    else:
+        profiles = explicit or configured
+    if _parallel_dispatch_required(config, max_spawn=max_spawn, max_in_progress=max_in_progress) and configured is None:
+        raise ValueError("canonical kanban.safe_dispatch_admission.allowed_worker_profiles is required when parallel dispatch safety is active")
+    return profiles
+
+
+def prepare_dispatch_admission(
+    effective_config: Optional[Mapping[str, Any]] = None, *, max_spawn: Any = None,
+    max_in_progress: Any = None, max_in_progress_per_profile: Any = None,
+    allowed_worker_profiles: Any = _ADMISSION_ARGUMENT_MISSING,
+) -> Optional[Mapping[str, Any]]:
+    snapshot = _canonical_dispatch_config(effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress)
+    if effective_config is not None:
+        _positive_dispatch_cap(_admission_section(effective_config).get("max_in_progress_per_profile"), "kanban.max_in_progress_per_profile")
+    _positive_dispatch_cap(max_in_progress_per_profile, "max_in_progress_per_profile")
+    resolved_spawn, resolved_progress = resolve_dispatch_caps(snapshot, max_spawn=max_spawn, max_in_progress=max_in_progress)
+    resolve_worker_profile_admission(snapshot, max_spawn=resolved_spawn, max_in_progress=resolved_progress, allowed_worker_profiles=allowed_worker_profiles)
+    return snapshot
+
+
+def _record_worker_profile_admission_skip(result: DispatchResult, task_id: str, assignee: str) -> None:
+    result.skipped_worker_profile_not_allowed_total += 1
+    if len(result.skipped_worker_profile_not_allowed) < MAX_ADMISSION_SKIP_DETAILS:
+        result.skipped_worker_profile_not_allowed.append((task_id, assignee))
+    else:
+        result.skipped_worker_profile_not_allowed_truncated = True
+
+
+def _record_worker_capability_rejection(result: DispatchResult, diagnostic: Optional[Mapping[str, Any]]) -> None:
+    if not diagnostic:
+        return
+    task_id = str(diagnostic.get("task_id") or "")
+    if not any(str(item.get("task_id") or "") == task_id for item in result.capability_rejections):
+        result.capability_rejections.append(dict(diagnostic))
+
+
+def _capability_admitted(
+    conn: sqlite3.Connection, row: sqlite3.Row, assignee: Optional[str],
+    result: DispatchResult, *, worker_toolsets: Optional[Iterable[str]] = None,
+) -> bool:
+    """Reject an explicit capability miss before claim or spawn budget use."""
+    task = _kb.get_task(conn, str(row["id"]))
+    diagnostic = (
+        _worker_capabilities_for_task(
+            task, assignee=assignee, toolsets_override=worker_toolsets,
+        )
+        if task is not None else None
+    )
+    if diagnostic is None:
+        return True
+    _record_worker_capability_rejection(result, diagnostic)
+    return False
+
+
+def _resolve_worker_capability_tools(assignee: str, *, toolsets_override: Optional[Iterable[str]] = None) -> Optional[set[str]]:
+    names = _normalize_worker_toolset_override(toolsets_override)
+    if names is None:
+        try:
+            from hermes_cli.profiles import resolve_profile_env
+            profile_home = resolve_profile_env(str(assignee))
+        except Exception:
+            try:
+                root = Path(_kb.kanban_home())
+                profile_home = str(root if str(assignee).casefold() == "default" else root / "profiles" / str(assignee).strip().lower())
+            except Exception:
+                return None
+        names = _kb._resolve_worker_cli_toolsets(profile_home)
+    if names is None:
+        return None
+    try:
+        from toolsets import resolve_toolset
+    except Exception:
+        return None
+    tools: set[str] = set()
+    for name in names:
+        tools.add(str(name).strip().casefold())
+        with contextlib.suppress(Exception):
+            tools.update(str(tool).casefold() for tool in resolve_toolset(str(name).strip()))
+    return tools
+
+
+def _worker_capabilities_for_task(task: "Task", *, assignee: Optional[str] = None, toolsets_override: Optional[Iterable[str]] = None) -> Optional[dict[str, Any]]:
+    try:
+        required = _kb.normalize_required_worker_capabilities(task.required_capabilities)
+    except ValueError as exc:
+        return {"task_id": task.id, "assignee": assignee or task.assignee, "reason": "invalid_required_capabilities", "reason_code": "invalid_required_capabilities", "missing_capabilities": sorted(str(value) for value in (task.required_capabilities or [])), "required_capabilities": sorted(str(value) for value in (task.required_capabilities or [])), "available_capabilities": [], "detail": str(exc)}
+    if not required:
+        return None
+    candidate = str(assignee or task.assignee or "").strip()
+    tools = _resolve_worker_capability_tools(candidate, toolsets_override=toolsets_override) if candidate else None
+    if tools is None:
+        return {"task_id": task.id, "assignee": candidate or None, "reason": "missing_capabilities", "reason_code": "worker_toolsets_unresolved", "missing_capabilities": list(required), "required_capabilities": list(required), "available_capabilities": []}
+    available: set[str] = set()
+    if {"terminal", "process_manage"} & tools:
+        available.update({"terminal", "local_file_hash"})
+    if {"read_file", "search_files"} & tools:
+        available.add("local_file_read")
+    if {"kanban_attach", "kanban_attach_url"} & tools:
+        available.add("task_attachment_write")
+    if task.workspace_kind in _kb.VALID_WORKSPACE_KINDS and ({"terminal", "process_manage", "read_file", "search_files"} & tools):
+        available.add("workspace_access")
+    missing = sorted(set(required) - available)
+    if not missing:
+        return None
+    return {"task_id": task.id, "assignee": candidate or None, "reason": "missing_capabilities", "reason_code": "missing_worker_capabilities", "missing_capabilities": missing, "required_capabilities": list(required), "available_capabilities": sorted(available)}
+
+
 def dispatch_once(
     conn: sqlite3.Connection,
     *,
@@ -1925,13 +2421,17 @@ def dispatch_once(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
     worker_toolsets: Optional[Iterable[str]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
+    selected_boards: Optional[Iterable[str]] = None,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
@@ -1942,20 +2442,72 @@ def dispatch_once(
     ``skipped_locked=True`` and writes nothing; the lock is keyed on the
     resolved DB path so unrelated boards tick in parallel.
     """
-    def _locked_tick() -> DispatchResult:
-        return _dispatch_once_locked(
+    # Resolve through the facade seam so native callers and tests can provide
+    # the already-admitted snapshot without bypassing dispatch ownership.
+    effective_config = _kb.prepare_dispatch_admission(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+        allowed_worker_profiles=allowed_worker_profiles,
+    )
+    max_spawn, max_in_progress = resolve_dispatch_caps(
+        effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress,
+    )
+    configured_per_profile = None
+    if effective_config is not None:
+        configured_per_profile = _positive_dispatch_cap(
+            _admission_section(effective_config).get("max_in_progress_per_profile"),
+            "kanban.max_in_progress_per_profile",
+        )
+    explicit_per_profile = _positive_dispatch_cap(
+        max_in_progress_per_profile, "max_in_progress_per_profile"
+    )
+    max_in_progress_per_profile = (
+        min(configured_per_profile, explicit_per_profile)
+        if configured_per_profile is not None and explicit_per_profile is not None
+        else explicit_per_profile if explicit_per_profile is not None
+        else configured_per_profile
+    )
+    allowed_worker_profiles = resolve_worker_profile_admission(
+        effective_config,
+        max_spawn=max_spawn,
+        max_in_progress=max_in_progress,
+        allowed_worker_profiles=allowed_worker_profiles,
+    )
+    worker_toolsets = _normalize_worker_toolset_override(worker_toolsets)
+    if max_new_spawns is not None and (type(max_new_spawns) is not int or max_new_spawns < 0):
+        raise ValueError("max_new_spawns must be a non-negative integer or None")
+    parallel_dispatch = _parallel_dispatch_required(
+        effective_config, max_spawn=max_spawn, max_in_progress=max_in_progress,
+    )
+    if parallel_dispatch:
+        max_new_spawns = 1 if max_new_spawns is None else min(max_new_spawns, 1)
+    if dry_run:
+        result = _dispatch_preview(
             conn,
-            spawn_fn=spawn_fn,
-            ttl_seconds=ttl_seconds,
-            dry_run=dry_run,
-            max_spawn=max_spawn,
-            max_in_progress=max_in_progress,
             failure_limit=failure_limit,
-            stale_timeout_seconds=stale_timeout_seconds,
-            board=board,
+            max_spawn=max_spawn,
+            max_new_spawns=max_new_spawns,
+            max_in_progress=max_in_progress,
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            allowed_worker_profiles=allowed_worker_profiles,
             worker_toolsets=worker_toolsets,
+        )
+        return result
+
+    def _locked_tick() -> DispatchResult:
+        return _dispatch_once_locked(
+            conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds, dry_run=dry_run,
+            max_spawn=max_spawn, max_new_spawns=max_new_spawns,
+            max_in_progress=max_in_progress, failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds, board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            allowed_worker_profiles=allowed_worker_profiles,
+            worker_toolsets=worker_toolsets, selected_boards=selected_boards,
+            effective_config=effective_config, parallel_dispatch=parallel_dispatch,
             reconcile_orphans=reconcile_orphans,
         )
 
@@ -1966,13 +2518,17 @@ def dispatch_once(
         result = _locked_tick()
         _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
         return result
-    with _kbc._dispatch_tick_lock(db_path) as held:
-        if not held:
+    allocation_scope = _kb._allocation_lock(required=True) if parallel_dispatch else contextlib.nullcontext(True)
+    with allocation_scope as allocation_held:
+        if not allocation_held:
             result = DispatchResult(skipped_locked=True)
         else:
-            result = _locked_tick()
-            # Still under the dispatch lock: periodic PASSIVE WAL checkpoint.
-            _kbc._maybe_checkpoint_wal(conn, db_path)
+            with _kbc._dispatch_tick_lock(db_path) as held:
+                if not held:
+                    result = DispatchResult(skipped_locked=True)
+                else:
+                    result = _locked_tick()
+                    _kbc._maybe_checkpoint_wal(conn, db_path)
     # Lock released. Fire the tick observer strictly OUTSIDE the critical
     # section: a slow subscriber must never stall a sibling dispatcher's tick.
     _kb._fire_dispatch_tick_hook(result, board=board, dry_run=dry_run)
@@ -1980,19 +2536,22 @@ def dispatch_once(
 
 
 def _call_spawn_fn(
-    spawn_fn, task: Task, workspace: str, board: Optional[str],
+    spawn_fn, task: Task, workspace: str, board: Optional[str], *,
     worker_toolsets: Optional[Iterable[str]] = None,
+    require_scope: bool = False,
 ) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
     import inspect
     try:
         sig = inspect.signature(spawn_fn)
-        kwargs = {}
+        kwargs: dict[str, Any] = {}
         if "board" in sig.parameters:
             kwargs["board"] = board
         if "worker_toolsets" in sig.parameters:
             kwargs["worker_toolsets"] = worker_toolsets
+        if "require_scope" in sig.parameters:
+            kwargs["require_scope"] = require_scope
         return spawn_fn(task, workspace, **kwargs)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
@@ -2012,22 +2571,23 @@ def _dispatch_lane_task(
     spawn_fn,
     per_profile_cap: Optional[int],
     per_profile_running: dict[str, int],
-    worker_toolsets: Optional[Iterable[str]],
+    worker_toolsets: Optional[Iterable[str]] = None,
+    require_scope: bool = False,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
     skip is recorded on ``result``.
     """
     task_id = row["id"]
-    task = _kb.get_task(conn, task_id)
+    candidate = _kb.get_task(conn, task_id)
     diagnostic = (
         _worker_capabilities_for_task(
-            task, assignee=assignee, toolsets_override=worker_toolsets,
-        ) if task is not None else None
+            candidate, assignee=assignee, toolsets_override=worker_toolsets,
+        )
+        if candidate is not None else None
     )
     if diagnostic is not None:
-        if not any(item.get("task_id") == task_id for item in result.capability_rejections):
-            result.capability_rejections.append(diagnostic)
+        _record_worker_capability_rejection(result, diagnostic)
         return False
     # Non-profile assignees (control-plane lanes that pull via ``claim_task``)
     # would fail ``hermes -p <assignee>`` at startup and loop ready→crash→ready
@@ -2095,9 +2655,10 @@ def _dispatch_lane_task(
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
+        effective_spawn = spawn_fn if spawn_fn is not None else _kb._default_spawn
         pid = _call_spawn_fn(
-            spawn_fn if spawn_fn is not None else _default_spawn,
-            claimed, str(workspace), board, worker_toolsets,
+            effective_spawn, claimed, str(workspace), board,
+            worker_toolsets=worker_toolsets, require_scope=require_scope,
         )
         if pid:
             _set_worker_pid(conn, claimed.id, int(pid))
@@ -2305,6 +2866,230 @@ def _resolve_default_assignee(default_assignee: Optional[str]) -> Optional[str]:
     return name
 
 
+def _dispatch_preview(
+    conn: sqlite3.Connection,
+    *,
+    failure_limit: int,
+    max_spawn: Optional[int],
+    max_new_spawns: Optional[int],
+    max_in_progress: Optional[int],
+    default_assignee: Optional[str],
+    max_in_progress_per_profile: Optional[int],
+    allowed_worker_profiles: Optional[Iterable[str]],
+    worker_toolsets: Optional[Iterable[str]],
+) -> DispatchResult:
+    """Build a dispatch preview in an in-memory copy, never mutating source DB."""
+    preview = sqlite3.connect(":memory:")
+    preview.row_factory = sqlite3.Row
+    try:
+        preview.executescript("\n".join(conn.iterdump()))
+        result = DispatchResult()
+        result.promoted = _kb.recompute_ready(preview, failure_limit=failure_limit)
+        rows = preview.execute(
+            "SELECT * FROM tasks WHERE status IN ('ready', 'review') "
+            "AND claim_lock IS NULL ORDER BY CASE status WHEN 'ready' THEN 0 ELSE 1 END, priority DESC, created_at ASC"
+        ).fetchall()
+        allowed = frozenset(allowed_worker_profiles) if allowed_worker_profiles is not None else None
+        running = int(preview.execute("SELECT COUNT(*) FROM tasks WHERE status = 'running'").fetchone()[0])
+        per_profile: dict[str, int] = {}
+        if max_in_progress_per_profile:
+            for row in preview.execute("SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' AND assignee IS NOT NULL GROUP BY assignee"):
+                per_profile[str(row[0])] = int(row[1])
+        default = _resolve_default_assignee(default_assignee)
+        for row in rows:
+            if max_new_spawns is not None and len(result.spawned) >= max_new_spawns:
+                break
+            if max_spawn is not None and running + len(result.spawned) >= max_spawn:
+                break
+            assignee = row["assignee"] or default
+            if not assignee:
+                result.skipped_unassigned.append(row["id"])
+                continue
+            if row["assignee"] is None and default:
+                result.auto_assigned_default.append(row["id"])
+            if allowed is not None and assignee not in allowed:
+                _record_worker_profile_admission_skip(result, row["id"], assignee)
+                continue
+            profile_exists = _profile_exists_fn()
+            if profile_exists is not None and not profile_exists(assignee):
+                result.skipped_nonspawnable.append(row["id"])
+                continue
+            task = _kb.Task.from_row(row)
+            diagnostic = _worker_capabilities_for_task(task, assignee=assignee, toolsets_override=worker_toolsets)
+            if diagnostic is not None:
+                _record_worker_capability_rejection(result, diagnostic)
+                continue
+            if max_in_progress_per_profile and per_profile.get(assignee, 0) >= max_in_progress_per_profile:
+                result.skipped_per_profile_capped.append((row["id"], assignee, per_profile.get(assignee, 0)))
+                continue
+            lane = "review" if row["status"] == "review" else "ready"
+            if lane == "review" and not review_dispatch_enabled():
+                continue
+            if check_respawn_guard(preview, row["id"], lane=lane) is not None:
+                continue
+            result.spawned.append((row["id"], assignee, ""))
+            per_profile[assignee] = per_profile.get(assignee, 0) + 1
+        if parallel_dispatch := bool(max_in_progress is not None and max_in_progress > 1):
+            pressure = _kb._memory_pressure_level()
+            if pressure == "unknown":
+                result.memory_pressure = pressure
+                result.spawned.clear()
+        return result
+    finally:
+        preview.close()
+
+
+def _dispatch_adaptive_locked(
+    conn: sqlite3.Connection,
+    *,
+    spawn_fn=None,
+    ttl_seconds: Optional[int] = None,
+    max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
+    max_in_progress: Optional[int] = None,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+    stale_timeout_seconds: int = 0,
+    board: Optional[str] = None,
+    default_assignee: Optional[str] = None,
+    max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
+    worker_toolsets: Optional[Iterable[str]] = None,
+    reconcile_orphans: bool = True,
+) -> DispatchResult:
+    """Adaptive host admission followed by the normal lane claim/spawn path."""
+    result = DispatchResult()
+    _run_reclaim_phase(
+        conn, result, stale_timeout_seconds=stale_timeout_seconds,
+        failure_limit=failure_limit, reconcile_orphans=reconcile_orphans,
+    )
+    ready_rows = _lane_rows(conn, "ready")
+    review_rows = _lane_rows(conn, "review") if review_dispatch_enabled() else []
+    if not ready_rows and not review_rows:
+        return result
+
+    scope_samples = []
+    foreign: Optional[_OtherBoardsRunningObservation] = None
+    foreign_error = "foreign-board occupancy unavailable"
+    for _ in range(2):
+        try:
+            sample = _kb._read_live_worker_scopes()
+            total = sample.get("total")
+            if type(total) is not int or total < 0:
+                raise ValueError("scope telemetry malformed")
+            scope_samples.append(sample)
+            try:
+                foreign = _kb.observe_running_tasks_other_boards(board)
+            except Exception as exc:
+                foreign = None
+                foreign_error = f"{type(exc).__name__}: {exc}"
+            expected = count_running_tasks(conn) + (foreign.running_count if foreign is not None else 0)
+            if total == expected:
+                break
+        except Exception as exc:
+            result.admission_blocked = True
+            result.admission_reason = "scope_telemetry_unavailable"
+            result.admission_metrics = {"error": f"{type(exc).__name__}: {exc}"}
+            return result
+    expected_total = count_running_tasks(conn) + (foreign.running_count if foreign is not None else 0)
+    if not scope_samples or scope_samples[-1].get("total") != expected_total:
+        result.admission_blocked = True
+        result.admission_reason = "scope_count_transition"
+        result.admission_metrics = {
+            "db_running": expected_total,
+            "scope_running": scope_samples[-1].get("total") if scope_samples else None,
+        }
+        return result
+    if foreign is None:
+        result.admission_blocked = True
+        result.admission_reason = "foreign_occupancy_unavailable"
+        result.admission_metrics = {"error": foreign_error}
+        return result
+
+    running_count = count_running_tasks(conn)
+    by_profile: dict[str, int] = {}
+    for row in conn.execute(
+        "SELECT assignee, COUNT(*) FROM tasks WHERE status = 'running' "
+        "AND assignee IS NOT NULL GROUP BY assignee"
+    ):
+        by_profile[str(row[0])] = int(row[1])
+    for profile, count in foreign.per_profile_running.items():
+        by_profile[str(profile)] = by_profile.get(str(profile), 0) + int(count)
+    total_running = running_count + foreign.running_count
+    if max_in_progress is not None and total_running >= max_in_progress:
+        return result
+    spawn_budget: Optional[int] = None
+    if max_spawn is not None:
+        if running_count >= max_spawn:
+            return result
+        spawn_budget = max_spawn - running_count
+    if max_in_progress is not None:
+        remaining = max_in_progress - total_running
+        spawn_budget = remaining if spawn_budget is None else min(spawn_budget, remaining)
+    if max_new_spawns is not None:
+        spawn_budget = max_new_spawns if spawn_budget is None else min(spawn_budget, max_new_spawns)
+    pressure = _kb._memory_pressure_level()
+    if pressure == "critical" or pressure == "unknown":
+        result.memory_pressure = pressure
+        return result
+    if pressure == "elevated":
+        result.memory_pressure = pressure
+        spawn_budget = 1 if spawn_budget is None else min(spawn_budget, 1)
+    if spawn_budget is not None and spawn_budget <= 0:
+        return result
+
+    allowed = frozenset(allowed_worker_profiles) if allowed_worker_profiles is not None else None
+    per_profile_cap = max_in_progress_per_profile if isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0 else None
+    profile_exists = _profile_exists_fn()
+    native_spawn = spawn_fn is None or spawn_fn is _default_spawn or spawn_fn is _kb._default_spawn
+    require_scope = False
+    if native_spawn:
+        capable, reason, _target = _kb._systemd_scope_preflight(require_scope=True, force_probe=True)
+        if not capable:
+            result.admission_blocked = True
+            result.admission_reason = str(reason or "scope_preflight_failed")
+            return result
+        require_scope = True
+
+    default_name = _resolve_default_assignee(default_assignee)
+    per_profile_running = dict(by_profile)
+    review_eligible = _any_spawnable_review(review_rows)
+    ready_budget = max(spawn_budget - 1, 0) if spawn_budget is not None and review_eligible else spawn_budget
+    spawned = 0
+    lane_kwargs = dict(
+        dry_run=False, ttl_seconds=ttl_seconds, board=board,
+        failure_limit=failure_limit, spawn_fn=spawn_fn,
+        per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
+        worker_toolsets=worker_toolsets, require_scope=require_scope,
+    )
+    for lane, rows, limit in (("ready", ready_rows, ready_budget), ("review", review_rows, spawn_budget)):
+        for row in rows:
+            if limit is not None and spawned >= limit:
+                break
+            assignee = row["assignee"]
+            if not assignee and lane == "ready" and default_name:
+                if _apply_default_assignee(conn, row["id"], default_name, dry_run=False):
+                    assignee = default_name
+                    result.auto_assigned_default.append(row["id"])
+            if not assignee:
+                result.skipped_unassigned.append(row["id"])
+                continue
+            if allowed is not None and assignee not in allowed:
+                _record_worker_profile_admission_skip(result, row["id"], assignee)
+                continue
+            if profile_exists is not None and not profile_exists(assignee):
+                result.skipped_nonspawnable.append(row["id"])
+                continue
+            if per_profile_cap is not None and per_profile_running.get(assignee, 0) >= per_profile_cap:
+                result.skipped_per_profile_capped.append((row["id"], assignee, per_profile_running.get(assignee, 0)))
+                continue
+            if check_respawn_guard(conn, row["id"], lane=lane) is not None:
+                result.respawn_guarded.append((row["id"], check_respawn_guard(conn, row["id"], lane=lane)))
+                continue
+            if _dispatch_lane_task(conn, row, assignee, result, lane=lane, **lane_kwargs):
+                spawned += 1
+    return result
+
+
 # The dispatch lock has been released here. Fire the tick observer strictly OUTSIDE the single-writer
 # critical section (#56066 sweeper finding / #64231 disposition): a slow subscriber must never extend the
 # lock hold and stall a sibling dispatcher's tick.
@@ -2315,13 +3100,18 @@ def _dispatch_once_locked(
     ttl_seconds: Optional[int] = None,
     dry_run: bool = False,
     max_spawn: Optional[int] = None,
+    max_new_spawns: Optional[int] = None,
     max_in_progress: Optional[int] = None,
     failure_limit: int = DEFAULT_FAILURE_LIMIT,
     stale_timeout_seconds: int = 0,
     board: Optional[str] = None,
     default_assignee: Optional[str] = None,
     max_in_progress_per_profile: Optional[int] = None,
+    allowed_worker_profiles: Optional[Iterable[str]] = None,
     worker_toolsets: Optional[Iterable[str]] = None,
+    effective_config: Optional[Mapping[str, Any]] = None,
+    selected_boards: Optional[Iterable[str]] = None,
+    parallel_dispatch: bool = False,
     reconcile_orphans: bool = True,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
@@ -2329,6 +3119,17 @@ def _dispatch_once_locked(
     call ``spawn_fn(task, workspace_path, board) -> Optional[int]``, recording
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
+    if parallel_dispatch:
+        return _dispatch_adaptive_locked(
+            conn, spawn_fn=spawn_fn, ttl_seconds=ttl_seconds,
+            max_spawn=max_spawn, max_new_spawns=max_new_spawns,
+            max_in_progress=max_in_progress, failure_limit=failure_limit,
+            stale_timeout_seconds=stale_timeout_seconds, board=board,
+            default_assignee=default_assignee,
+            max_in_progress_per_profile=max_in_progress_per_profile,
+            allowed_worker_profiles=allowed_worker_profiles,
+            worker_toolsets=worker_toolsets, reconcile_orphans=reconcile_orphans,
+        )
     result = DispatchResult()
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,

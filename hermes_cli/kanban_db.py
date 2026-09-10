@@ -1446,7 +1446,11 @@ def create_task(
     from hermes_cli.kanban_db_graph import initial_task_state, inherit_creator_origin
     from hermes_cli.kanban_pr_acceptance import validate_contract
 
+    _ensure_required_capabilities_column(conn)
     completion_contract = validate_contract(completion_contract)
+    normalized_required_capabilities = normalize_required_worker_capabilities(
+        required_capabilities
+    )
     model_override, provider_override = _validate_model_override(model_override, provider_override)
     reasoning_effort = normalize_reasoning_effort(reasoning_effort)
     assignee = _canonical_assignee(assignee)
@@ -1791,7 +1795,18 @@ def _inherit_notify_subs(
     )
 
 
+def _ensure_required_capabilities_column(conn: sqlite3.Connection) -> None:
+    """Add the capability column to a pre-R5 board without rebuilding it."""
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(tasks)")}
+    if "required_capabilities" in columns:
+        return
+    conn.execute("ALTER TABLE tasks ADD COLUMN required_capabilities TEXT")
+    if not conn.in_transaction:
+        conn.commit()
+
+
 def get_task(conn: sqlite3.Connection, task_id: str) -> Optional[Task]:
+    _ensure_required_capabilities_column(conn)
     row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
     return Task.from_row(row) if row else None
 
@@ -5131,6 +5146,8 @@ def latest_summaries(conn: sqlite3.Connection, task_ids: Iterable[str]) -> dict[
 # --- Split modules (imported at the tail: they import this module as ``_kb``) ---
 from hermes_cli.kanban_db_connect import (  # noqa: E402
     _INITIALIZED_PATHS,
+    _dispatch_tick_lock,
+    connect,
     init_db,
     write_txn,
 )
@@ -5152,7 +5169,57 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _worker_alive,
     _worker_survived_termination,
     _worker_terminal_timeout_env,
+    _CanonicalAdmissionSnapshot,
+    _OtherBoardsRunningObservation,
+    _allocation_lock,
+    _canonical_dispatch_config,
+    _capability_admitted,
+    _default_spawn,
+    _memory_pressure_level,
+    _parallel_dispatch_required,
+    _read_live_worker_scopes,
+    reconcile_worker_scope_terminals,
+    _record_worker_capability_rejection,
+    _resolve_worker_capability_tools,
+    _resolve_worker_cli_toolsets,
+    _systemd_scope_preflight,
+    _worker_capabilities_for_task,
+    _dispatch_lane_task,
+    _dispatch_once_locked,
+    dispatch_once,
+    observe_running_tasks_other_boards,
+    prepare_dispatch_admission,
+    resolve_dispatch_caps,
+    resolve_worker_profile_admission,
 )
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(*, db_path: Optional[Path] = None, board: Optional[str] = None):
+    """Open a board database read-only without creating WAL sidecars."""
+    path = db_path if db_path is not None else kanban_db_path(board=board)
+    sidecars: dict[Path, tuple[bytes, int]] = {}
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{path}{suffix}")
+        if sidecar.exists():
+            sidecars[sidecar] = (sidecar.read_bytes(), sidecar.stat().st_mtime_ns)
+    uri = path.expanduser().resolve().as_uri() + "?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+    conn.row_factory = sqlite3.Row
+    try:
+        yield conn
+    finally:
+        conn.close()
+        known_sidecars = set(sidecars)
+        for suffix in ("-wal", "-shm"):
+            sidecar = Path(f"{path}{suffix}")
+            if sidecar not in known_sidecars:
+                with contextlib.suppress(OSError):
+                    sidecar.unlink()
+        for sidecar, (content, mtime_ns) in sidecars.items():
+            with contextlib.suppress(OSError):
+                sidecar.write_bytes(content)
+                os.utime(sidecar, ns=(mtime_ns, mtime_ns))
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----
