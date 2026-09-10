@@ -96,7 +96,7 @@ async def test_dispatcher_passes_one_canonical_snapshot_to_every_board(
 ):
     import gateway.kanban_watchers as watchers
     import hermes_cli.config as config_module
-    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db, kanban_db_connect, kanban_db_dispatch
 
     monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path))
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
@@ -118,15 +118,18 @@ async def test_dispatcher_passes_one_canonical_snapshot_to_every_board(
         kanban_db, "list_boards",
         lambda **_k: [{"slug": "default"}, {"slug": "second"}],
     )
-    monkeypatch.setattr(kanban_db, "reap_worker_zombies", lambda: [])
-    monkeypatch.setattr(kanban_db, "review_dispatch_enabled", lambda: False)
-    monkeypatch.setattr(kanban_db, "has_spawnable_ready", lambda _conn: False)
+    # The split dispatcher calls defining modules directly; patch those native
+    # seams so this loop remains a deterministic fixture rather than opening a
+    # real board or entering the real spawn path.
+    monkeypatch.setattr(kanban_db_dispatch, "reap_worker_zombies", lambda: [])
+    monkeypatch.setattr(kanban_db_dispatch, "review_dispatch_enabled", lambda: False)
+    monkeypatch.setattr(kanban_db_dispatch, "has_spawnable_ready", lambda _conn: False)
 
     class FakeConnection:
         def close(self):
             return None
 
-    monkeypatch.setattr(kanban_db, "connect", lambda **_k: FakeConnection())
+    monkeypatch.setattr(kanban_db_connect, "connect", lambda **_k: FakeConnection())
     monkeypatch.setattr(watchers, "_kanban_dispatch_allowed", lambda: True)
 
     async def no_sleep(_seconds):
@@ -147,6 +150,7 @@ async def test_dispatcher_passes_one_canonical_snapshot_to_every_board(
             runner._running = False
         return kanban_db.DispatchResult()
 
-    monkeypatch.setattr(kanban_db, "dispatch_once", dispatch_once)
+    monkeypatch.setattr(kanban_db_dispatch, "dispatch_once", dispatch_once)
     await runner._kanban_dispatcher_watcher()
-    assert received == [snapshot, snapshot]
+    assert received[0] is snapshot
+    assert received[1] is snapshot
