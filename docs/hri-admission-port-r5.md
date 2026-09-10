@@ -42,13 +42,14 @@ All test commands used the existing interpreter and canonical runner:
 
 ## Remaining gates and handoff
 
-The CLI passthrough pre-gating failures remain **NOT_VERIFIED** for this slice
-because their required fix is in the out-of-scope `hermes_cli/kanban.py` facade.
-The requested adaptive, worker-toolset, dispatch-lock, and dispatch-hook proof
-is green. Independent QA is deferred to Dolly's exact-committed candidate
-review and full release-runtime gates. Deferred project/outcome lifecycle,
-notifier, updater/runtime bridge, auth circuit, Outcome wake, and unrelated
-prompt/toolset/runtime improvements remain out of scope.
+The R6 follow-up moved CLI dispatch/forced-daemon admission ahead of database
+initialization in `hermes_cli/kanban.py`; the passthrough regression file is
+now green in the focused R6 receipt. The requested adaptive, worker-toolset,
+dispatch-lock, and dispatch-hook proof remains green. Independent QA is
+deferred to Dolly's exact-committed candidate review and full release-runtime
+gates. Deferred project/outcome lifecycle, notifier, updater/runtime bridge,
+auth circuit, Outcome wake, and unrelated prompt/toolset/runtime improvements
+remain out of scope.
 
 Final receipt: useful R5 implementation diff retained; no commit, push, merge,
 install, service, live-config, database, or network write was performed.

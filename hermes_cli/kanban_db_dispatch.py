@@ -693,7 +693,17 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         pid = int(row["worker_pid"])
         tid = row["id"]
         started_at = _kb._row_get(row, "worker_started_at")
-        if started_at == UNVERIFIED_WORKER_FINGERPRINT and _kb._pid_alive(pid):
+        current_run = _kb._current_run_id(conn, tid)
+        scope_release = _kb._scope_release_result(
+            conn, tid, int(current_run) if current_run is not None else None,
+        )
+        if not scope_release.can_release:
+            continue
+        if (
+            scope_release.pid_signal_allowed
+            and started_at == UNVERIFIED_WORKER_FINGERPRINT
+            and _kb._pid_alive(pid)
+        ):
             # Fingerprint capture failed at spawn: we cannot prove this live PID is our worker, so
             # it is neither signalled nor released beside (duplicate). It is reclaimed once it exits.
             _kb._log.warning("kanban: task %s worker pid %s exceeded max runtime but has no verified "
@@ -704,7 +714,11 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         # mismatch) is never signalled: the worker is already gone.
         killed = False
         kill = _kill_fn(signal_fn)
-        if kill is not None and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at)):
+        if (
+            kill is not None
+            and scope_release.pid_signal_allowed
+            and not (_kb._pid_alive(pid) and _pid_recycled(pid, started_at))
+        ):
             with contextlib.suppress(ProcessLookupError, OSError):
                 kill(pid, signal.SIGTERM)
             # Short polling wait — no time.sleep on the write txn.
@@ -781,7 +795,8 @@ def detect_stale_running(
 
     rows = conn.execute(
         "SELECT t.id, t.worker_pid, t.worker_started_at, t.last_heartbeat_at, t.claim_lock, "
-        "       COALESCE(r.started_at, t.started_at) AS active_started_at "
+        "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
+        "       t.current_run_id "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
         "WHERE t.status = 'running'"
@@ -803,8 +818,23 @@ def detect_stale_running(
         tid = row["id"]
         lock = row["claim_lock"] or ""
 
-        termination = _kb._terminate_reclaimed_worker(
-            pid, lock, signal_fn=signal_fn, started_at=_kb._row_get(row, "worker_started_at"))
+        scope_release = _kb._scope_release_result(
+            conn,
+            tid,
+            int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+        )
+        if not scope_release.can_release:
+            continue
+        termination = (
+            _kb._termination_metadata_without_pid_signal(pid, scope_release)
+            if not scope_release.pid_signal_allowed
+            else _kb._terminate_reclaimed_worker(
+                pid,
+                lock,
+                signal_fn=signal_fn,
+                started_at=_kb._row_get(row, "worker_started_at"),
+            )
+        )
 
         # Never release a claim while our own worker is still alive: that would
         # spawn a duplicate beside it. Hold the claim and retry next tick.
@@ -1152,6 +1182,7 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
     with _kb.write_txn(conn):
         rows = conn.execute(
             "SELECT id, worker_pid, worker_started_at, claim_lock, started_at, assignee "
+            "       , current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
@@ -1166,6 +1197,15 @@ def _reclaim_dead_workers(conn: sqlite3.Connection, board: Optional[str] = None)
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             if _worker_alive(row["worker_pid"], _kb._row_get(row, "worker_started_at")):
+                continue
+
+            run_id = row["current_run_id"]
+            scope_release = _kb._scope_release_result(
+                conn, row["id"], int(run_id) if run_id is not None else None,
+            )
+            if not scope_release.can_release:
+                # Unknown/active scoped occupancy remains fenced; a host PID
+                # being dead does not prove descendants are gone.
                 continue
 
             pid = int(row["worker_pid"])
@@ -1469,20 +1509,95 @@ def _record_task_failure(
 
 
 def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
-    """Record the spawned child's pid + its restart-stable fingerprint (``_process_fingerprint``), and
-    emit a ``spawned`` event carrying them. The fingerprint is what lets every later liveness/kill
-    decision tell OUR worker from a process that recycled the PID after a reboot. A failed capture is
-    persisted as ``UNVERIFIED_WORKER_FINGERPRINT``, never NULL: NULL is the legacy pre-fingerprint row
-    whose bare-PID kill authority a new spawn must not inherit."""
+    """Persist an authenticated launch receipt and PID-reuse fingerprint."""
+    receipt_launch_mode = getattr(pid, "launch_mode", None)
+    launch_mode = receipt_launch_mode or "direct"
+    scope_unit = getattr(pid, "scope_unit", None)
+    receipt_verification_status = getattr(pid, "verification_status", None)
+    verification_status = receipt_verification_status or "not-applicable"
+    manager_kind = getattr(pid, "manager_kind", None)
+    manager_uid = getattr(pid, "manager_uid", None)
+    launch_acknowledged = getattr(pid, "launch_acknowledged", None)
+    scope_slice = getattr(pid, "scope_slice", None)
+    memory_high = getattr(pid, "memory_high", None)
+    memory_max = getattr(pid, "memory_max", None)
+    memory_swap_max = getattr(pid, "memory_swap_max", None)
+    tasks_max = getattr(pid, "tasks_max", None)
+    oom_policy = getattr(pid, "oom_policy", None)
+    control_group = getattr(pid, "control_group", None)
+    if type(pid) is bool or not isinstance(pid, int) or int(pid) <= 0:
+        raise ValueError("worker PID must be a positive integer")
+    if launch_mode not in {"direct", "systemd-user-scope"}:
+        raise RuntimeError(f"unknown worker launch mode: {launch_mode!r}")
     started_at = _process_fingerprint(int(pid)) or UNVERIFIED_WORKER_FINGERPRINT
     with _kb.write_txn(conn):
-        conn.execute("UPDATE tasks SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                     (int(pid), started_at, task_id))
-        run_id = _kb._current_run_id(conn, task_id)
-        if run_id is not None:
-            conn.execute("UPDATE task_runs SET worker_pid = ?, worker_started_at = ? WHERE id = ?",
-                         (int(pid), started_at, run_id))
-        _kb._append_event(conn, task_id, "spawned", {"pid": int(pid), "started_at": started_at}, run_id=run_id)
+        task_row = conn.execute(
+            "SELECT status, current_run_id FROM tasks WHERE id=?", (task_id,),
+        ).fetchone()
+        run_id = int(task_row["current_run_id"]) if task_row and task_row["current_run_id"] is not None else None
+        if task_row is None or task_row["status"] != "running" or run_id is None:
+            raise RuntimeError("worker launch no longer owns the active task run")
+        if launch_mode == "systemd-user-scope":
+            try:
+                db_row = next(item for item in conn.execute("PRAGMA database_list").fetchall() if item[1] == "main")
+                expected_unit = _kb._systemd_scope_unit_name(task_id, run_id, db_path=db_row[2])
+            except (OSError, StopIteration, TypeError, ValueError, IndexError):
+                expected_unit = None
+            if not (
+                scope_unit == expected_unit
+                and _kb._SYSTEMD_WORKER_SCOPE_RE.fullmatch(scope_unit or "")
+                and manager_kind == _kb._SYSTEMD_USER_MANAGER_KIND
+                and type(manager_uid) is int
+                and _kb._systemd_user_manager_target_for_uid(manager_uid) is not None
+                and launch_acknowledged is True
+                and verification_status == "verified"
+                and _kb._valid_scope_resource_receipt(
+                    scope_slice=scope_slice, memory_high=memory_high,
+                    memory_max=memory_max, memory_swap_max=memory_swap_max,
+                    tasks_max=tasks_max, oom_policy=oom_policy,
+                    control_group=control_group,
+                )
+            ):
+                raise RuntimeError("refusing to persist an unauthenticated worker scope receipt")
+        elif any(value is not None for value in (
+            scope_unit, manager_kind, manager_uid, launch_acknowledged,
+            scope_slice, memory_high, memory_max, memory_swap_max,
+            tasks_max, oom_policy, control_group,
+        )):
+            raise RuntimeError("direct worker launch carried scoped identity fields")
+        cur = conn.execute(
+            "UPDATE tasks SET worker_pid=?, worker_started_at=? "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (int(pid), started_at, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("worker launch lost its task/run fence")
+        cur = conn.execute(
+            "UPDATE task_runs SET worker_pid=?, worker_started_at=?, launch_mode=?, scope_unit=?, manager_kind=?, manager_uid=?, "
+            "launch_acknowledged=?, verification_status=?, scope_slice=?, memory_high=?, memory_max=?, "
+            "memory_swap_max=?, tasks_max=?, oom_policy=?, control_group=?, "
+            "reap_state=CASE WHEN terminal_action IS NOT NULL THEN reap_state ELSE NULL END, "
+            "reap_error=CASE WHEN terminal_action IS NOT NULL THEN reap_error ELSE NULL END "
+            "WHERE id=? AND task_id=? AND ended_at IS NULL",
+            (int(pid), started_at, launch_mode, scope_unit, manager_kind, manager_uid,
+             int(launch_acknowledged) if type(launch_acknowledged) is bool else None,
+             verification_status, scope_slice, memory_high, memory_max,
+             memory_swap_max, tasks_max, oom_policy, control_group, run_id, task_id),
+        )
+        if cur.rowcount != 1:
+            raise RuntimeError("worker launch receipt promotion lost its run fence")
+        payload = {"pid": int(pid), "started_at": started_at}
+        for key, value in (
+            ("launch_mode", receipt_launch_mode), ("scope_unit", scope_unit),
+            ("verification_status", receipt_verification_status), ("manager_kind", manager_kind),
+            ("manager_uid", manager_uid), ("launch_acknowledged", launch_acknowledged),
+            ("scope_slice", scope_slice), ("memory_high", memory_high),
+            ("memory_max", memory_max), ("memory_swap_max", memory_swap_max),
+            ("tasks_max", tasks_max), ("oom_policy", oom_policy), ("control_group", control_group),
+        ):
+            if value is not None:
+                payload[key] = value
+        _kb._append_event(conn, task_id, "spawned", payload, run_id=run_id)
 
 
 def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
@@ -1982,42 +2097,110 @@ class _OtherBoardsRunningObservation:
 def observe_running_tasks_other_boards(
     board: Optional[str] = None,
 ) -> Optional[_OtherBoardsRunningObservation]:
-    """Read immutable foreign-board occupancy without creating SQLite sidecars."""
+    """Read exact foreign occupancy and lock-domain evidence, or ``None``.
+
+    A safety decision may use only a stable, immutable snapshot.  A missing,
+    replacing, locked, malformed, or WAL-backed board therefore remains
+    unknown rather than being treated as idle.
+    """
+
+    def _regular_snapshot(path: Path) -> tuple[Path, tuple[int, int, int, int]]:
+        resolved = path.resolve(strict=True)
+        info = os.lstat(resolved)
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"kanban DB is not a regular file: {resolved}")
+        return resolved, (int(info.st_dev), int(info.st_ino), int(info.st_size), int(info.st_mtime_ns))
+
+    def _wal_snapshot(db_path: Path) -> tuple[str, Optional[tuple[int, int, int, int]]]:
+        wal_path = Path(f"{db_path}-wal")
+        try:
+            info = os.lstat(wal_path)
+        except FileNotFoundError:
+            return "absent", None
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"kanban WAL is not a regular file: {wal_path}")
+        snapshot = (int(info.st_dev), int(info.st_ino), int(info.st_size), int(info.st_mtime_ns))
+        if snapshot[2] != 0:
+            raise ValueError(f"kanban WAL is non-empty: {wal_path}")
+        return "empty", snapshot
+
+    def _same_snapshot(raw_path: Path, resolved_path: Path,
+                       db_snapshot: tuple[int, int, int, int],
+                       wal_snapshot: tuple[str, Optional[tuple[int, int, int, int]]]) -> bool:
+        try:
+            after_path, after_db = _regular_snapshot(raw_path)
+            after_wal = _wal_snapshot(after_path)
+        except (OSError, ValueError):
+            return False
+        return after_path == resolved_path and after_db == db_snapshot and after_wal == wal_snapshot
+
     try:
-        current = _kb.kanban_db_path(board=board).expanduser().resolve(strict=True)
+        current_raw = _kb.kanban_db_path(board=board).expanduser()
+        current_path, current_snapshot = _regular_snapshot(current_raw)
         boards = _kb.list_boards(include_archived=False)
     except Exception:
         return None
+
     total = 0
     per_profile: dict[str, int] = {}
-    independent = False
-    seen: set[Path] = set()
+    foreign_paths: set[Path] = set()
+    foreign_identities: set[tuple[int, int]] = set()
+    observations: list[tuple[Path, Path, tuple[int, int, int, int],
+                              tuple[str, Optional[tuple[int, int, int, int]]]]] = []
     for metadata in boards:
+        if not isinstance(metadata, dict):
+            return None
+        slug = metadata.get("slug") or _kb.DEFAULT_BOARD
         try:
-            slug = metadata.get("slug") or "default"
-            path = _kb.kanban_db_path(board=slug).expanduser().resolve(strict=True)
-            if path == current or path in seen:
+            raw_path = _kb.kanban_db_path(board=slug).expanduser()
+            path, db_snapshot = _regular_snapshot(raw_path)
+            identity = (db_snapshot[0], db_snapshot[1])
+            if path == current_path or identity == (current_snapshot[0], current_snapshot[1]):
                 continue
-            seen.add(path)
-            independent = True
+            if path in foreign_paths or identity in foreign_identities:
+                continue
+            wal_snapshot = _wal_snapshot(path)
+            foreign_paths.add(path)
+            foreign_identities.add(identity)
+            observations.append((raw_path, path, db_snapshot, wal_snapshot))
             other = sqlite3.connect(path.as_uri() + "?immutable=1", uri=True, timeout=0.5)
             try:
                 rows = other.execute(
                     "SELECT assignee, COUNT(*) FROM tasks "
                     "WHERE status = 'running' GROUP BY assignee"
                 ).fetchall()
+                board_total = 0
+                for row in rows:
+                    if row is None or len(row) < 2:
+                        return None
+                    assignee, raw_count = row[0], row[1]
+                    if type(raw_count) is not int or raw_count < 0:
+                        return None
+                    if assignee is not None and (type(assignee) is not str or not assignee.strip()):
+                        return None
+                    board_total += raw_count
+                    if assignee is not None:
+                        per_profile[assignee] = per_profile.get(assignee, 0) + raw_count
+                total += board_total
             finally:
                 other.close()
-            for assignee, count in rows:
-                if type(count) is not int or count < 0:
-                    return None
-                total += count
-                if assignee:
-                    per_profile[str(assignee)] = per_profile.get(str(assignee), 0) + count
-        except (OSError, sqlite3.Error, ValueError, TypeError):
+            if not _same_snapshot(raw_path, path, db_snapshot, wal_snapshot):
+                return None
+        except (OSError, sqlite3.Error, TypeError, ValueError, OverflowError):
             return None
+    for raw_path, path, db_snapshot, wal_snapshot in observations:
+        if not _same_snapshot(raw_path, path, db_snapshot, wal_snapshot):
+            return None
+    try:
+        current_after, current_after_snapshot = _regular_snapshot(current_raw)
+    except (OSError, ValueError):
+        return None
+    if current_after != current_path or current_after_snapshot != current_snapshot:
+        return None
     return _OtherBoardsRunningObservation(
-        total, independent, MappingProxyType(dict(per_profile))
+        running_count=total,
+        has_independent_db=bool(foreign_paths),
+        per_profile_running=MappingProxyType(dict(per_profile)),
     )
 
 
@@ -2047,16 +2230,6 @@ def _read_live_worker_scopes() -> dict[str, int]:
     return counts
 
 
-def reconcile_worker_scope_terminals(_conn: sqlite3.Connection) -> list[str]:
-    """Compatibility hook for native scope cleanup; no-op without scope state."""
-    return []
-
-
-def _systemd_scope_preflight(**_kwargs: Any) -> tuple[bool, Optional[str], Optional[str]]:
-    """Return the local scope capability used by adaptive native admission."""
-    return True, None, "systemd-run"
-
-
 def _normalize_worker_toolset_override(toolsets: Optional[Iterable[str]]) -> Optional[list[str]]:
     if toolsets is None:
         return None
@@ -2080,6 +2253,14 @@ def _positive_dispatch_cap(value: Any, name: str) -> Optional[int]:
     return value
 
 
+def _nonnegative_dispatch_cap(value: Any, name: str) -> Optional[int]:
+    if value is None:
+        return None
+    if type(value) is not int or value < 0:
+        raise ValueError(f"{name} must be a non-negative integer")
+    return value
+
+
 def resolve_dispatch_caps(
     config: Optional[Mapping[str, Any]] = None, *, max_spawn: Any = None,
     max_in_progress: Any = None,
@@ -2091,9 +2272,9 @@ def resolve_dispatch_caps(
         section = config.get("kanban", {}) or {}
         if not isinstance(section, Mapping):
             raise ValueError("kanban config must be a mapping")
-        configured_spawn = _positive_dispatch_cap(section.get("max_spawn"), "kanban.max_spawn")
+        configured_spawn = _nonnegative_dispatch_cap(section.get("max_spawn"), "kanban.max_spawn")
         configured_progress = _positive_dispatch_cap(section.get("max_in_progress"), "kanban.max_in_progress")
-    explicit_spawn = _positive_dispatch_cap(max_spawn, "max_spawn") if max_spawn is not None else None
+    explicit_spawn = _nonnegative_dispatch_cap(max_spawn, "max_spawn") if max_spawn is not None else None
     explicit_progress = _positive_dispatch_cap(max_in_progress, "max_in_progress") if max_in_progress is not None else None
     return (
         min(configured_spawn, explicit_spawn) if configured_spawn is not None and explicit_spawn is not None
@@ -2495,6 +2676,10 @@ def dispatch_once(
             allowed_worker_profiles=allowed_worker_profiles,
             worker_toolsets=worker_toolsets,
         )
+        # Dry-run previews never claim/spawn work, but terminal worker cleanup
+        # is lifecycle maintenance rather than dispatch mutation and remains
+        # active just as it did on the pre-admission path.
+        result.reaped_terminal_workers = reap_terminal_workers(conn)
         return result
 
     def _locked_tick() -> DispatchResult:
@@ -2539,6 +2724,9 @@ def _call_spawn_fn(
     spawn_fn, task: Task, workspace: str, board: Optional[str], *,
     worker_toolsets: Optional[Iterable[str]] = None,
     require_scope: bool = False,
+    scope_config: Optional[_WorkerScopeConfig] = None,
+    launch_intent_fn=None,
+    clear_launch_intent_fn=None,
 ) -> Optional[int]:
     """Back-compat: older spawn_fn signatures (and test stubs) accept only
     ``(task, workspace)``; pass ``board`` only when the callable supports it."""
@@ -2552,6 +2740,12 @@ def _call_spawn_fn(
             kwargs["worker_toolsets"] = worker_toolsets
         if "require_scope" in sig.parameters:
             kwargs["require_scope"] = require_scope
+        if "scope_config" in sig.parameters:
+            kwargs["scope_config"] = scope_config
+        if "launch_intent_fn" in sig.parameters:
+            kwargs["launch_intent_fn"] = launch_intent_fn
+        if "clear_launch_intent_fn" in sig.parameters:
+            kwargs["clear_launch_intent_fn"] = clear_launch_intent_fn
         return spawn_fn(task, workspace, **kwargs)
     except (TypeError, ValueError):
         return spawn_fn(task, workspace)
@@ -2573,6 +2767,7 @@ def _dispatch_lane_task(
     per_profile_running: dict[str, int],
     worker_toolsets: Optional[Iterable[str]] = None,
     require_scope: bool = False,
+    scope_config: Optional[_WorkerScopeConfig] = None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -2656,12 +2851,25 @@ def _dispatch_lane_task(
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
     try:
         effective_spawn = spawn_fn if spawn_fn is not None else _kb._default_spawn
+        launch_config = scope_config
+        if launch_config is None and effective_spawn is _kb._default_spawn:
+            with contextlib.suppress(Exception):
+                launch_config = _kb._worker_scope_config()
         pid = _call_spawn_fn(
             effective_spawn, claimed, str(workspace), board,
             worker_toolsets=worker_toolsets, require_scope=require_scope,
+            scope_config=launch_config,
+            launch_intent_fn=(
+                lambda unit, target, config: _kb._set_worker_launching(
+                    conn, claimed.id, scope_unit=unit, target=target, scope_config=config,
+                )
+            ) if launch_config is not None else None,
+            clear_launch_intent_fn=(
+                lambda: _kb._clear_worker_launching(conn, claimed.id)
+            ) if launch_config is not None else None,
         )
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid))
+            _set_worker_pid(conn, claimed.id, pid)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -3042,8 +3250,18 @@ def _dispatch_adaptive_locked(
     profile_exists = _profile_exists_fn()
     native_spawn = spawn_fn is None or spawn_fn is _default_spawn or spawn_fn is _kb._default_spawn
     require_scope = False
+    scope_config = None
     if native_spawn:
-        capable, reason, _target = _kb._systemd_scope_preflight(require_scope=True, force_probe=True)
+        try:
+            scope_config = _kb._worker_scope_config()
+        except Exception as exc:
+            result.admission_blocked = True
+            result.admission_reason = "scope_config_invalid"
+            result.admission_metrics = {"error": f"{type(exc).__name__}: {exc}"}
+            return result
+        capable, reason, _target = _kb._systemd_scope_preflight(
+            require_scope=True, force_probe=True, scope_config=scope_config,
+        )
         if not capable:
             result.admission_blocked = True
             result.admission_reason = str(reason or "scope_preflight_failed")
@@ -3060,6 +3278,7 @@ def _dispatch_adaptive_locked(
         failure_limit=failure_limit, spawn_fn=spawn_fn,
         per_profile_cap=per_profile_cap, per_profile_running=per_profile_running,
         worker_toolsets=worker_toolsets, require_scope=require_scope,
+        scope_config=scope_config,
     )
     for lane, rows, limit in (("ready", ready_rows, ready_budget), ("review", review_rows, spawn_budget)):
         for row in rows:
@@ -3694,8 +3913,15 @@ def _restart_safe_worker_argv(task: Task, command: list[str]) -> list[str]:
 
 
 def _default_spawn(
-    task: Task, workspace: str, *, board: Optional[str] = None,
+    task: Task,
+    workspace: str,
+    *,
+    board: Optional[str] = None,
     worker_toolsets: Optional[Iterable[str]] = None,
+    require_scope: bool = False,
+    scope_config: Optional[_WorkerScopeConfig] = None,
+    launch_intent_fn=None,
+    clear_launch_intent_fn=None,
 ) -> Optional[int]:
     """Fire-and-forget ``hermes -p <profile> chat -q ...`` subprocess.
 
@@ -3805,15 +4031,29 @@ def _default_spawn(
     # older hermes builds on PATH that predate the flag's precedence.
     env.pop("HERMES_TUI", None)
 
-    cmd = _worker_argv(
+    worker_cmd = _worker_argv(
         task, profile_arg, env.get("HERMES_HOME"), worker_toolsets=worker_toolsets,
     )
-    # A worker spawned by a managed systemd gateway must leave the gateway's
-    # cgroup before startup; otherwise restarting the service kills the worker
-    # that is performing the handoff.
-    cmd = _restart_safe_worker_argv(task, cmd)
-    from tools.process_registry import systemd_user_bus_env
-    env = systemd_user_bus_env(env)
+    if scope_config is None:
+        scope_config = _kb._worker_scope_config()
+    cmd, scope_unit, scope_target = _kb._systemd_scope_argv(
+        worker_cmd, task, board=board, require_scope=require_scope,
+        scope_config=scope_config,
+    )
+    direct_env = dict(env)
+    if scope_unit is None:
+        # A worker spawned by a managed systemd gateway must leave the
+        # gateway's cgroup before startup; otherwise its handoff is killed
+        # with the gateway.  This is only the portable direct fallback.
+        cmd = _restart_safe_worker_argv(task, worker_cmd)
+        from tools.process_registry import systemd_user_bus_env
+        env = systemd_user_bus_env(env)
+    else:
+        if launch_intent_fn is not None:
+            launch_intent_fn(scope_unit, scope_target, scope_config)
+        for key in ("DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
+            env.pop(key, None)
+        env.update(_kb._systemd_user_manager_environment(scope_target))
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above
@@ -3834,9 +4074,50 @@ def _default_spawn(
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
-    return proc.pid
+    if scope_unit is None:
+        if _kb._IS_WINDOWS:
+            _live_worker_procs[proc.pid] = proc
+        return _WorkerLaunchPid(proc.pid, launch_mode="direct", verification_status="not-applicable")
+    try:
+        verified_pid = _kb._verify_systemd_scope_worker_pid(
+            proc, scope_unit, scope_target, worker_cmd,
+        )
+        control_group = getattr(verified_pid, "control_group", None)
+        if not control_group:
+            properties = _kb._systemd_scope_properties(scope_unit, scope_target)
+            control_group = properties.get("ControlGroup") if properties else None
+        if not control_group:
+            raise RuntimeError("systemd scope worker receipt has no control group")
+    except Exception as exc:
+        with contextlib.suppress(Exception):
+            _kb._cleanup_systemd_scope_launch(proc, scope_unit, scope_target)
+        raise _kb._WorkerScopeLaunchError(
+            str(exc),
+            _WorkerLaunchPid(
+                proc.pid, launch_mode="systemd-user-scope", scope_unit=scope_unit,
+                verification_status="launching", manager_kind=_kb._SYSTEMD_USER_MANAGER_KIND,
+                manager_uid=scope_target.uid, launch_acknowledged=False,
+                scope_slice=scope_config.slice if scope_config else None,
+                memory_high=scope_config.memory_high if scope_config else None,
+                memory_max=scope_config.memory_max if scope_config else None,
+                memory_swap_max=scope_config.memory_swap_max if scope_config else None,
+                tasks_max=scope_config.tasks_max if scope_config else None,
+                oom_policy=scope_config.oom_policy if scope_config else None,
+                control_group=control_group,
+            ),
+        ) from exc
+    return _WorkerLaunchPid(
+        int(verified_pid), launch_mode="systemd-user-scope", scope_unit=scope_unit,
+        verification_status="verified", manager_kind=_kb._SYSTEMD_USER_MANAGER_KIND,
+        manager_uid=scope_target.uid, launch_acknowledged=True,
+        scope_slice=scope_config.slice if scope_config else None,
+        memory_high=scope_config.memory_high if scope_config else None,
+        memory_max=scope_config.memory_max if scope_config else None,
+        memory_swap_max=scope_config.memory_swap_max if scope_config else None,
+        tasks_max=scope_config.tasks_max if scope_config else None,
+        oom_policy=scope_config.oom_policy if scope_config else None,
+        control_group=control_group,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3903,3 +4184,56 @@ def run_daemon(
 from hermes_cli import kanban_db as _kb  # noqa: E402
 from hermes_cli import kanban_db_connect as _kbc  # noqa: E402
 from hermes_cli import kanban_db_workspace as _kbw  # noqa: E402
+from hermes_cli.kanban_db_worker_scope import (  # noqa: E402
+    _SYSTEMD_RESOURCE_VALUE_RE,
+    _SYSTEMD_SCOPE_CLEANUP_TIMEOUT,
+    _SYSTEMD_SCOPE_MIN_VERSION,
+    _SYSTEMD_SCOPE_PROBE_TIMEOUT,
+    _SYSTEMD_SCOPE_VERIFY_TIMEOUT,
+    _SYSTEMD_USER_MANAGER_KIND,
+    _SYSTEMD_WORKER_SCOPE_PREFIX,
+    _SYSTEMD_WORKER_SCOPE_RE,
+    _SYSTEMD_WORKER_SLICE_RE,
+    _WorkerLaunchPid,
+    _WorkerScopeConfig,
+    _WorkerScopeLaunchError,
+    _WorkerScopeMode,
+    _WorkerScopeReceipt,
+    _WorkerScopeRelease,
+    _SystemdUserManagerTarget,
+    _VerifiedWorkerPid,
+    _abort_unpersisted_worker_launch,
+    _clear_worker_launching,
+    _cleanup_systemd_scope_launch,
+    _current_cgroup_path,
+    _ensure_worker_launch_identity,
+    _mark_worker_launch_cleanup_pending,
+    _persisted_worker_scope,
+    _process_cgroup_path,
+    _process_command_argv,
+    _process_command_matches,
+    _request_scoped_terminal_transition,
+    _scope_absence_confirmed,
+    _scope_release_result,
+    _scope_release_result_for_receipt,
+    _set_worker_launching,
+    _stop_persisted_scope_for_release,
+    _stop_systemd_scope,
+    _systemd_resource_value_bytes,
+    _systemd_run_version,
+    _systemd_scope_argv,
+    _systemd_scope_preflight,
+    _systemd_scope_process_ids,
+    _systemd_scope_properties,
+    _systemd_scope_state,
+    _systemd_scope_unit_name,
+    _systemd_user_manager_environment,
+    _systemd_user_manager_reachable,
+    _systemd_user_manager_target_for_cgroup,
+    _systemd_user_manager_target_for_uid,
+    _valid_scope_resource_receipt,
+    _verify_systemd_scope_worker_pid,
+    _worker_scope_config,
+    _worker_scope_runtime_status,
+    reconcile_worker_scope_terminals,
+)

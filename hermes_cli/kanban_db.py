@@ -861,17 +861,38 @@ class Run:
     claim_lock: Optional[str]
     claim_expires: Optional[int]
     worker_pid: Optional[int]
-    max_runtime_seconds: Optional[int]
-    last_heartbeat_at: Optional[int]
-    started_at: int
-    ended_at: Optional[int]
-    outcome: Optional[str]
-    summary: Optional[str]
-    metadata: Optional[dict]
-    error: Optional[str]
+    launch_mode: Optional[str] = None
+    scope_unit: Optional[str] = None
+    manager_kind: Optional[str] = None
+    manager_uid: Optional[int] = None
+    launch_acknowledged: Optional[bool] = None
+    verification_status: Optional[str] = None
+    scope_slice: Optional[str] = None
+    memory_high: Optional[str] = None
+    memory_max: Optional[str] = None
+    memory_swap_max: Optional[str] = None
+    tasks_max: Optional[int] = None
+    oom_policy: Optional[str] = None
+    control_group: Optional[str] = None
+    terminal_action: Optional[str] = None
+    terminal_payload: Optional[dict] = None
+    reap_state: Optional[str] = None
+    reap_requested_at: Optional[int] = None
+    reap_completed_at: Optional[int] = None
+    reap_error: Optional[str] = None
+    max_runtime_seconds: Optional[int] = None
+    last_heartbeat_at: Optional[int] = None
+    started_at: int = 0
+    ended_at: Optional[int] = None
+    outcome: Optional[str] = None
+    summary: Optional[str] = None
+    metadata: Optional[dict] = None
+    error: Optional[str] = None
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "Run":
+        keys = set(row.keys())
+        terminal_payload = _json_or(row["terminal_payload"]) if "terminal_payload" in keys else None
         return cls(
             **{
                 col: _lossy_text(row[col]) for col in (
@@ -883,6 +904,29 @@ class Run:
             started_at=int(row["started_at"]),
             ended_at=_opt_int(row["ended_at"]),
             metadata=_json_or(_lossy_text(row["metadata"])),
+            launch_mode=row["launch_mode"] if "launch_mode" in keys else None,
+            scope_unit=row["scope_unit"] if "scope_unit" in keys else None,
+            manager_kind=row["manager_kind"] if "manager_kind" in keys else None,
+            manager_uid=_opt_int(row["manager_uid"]) if "manager_uid" in keys else None,
+            launch_acknowledged=(
+                bool(row["launch_acknowledged"])
+                if "launch_acknowledged" in keys and row["launch_acknowledged"] is not None
+                else None
+            ),
+            verification_status=row["verification_status"] if "verification_status" in keys else None,
+            scope_slice=row["scope_slice"] if "scope_slice" in keys else None,
+            memory_high=row["memory_high"] if "memory_high" in keys else None,
+            memory_max=row["memory_max"] if "memory_max" in keys else None,
+            memory_swap_max=row["memory_swap_max"] if "memory_swap_max" in keys else None,
+            tasks_max=_opt_int(row["tasks_max"]) if "tasks_max" in keys else None,
+            oom_policy=row["oom_policy"] if "oom_policy" in keys else None,
+            control_group=row["control_group"] if "control_group" in keys else None,
+            terminal_action=row["terminal_action"] if "terminal_action" in keys else None,
+            terminal_payload=terminal_payload if isinstance(terminal_payload, dict) else None,
+            reap_state=row["reap_state"] if "reap_state" in keys else None,
+            reap_requested_at=_opt_int(row["reap_requested_at"]) if "reap_requested_at" in keys else None,
+            reap_completed_at=_opt_int(row["reap_completed_at"]) if "reap_completed_at" in keys else None,
+            reap_error=row["reap_error"] if "reap_error" in keys else None,
         )
 
 
@@ -1103,6 +1147,25 @@ CREATE TABLE IF NOT EXISTS task_runs (
     -- worker_pid after the run ends so a worker that outlives its terminal transition can
     -- still be found and reaped; NULL = legacy row, never signalled.
     worker_started_at   INTEGER,
+    launch_mode         TEXT,
+    scope_unit          TEXT,
+    manager_kind        TEXT,
+    manager_uid         INTEGER,
+    launch_acknowledged INTEGER,
+    verification_status TEXT,
+    scope_slice         TEXT,
+    memory_high         TEXT,
+    memory_max          TEXT,
+    memory_swap_max     TEXT,
+    tasks_max           INTEGER,
+    oom_policy          TEXT,
+    control_group       TEXT,
+    terminal_action     TEXT,
+    terminal_payload    TEXT,
+    reap_state          TEXT,
+    reap_requested_at   INTEGER,
+    reap_completed_at   INTEGER,
+    reap_error          TEXT,
     max_runtime_seconds INTEGER,
     last_heartbeat_at   INTEGER,
     started_at          INTEGER NOT NULL,
@@ -3140,7 +3203,7 @@ def release_stale_claims(
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, worker_started_at, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
@@ -3157,8 +3220,20 @@ def release_stale_claims(
             _extend_live_stale_claim(conn, row, now)
             continue
 
-        termination = _terminate_reclaimed_worker(
-            row["worker_pid"], row["claim_lock"], signal_fn=signal_fn, started_at=started_at,
+        scope_release = _scope_release_result(
+            conn,
+            row["id"],
+            int(row["current_run_id"]) if row["current_run_id"] is not None else None,
+        )
+        if not scope_release.can_release:
+            continue
+        termination = (
+            _termination_metadata_without_pid_signal(row["worker_pid"], scope_release)
+            if not scope_release.pid_signal_allowed
+            else _terminate_reclaimed_worker(
+                row["worker_pid"], row["claim_lock"], signal_fn=signal_fn,
+                started_at=started_at,
+            )
         )
         # A live worker of ours must keep its claim (else a duplicate spawns beside it).
         if _worker_survived_termination(termination):
@@ -3269,8 +3344,21 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
-    termination = _terminate_reclaimed_worker(
-        row["worker_pid"], prev_lock, signal_fn=signal_fn, started_at=row["worker_started_at"])
+    run_id = _current_run_id(conn, task_id)
+    # A scoped worker's PID is not an authority for release: stop and prove
+    # the exact manager/cgroup boundary first, leaving unknown occupancy held.
+    scope_release = _scope_release_result(conn, task_id, run_id)
+    if not scope_release.can_release:
+        return False
+    termination = (
+        {"prev_pid": _opt_int(row["worker_pid"]), "host_local": False,
+         "termination_attempted": False, "terminated": False, "sigkill": False}
+        if not scope_release.pid_signal_allowed
+        else _terminate_reclaimed_worker(
+            row["worker_pid"], prev_lock, signal_fn=signal_fn,
+            started_at=row["worker_started_at"],
+        )
+    )
     with write_txn(conn):
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
@@ -3420,6 +3508,60 @@ def _claim_is_live(trow) -> bool:
     )
 
 
+def _finalize_iteration_exhaustion_immediately(
+    conn: sqlite3.Connection,
+    task_id: str,
+    *,
+    budget_used: int,
+    budget_max: int,
+    error: str,
+    expected_run_id: Optional[int] = None,
+) -> Optional[int]:
+    """Close a non-retryable goal run after its scoped worker is reaped."""
+    message = str(error)[:500]
+    with write_txn(conn):
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (task_id,)).fetchone()
+        if row is None:
+            return None
+        run_id = int(row["current_run_id"]) if row["current_run_id"] else None
+        if expected_run_id is not None and run_id != int(expected_run_id):
+            return None
+        if row["status"] != "running" or run_id is None:
+            return None
+        failures = int(row["consecutive_failures"] or 0) + 1
+        cur = conn.execute(
+            "UPDATE tasks SET status='blocked', block_kind='iteration_exhausted', "
+            "max_retries=0, claim_lock=NULL, claim_expires=NULL, worker_pid=NULL, "
+            "consecutive_failures=?, last_failure_error=? "
+            "WHERE id=? AND status='running' AND current_run_id=?",
+            (failures, message, task_id, run_id),
+        )
+        if cur.rowcount != 1:
+            return None
+        closed_run_id = _end_run(
+            conn,
+            task_id,
+            outcome="iteration_exhausted",
+            status="iteration_exhausted",
+            error=message,
+            metadata={
+                "budget_used": max(0, int(budget_used)),
+                "budget_max": max(0, int(budget_max)),
+                "checkpoint_required": True,
+                "retryable": False,
+                "resume_policy": "never",
+            },
+        )
+        _append_event(
+            conn,
+            task_id,
+            "iteration_exhausted",
+            {"error": message, "budget_used": int(budget_used), "budget_max": int(budget_max)},
+            run_id=closed_run_id,
+        )
+        return closed_run_id
+
+
 def complete_task(
     conn: sqlite3.Connection, task_id: str, *, result: Optional[str] = None,
     summary: Optional[str] = None, metadata: Optional[dict] = None,
@@ -3444,12 +3586,37 @@ def complete_task(
     auditable event. Approving a card out of ``review`` stays exempt.
     """
     now = int(time.time())
+    created_cards_list = list(dict.fromkeys(
+        str(card).strip() for card in (created_cards or ()) if str(card).strip()
+    ))
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
         return False
     from hermes_cli.kanban_pr_acceptance_store import prepare_acceptance, record_acceptance
-    verified_cards = _gate_created_cards(conn, task_id, created_cards, summary or result)
+    verified_cards = _gate_created_cards(conn, task_id, created_cards_list, summary or result)
     _gate_empty_completion(conn, task_id, result=result, summary=summary)
+    guard_row = conn.execute(
+        "SELECT status, claim_lock, worker_pid, worker_started_at, current_run_id "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if expected_run_id is None and not force and guard_row and _claim_is_live(guard_row):
+        raise LiveClaimError(task_id)
+    scoped_request = _request_scoped_terminal_transition(
+        conn,
+        task_id,
+        action="complete",
+        payload={
+            "result": result,
+            "summary": summary,
+            "metadata": metadata,
+            "created_cards": verified_cards,
+            "fire_lifecycle_hook": fire_lifecycle_hook,
+        },
+        expected_run_id=expected_run_id,
+    )
+    if scoped_request is not None:
+        return scoped_request
     metadata = _merge_completion_prose_artifacts(
         conn, task_id, metadata, summary=summary, result=result,
     )
@@ -3931,6 +4098,15 @@ def block_task(
     """
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
+    scoped_request = _request_scoped_terminal_transition(
+        conn,
+        task_id,
+        action="block",
+        payload={"reason": reason, "kind": kind},
+        expected_run_id=expected_run_id,
+    )
+    if scoped_request is not None:
+        return scoped_request
     with write_txn(conn):
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
@@ -4053,6 +4229,7 @@ def request_review(
     conn: sqlite3.Connection, task_id: str, *, summary: Optional[str] = None,
     metadata: Optional[dict] = None, reviewer: Optional[str] = None,
     expected_run_id: Optional[int] = None, force: bool = False, with_reason: bool = False,
+    _scope_finalizing: bool = False,
 ):
     """``running``/``ready`` -> ``review``; never touches block recurrence accounting.
 
@@ -4077,6 +4254,29 @@ def request_review(
 
     summary = redact_review_value(summary)
     metadata = redact_review_value(metadata)
+    guard_row = conn.execute(
+        "SELECT status, claim_lock, current_run_id, worker_pid, worker_started_at "
+        "FROM tasks WHERE id = ?",
+        (task_id,),
+    ).fetchone()
+    if guard_row is None:
+        return _ret(False, "task not found")
+    if expected_run_id is None and not force and _claim_is_live(guard_row):
+        return _ret(
+            False, "task is running under a live claim; pass expected_run_id "
+            "(worker ownership) or force=True (explicit operator override) "
+            "instead of clearing the live run's claim",
+        )
+    if not _scope_finalizing:
+        scoped_request = _request_scoped_terminal_transition(
+            conn,
+            task_id,
+            action="review_requested",
+            payload={"summary": summary, "metadata": metadata, "reviewer": reviewer},
+            expected_run_id=expected_run_id,
+        )
+        if scoped_request is not None:
+            return _ret(scoped_request)
     # Declared (metadata["artifacts"]) and prose-referenced files
     # must be durable BEFORE anything can clean the scratch workspace up: for a
     # review-bound card the reviewer's completion is the cleanup trigger.
@@ -4207,6 +4407,20 @@ def request_changes(
     reason = str(redact_review_value(reason or "")).strip()
     if not reason:
         return False, "reason is required"
+
+    requested_event = _latest_event(conn, task_id, "review_requested")
+    requested_payload = _json_dict(_row_get(requested_event, "payload"))
+    implementer_hint = _nonblank_str(requested_payload.get("implementer"))
+    if implementer_hint is not None:
+        scoped_request = _request_scoped_terminal_transition(
+            conn,
+            task_id,
+            action="changes_requested",
+            payload={"reason": reason},
+            expected_run_id=expected_run_id,
+        )
+        if scoped_request is not None:
+            return (scoped_request, _canonical_assignee(implementer_hint))
 
     with write_txn(conn):
         task_row = conn.execute(
@@ -5150,6 +5364,8 @@ from hermes_cli.kanban_db_connect import (  # noqa: E402
     connect,
     init_db,
     write_txn,
+    connect_readonly_closing,
+    _private_db_snapshot,
 )
 from hermes_cli.kanban_db_workspace import (  # noqa: E402
     _cleanup_workspace,
@@ -5165,6 +5381,7 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _defer_reclaim_for_live_worker,
     _pid_alive,
     _record_task_failure,
+    _set_worker_pid,
     _terminate_reclaimed_worker,
     _worker_alive,
     _worker_survived_termination,
@@ -5178,11 +5395,9 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     _memory_pressure_level,
     _parallel_dispatch_required,
     _read_live_worker_scopes,
-    reconcile_worker_scope_terminals,
     _record_worker_capability_rejection,
     _resolve_worker_capability_tools,
     _resolve_worker_cli_toolsets,
-    _systemd_scope_preflight,
     _worker_capabilities_for_task,
     _dispatch_lane_task,
     _dispatch_once_locked,
@@ -5192,34 +5407,58 @@ from hermes_cli.kanban_db_dispatch import (  # noqa: E402
     resolve_dispatch_caps,
     resolve_worker_profile_admission,
 )
-
-
-@contextlib.contextmanager
-def connect_readonly_closing(*, db_path: Optional[Path] = None, board: Optional[str] = None):
-    """Open a board database read-only without creating WAL sidecars."""
-    path = db_path if db_path is not None else kanban_db_path(board=board)
-    sidecars: dict[Path, tuple[bytes, int]] = {}
-    for suffix in ("-wal", "-shm"):
-        sidecar = Path(f"{path}{suffix}")
-        if sidecar.exists():
-            sidecars[sidecar] = (sidecar.read_bytes(), sidecar.stat().st_mtime_ns)
-    uri = path.expanduser().resolve().as_uri() + "?mode=ro"
-    conn = sqlite3.connect(uri, uri=True, timeout=0.5)
-    conn.row_factory = sqlite3.Row
-    try:
-        yield conn
-    finally:
-        conn.close()
-        known_sidecars = set(sidecars)
-        for suffix in ("-wal", "-shm"):
-            sidecar = Path(f"{path}{suffix}")
-            if sidecar not in known_sidecars:
-                with contextlib.suppress(OSError):
-                    sidecar.unlink()
-        for sidecar, (content, mtime_ns) in sidecars.items():
-            with contextlib.suppress(OSError):
-                sidecar.write_bytes(content)
-                os.utime(sidecar, ns=(mtime_ns, mtime_ns))
+from hermes_cli.kanban_db_worker_scope import (  # noqa: E402
+    _SYSTEMD_RESOURCE_VALUE_RE,
+    _SYSTEMD_SCOPE_CLEANUP_TIMEOUT,
+    _SYSTEMD_SCOPE_MIN_VERSION,
+    _SYSTEMD_SCOPE_PROBE_TIMEOUT,
+    _SYSTEMD_SCOPE_VERIFY_TIMEOUT,
+    _SYSTEMD_USER_MANAGER_KIND,
+    _SYSTEMD_WORKER_SCOPE_PREFIX,
+    _SYSTEMD_WORKER_SCOPE_RE,
+    _SYSTEMD_WORKER_SLICE_RE,
+    _WorkerLaunchPid,
+    _WorkerScopeConfig,
+    _WorkerScopeLaunchError,
+    _WorkerScopeMode,
+    _WorkerScopeReceipt,
+    _WorkerScopeRelease,
+    _SystemdUserManagerTarget,
+    _VerifiedWorkerPid,
+    _abort_unpersisted_worker_launch,
+    _clear_worker_launching,
+    _cleanup_systemd_scope_launch,
+    _current_cgroup_path,
+    _ensure_worker_launch_identity,
+    _mark_worker_launch_cleanup_pending,
+    _persisted_worker_scope,
+    _process_cgroup_path,
+    _process_command_argv,
+    _process_command_matches,
+    _request_scoped_terminal_transition,
+    _scope_absence_confirmed,
+    _scope_release_result,
+    _scope_release_result_for_receipt,
+    _termination_metadata_without_pid_signal,
+    _set_worker_launching,
+    _stop_persisted_scope_for_release,
+    _stop_systemd_scope,
+    _systemd_run_version,
+    _systemd_resource_value_bytes,
+    _systemd_scope_argv,
+    _systemd_scope_process_ids,
+    _systemd_scope_properties,
+    _systemd_scope_state,
+    _systemd_scope_unit_name,
+    _systemd_user_manager_environment,
+    _systemd_user_manager_reachable,
+    _systemd_user_manager_target_for_cgroup,
+    _systemd_user_manager_target_for_uid,
+    _valid_scope_resource_receipt,
+    _verify_systemd_scope_worker_pid,
+    _worker_scope_config,
+    _worker_scope_runtime_status,
+)
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

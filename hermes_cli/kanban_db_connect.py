@@ -9,13 +9,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import os
 import random
 import re
 import secrets
 import shutil
 import sqlite3
+import stat
 import threading
 import time
+import tempfile
 from dataclasses import dataclass
 from dataclasses import field
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
@@ -752,6 +755,75 @@ def connect_closing(db_path: Optional[Path] = None, *, board: Optional[str] = No
             conn.close()
 
 
+@contextlib.contextmanager
+def _private_db_snapshot(db_path: Optional[Path]):
+    """Copy a board DB and WAL to private storage without SQLite I/O.
+
+    A preview must never open the live WAL database through a normal read-only
+    connection: SQLite may create or update ``-shm`` while reading. Raw copies
+    keep all sidecars private, and replacement fingerprints make a concurrent
+    commit retry rather than yielding a torn snapshot.
+    """
+    if db_path is None:
+        yield None
+        return
+    resolved = Path(db_path).expanduser().resolve()
+    if not resolved.is_file():
+        yield None
+        return
+
+    def signature() -> tuple[tuple[int, int, int, int] | None, ...]:
+        values: list[tuple[int, int, int, int] | None] = []
+        for source in (resolved, Path(f"{resolved}-wal")):
+            try:
+                info = os.lstat(source)
+            except FileNotFoundError:
+                values.append(None)
+                continue
+            if not stat.S_ISREG(info.st_mode):
+                raise RuntimeError(f"kanban snapshot source is not a regular file: {source}")
+            values.append((int(info.st_dev), int(info.st_ino), int(info.st_size), int(info.st_mtime_ns)))
+        return tuple(values)
+
+    with tempfile.TemporaryDirectory(prefix="hermes-kanban-preview-") as temp_dir:
+        snapshot = Path(temp_dir) / resolved.name
+        for attempt in range(3):
+            before = signature()
+            shutil.copyfile(resolved, snapshot)
+            source_wal = Path(f"{resolved}-wal")
+            snapshot_wal = Path(f"{snapshot}-wal")
+            if source_wal.is_file():
+                shutil.copyfile(source_wal, snapshot_wal)
+            else:
+                snapshot_wal.unlink(missing_ok=True)
+            after = signature()
+            if before == after:
+                break
+            if attempt == 2:
+                raise RuntimeError("kanban database changed while creating read-only preview snapshot")
+        yield snapshot
+
+
+@contextlib.contextmanager
+def connect_readonly_closing(*, db_path: Optional[Path] = None, board: Optional[str] = None):
+    """Read a private immutable snapshot and never touch source sidecars."""
+    path = db_path if db_path is not None else _kb.kanban_db_path(board=board)
+    with _private_db_snapshot(path) as snapshot:
+        if snapshot is None:
+            conn = sqlite3.connect(":memory:", isolation_level=None)
+            conn.executescript(_kb.SCHEMA_SQL)
+        else:
+            conn = sqlite3.connect(
+                snapshot.as_uri() + "?mode=ro", uri=True,
+                isolation_level=None, timeout=0.5,
+            )
+        conn.row_factory = sqlite3.Row
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+
 def init_db(db_path: Optional[Path] = None, *, board: Optional[str] = None) -> Path:
     """Create the schema if it doesn't exist; return the path used. Unlike
     :func:`connect`'s cached first-time auto-init, this always re-runs the
@@ -848,6 +920,28 @@ _LATER_TASK_COLUMNS = (
     ("worker_started_at", "worker_started_at INTEGER"),
 )
 
+_RUN_SCOPE_COLUMNS = {
+    "launch_mode": "launch_mode TEXT",
+    "scope_unit": "scope_unit TEXT",
+    "manager_kind": "manager_kind TEXT",
+    "manager_uid": "manager_uid INTEGER",
+    "launch_acknowledged": "launch_acknowledged INTEGER",
+    "verification_status": "verification_status TEXT",
+    "scope_slice": "scope_slice TEXT",
+    "memory_high": "memory_high TEXT",
+    "memory_max": "memory_max TEXT",
+    "memory_swap_max": "memory_swap_max TEXT",
+    "tasks_max": "tasks_max INTEGER",
+    "oom_policy": "oom_policy TEXT",
+    "control_group": "control_group TEXT",
+    "terminal_action": "terminal_action TEXT",
+    "terminal_payload": "terminal_payload TEXT",
+    "reap_state": "reap_state TEXT",
+    "reap_requested_at": "reap_requested_at INTEGER",
+    "reap_completed_at": "reap_completed_at INTEGER",
+    "reap_error": "reap_error TEXT",
+}
+
 _NOTIFY_SUB_COLUMNS = (
     ("last_ping_event_id", "last_ping_event_id INTEGER NOT NULL DEFAULT 0"),
     ("notifier_profile", "notifier_profile TEXT"),
@@ -940,6 +1034,9 @@ def _migrate_add_optional_columns(conn: sqlite3.Connection) -> None:
     if _table_exists(conn, "task_runs"):
         run_cols = _column_names(conn, "task_runs")
         for name, ddl in _TASK_RUN_COLUMNS:
+            if name not in run_cols:
+                _add_column_if_missing(conn, "task_runs", name, ddl)
+        for name, ddl in _RUN_SCOPE_COLUMNS.items():
             if name not in run_cols:
                 _add_column_if_missing(conn, "task_runs", name, ddl)
         _backfill_legacy_inflight_runs(conn)
@@ -1042,6 +1139,14 @@ _REBUILD_SPECS = {
         " task_id TEXT NOT NULL, profile TEXT, step_key TEXT,"
         " status TEXT NOT NULL, claim_lock TEXT, claim_expires INTEGER,"
         " worker_pid INTEGER, worker_started_at INTEGER, max_runtime_seconds INTEGER,"
+        " launch_mode TEXT, scope_unit TEXT,"
+        " manager_kind TEXT, manager_uid INTEGER, launch_acknowledged INTEGER,"
+        " verification_status TEXT, scope_slice TEXT, memory_high TEXT,"
+        " memory_max TEXT, memory_swap_max TEXT, tasks_max INTEGER,"
+        " oom_policy TEXT, control_group TEXT, terminal_action TEXT,"
+        " terminal_payload TEXT, reap_state TEXT, reap_requested_at INTEGER,"
+        " reap_completed_at INTEGER, reap_error TEXT,"
+        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",
