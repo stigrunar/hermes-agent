@@ -342,8 +342,6 @@ class _Collector:
             conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
             thread_id=sub.get("thread_id") or "", kinds=TERMINAL_KINDS,
         )
-        if not events:
-            return None
         task = self.kb.get_task(conn, sub["task_id"])
         owner_replan = None
         try:

@@ -3508,14 +3508,17 @@ def claim_owner_replan_for_route(
                 if not claim and control == "owner_replan_wake_claimed":
                     interrupted = dict(payload); interrupted.update({"replan_event_id": int(row["id"]), "interrupted_claim": True}); return interrupted
                 continue
-            task = get_task(conn, task_id)
-            if task is None:
+            task_row = conn.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+            if task_row is None:
                 return None
-            task_map = task.__dict__
+            # Inspect the authoritative current row.  ``Task`` is a deliberately
+            # lossy compatibility view and may not carry newer hygiene columns
+            # added by a board migration after the intent was emitted.
+            task_map = {key: task_row[key] for key in task_row.keys()}
             fields = _owner_replan_body_fields(task_map)
-            hygiene = str(fields.get("hygiene_class") or "").casefold()
+            hygiene = str(_row_value(task_map, "hygiene_class") or fields.get("hygiene_class") or "").casefold()
             reason = None
-            if hygiene in {"obsolete", "superseded"} or task_map.get("superseded_by"):
+            if hygiene in {"obsolete", "superseded"} or _row_value(task_map, "superseded_by") or fields.get("superseded_by"):
                 reason = "superseded_or_obsolete"
             else:
                 reason = _owner_replan_repo_suppression(task_map)

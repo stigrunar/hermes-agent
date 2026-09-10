@@ -78,30 +78,8 @@ def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
 
 
 async def _owner_deliver_wake(adapter: Any, *, text: str, session_id: str, source: Any = None) -> None:
-    """Deliver through the native wake path, tolerating minimal recording adapters in tests."""
-    from gateway.wake import adapter_supports_push, deliver_wake
-    if adapter_supports_push(adapter):
-        from gateway.platforms.base import BasePlatformAdapter
-        if not isinstance(adapter, BasePlatformAdapter):
-            # Test/recording transports expose only handle_message and have no
-            # native admission receipt; one direct synthetic event is enough
-            # to exercise owner routing without double-recording it.
-            await adapter.handle_message(
-                type("OwnerWakeEvent", (), {"text": text, "source": source, "internal": True})(),
-            )
-            return
-        try:
-            await deliver_wake(adapter, text=text, session_id=session_id, source=source)
-            return
-        except Exception as exc:
-            # Small recording adapters do not implement the native admission
-            # receipt.  Real BasePlatformAdapter instances always do, so keep
-            # their WakeNotAccepted failures retryable while allowing a
-            # no-op test transport to observe the owner message.
-            from gateway.wake import WakeNotAccepted
-            if isinstance(adapter, BasePlatformAdapter) or not isinstance(exc, WakeNotAccepted):
-                raise
-            return
+    """Deliver through the native wake path and require adapter admission."""
+    from gateway.wake import deliver_wake
     await deliver_wake(adapter, text=text, session_id=session_id, source=source)
 
 

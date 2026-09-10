@@ -68,6 +68,8 @@ def _bound_event(tmp_path: Path, monkeypatch, *, payload=None):
 
 
 class _OwnerAdapter:
+    supports_async_delivery = True
+
     def __init__(self, *, fail_once: bool = False):
         self.fail_once = fail_once
         self.handled = []
@@ -76,6 +78,7 @@ class _OwnerAdapter:
 
     async def handle_message(self, event):
         self.handled.append(event)
+        event._gateway_accepted = True
         if self.fail_once:
             self.fail_once = False
             raise RuntimeError("owner adapter unavailable")
