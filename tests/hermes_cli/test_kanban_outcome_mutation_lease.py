@@ -94,6 +94,85 @@ def test_non_overlapping_outcome_mutators_can_run_in_parallel(stores):
     assert kb.claim_task(second_db, sales_task, claimer="sales") is not None
 
 
+def test_projection_disabled_keeps_overlap_serial_and_disjoint_parallel(stores, monkeypatch):
+    project, outcome, first_db, second_db = stores
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: False)
+    first = _task(first_db, project, outcome, title="standalone-first")
+    second = _task(second_db, project, outcome, title="standalone-second")
+
+    assert kb.claim_task(first_db, first, claimer="worker-a") is not None
+    assert kb.claim_task(second_db, second, claimer="worker-b") is None
+    assert kb.get_task(second_db, second).status == "ready"
+    with odb.connect_closing() as oc:
+        leases = odb.active_mutation_leases(oc)
+        assert len(leases) == 1
+        assert leases[0]["owner_execution_id"] == kb.kanban_execution_id(first)
+
+    with odb.connect_closing() as oc:
+        disjoint_outcome = odb.create_outcome(
+            oc, project_id=project.id, outcome_key="STANDALONE-DISJOINT",
+        )
+    disjoint = kb.create_task(
+        second_db,
+        title="standalone-disjoint",
+        project_id=project.id,
+        outcome_id=disjoint_outcome,
+        mutation_repository="stigrunar/hovewest-prosjektstyring",
+        mutation_scope=["apps/prosjektstyring/app/salg/**"],
+    )
+    assert kb.claim_task(second_db, disjoint, claimer="worker-c") is not None
+
+    assert kb.complete_task(first_db, first, result="released")
+    assert kb.claim_task(second_db, second, claimer="worker-b") is not None
+
+
+def test_projection_disabled_heartbeat_and_terminal_release_standalone_lease(stores, monkeypatch):
+    project, outcome, first_db, _ = stores
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: False)
+    task_id = _task(first_db, project, outcome, title="standalone-heartbeat")
+    assert kb.claim_task(first_db, task_id, claimer="worker") is not None
+    with odb.connect_closing() as oc:
+        before = odb.active_mutation_leases(oc)[0]["expires_at"]
+
+    assert kb.heartbeat_claim(first_db, task_id, claimer="worker")
+    with odb.connect_closing() as oc:
+        after = odb.active_mutation_leases(oc)[0]["expires_at"]
+    assert after >= before
+
+    assert kb.block_task(first_db, task_id, reason="retry later")
+    with odb.connect_closing() as oc:
+        assert odb.active_mutation_leases(oc) == []
+
+
+def test_projection_disabled_failed_claim_rolls_back_standalone_lease(stores, monkeypatch):
+    project, outcome, first_db, _ = stores
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: False)
+    task_id = _task(first_db, project, outcome, title="standalone-rollback")
+    monkeypatch.setattr(kb, "_claim_and_open_run", lambda *args, **kwargs: None)
+
+    assert kb.claim_task(first_db, task_id, claimer="worker") is None
+    with odb.connect_closing() as oc:
+        assert odb.active_mutation_leases(oc) == []
+    assert kb.get_task(first_db, task_id).status == "ready"
+
+
+def test_projection_disabled_unavailable_lease_authority_fails_closed(stores, monkeypatch):
+    project, outcome, first_db, _ = stores
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: False)
+    task_id = _task(first_db, project, outcome, title="standalone-unavailable")
+
+    def unavailable(*_args, **_kwargs):
+        raise RuntimeError("coordination store unavailable")
+
+    monkeypatch.setattr(odb, "acquire_mutation_lease", unavailable)
+    assert kb.claim_task(first_db, task_id, claimer="worker") is None
+    assert kb.get_task(first_db, task_id).status == "ready"
+    event = first_db.execute(
+        "SELECT kind FROM task_events WHERE task_id=? ORDER BY id DESC LIMIT 1", (task_id,)
+    ).fetchone()
+    assert event["kind"] == "mutation_lease_error"
+
+
 def test_heartbeat_renews_active_mutation_lease(stores, monkeypatch):
     project, outcome, first_db, _ = stores
     task_id = _task(first_db, project, outcome, title="long")

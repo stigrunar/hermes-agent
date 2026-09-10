@@ -2286,6 +2286,27 @@ def _mutation_lease_owner(task_id: str, *, board: Optional[str] = None) -> str:
     return kanban_execution_id(task_id, board=board)
 
 
+def _cross_project_orchestration_enabled() -> bool:
+    """Return the rollout gate used to select the root execution path."""
+    from hermes_cli import outcomes_db as _odb
+
+    return _odb.cross_project_orchestration_enabled()
+
+
+def _mutation_lease_ttl(task: Mapping[str, Any]) -> int:
+    from hermes_cli import outcomes_db as _odb
+
+    ttl = _odb.DEFAULT_MUTATION_LEASE_TTL_SECONDS
+    max_runtime = task.get("max_runtime_seconds")
+    if max_runtime is not None:
+        try:
+            ttl = max(ttl, int(max_runtime) + 600)
+        except (TypeError, ValueError):
+            pass
+        ttl = min(ttl, _odb.MAX_MUTATION_LEASE_TTL_SECONDS)
+    return ttl
+
+
 def _task_projection_payload(
     task: Mapping[str, Any], *, board: Optional[str] = None,
 ) -> Optional[dict[str, Any]]:
@@ -2416,6 +2437,68 @@ def _terminalize_task_execution_projection(
         _log.warning("execution projection terminalization failed for %s: %s", task_id, type(exc).__name__)
 
 
+def _acquire_task_mutation_lease(
+    task: Mapping[str, Any], *, board: Optional[str] = None,
+) -> Optional[dict[str, Any]]:
+    """Acquire the standalone mutation lease used when projection is disabled."""
+    outcome_id = str(task.get("outcome_id") or "").strip()
+    repository = str(task.get("mutation_repository") or "").strip()
+    raw_scope = task.get("mutation_scope")
+    if isinstance(raw_scope, str):
+        raw_scope = _json_or(raw_scope)
+    if not outcome_id or not repository or not isinstance(raw_scope, list) or not raw_scope:
+        return None
+    project_id = str(task.get("project_id") or "").strip()
+    if not project_id:
+        return None
+    from hermes_cli import outcomes_db as _odb
+
+    with _odb.connect_closing() as oconn:
+        return _odb.acquire_mutation_lease(
+            oconn,
+            project_id=project_id,
+            outcome_id=outcome_id,
+            repository=repository,
+            path_scope=raw_scope,
+            owner_execution_id=_mutation_lease_owner(
+                str(task.get("id") or ""), board=board,
+            ),
+            base_ref=str(task.get("mutation_base_ref") or "").strip() or None,
+            ttl_seconds=_mutation_lease_ttl(task),
+        )
+
+
+def _renew_task_mutation_lease(task_id: str, *, board: Optional[str] = None) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as oconn:
+            _odb.renew_mutation_lease(
+                oconn,
+                owner_execution_id=_mutation_lease_owner(task_id, board=board),
+            )
+    except Exception as exc:
+        _log.warning("mutation lease renewal failed for %s: %s", task_id, type(exc).__name__)
+
+
+def _release_task_mutation_lease(
+    task_id: str, *, reason: str, board: Optional[str] = None,
+) -> None:
+    from hermes_cli import outcomes_db as _odb
+
+    try:
+        with _odb.connect_closing() as oconn:
+            _odb.release_mutation_lease(
+                oconn,
+                owner_execution_id=_mutation_lease_owner(task_id, board=board),
+                reason=reason,
+            )
+    except Exception as exc:
+        # A release failure cannot roll back the board transition. The lease
+        # remains bounded by the coordination store's crash TTL.
+        _log.warning("mutation lease release failed for %s: %s", task_id, type(exc).__name__)
+
+
 def _record_mutation_lease_conflict(
     conn: sqlite3.Connection, task_id: str, conflict: Mapping[str, Any],
 ) -> None:
@@ -2430,18 +2513,19 @@ def _record_mutation_lease_conflict(
         payload = _json_dict(last["payload"])
         if str(payload.get("conflicting_lease_id") or "") == lease_id:
             return
-    with write_txn(conn):
-        _append_event(
-            conn, task_id, "mutation_lease_conflict",
-            {
-                "conflicting_lease_id": lease_id or None,
-                "conflicting_owner": conflicting.get("owner_execution_id"),
-                "conflicting_project_id": conflicting.get("project_id"),
-                "conflicting_outcome_id": conflicting.get("outcome_id"),
-                "repository": conflicting.get("repository"),
-                "path_scope": conflicting.get("path_scope"),
-            },
-        )
+    payload = {
+        "conflicting_lease_id": lease_id or None,
+        "conflicting_owner": conflicting.get("owner_execution_id"),
+        "conflicting_project_id": conflicting.get("project_id"),
+        "conflicting_outcome_id": conflicting.get("outcome_id"),
+        "repository": conflicting.get("repository"),
+        "path_scope": conflicting.get("path_scope"),
+    }
+    if conn.in_transaction:
+        _append_event(conn, task_id, "mutation_lease_conflict", payload)
+    else:
+        with write_txn(conn):
+            _append_event(conn, task_id, "mutation_lease_conflict", payload)
 
 
 def _end_run(
@@ -2472,10 +2556,17 @@ def _end_run(
         (status or outcome, outcome, summary, error, _json_or_null(metadata), now, run_id),
     )
     conn.execute("UPDATE tasks SET current_run_id = NULL WHERE id = ?", (task_id,))
-    # Keep the root execution projection aligned with the board lifecycle.
-    # Completion terminalizes after workspace cleanup; all other run endings
-    # release admission immediately so a retry can compete fairly.
-    if outcome != "completed":
+    # Projection owns the mutation lease only when its rollout path is enabled.
+    # The standalone path uses the same root authority without creating a
+    # dummy execution, and releases it when this run closes.
+    if not _cross_project_orchestration_enabled():
+        _release_task_mutation_lease(
+            task_id, reason=outcome, board=_board_slug_for_connection(conn),
+        )
+    elif outcome != "completed":
+        # Keep the root execution projection aligned with the board lifecycle.
+        # Completion terminalizes after workspace cleanup; all other run endings
+        # release admission immediately so a retry can compete fairly.
         _set_task_execution_projection_state(
             task_id,
             state="blocked" if outcome in {"blocked", "dependency_wait", "iteration_exhausted", "gave_up"} else "queued",
@@ -2745,7 +2836,8 @@ def claim_task(
     if projection_snapshot is not None:
         task_payload = dict(projection_snapshot)
         from hermes_cli import outcomes_db as _odb
-        if _odb.cross_project_orchestration_enabled() and _task_projection_payload(
+        projection_enabled = _cross_project_orchestration_enabled()
+        if projection_enabled and _task_projection_payload(
             task_payload, board=projection_board
         ) is not None:
             try:
@@ -2768,6 +2860,8 @@ def claim_task(
                 with write_txn(conn):
                     _append_event(conn, task_id, "execution_projection_error", {"error_type": type(exc).__name__})
                 return None
+    else:
+        projection_enabled = _cross_project_orchestration_enabled()
 
     now = int(time.time())
     lock = claimer or _claimer_id()
@@ -2789,8 +2883,38 @@ def claim_task(
         _reclaim_dangling_run(
             conn, task_id, statuses=("ready",), now=now, note="invariant recovery on re-claim",
         )
-        run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        lease = None
+        claim_snapshot = conn.execute(
+            "SELECT * FROM tasks WHERE id=? AND status='ready' AND claim_lock IS NULL", (task_id,)
+        ).fetchone()
+        if claim_snapshot is not None and not projection_enabled:
+            try:
+                lease = _acquire_task_mutation_lease(
+                    dict(claim_snapshot), board=projection_board,
+                )
+            except _odb.MutationLeaseConflict as exc:
+                _record_mutation_lease_conflict(
+                    conn, task_id, {"conflicting": exc.conflicting, "requested": exc.requested}
+                )
+                return None
+            except Exception as exc:
+                _append_event(
+                    conn, task_id, "mutation_lease_error", {"error_type": type(exc).__name__},
+                )
+                return None
+        try:
+            run_id = _claim_and_open_run(conn, task_id, "ready", lock, expires, now)
+        except Exception:
+            if lease is not None:
+                _release_task_mutation_lease(
+                    task_id, reason="claim_rollback", board=projection_board,
+                )
+            raise
         if run_id is None:
+            if lease is not None:
+                _release_task_mutation_lease(
+                    task_id, reason="claim_lost", board=projection_board,
+                )
             if projection_admitted:
                 _rollback_task_execution_admission(task_id, board=projection_board, reason="claim_lost")
             return None
@@ -2899,9 +3023,11 @@ def heartbeat_claim(
         if cur.rowcount != 1:
             return False
         _extend_run_claim(conn, task_id, expires)
-        _heartbeat_task_execution_projection(
-            task_id, board=_board_slug_for_connection(conn),
-        )
+        board = _board_slug_for_connection(conn)
+        if _cross_project_orchestration_enabled():
+            _heartbeat_task_execution_projection(task_id, board=board)
+        else:
+            _renew_task_mutation_lease(task_id, board=board)
         return True
 
 
