@@ -195,6 +195,49 @@ class TestDeferredTelegramQueue:
         ] == "ob-1"
         assert _row("ob-2")["state"] == "deferred"
 
+    def test_legacy_null_profile_is_default_only_for_deferred_claims(self):
+        _record(platform="telegram")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET adapter_profile=NULL, state='deferred', "
+                "retry_not_before=? WHERE obligation_id=?",
+                (100.0, "ob-1"),
+            )
+
+        assert dl.next_deferred_due(profile="reviewer", now=100.0) is None
+        assert dl.claim_due_deferred(profile="reviewer", now=100.0) is None
+        assert _row("ob-1")["attempts"] == 0
+
+        assert dl.next_deferred_due(profile="default", now=90.0) == 100.0
+        claimed = dl.claim_due_deferred(profile="default", now=100.0)
+        assert claimed["obligation_id"] == "ob-1"
+        assert claimed["profile"] == "default"
+        assert _row("ob-1")["attempts"] == 1
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT adapter_profile FROM delivery_obligations WHERE obligation_id=?",
+                ("ob-1",),
+            ).fetchone()[0] == "default"
+
+    def test_legacy_null_in_flight_serializes_with_explicit_default(self):
+        _record(oid="legacy", platform="telegram")
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET adapter_profile=NULL, state='attempting', "
+                "retry_not_before=? WHERE obligation_id=?",
+                (100.0, "legacy"),
+            )
+        _record(oid="explicit", platform="telegram", adapter_profile="default")
+        dl.mark_deferred("explicit", 0, now=100.0)
+
+        assert dl.claim_due_deferred(profile="default", now=100.0) is None
+        assert _row("explicit")["attempts"] == 0
+
+        _orphan("legacy")
+        assert dl.pending_flood_retries(now=100.0) == [
+            {"platform": "telegram", "profile": "default", "not_before": 100.0}
+        ]
+
     def test_fifo_is_due_then_creation_then_id(self, monkeypatch):
         monkeypatch.setattr(dl.random, "uniform", lambda _low, _high: 0.0)
         for oid in ("ob-c", "ob-a", "ob-b"):
