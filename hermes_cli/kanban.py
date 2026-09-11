@@ -493,6 +493,13 @@ def _cmd_create(args: argparse.Namespace) -> int:
             created_by=args.created_by or _profile_author(),
             workspace_kind=ws_kind, workspace_path=ws_path, branch_name=branch_name,
             project_id=getattr(args, "project", None), tenant=args.tenant, priority=args.priority,
+            outcome_id=getattr(args, "outcome_id", None),
+            conversation_lane_id=getattr(args, "conversation_lane_id", None),
+            topic_target=getattr(args, "topic_target", None),
+            mutation_repository=getattr(args, "mutation_repository", None),
+            mutation_scope=getattr(args, "mutation_scope", None),
+            mutation_base_ref=getattr(args, "mutation_base_ref", None),
+            resource_requirements=getattr(args, "resource_requirements", None),
             parents=tuple(args.parent or ()), triage=bool(getattr(args, "triage", False)),
             idempotency_key=getattr(args, "idempotency_key", None),
             max_runtime_seconds=max_runtime, skills=getattr(args, "skills", None) or None,
@@ -507,7 +514,15 @@ def _cmd_create(args: argparse.Namespace) -> int:
         )
         task = kb.get_task(conn, task_id)
     if getattr(args, "json", False):
-        _print_json(_task_to_dict(task))
+        payload = _task_to_dict(task)
+        payload.update({
+            field: getattr(task, field)
+            for field in (
+                "outcome_id", "conversation_lane_id", "topic_target", "parent_execution_id",
+                "mutation_repository", "mutation_scope", "mutation_base_ref", "resource_requirements",
+            )
+        })
+        _print_json(payload)
     else:
         print(f"Created {task_id}  ({task.status}, assignee={task.assignee or '-'})")
         # Warn only for ready+assigned tasks that would sit without a dispatcher (triage/todo idle

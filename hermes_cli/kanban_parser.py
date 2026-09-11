@@ -158,6 +158,13 @@ _SPECS = [
              help="Link to a project (id or slug). Anchors the task's "
                   "worktree under the project's primary repo with a "
                   "deterministic branch. See `hermes project list`."),
+        _arg("--outcome", dest="outcome_id", help="Bind the task to a project outcome"),
+        _arg("--conversation-lane", dest="conversation_lane_id", help="Bind the task to a conversation lane"),
+        _arg("--topic-target", dest="topic_target", help="Structured conversation target"),
+        _arg("--mutation-repository", dest="mutation_repository"),
+        _arg("--mutation-scope", action="append", dest="mutation_scope"),
+        _arg("--mutation-base", dest="mutation_base_ref"),
+        _arg("--resource", action="append", dest="resource_requirements"),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",

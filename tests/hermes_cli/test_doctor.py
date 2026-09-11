@@ -21,6 +21,8 @@ from hermes_cli.doctor_config import _has_provider_env_config
 import shutil
 from hermes_cli import doctor_tools
 from hermes_cli import doctor_state
+import hermes_state_repair
+import hermes_state_dbfile
 from hermes_cli import doctor_platform
 from hermes_cli import doctor_config
 from tools import browser_tool_install as bt_install
@@ -41,7 +43,7 @@ def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(doctor_mod, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
-        doctor_mod,
+        doctor_state,
         "_render_state_db_stats",
         lambda stats, holders=None: [],
     )
@@ -52,7 +54,6 @@ def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
     )
     monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
-    import hermes_state
     import tools.browser_tool as browser_tool
 
     monkeypatch.setattr(browser_tool, "warm_agent_browser_npx_cache", lambda: False)
@@ -63,13 +64,13 @@ def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
         probe_calls.append(kwargs)
         return None
 
-    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", fake_probe)
+    monkeypatch.setattr(hermes_state_repair, "_db_opens_cleanly", fake_probe)
     monkeypatch.setattr(
-        hermes_state,
+        hermes_state_dbfile,
         "collect_state_db_stats",
         lambda path: {"logical_size_bytes": logical_size},
     )
-    monkeypatch.setattr(hermes_state, "count_db_holders", lambda path: None)
+    monkeypatch.setattr(hermes_state_dbfile, "count_db_holders", lambda path: None)
 
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):

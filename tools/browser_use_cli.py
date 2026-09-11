@@ -5,6 +5,8 @@ instead of default browser tools
 """
 
 import hashlib
+import contextlib
+import importlib
 import json
 import logging
 import os

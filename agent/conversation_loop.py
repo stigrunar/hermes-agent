@@ -1655,7 +1655,11 @@ def _run_conversation_turn(
         _maybe_inject_kanban_closeout_reserve(
             agent=agent,
             messages=s.messages,
-            api_call_count=s.api_call_count,
+            # prepare_iteration increments the count for the request about to
+            # be sent.  The reserve threshold is expressed in completed API
+            # calls so the notice is attached to the preceding tool result and
+            # reaches the next request.
+            api_call_count=max(0, s.api_call_count - 1),
         )
         _run_phase(assemble_api_request, agent, s)
         _pg = _run_phase(run_preflight_gate, agent, s)

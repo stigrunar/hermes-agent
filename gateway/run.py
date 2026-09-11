@@ -3438,8 +3438,6 @@ class GatewayRunner(
         self._session_db_init_error: Optional[str] = None
         # Non-default profiles' adapters by profile then Platform; self.adapters stays the default's map.
         self._profile_adapters: Dict[str, Dict[Platform, BasePlatformAdapter]] = {}
-        self._telegram_deferred_drains: Dict[str, asyncio.Task] = {}
-        self._telegram_deferred_wakeups: Dict[str, asyncio.Event] = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
