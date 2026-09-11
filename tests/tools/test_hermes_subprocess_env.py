@@ -177,6 +177,47 @@ class TestDelegatedChildMarker:
         assert env["HERMES_KANBAN_WORKSPACE"] == "/tmp/parent-workspace"
         assert env["MY_APP_VAR"] == "keep-me"
 
+    def test_native_child_denies_worker_scope_but_preserves_routing_and_credentials(self):
+        """Native executor descendants cannot inherit dispatcher authority.
+
+        The child keeps only Kanban read-location hints and the lineage fence;
+        the managed MCP endpoint receives task scope separately. Provider
+        credentials remain available to the model-driving runtime, while Tier-1
+        gateway credentials stay stripped.
+        """
+        env = _build(
+            {
+                "HERMES_KANBAN_TASK": "t_parent",
+                "HERMES_KANBAN_RUN_ID": "123",
+                "HERMES_KANBAN_CLAIM_LOCK": "/tmp/parent-claim.lock",
+                "HERMES_KANBAN_GOAL_MODE": "1",
+                "HERMES_KANBAN_GOAL_MAX_TURNS": "3",
+                "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
+                "HERMES_KANBAN_BOARD": "parent-board",
+                "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+                "OPENAI_API_KEY": "sk-native",
+                "TELEGRAM_BOT_TOKEN": "gateway-secret",
+            },
+            inherit_credentials=True,
+        )
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER,
+            KANBAN_ENV_KEYS,
+            KANBAN_READ_LOCATION_KEYS,
+        )
+
+        assert not (set(KANBAN_ENV_KEYS) & env.keys())
+        assert {
+            key: env[key] for key in KANBAN_READ_LOCATION_KEYS
+        } == {
+            "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
+            "HERMES_KANBAN_BOARD": "parent-board",
+            "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+        }
+        assert env[DELEGATED_CHILD_ENV_MARKER] == "1"
+        assert env["OPENAI_API_KEY"] == "sk-native"
+        assert "TELEGRAM_BOT_TOKEN" not in env
+
 
 _INTERNAL_DYNAMIC_SAMPLE = {
     "AUXILIARY_VISION_API_KEY": "sk-vision",

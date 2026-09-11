@@ -362,7 +362,7 @@ def claim_due_deferred(
     with _DB_LOCK, _transaction() as conn:
         in_flight = conn.execute(
             "SELECT owner_pid, owner_started_at FROM delivery_obligations "
-            "WHERE platform='telegram' AND adapter_profile=? "
+            "WHERE platform='telegram' AND COALESCE(adapter_profile, 'default')=? "
             "AND retry_not_before IS NOT NULL AND state='attempting'",
             (expected_profile,),
         ).fetchall()
@@ -371,7 +371,8 @@ def claim_due_deferred(
         rows = conn.execute(
             "SELECT obligation_id, session_key, chat_id, thread_id, content, attempts, "
             "created_at, owner_pid, owner_started_at, retry_not_before, state "
-            "FROM delivery_obligations WHERE platform='telegram' AND adapter_profile=? "
+            "FROM delivery_obligations "
+            "WHERE platform='telegram' AND COALESCE(adapter_profile, 'default')=? "
             "AND retry_not_before IS NOT NULL AND retry_not_before <= ? "
             "AND state IN ('deferred','attempting') "
             "ORDER BY retry_not_before, created_at, obligation_id",
@@ -393,7 +394,8 @@ def claim_due_deferred(
                 continue
             cursor = conn.execute(
                 "UPDATE delivery_obligations SET state='attempting', owner_pid=?, owner_started_at=?, "
-                "attempts=attempts+1, updated_at=? WHERE obligation_id=? AND state=? "
+                "attempts=attempts+1, updated_at=?, adapter_profile=COALESCE(adapter_profile, 'default') "
+                "WHERE obligation_id=? AND state=? "
                 "AND owner_pid IS ? AND owner_started_at IS ?",
                 (pid, started, current, oid, state, owner_pid, owner_started_at),
             )
@@ -419,7 +421,8 @@ def next_deferred_due(
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
             "SELECT retry_not_before, state, owner_pid, owner_started_at "
-            "FROM delivery_obligations WHERE platform='telegram' AND adapter_profile=? "
+            "FROM delivery_obligations "
+            "WHERE platform='telegram' AND COALESCE(adapter_profile, 'default')=? "
             "AND retry_not_before IS NOT NULL AND state IN ('deferred','attempting') "
             "ORDER BY retry_not_before, created_at, obligation_id",
             (expected_profile,),
