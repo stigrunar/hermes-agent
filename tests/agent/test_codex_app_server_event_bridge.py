@@ -322,11 +322,19 @@ class TestNativeProgressActivity:
         {"method": "item/commandExecution/outputDelta", "params": {"delta": "stdout"}},
         {"method": "item/fileChange/outputDelta", "params": {"delta": "patch output"}},
         {"method": "item/mcpToolCall/progress", "params": {"message": "2 / 5"}},
-        {"method": "item/fileChange/patchUpdated", "params": {"changes": [{"path": "a.py"}]}},
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@ -1 +1 @@", "kind": {"type": "update"}}]
+            },
+        },
         {"method": "item/fileChange/patchUpdated", "params": {"patch": "@@ -1 +1 @@"}},
         {"method": "item/commandExecution/terminalInteraction", "params": {"stdin": "y\n"}},
         {"method": "turn/diff/updated", "params": {"diff": "@@ -1 +1 @@"}},
-        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests"}]}},
+        {
+            "method": "turn/plan/updated",
+            "params": {"plan": [{"step": "run tests", "status": "inProgress"}]},
+        },
         {"method": "item/started", "params": {"item": {"type": "commandExecution", "id": "exec-1"}}},
         {"method": "item/completed", "params": {"item": {"type": "mcpToolCall", "id": "mcp-1"}}},
         {"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": "done"}}},
@@ -343,6 +351,22 @@ class TestNativeProgressActivity:
         {"method": "item/commandExecution/outputDelta", "params": {"delta": None}},
         {"method": "item/mcpToolCall/progress", "params": {"message": ""}},
         {"method": "item/fileChange/patchUpdated", "params": {"changes": []}},
+        {"method": "item/fileChange/patchUpdated", "params": {"changes": [{"path": "a.py"}]}},
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@", "kind": {"type": []}}]
+            },
+        },
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@", "kind": {"type": {}}}]
+            },
+        },
+        {"method": "turn/plan/updated", "params": {"plan": [{"garbage": True}]}},
+        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests", "status": []}]}},
+        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests", "status": {}}]}},
         {"method": "turn/diff/updated", "params": {"diff": ""}},
         {"method": "turn/plan/updated", "params": {"plan": []}},
         {"method": "item/reasoning/summaryPartAdded", "params": {"itemId": "r1"}},

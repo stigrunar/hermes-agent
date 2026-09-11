@@ -10,8 +10,14 @@ Liveness requires explicit current `threadId` and `turnId` identity. Unscoped,
 internally conflicting, foreign-thread, foreign-turn, and late-old-turn events
 cannot refresh it. Transport lifecycle, keepalive/polling, malformed, empty,
 unknown, and boundary-only notifications also do not refresh it. A permissive
-legacy event may still reach safe display/projection handling, but display is a
-separate guarded callback and cannot touch liveness.
+legacy event may still reach the guarded display callback, but it cannot enter
+the authoritative projector, mutate the turn result, complete the turn, or
+touch liveness.
+
+Structured progress is schema-shaped before it is counted: plan steps require
+their status and step fields, reasoning summaries/content require text entries,
+and structured file-change entries require a path, diff, and valid change kind.
+A merely non-empty malformed object is not progress.
 
 The session's existing `turn_timeout` is a silence window, not an absolute turn
 deadline. Its default remains 600 seconds. Each strictly owned substantive event
