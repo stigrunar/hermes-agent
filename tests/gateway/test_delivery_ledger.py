@@ -565,6 +565,135 @@ class TestGatewayRedeliverySweep:
         assert _row("ob-1")["attempts"] == 0
         assert _row("ob-1")["last_error"] == "send_path_degraded"
 
+    @pytest.mark.asyncio
+    async def test_runtime_claim_cancellation_refunds_committed_claim(self, monkeypatch):
+        """Cancellation after the threaded claim commits must refund that exact claim."""
+        import asyncio
+
+        from gateway.config import Platform
+
+        _record(platform="slack")
+        dl.mark_failed("ob-1", "send_path_degraded")
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+        started = threading.Event()
+        release = threading.Event()
+        original = dl.sweep_failed_for_runtime
+
+        def blocking_sweep(*args, **kwargs):
+            started.set()
+            assert release.wait(timeout=5.0)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(dl, "sweep_failed_for_runtime", blocking_sweep)
+        task = asyncio.create_task(
+            runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+        )
+        deadline = asyncio.get_running_loop().time() + 2
+        while not started.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("runtime sweep never started")
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation detached the threaded claim"
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "repeated cancellation detached the threaded claim"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert adapter.send.await_count == 0
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["attempts"] == 0
+        assert _row("ob-1")["last_error"] == "send_path_degraded"
+
+    @pytest.mark.asyncio
+    async def test_runtime_clear_cancellation_refunds_claim_before_send(self):
+        """A cancelled resume-flag clear leaves the claimed response retryable and unsent."""
+        import asyncio
+
+        from gateway.config import Platform
+
+        _record(platform="slack")
+        dl.mark_failed("ob-1", "send_path_degraded")
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+        started = threading.Event()
+        release = asyncio.Event()
+
+        async def blocking_clear(rows, *, require_success=False):
+            started.set()
+            await release.wait()
+            return rows
+
+        runner._clear_resume_pending_for_claimed_obligations = blocking_clear
+        task = asyncio.create_task(
+            runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+        )
+        deadline = asyncio.get_running_loop().time() + 2
+        while not started.is_set():
+            if asyncio.get_running_loop().time() >= deadline:
+                raise AssertionError("resume-pending clear never started")
+            await asyncio.sleep(0)
+        task.cancel()
+        await asyncio.sleep(0)
+        assert not task.done(), "cancellation detached the resume-pending clear"
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert adapter.send.await_count == 0
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["attempts"] == 0
+        assert _row("ob-1")["last_error"] == "send_path_degraded"
+
+    @pytest.mark.asyncio
+    async def test_runtime_send_cancellation_refunds_only_unsent_tail(self):
+        """A cancelled active send stays ambiguous while later claims are refunded."""
+        import asyncio
+
+        from gateway.config import Platform
+
+        for oid in ("ob-1", "ob-2", "ob-3"):
+            _record(oid, platform="slack", content=f"answer {oid}")
+            dl.mark_failed(oid, "send_path_degraded")
+        adapter = MagicMock()
+        second_send_started = asyncio.Event()
+        send_release = asyncio.Event()
+        send_count = 0
+        sent_ids = []
+
+        async def send(**kwargs):
+            nonlocal send_count
+            send_count += 1
+            sent_ids.append(kwargs["content"].split()[-1])
+            if send_count == 2:
+                second_send_started.set()
+                await send_release.wait()
+            return MagicMock(success=True, error="")
+
+        adapter.send = send
+        runner = self._runner(adapter)
+        task = asyncio.create_task(
+            runner._redeliver_failed_obligations_for_platform(Platform.SLACK)
+        )
+        await asyncio.wait_for(second_send_started.wait(), timeout=2)
+        task.cancel()
+        await asyncio.sleep(0)
+        send_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        assert send_count == 2
+        assert _row(sent_ids[0])["state"] == "delivered"
+        assert _row(sent_ids[1])["state"] == "attempting"
+        assert _row(sent_ids[1])["attempts"] == 1
+        unsent_id = ({"ob-1", "ob-2", "ob-3"} - set(sent_ids)).pop()
+        assert _row(unsent_id)["state"] == "failed"
+        assert _row(unsent_id)["attempts"] == 0
+
     @pytest.mark.parametrize(
         ("send_success", "ledger_method"),
         [(True, "mark_delivered"), (False, "mark_failed")],

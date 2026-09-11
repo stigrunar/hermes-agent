@@ -3652,6 +3652,21 @@ class BasePlatformAdapter(ABC):
                 chat_id=chat_id, metadata=metadata),
             reply_to=reply_to, metadata=metadata)
 
+    async def _ledger_call(self, operation, *args, **kwargs):
+        """Run a delivery-ledger operation through the runner's cancellation-safe seam."""
+        runner_call = getattr(self.gateway_runner, "_ledger_call", None)
+        if callable(runner_call):
+            result = runner_call(operation, *args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+
+        from gateway.run_startup import GatewayStartupMixin
+        operation_task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
+        result, cancelled = await GatewayStartupMixin._await_task_result(operation_task)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
+
     @staticmethod
     def _merge_caption(existing_text: Optional[str], new_text: str) -> str:
         """Merge a new caption into existing text unless an identical (stripped) caption already
@@ -4069,8 +4084,8 @@ class BasePlatformAdapter(ABC):
             return None
         try:
             from gateway.delivery_ledger import (
-                compute_obligation_id, ledger_enabled, mark_attempting, record_obligation)
-            if not await asyncio.to_thread(ledger_enabled):
+                compute_obligation_id, ledger_enabled, mark_attempting, mark_failed, record_obligation)
+            if not await self._ledger_call(ledger_enabled):
                 return None
             source = event.source
             # ``ledger_message_id`` wins when set: a queued chain's final answers the last message
@@ -4080,13 +4095,23 @@ class BasePlatformAdapter(ABC):
                 _ledger_id = getattr(event, "message_id", "")
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_id or ""), text_content)
-            await asyncio.to_thread(
-                record_obligation, obligation_id=obligation_id, session_key=session_key,
-                platform=str(getattr(source.platform, "value", source.platform)),
-                chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
-                content=text_content,
-                adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
-            await asyncio.to_thread(mark_attempting, obligation_id)
+            try:
+                await self._ledger_call(
+                    record_obligation, obligation_id=obligation_id, session_key=session_key,
+                    platform=str(getattr(source.platform, "value", source.platform)),
+                    chat_id=source.chat_id, thread_id=getattr(source, "thread_id", None),
+                    content=text_content,
+                    adapter_profile=getattr(delivery_adapter, "_owner_profile", None))
+            except asyncio.CancelledError:
+                with contextlib.suppress(BaseException):
+                    await self._ledger_call(mark_failed, obligation_id, "send_path_degraded")
+                raise
+            try:
+                await self._ledger_call(mark_attempting, obligation_id)
+            except asyncio.CancelledError:
+                with contextlib.suppress(BaseException):
+                    await self._ledger_call(mark_failed, obligation_id, "send_path_degraded")
+                raise
             return obligation_id
         except Exception:
             logger.debug("delivery ledger record failed", exc_info=True)
@@ -4104,10 +4129,18 @@ class BasePlatformAdapter(ABC):
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await self._ledger_call(mark_delivered, obligation_id)
                 return
             error = str(getattr(result, "error", "") or "")
-            await asyncio.to_thread(mark_failed, obligation_id, error)
+            try:
+                await self._ledger_call(mark_failed, obligation_id, error)
+            except asyncio.CancelledError:
+                if classify_dead_error(error) is None:
+                    schedule = getattr(self.gateway_runner, "_schedule_flood_redelivery", None)
+                    if callable(schedule):
+                        schedule(event.source.platform,
+                                 profile=getattr(delivery_adapter, "_owner_profile", None))
+                raise
             if is_reconnect_only(error):
                 redeliver = getattr(
                     self.gateway_runner, "_redeliver_failed_obligations_for_platform", None)

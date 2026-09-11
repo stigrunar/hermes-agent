@@ -58,35 +58,60 @@ class GatewayStartupMixin:
     def _serving_state(self) -> str:
         return "degraded" if self._startup_parked_platforms else "running"
 
+    @staticmethod
+    async def _await_task_result(task: "asyncio.Task") -> tuple[Any, bool]:
+        """Wait for a shielded task while retaining cancellation until its result is known."""
+        cancelled = False
+        while True:
+            try:
+                result = await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if task.done():
+                    if task.cancelled():
+                        if cancelled:
+                            return None, True
+                        raise
+                    try:
+                        result = task.result()
+                    except BaseException:
+                        if cancelled:
+                            return None, True
+                        raise
+                    return result, True
+                cancelled = True
+                continue
+            except BaseException:
+                if cancelled:
+                    return None, True
+                raise
+            return result, cancelled
+
     async def _ledger_call(self, operation, *args, **kwargs):
         """Run one SQLite operation off-loop, completing it before cancellation propagates."""
         operation_task = asyncio.create_task(asyncio.to_thread(operation, *args, **kwargs))
-        try:
-            return await asyncio.shield(operation_task)
-        except asyncio.CancelledError:
-            current = asyncio.current_task()
-            if current is not None:
-                current.uncancel()
-            try:
-                while not operation_task.done():
-                    await asyncio.sleep(0.01)
-                with suppress(BaseException):
-                    operation_task.result()
-            finally:
-                if current is not None:
-                    current.cancel()
-            raise
+        result, cancelled = await self._await_task_result(operation_task)
+        if cancelled:
+            raise asyncio.CancelledError
+        return result
 
     async def _ledger_call_after_cancel(self, operation, *args, **kwargs):
         """Finish a compensating SQLite update after cancellation, then restore cancellation."""
-        current = asyncio.current_task()
-        if current is not None:
-            current.uncancel()
-        try:
-            return await self._ledger_call(operation, *args, **kwargs)
-        finally:
-            if current is not None:
-                current.cancel()
+        return await self._ledger_call(operation, *args, **kwargs)
+
+    async def _release_runtime_claims(self, claimed: list) -> None:
+        """Refund runtime claims that were not handed to the send path."""
+        for row in claimed or []:
+            if not row.get("runtime_recovery"):
+                continue
+            await self._release_runtime_claim_quiet(
+                row["obligation_id"], "failed to release cancelled runtime delivery claim %s",
+                error=row.get("last_error") or "send_path_degraded",
+            )
+
+    async def _release_runtime_claims_after_cancel(self, claimed: list) -> None:
+        """Complete claim refunds despite repeated cancellation, then let the caller re-raise."""
+        cleanup_task = asyncio.create_task(self._release_runtime_claims(claimed))
+        await self._await_task_result(cleanup_task)
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
@@ -383,8 +408,7 @@ class GatewayStartupMixin:
         await self._clear_resume_pending_for_claimed_obligations(claimed)
         return claimed
 
-    @staticmethod
-    async def _release_runtime_claim_quiet(obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
+    async def _release_runtime_claim_quiet(self, obligation_id, log_fmt: str, error: str = "send_path_degraded") -> None:
         """Release an unsent runtime delivery-ledger claim; log-only on failure. ``error`` is what the row
         goes back to ``failed`` with: the claim's own pre-claim error when the caller knows it, so a
         flood-refused row keeps its ``flood_control:<seconds>`` and stays on the flood timer's list (the
@@ -392,7 +416,7 @@ class GatewayStartupMixin:
         ``send_path_degraded``."""
         from gateway.delivery_ledger import release_runtime_claim
         try:
-            await asyncio.to_thread(release_runtime_claim, obligation_id, error)
+            await self._ledger_call(release_runtime_claim, obligation_id, error)
         except Exception:
             logger.debug(log_fmt, obligation_id, exc_info=True)
 
@@ -465,27 +489,15 @@ class GatewayStartupMixin:
             operation_task = asyncio.create_task(
                 self._ledger_call(claim_due_deferred, profile=profile)
             )
-            try:
-                return await asyncio.shield(operation_task)
-            except asyncio.CancelledError:
-                row = None
-                current = asyncio.current_task()
-                if current is not None:
-                    current.uncancel()
-                try:
-                    while not operation_task.done():
-                        await asyncio.sleep(0.01)
-                    with suppress(BaseException):
-                        row = operation_task.result()
-                    if row is not None:
-                        with suppress(BaseException):
-                            await self._ledger_call_after_cancel(
-                                release_deferred_claim, row["obligation_id"]
-                            )
-                finally:
-                    if current is not None:
-                        current.cancel()
-                raise
+            row, cancelled = await self._await_task_result(operation_task)
+            if cancelled:
+                if row is not None:
+                    cleanup_task = asyncio.create_task(
+                        self._ledger_call(release_deferred_claim, row["obligation_id"])
+                    )
+                    await self._await_task_result(cleanup_task)
+                raise asyncio.CancelledError
+            return row
 
         delivered = 0
         while True:
@@ -566,7 +578,7 @@ class GatewayStartupMixin:
                     )
                 raise
 
-    async def _redeliver_claimed_obligations(self, claimed: list) -> int:
+    async def _redeliver_claimed_obligations(self, claimed: list, *, _cancellation_state: Optional[dict] = None) -> int:
         """Redeliver final responses for claimed rows (network half of the split): runs inside the
         bounded boot-send task, so a flood-limited send can be abandoned by the restore gate without
         reopening the turn-replay window. Returns the redelivered count."""
@@ -578,12 +590,19 @@ class GatewayStartupMixin:
             logger.debug("delivery ledger import failed", exc_info=True)
             return 0
         redelivered = 0
-        for row in claimed:
+        for index, row in enumerate(claimed):
+            if _cancellation_state is not None:
+                _cancellation_state["started"] = True
             if row.get("adopted"):
                 # Adopted at boot inside its flood wait: its resume flag is cleared with the others, and
                 # the timer armed below sends it once the platform's deadline has passed.
                 continue
-            adapter = await self._obligation_adapter(row)
+            try:
+                adapter = await self._obligation_adapter(row)
+            except asyncio.CancelledError:
+                if _cancellation_state is not None:
+                    await self._release_runtime_claims_after_cancel(claimed[index:])
+                raise
             if adapter is None:
                 continue
             content = row["content"]
@@ -592,23 +611,31 @@ class GatewayStartupMixin:
             metadata = {"thread_id": row["thread_id"]} if row.get("thread_id") else None
             try:
                 result = await adapter.send(chat_id=row["chat_id"], content=content, metadata=metadata)
+            except asyncio.CancelledError:
+                if _cancellation_state is not None:
+                    await self._release_runtime_claims_after_cancel(claimed[index + 1:])
+                raise
             except Exception as send_err:
                 logger.warning("obligation %s: redelivery send raised: %s", row["obligation_id"], send_err)
                 result = None
-            with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
-                if result is not None and getattr(result, "success", False):
-                    await self._ledger_call(mark_delivered, row["obligation_id"])
-                    redelivered += 1
-                    logger.info(
-                        "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
-                        row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
-                    )
-                else:
-                    await self._ledger_call(
-                        mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
-                    )
-        # Whatever is still waiting on a flood penalty or a retry backoff (adopted at boot, skipped as not
-        # yet due, refused again just now) gets a timer, so no rejected reply waits for the next restart.
+            try:
+                with _log_suppressed(logging.DEBUG, "delivery ledger update failed", exc_info=True):
+                    if result is not None and getattr(result, "success", False):
+                        await self._ledger_call(mark_delivered, row["obligation_id"])
+                        redelivered += 1
+                        logger.info(
+                            "Redelivered recovered final response to %s:%s (obligation %s, attempt %d)",
+                            row["platform"], row["chat_id"], row["obligation_id"], row["attempts"],
+                        )
+                    else:
+                        await self._ledger_call(
+                            mark_failed, row["obligation_id"], str(getattr(result, "error", "") or "send failed")
+                        )
+            except asyncio.CancelledError:
+                if _cancellation_state is not None:
+                    await self._release_runtime_claims_after_cancel(claimed[index + 1:])
+                raise
+        # Whatever is still waiting on a flood penalty or retry backoff gets a timer.
         with _log_suppressed(logging.DEBUG, "arming flood redelivery timers failed", exc_info=True):
             await self._arm_flood_timers_for_waiting_rows()
         return redelivered
@@ -658,9 +685,14 @@ class GatewayStartupMixin:
             from gateway.delivery_ledger import ledger_enabled, sweep_failed_for_runtime
             if not await self._ledger_call(ledger_enabled):
                 return deferred_redelivered
-            claimed = await self._ledger_call(
-                sweep_failed_for_runtime, platform.value, profile=profile
+            claim_task = asyncio.create_task(
+                self._ledger_call(sweep_failed_for_runtime, platform.value, profile=profile)
             )
+            claimed, claim_cancelled = await self._await_task_result(claim_task)
+            if claim_cancelled:
+                cleanup_task = asyncio.create_task(self._release_runtime_claims(claimed))
+                await self._await_task_result(cleanup_task)
+                raise asyncio.CancelledError
         except Exception:
             logger.debug(
                 "runtime delivery ledger sweep failed after %s reconnect", platform.value, exc_info=True,
@@ -669,15 +701,32 @@ class GatewayStartupMixin:
         if not claimed:
             return deferred_redelivered
         # Clear before any send so the reconnect path cannot both redeliver AND resume the same turn.
-        sendable = await self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
+        clear_task = asyncio.create_task(
+            self._clear_resume_pending_for_claimed_obligations(claimed, require_success=True)
+        )
+        sendable, clear_cancelled = await self._await_task_result(clear_task)
+        if clear_cancelled:
+            cleanup_task = asyncio.create_task(self._release_runtime_claims(claimed))
+            await self._await_task_result(cleanup_task)
+            raise asyncio.CancelledError
         sendable_ids = {row["obligation_id"] for row in sendable}
-        for row in claimed:
-            if row["obligation_id"] not in sendable_ids:
-                await self._release_runtime_claim_quiet(
-                    row["obligation_id"], "failed to release runtime delivery claim %s",
-                    error=row.get("last_error") or "send_path_degraded",
-                )
-        return deferred_redelivered + await self._redeliver_claimed_obligations(sendable)
+        unsendable = [row for row in claimed if row["obligation_id"] not in sendable_ids]
+        if unsendable:
+            release_task = asyncio.create_task(self._release_runtime_claims(unsendable))
+            _, release_cancelled = await self._await_task_result(release_task)
+            if release_cancelled:
+                await self._release_runtime_claims_after_cancel(sendable)
+                raise asyncio.CancelledError
+        dispatch_state = {"started": False}
+        try:
+            redelivered = await self._redeliver_claimed_obligations(
+                sendable, _cancellation_state=dispatch_state
+            )
+        except asyncio.CancelledError:
+            if not dispatch_state["started"]:
+                await self._release_runtime_claims_after_cancel(sendable)
+            raise
+        return deferred_redelivered + redelivered
 
     def _resume_pending_candidates(self, platform=None) -> Optional[list]:
         """Snapshot resume-pending entries (optionally scoped to ``platform``); None when
