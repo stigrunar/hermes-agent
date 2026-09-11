@@ -131,6 +131,29 @@ def test_cli_spawn_budget_is_separate_from_live_cap(
     assert captured["max_new_spawns"] == 1
 
 
+def test_cli_dispatch_parser_exposes_spawn_budget_separately():
+    from hermes_cli.kanban_parser import build_parser
+
+    parser = argparse.ArgumentParser(prog="hermes")
+    kanban_parser = build_parser(parser.add_subparsers(dest="command"))
+    args = parser.parse_args([
+        "kanban", "dispatch", "--max", "3", "--spawn-budget", "1",
+    ])
+
+    assert args.max == 3
+    assert args.spawn_budget == 1
+    dispatch_parser = next(
+        action.choices["dispatch"]
+        for action in kanban_parser._actions
+        if isinstance(action, argparse._SubParsersAction)
+    )
+    help_text = dispatch_parser.format_help()
+    assert "--max N" in help_text
+    assert "Cap live concurrency" in help_text
+    assert "--spawn-budget N" in help_text
+    assert "Independently cap new worker starts" in help_text
+
+
 def test_cli_dispatch_pregates_canonical_policy_before_init_or_connect(
     isolated_kanban_home, monkeypatch, capsys,
 ):
