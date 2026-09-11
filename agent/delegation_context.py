@@ -183,17 +183,12 @@ def delegated_child_subprocess_env(
 ) -> dict[str, str] | None:
     """Carry worker/delegate descendant denial across a real process spawn.
 
-    A delegated child (or its descendants) must materialize a scrubbed
-    environment too: merely deleting TASK would otherwise promote that child
-    to an orchestrator. A normal dispatcher-owned worker's runtime is an
-    owned execution surface and deliberately keeps its task identity.
+    A dispatcher-owned parent must materialize a scrubbed child environment too:
+    merely deleting TASK would otherwise promote that child to an orchestrator.
+    Explicit mappings carrying TASK or the marker are treated the same way.
     Ordinary ``env=None`` callers retain subprocess inheritance semantics.
     """
-    # Callers frequently construct an explicit child mapping while the marker
-    # is absent from this process (the dispatcher must keep its own env intact).
-    # Honour that mapping as a denial signal too; an ambient ordinary context
-    # must never erase the fence already carried by a descendant mapping.
-    explicit_child = env is not None and bool(env.get(DELEGATED_CHILD_ENV_MARKER))
-    if not (is_delegated_child_process_context() or explicit_child):
+    if not (is_delegated_child_process_context() or os.environ.get("HERMES_KANBAN_TASK")
+            or (env and (env.get("HERMES_KANBAN_TASK") or env.get(DELEGATED_CHILD_ENV_MARKER)))):
         return None if env is None else dict(env)
     return scrub_kanban_env(os.environ if env is None else env)

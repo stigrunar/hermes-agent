@@ -23,10 +23,23 @@ from pathlib import Path
 import pytest
 
 import hermes_state
+import hermes_state_holders
 import hermes_state_repair
 import hermes_state_wal
 from hermes_state import SessionDB, is_malformed_db_error
 from hermes_state_repair import repair_state_db_schema
+
+
+@pytest.fixture(autouse=True)
+def _known_empty_holder_view(monkeypatch):
+    """Keep synthetic repair fixtures independent of host /proc visibility.
+
+    The production holder scan correctly defers when another Hermes process is
+    unreadable. These fixtures create disposable databases and must state their
+    holder view explicitly so that host-level permission noise cannot turn a
+    positive repair assertion into a false deferral.
+    """
+    monkeypatch.setattr(hermes_state_holders, "foreign_state_db_holders", lambda _path: [])
 
 
 def _build_healthy_db(db_path: Path) -> str:
@@ -37,6 +50,43 @@ def _build_healthy_db(db_path: Path) -> str:
         db.append_message(sid, role="assistant", content=f"reply about pizza {i}")
     db.close()
     return sid
+
+
+def test_db_opens_cleanly_defaults_to_full_integrity_scan(tmp_path, monkeypatch):
+    """The bounded option skips only integrity_check; default callers do not."""
+    db_path = tmp_path / "state.db"
+    _build_healthy_db(db_path)
+
+    statements = []
+    real_connect = hermes_state.sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        conn = real_connect(*args, **kwargs)
+        conn.set_trace_callback(statements.append)
+        return conn
+
+    monkeypatch.setattr(hermes_state.sqlite3, "connect", traced_connect)
+
+    assert hermes_state_repair._db_opens_cleanly(db_path) is None
+    assert any(
+        statement.strip().lower().startswith("pragma integrity_check")
+        for statement in statements
+    )
+
+    statements.clear()
+    assert hermes_state_repair._db_opens_cleanly(
+        db_path, skip_integrity_check=True
+    ) is None
+    assert not any(
+        statement.strip().lower().startswith("pragma integrity_check")
+        for statement in statements
+    )
+    traced_sql = "\n".join(statements).lower()
+    assert "pragma journal_mode" in traced_sql
+    assert "select count(*) from sessions" in traced_sql
+    assert " from messages_fts where messages_fts match " in traced_sql
+    assert "insert into messages" in traced_sql
+    assert "rollback" in traced_sql
 
 
 def _corrupt_duplicate_fts(db_path: Path) -> None:
@@ -501,6 +551,8 @@ def test_repair_reports_success_when_the_holder_already_healed_the_db(
 _REPAIR_SCRIPT = """
 import sys, json
 sys.path.insert(0, {root!r})
+import hermes_state_holders
+hermes_state_holders.foreign_state_db_holders = lambda _path: []
 from hermes_state_repair import repair_state_db_schema
 print(json.dumps(repair_state_db_schema({db!r})), flush=True)
 """

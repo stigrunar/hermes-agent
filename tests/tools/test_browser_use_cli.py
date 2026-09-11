@@ -1468,6 +1468,28 @@ class TestTimeoutProcessGroupKill:
     blocked forever, and the wedged call's activity heartbeat pins the session at
     "now" in the sidebar indefinitely."""
 
+    @staticmethod
+    def _pid_terminated(pid):
+        """Accept only a missing POSIX process or a Linux zombie as terminated."""
+        if sys.platform.startswith("linux"):
+            try:
+                stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+            except FileNotFoundError:
+                return True
+            except OSError:
+                return False
+            try:
+                return stat.rsplit(") ", 1)[1].split()[0] == "Z"
+            except (IndexError, ValueError):
+                return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
     @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
     def test_timeout_kills_grandchild_and_returns_promptly(self, tmp_path, monkeypatch):
         """A grandchild that outlives the direct child and holds the inherited stdout
@@ -1493,8 +1515,9 @@ class TestTimeoutProcessGroupKill:
         # The pipe-holding grandchild died with the group instead of leaking.
         pid = int(pid_file.read_text().strip())
         time.sleep(0.5)
-        with pytest.raises(OSError):
-            os.kill(pid, 0)
+        # A reparented child may remain as a zombie until the host reaps it;
+        # state Z is terminated and must not be treated as a live leak.
+        assert self._pid_terminated(pid)
 
     def test_post_kill_drain_is_bounded(self, monkeypatch):
         """If even the post-kill drain misses its deadline, give up instead of wedging."""

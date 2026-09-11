@@ -50,6 +50,24 @@ logger = logging.getLogger(__name__)
 
 _LOCAL_MODES = {"local", "local_embedded"}
 _RETAIN_CONTEXT_DEFAULT = "conversation between Hermes Agent and the User"
+_LOCAL_EMBEDDED_ROOT_WARNING = (
+    "Hindsight local_embedded mode cannot run as root "
+    "(PostgreSQL initdb refuses root). Skipping the embedded "
+    "memory daemon. Run Hermes as a non-root user, or switch "
+    "to cloud / local_external mode via 'hermes memory setup'."
+)
+
+
+def _local_embedded_root_blocked() -> bool:
+    """Return whether the embedded runtime is unsafe for this process user."""
+    geteuid = getattr(os, "geteuid", None)
+    return callable(geteuid) and geteuid() == 0
+
+
+def _warn_local_embedded_root_block() -> None:
+    logger.warning(_LOCAL_EMBEDDED_ROOT_WARNING)
+    with contextlib.suppress(Exception):
+        print(f"  ⚠ {_LOCAL_EMBEDDED_ROOT_WARNING}", file=sys.stderr, flush=True)
 
 
 def _ensure_client_dependency() -> None:
@@ -379,6 +397,8 @@ class HindsightMemoryProvider(MemoryProvider):
             cfg = _load_config()
             mode = cfg.get("mode", "cloud")
             if mode in _LOCAL_MODES:
+                if _local_embedded_root_blocked():
+                    return False
                 return _check_local_runtime()[0]
             return mode == "local_external" or bool(
                 _cloud_api_key(cfg) or cfg.get("api_url") or get_secret("HINDSIGHT_API_URL", ""))
@@ -694,6 +714,10 @@ class HindsightMemoryProvider(MemoryProvider):
         if self._mode == "local":  # legacy alias
             self._mode = "local_embedded"
         if self._mode == "local_embedded":
+            if _local_embedded_root_blocked():
+                _warn_local_embedded_root_block()
+                self._mode = "disabled"
+                return
             # Must precede the daemon_embed_manager import, which reads it at import time.
             _export_port_health_grace_timeout(cfg)
             available, reason = _check_local_runtime()
@@ -811,24 +835,8 @@ class HindsightMemoryProvider(MemoryProvider):
         # PostgreSQL's initdb refuses root; without this guard the start thread
         # retries forever, reloading embedding models (~958MB RAM, ~33% CPU)
         # with no user-visible error.
-        if hasattr(os, "geteuid") and os.geteuid() == 0:
-            msg = ("Hindsight local_embedded mode cannot run as root "
-                   "(PostgreSQL initdb refuses root). Skipping the embedded "
-                   "memory daemon. Run Hermes as a non-root user, or switch "
-                   "to cloud / local_external mode via 'hermes memory setup'.")
-            logger.warning(msg)
-            # Surface to the terminal too — a daemon that never starts would otherwise fail silently and
-            # the user would only see Hermes get sluggish (issue #13125). This is an automatic
-            # startup diagnostic: it goes through the agent's gated warning sink when wired,
-            # otherwise through the shared render boundary; the log line above never does.
-            with contextlib.suppress(Exception):
-                cb = getattr(self, "_warning_callback", None)
-                if cb is not None:
-                    cb(msg)
-                else:
-                    from gateway.warning_notifications import render_notification
-                    render_notification(lambda: print(f"  ⚠ {msg}", file=sys.stderr, flush=True),
-                                        platform=getattr(self, "_platform", "cli"))
+        if _local_embedded_root_blocked():
+            _warn_local_embedded_root_block()
             self._mode = "disabled"
             return
         spawn_context_thread(self._daemon_start_worker, name="hindsight-daemon-start").start()
