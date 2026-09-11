@@ -568,6 +568,41 @@ class TestRunTurn:
         assert result.error is None
         touch_activity.assert_not_called()
 
+    def test_unscoped_completed_message_cannot_be_terminal_projection(self):
+        """A compatibility display event must not defeat the silence retirement path."""
+        client = FakeClient()
+        client._notifications.append({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "unscoped-1", "text": "UNSCOPED"}},
+        })
+        clock = [0.0]
+        original_take_notification = client.take_notification
+
+        def take_notification(timeout=0.0):
+            clock[0] += 0.06
+            return original_take_notification(0.0)
+
+        client.take_notification = take_notification
+        touch_activity = MagicMock()
+        session = make_session(client, on_activity=touch_activity)
+
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = session.run_turn(
+                "ignore unattributed output",
+                turn_timeout=0.05,
+                notification_poll_timeout=0.0,
+            )
+
+        assert result.final_text == ""
+        assert result.projected_messages == []
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert session._active_turn_id is None
+        touch_activity.assert_not_called()
+        assert ("turn/interrupt", {
+            "threadId": "thread-fake-001", "turnId": "turn-fake-001"
+        }) in client.requests
+
     def test_substantive_progress_crosses_original_timeout_boundary(self):
         client = FakeClient()
         for delta in ("one", "two", "three"):

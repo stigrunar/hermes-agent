@@ -198,11 +198,40 @@ def _notification_has_current_turn_identity(
     return all_current(thread_values, thread_id) and all_current(turn_values, turn_id)
 
 
-def _codex_app_server_has_nonempty_sequence(value: Any) -> bool:
-    """Whether a protocol list contains at least one real (non-empty) entry."""
-    return isinstance(value, list) and any(
-        (isinstance(entry, str) and entry.strip()) or isinstance(entry, dict) and bool(entry)
-        for entry in value
+def _codex_app_server_has_nonempty_sequence(
+    value: Any, *, entry_validator: Callable[[Any], bool]
+) -> bool:
+    """Whether a protocol list is wholly schema-valid and substantively non-empty."""
+    return isinstance(value, list) and bool(value) and all(entry_validator(entry) for entry in value)
+
+
+def _codex_app_server_nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
+
+
+def _codex_app_server_valid_plan_step(value: Any) -> bool:
+    """Match the required fields of the app-server ``TurnPlanStep`` schema."""
+    if not isinstance(value, dict):
+        return False
+    status = value.get("status")
+    return (
+        isinstance(status, str)
+        and status in {"pending", "inProgress", "completed"}
+        and _codex_app_server_nonempty_text(value.get("step"))
+    )
+
+
+def _codex_app_server_valid_file_change(value: Any) -> bool:
+    """Match the required fields of the app-server ``FileUpdateChange`` schema."""
+    if not isinstance(value, dict):
+        return False
+    kind = value.get("kind")
+    kind_type = kind.get("type") if isinstance(kind, dict) else None
+    return (
+        _codex_app_server_nonempty_text(value.get("path"))
+        and _codex_app_server_nonempty_text(value.get("diff"))
+        and isinstance(kind_type, str)
+        and kind_type in {"add", "delete", "update"}
     )
 
 
@@ -229,7 +258,9 @@ def _codex_app_server_event_progress(note: dict) -> Optional[str]:
     if method == "turn/plan/updated":
         return (
             f"codex app-server progress: {method}"
-            if _codex_app_server_has_nonempty_sequence(params.get("plan"))
+            if _codex_app_server_has_nonempty_sequence(
+                params.get("plan"), entry_validator=_codex_app_server_valid_plan_step
+            )
             else None
         )
 
@@ -249,8 +280,12 @@ def _codex_app_server_event_progress(note: dict) -> Optional[str]:
             substantive = isinstance(item.get("text"), str) and bool(item["text"].strip())
         elif item_type == "reasoning":
             substantive = (
-                _codex_app_server_has_nonempty_sequence(item.get("summary"))
-                or _codex_app_server_has_nonempty_sequence(item.get("content"))
+                _codex_app_server_has_nonempty_sequence(
+                    item.get("summary"), entry_validator=_codex_app_server_nonempty_text
+                )
+                or _codex_app_server_has_nonempty_sequence(
+                    item.get("content"), entry_validator=_codex_app_server_nonempty_text
+                )
             )
         else:
             substantive = False
@@ -260,8 +295,13 @@ def _codex_app_server_event_progress(note: dict) -> Optional[str]:
     if fields is None:
         return None
     substantive = any(
-        (isinstance(params.get(field), str) and params[field].strip())
-        or (field == "changes" and _codex_app_server_has_nonempty_sequence(params.get(field)))
+        (_codex_app_server_nonempty_text(params.get(field)))
+        or (
+            field == "changes"
+            and _codex_app_server_has_nonempty_sequence(
+                params.get(field), entry_validator=_codex_app_server_valid_file_change
+            )
+        )
         for field in fields
     )
     return f"codex app-server progress: {method}" if substantive else None
@@ -564,7 +604,7 @@ class CodexAppServerSession:
         return True
 
     def _absorb_notification(
-        self, result: TurnResult, projector: CodexEventProjector, note: dict
+        self, result: TurnResult, projector: CodexEventProjector, note: dict, *, authoritative: bool
     ) -> tuple[ProjectionResult, bool]:
         """Fan one in-scope notification out to display, accounting, file-change tracking and the projector.
 
@@ -575,6 +615,10 @@ class CodexAppServerSession:
                 self._on_event(note)
             except Exception:  # pragma: no cover - display callback
                 logger.debug("on_event callback raised", exc_info=True)
+        if not authoritative:
+            # Legacy/unscoped notifications may still feed the guarded display hook,
+            # but can never become terminal or mutate the authoritative transcript.
+            return ProjectionResult(), False
         _apply_accounting_notification(result, note)
         self._track_pending_file_change(note)
         projection = projector.project(note)
@@ -685,7 +729,14 @@ class CodexAppServerSession:
                     logger.debug("ignoring foreign codex notification while draining server request: method=%s", pending.get("method"))
                     continue
                 made_progress = self._record_notification_activity(pending, result) or made_progress
-                proj, aborted = self._absorb_notification(result, projector, pending)
+                proj, aborted = self._absorb_notification(
+                    result,
+                    projector,
+                    pending,
+                    authoritative=_notification_has_current_turn_identity(
+                        pending, thread_id=self._thread_id, turn_id=result.turn_id
+                    ),
+                )
                 if proj.is_tool_iteration:
                     last_tool_completion_at = time.monotonic()
                 turn_complete = turn_complete or aborted
@@ -696,12 +747,17 @@ class CodexAppServerSession:
 
         def on_note(note: dict, method: str, made_progress: bool) -> bool:
             nonlocal last_tool_completion_at
-            projection, aborted = self._absorb_notification(result, projector, note)
+            authoritative = _notification_has_current_turn_identity(
+                note, thread_id=self._thread_id, turn_id=result.turn_id
+            )
+            projection, aborted = self._absorb_notification(
+                result, projector, note, authoritative=authoritative
+            )
             if projection.is_tool_iteration:
                 last_tool_completion_at = time.monotonic()
             elif made_progress or projection.messages or projection.final_text is not None:
                 last_tool_completion_at = None
-            if method != "turn/completed":
+            if not authoritative or method != "turn/completed":
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}
             turn_status = turn_obj.get("status")
@@ -823,7 +879,14 @@ class CodexAppServerSession:
             return True
 
         def on_note(note: dict, method: str, _made_progress: bool) -> bool:
-            _, aborted = self._absorb_notification(result, projector, note)
+            authoritative = _notification_has_current_turn_identity(
+                note, thread_id=self._thread_id, turn_id=result.turn_id
+            )
+            _, aborted = self._absorb_notification(
+                result, projector, note, authoritative=authoritative
+            )
+            if not authoritative:
+                return aborted
             if method not in {"turn/started", "turn/completed"}:
                 return aborted
             turn_obj = (note.get("params") or {}).get("turn") or {}

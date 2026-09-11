@@ -57,6 +57,42 @@ def test_native_progress_keeps_the_real_activity_clock_under_600_seconds():
     assert active == [True]
 
 
+def test_malformed_structured_progress_does_not_refresh_activity():
+    agent = _ActivityAgent()
+    agent._touch_activity("starting new turn")
+    before_generation = agent._turn_liveness_activity_generation
+
+    for note in (
+        {
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "plan": [{"garbage": True}],
+            },
+        },
+        {
+            "method": "turn/plan/updated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "plan": [{"step": "run tests", "status": []}],
+            },
+        },
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "changes": [{"path": "a.py", "diff": "@@", "kind": {"type": {}}}],
+            },
+        },
+    ):
+        assert _record_current_progress(agent, note) is False
+
+    assert agent._turn_liveness_activity_generation == before_generation
+
+
 def test_silence_at_the_unchanged_600_second_boundary_commits_abort_and_deactivates():
     agent = _ActivityAgent()
     agent._turn_liveness_activity_generation = 7
