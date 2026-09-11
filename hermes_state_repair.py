@@ -753,13 +753,14 @@ def state_db_has_structural_damage(db_path: Path) -> bool:
         itertools.chain.from_iterable(line.splitlines() for line in lines), master_rows)
 
 
-def _db_opens_cleanly(db_path: Path) -> Optional[str]:
+def _db_opens_cleanly(db_path: Path, *, skip_integrity_check: bool = False) -> Optional[str]:
     """Probe a DB on a fresh connection. Returns None if healthy, else a reason.
 
     Runs the first statement that trips the malformed-schema parse (``PRAGMA journal_mode``),
-    ``integrity_check``, a ``sessions`` read, FTS5 MATCH probes and a rolled-back ``messages`` write — so FTS5
-    index corruption (reads and ``integrity_check`` pass, every ``INSERT INTO messages`` fails through the FTS
-    triggers) is reported as unhealthy.
+    ``integrity_check`` (unless explicitly deferred), a ``sessions`` read, FTS5 MATCH probes and a rolled-back
+    ``messages`` write — so FTS5 index corruption (reads and ``integrity_check`` pass, every ``INSERT INTO
+    messages`` fails through the FTS triggers) is reported as unhealthy. Deferring the full scan does not skip
+    any of the targeted schema, read, or transactional write probes.
 
     See #50502.
     """
@@ -775,10 +776,11 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
             # tokenizer absence must never classify as corruption.
             load_fts5_cjk_extension(conn)
             conn.execute("PRAGMA journal_mode").fetchone()
-            rows = conn.execute("PRAGMA integrity_check").fetchall()
-            problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
-            if problems:
-                return "; ".join(problems[:3])
+            if not skip_integrity_check:
+                rows = conn.execute("PRAGMA integrity_check").fetchall()
+                problems = [str(r[0]) for r in rows if r and str(r[0]).lower() != "ok"]
+                if problems:
+                    return "; ".join(problems[:3])
             conn.execute("SELECT COUNT(*) FROM sessions").fetchone()
             # FTS5 read probe: partial shadow-table corruption makes MATCH/snippet/rank raise while integrity_check
             # reports healthy. MATCH '""' (empty phrase) parses, scans zero rows and exercises the shadow tables;

@@ -195,9 +195,20 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
     """FTS/write-health probe (a rolled-back BEGIN IMMEDIATE). Against a store a live writer holds,
     that probe is the second-writer class (#103339), so probe a read-only snapshot instead; a quiet
     store is probed in place. Returns the failure reason, or None when healthy or skipped."""
+    from hermes_state_dbfile import collect_state_db_stats
     from hermes_state_repair import _db_opens_cleanly, _live_writer_holds_db
+    logical_size = collect_state_db_stats(state_db_path).get("logical_size_bytes")
+    skip_integrity_check = bool(
+        not should_fix
+        and logical_size is not None
+        and logical_size > STATE_DB_SIZE_WARN_BYTES
+    )
+    if skip_integrity_check:
+        check_info("PRAGMA integrity_check deferred/skipped due to large DB")
     if not _live_writer_holds_db(state_db_path):
-        return _db_opens_cleanly(state_db_path)
+        return _db_opens_cleanly(
+            state_db_path, skip_integrity_check=skip_integrity_check
+        )
     if not should_fix and state_db_path.stat().st_size > _WRITE_PROBE_SNAPSHOT_MAX_BYTES:
         check_info("state.db write-health probe skipped: store is held by a live writer and larger than 1 GB "
                    "(run 'hermes doctor --fix' to probe it)")
@@ -215,7 +226,9 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
                 dest.close()
         finally:
             src.close()
-        return _db_opens_cleanly(snapshot)
+        return _db_opens_cleanly(
+            snapshot, skip_integrity_check=skip_integrity_check
+        )
 
 
 # Corruption class -> (ok label, not-fixed label, failed issue, fix hint). ``{count}`` = recovered sessions.
