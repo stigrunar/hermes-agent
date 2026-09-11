@@ -11,7 +11,7 @@ import itertools
 import logging
 import time
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 from typing import Any, Optional
 
 import pytest
@@ -374,6 +374,68 @@ class TestRunTurn:
             {"role": "assistant", "content": "parent after approval"}
         ]
 
+    def test_foreign_progress_never_reaches_activity_bridge(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+
+        client = FakeClient()
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-child-001", turnId="turn-child-001",
+            itemId="child-message", delta="stale child progress",
+        )
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-fake-001", turnId="turn-fake-001",
+            itemId="parent-message", delta="current progress",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        agent = SimpleNamespace(_touch_activity=MagicMock())
+        session = make_session(client, on_event=make_codex_app_server_event_bridge(agent))
+
+        result = session.run_turn("keep going", turn_timeout=1.0)
+
+        assert result.error is None
+        agent._touch_activity.assert_called_once_with(
+            "codex app-server progress: item/agentMessage/delta"
+        )
+
+    def test_display_failure_does_not_interrupt_current_turn_or_activity(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+
+        client = FakeClient()
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-fake-001", turnId="turn-fake-001",
+            itemId="parent-message", delta="current progress",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        agent = SimpleNamespace(
+            _touch_activity=MagicMock(),
+            _fire_stream_delta=MagicMock(side_effect=RuntimeError("display boom")),
+        )
+        session = make_session(client, on_event=make_codex_app_server_event_bridge(agent))
+
+        result = session.run_turn("keep going", turn_timeout=1.0)
+
+        assert result.error is None
+        assert result.interrupted is False
+        agent._touch_activity.assert_called_once()
+
+    def test_request_interrupt_is_consumed_and_active_turn_is_cleaned_up(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.request_interrupt()
+
+        result = session.run_turn("cancel me", turn_timeout=1.0)
+
+        assert result.interrupted is True
+        assert not any(method == "turn/start" for method, _ in client.requests)
+        assert session._interrupt_event.is_set() is False
+        assert session._active_turn_id is None
+
 
 
     def test_tool_iteration_counter_ticks(self):
@@ -712,6 +774,21 @@ class TestServerRequestRouting:
             auto_approve_exec=True))
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
+
+    def test_approval_without_callback_fails_closed(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval", request_id="r-deny",
+            command="touch /tmp/nope", cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("hi", turn_timeout=0.05)
+
+        assert ("r-deny", {"decision": "decline"}) in client.responses
 
 
 

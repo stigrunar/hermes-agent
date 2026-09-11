@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.codex_runtime import (
+    _codex_app_server_event_progress,
     _codex_item_completion_payload,
     _codex_item_to_args,
     _codex_item_to_preview,
@@ -39,6 +40,7 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
+        _touch_activity=MagicMock(name="_touch_activity"),
     )
 
 
@@ -307,6 +309,93 @@ class TestBridgeRobustness:
         bridge(_item_completed({
             "type": "agentMessage", "id": "am-x", "text": "hi",
         }))
+
+
+class TestNativeProgressActivity:
+    """Native progress feeds the turn watchdog before optional display hooks."""
+
+    @pytest.mark.parametrize("note", [
+        {"method": "item/agentMessage/delta", "params": {"delta": "answer"}},
+        {"method": "item/reasoning/summaryTextDelta", "params": {"delta": "thinking"}},
+        {"method": "item/reasoning/textDelta", "params": {"delta": "analysis"}},
+        {"method": "item/plan/delta", "params": {"delta": "step"}},
+        {"method": "item/commandExecution/outputDelta", "params": {"delta": "stdout"}},
+        {"method": "item/fileChange/outputDelta", "params": {"delta": "patch output"}},
+        {"method": "item/mcpToolCall/progress", "params": {"message": "2 / 5"}},
+        {"method": "item/fileChange/patchUpdated", "params": {"changes": [{"path": "a.py"}]}},
+        {"method": "item/fileChange/patchUpdated", "params": {"patch": "@@ -1 +1 @@"}},
+        {"method": "item/commandExecution/terminalInteraction", "params": {"stdin": "y\n"}},
+        {"method": "turn/diff/updated", "params": {"diff": "@@ -1 +1 @@"}},
+        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests"}]}},
+        {"method": "item/started", "params": {"item": {"type": "commandExecution", "id": "exec-1"}}},
+        {"method": "item/completed", "params": {"item": {"type": "mcpToolCall", "id": "mcp-1"}}},
+        {"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": "done"}}},
+    ])
+    def test_substantive_native_events_touch_activity(self, note):
+        agent = SimpleNamespace(_touch_activity=MagicMock())
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge(note)
+
+        agent._touch_activity.assert_called_once()
+        assert note["method"] in agent._touch_activity.call_args.args[0]
+
+    @pytest.mark.parametrize("note", [
+        {"method": "item/agentMessage/delta", "params": {"delta": ""}},
+        {"method": "item/reasoning/summaryTextDelta", "params": {"delta": "   "}},
+        {"method": "item/commandExecution/outputDelta", "params": {"delta": None}},
+        {"method": "item/mcpToolCall/progress", "params": {"message": ""}},
+        {"method": "item/fileChange/patchUpdated", "params": {"changes": []}},
+        {"method": "turn/diff/updated", "params": {"diff": ""}},
+        {"method": "turn/plan/updated", "params": {"plan": []}},
+        {"method": "item/reasoning/summaryPartAdded", "params": {"itemId": "r1"}},
+        {"method": "turn/started", "params": {"turn": {"id": "t1"}}},
+        {"method": "keepalive", "params": {}},
+        {"method": "item/started", "params": {"item": {"type": "commandExecution"}}},
+        {"method": "item/completed", "params": {"item": {"type": "contextCompaction", "id": "c1"}}},
+        {"method": "item/completed", "params": {"item": {"type": [], "id": "bad"}}},
+        {"method": "totally/unknown", "params": {"delta": "not progress"}},
+        None,
+    ])
+    def test_empty_boundary_malformed_and_unknown_events_do_not_touch_activity(self, note):
+        agent = SimpleNamespace(_touch_activity=MagicMock())
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge(note)
+
+        agent._touch_activity.assert_not_called()
+
+    def test_display_callback_absent_does_not_disable_activity(self):
+        agent = SimpleNamespace(_touch_activity=MagicMock())
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
+
+        agent._touch_activity.assert_called_once()
+
+    def test_display_callback_raising_does_not_disable_activity_or_bridge(self):
+        agent = _make_stub_agent()
+        agent._fire_stream_delta.side_effect = RuntimeError("display boom")
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
+
+        agent._touch_activity.assert_called_once()
+        agent._fire_stream_delta.assert_called_once_with("hello")
+
+    def test_touch_activity_raising_does_not_disable_display(self):
+        agent = _make_stub_agent()
+        agent._touch_activity = MagicMock(side_effect=RuntimeError("touch boom"))
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
+
+        agent._fire_stream_delta.assert_called_once_with("hello")
+
+    def test_classifier_requires_tool_item_ids(self):
+        assert _codex_app_server_event_progress({
+            "method": "item/started", "params": {"item": {"type": "commandExecution"}}
+        }) is None
 
 
 
