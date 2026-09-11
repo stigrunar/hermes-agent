@@ -3393,6 +3393,7 @@ def _tick_spawn_budget(
     result: DispatchResult,
     *,
     max_spawn: Optional[int],
+    max_new_spawns: Optional[int],
     max_in_progress: Optional[int],
     board: Optional[str],
 ) -> tuple[bool, Optional[int]]:
@@ -3425,6 +3426,19 @@ def _tick_spawn_budget(
         remaining = max_in_progress - total_running
         if spawn_budget is None or spawn_budget > remaining:
             spawn_budget = remaining
+
+    # ``max_new_spawns`` is a per-tick budget shared by the ready and review
+    # lanes. Apply it before either lane can claim a task or resolve a
+    # workspace, while leaving the live-concurrency caps above unchanged.
+    if max_new_spawns is not None:
+        spawn_budget = (
+            max_new_spawns
+            if spawn_budget is None
+            else min(spawn_budget, max_new_spawns)
+        )
+
+    if spawn_budget is not None and spawn_budget <= 0:
+        return False, None
 
     # Memory-pressure guard: a static cap can't see the host's actual state.
     # critical -> spawn nothing this tick; elevated -> at most one new worker.
@@ -3833,7 +3847,8 @@ def _dispatch_once_locked(
             board=board,
         )
     may_spawn, spawn_budget = _tick_spawn_budget(
-        conn, result, max_spawn=max_spawn, max_in_progress=max_in_progress, board=board,
+        conn, result, max_spawn=max_spawn, max_new_spawns=max_new_spawns,
+        max_in_progress=max_in_progress, board=board,
     )
     if not may_spawn:
         return result
