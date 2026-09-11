@@ -1,17 +1,25 @@
 # HRI App Server liveness
 
-The Codex app-server bridge treats only substantive, in-scope native progress as
-turn activity. Non-empty assistant/reasoning/plan deltas, tool lifecycle events,
-and non-empty tool output, progress, diff, plan, or patch payloads call the
-existing `AIAgent._touch_activity` path before optional display callbacks.
+The Codex app-server session treats only substantive, exactly attributable native
+progress as turn activity. Non-empty assistant/reasoning/plan deltas, tool
+lifecycle events, and non-empty tool output, progress, diff, plan, or patch
+payloads call the existing `AIAgent._touch_activity` path before optional display
+callbacks.
 
-Transport lifecycle, keepalive/polling, malformed, empty, unknown, and
-boundary-only notifications do not refresh the clock. The session's existing
-thread/turn ownership fence runs before the bridge, so stale child notifications
-cannot refresh a later parent turn. Display callback failures are guarded and
-cannot interrupt execution. The existing 600-second watchdog and its
-generation/timestamp-locked abort settlement are unchanged: this adds no
-timeout increase, fake heartbeat, second watchdog, or config setting.
+Liveness requires explicit current `threadId` and `turnId` identity. Unscoped,
+internally conflicting, foreign-thread, foreign-turn, and late-old-turn events
+cannot refresh it. Transport lifecycle, keepalive/polling, malformed, empty,
+unknown, and boundary-only notifications also do not refresh it. A permissive
+legacy event may still reach safe display/projection handling, but display is a
+separate guarded callback and cannot touch liveness.
+
+The session's existing `turn_timeout` is a silence window, not an absolute turn
+deadline. Its default remains 600 seconds. Each strictly owned substantive event
+resets that window and the same authoritative classifier touches the existing
+generation/timestamp-locked `AIAgent` watchdog. Continuous progress may therefore
+cross 600 seconds of total elapsed time; 600 seconds without progress still
+interrupts and retires the app-server session. This adds no timeout increase,
+fake heartbeat, competing watchdog, or config setting.
 
 The focused deterministic gate is:
 

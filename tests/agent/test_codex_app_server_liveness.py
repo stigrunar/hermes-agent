@@ -7,8 +7,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from agent.activity_tracking import ActivityTrackingMixin
-from agent.codex_runtime import make_codex_app_server_event_bridge
 from agent import turn_liveness
+from agent.transports.codex_app_server_session import CodexAppServerSession, TurnResult
 
 
 class _ActivityAgent(ActivityTrackingMixin):
@@ -30,13 +30,22 @@ def _watchdog(agent, *, active, commits):
     )
 
 
+def _record_current_progress(agent, note):
+    session = CodexAppServerSession(on_activity=agent._touch_activity)
+    session._thread_id = "thread-1"
+    result = TurnResult(thread_id="thread-1", turn_id="turn-1")
+    return session._record_notification_activity(note, result)
+
+
 def test_native_progress_keeps_the_real_activity_clock_under_600_seconds():
     agent = _ActivityAgent()
     agent._touch_activity("starting new turn")
-    bridge = make_codex_app_server_event_bridge(agent)
     before_generation = agent._turn_liveness_activity_generation
 
-    bridge({"method": "item/agentMessage/delta", "params": {"delta": "working"}})
+    assert _record_current_progress(agent, {
+        "method": "item/agentMessage/delta",
+        "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "working"},
+    }) is True
 
     assert agent._turn_liveness_activity_generation == before_generation + 1
     active = [True]
@@ -71,8 +80,10 @@ def test_silence_at_the_unchanged_600_second_boundary_commits_abort_and_deactiva
 def test_activity_bridge_is_independent_of_missing_display_callbacks():
     activity = []
     agent = SimpleNamespace(_touch_activity=activity.append)
-    bridge = make_codex_app_server_event_bridge(agent)
 
-    bridge({"method": "item/commandExecution/outputDelta", "params": {"delta": "stdout"}})
+    assert _record_current_progress(agent, {
+        "method": "item/commandExecution/outputDelta",
+        "params": {"threadId": "thread-1", "turnId": "turn-1", "delta": "stdout"},
+    }) is True
 
     assert activity == ["codex app-server progress: item/commandExecution/outputDelta"]
