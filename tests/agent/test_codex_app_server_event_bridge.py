@@ -22,13 +22,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from agent.codex_runtime import (
-    _codex_app_server_event_progress,
     _codex_item_completion_payload,
     _codex_item_to_args,
     _codex_item_to_preview,
     _codex_item_to_tool_name,
     make_codex_app_server_event_bridge,
 )
+from agent.transports.codex_app_server_session import _codex_app_server_event_progress
 
 
 def _make_stub_agent() -> SimpleNamespace:
@@ -312,7 +312,7 @@ class TestBridgeRobustness:
 
 
 class TestNativeProgressActivity:
-    """Native progress feeds the turn watchdog before optional display hooks."""
+    """Only substantive native payloads classify as turn progress."""
 
     @pytest.mark.parametrize("note", [
         {"method": "item/agentMessage/delta", "params": {"delta": "answer"}},
@@ -331,14 +331,11 @@ class TestNativeProgressActivity:
         {"method": "item/completed", "params": {"item": {"type": "mcpToolCall", "id": "mcp-1"}}},
         {"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": "done"}}},
     ])
-    def test_substantive_native_events_touch_activity(self, note):
-        agent = SimpleNamespace(_touch_activity=MagicMock())
-        bridge = make_codex_app_server_event_bridge(agent)
+    def test_substantive_native_events_are_progress(self, note):
+        progress = _codex_app_server_event_progress(note)
 
-        bridge(note)
-
-        agent._touch_activity.assert_called_once()
-        assert note["method"] in agent._touch_activity.call_args.args[0]
+        assert progress is not None
+        assert note["method"] in progress
 
     @pytest.mark.parametrize("note", [
         {"method": "item/agentMessage/delta", "params": {"delta": ""}},
@@ -357,39 +354,32 @@ class TestNativeProgressActivity:
         {"method": "totally/unknown", "params": {"delta": "not progress"}},
         None,
     ])
-    def test_empty_boundary_malformed_and_unknown_events_do_not_touch_activity(self, note):
-        agent = SimpleNamespace(_touch_activity=MagicMock())
-        bridge = make_codex_app_server_event_bridge(agent)
+    def test_empty_boundary_malformed_and_unknown_events_are_not_progress(self, note):
+        assert _codex_app_server_event_progress(note) is None
 
-        bridge(note)
+    def test_display_callback_absence_does_not_change_progress_classification(self):
+        assert _codex_app_server_event_progress({
+            "method": "item/agentMessage/delta", "params": {"delta": "hello"}
+        }) == "codex app-server progress: item/agentMessage/delta"
 
-        agent._touch_activity.assert_not_called()
-
-    def test_display_callback_absent_does_not_disable_activity(self):
-        agent = SimpleNamespace(_touch_activity=MagicMock())
-        bridge = make_codex_app_server_event_bridge(agent)
-
-        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
-
-        agent._touch_activity.assert_called_once()
-
-    def test_display_callback_raising_does_not_disable_activity_or_bridge(self):
+    def test_display_callback_raising_is_isolated_by_bridge(self):
         agent = _make_stub_agent()
         agent._fire_stream_delta.side_effect = RuntimeError("display boom")
         bridge = make_codex_app_server_event_bridge(agent)
 
         bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
 
-        agent._touch_activity.assert_called_once()
+        agent._touch_activity.assert_not_called()
         agent._fire_stream_delta.assert_called_once_with("hello")
 
-    def test_touch_activity_raising_does_not_disable_display(self):
+    def test_display_bridge_never_calls_activity_directly(self):
         agent = _make_stub_agent()
         agent._touch_activity = MagicMock(side_effect=RuntimeError("touch boom"))
         bridge = make_codex_app_server_event_bridge(agent)
 
         bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
 
+        agent._touch_activity.assert_not_called()
         agent._fire_stream_delta.assert_called_once_with("hello")
 
     def test_classifier_requires_tool_item_ids(self):
@@ -460,6 +450,7 @@ class TestBridgeWiredInRuntime:
             context_compressor=None,
             event_callback=None,
             _session_db=None,
+            _touch_activity=MagicMock(),
         )
 
         codex_runtime.run_codex_app_server_turn(
@@ -477,6 +468,7 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        assert captured["on_activity"] is agent._touch_activity
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.

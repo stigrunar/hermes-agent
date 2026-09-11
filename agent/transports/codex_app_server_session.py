@@ -54,13 +54,44 @@ class TurnResult:
     token_usage_last: Optional[dict[str, Any]] = None
     model_context_window: Optional[int] = None
     compacted: bool = False
-    # Codex likely wedged (turn timeout, dead subprocess, token refresh failure): caller respawns next turn.
+    # Codex likely wedged (silence timeout, watchdog, token refresh failure): caller respawns next turn.
     should_retire: bool = False
 
 
 # Some codex versions stream ``<turn_aborted>`` as raw agentMessage text when an
 # interrupt/upstream error tears the turn down without emitting turn/completed.
 _TURN_ABORTED_MARKERS = ("<turn_aborted>", "<turn_aborted/>")
+
+# App-server notifications are also the native turn-liveness signal. Keep this
+# allowlist deliberately explicit: transport/lifecycle frames (and unknown
+# future frames) are not evidence that the model or a tool is progressing.
+_CODEX_APP_SERVER_DELTA_METHODS = frozenset({
+    "item/agentMessage/delta",
+    "item/plan/delta",
+    "item/reasoning/delta",  # legacy Codex builds
+    "item/reasoning/summaryDelta",  # legacy Codex builds
+    "item/reasoning/summaryTextDelta",
+    "item/reasoning/textDelta",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",  # deprecated, retained by Codex for compatibility
+})
+_CODEX_APP_SERVER_TOOL_ITEM_TYPES = frozenset({
+    "commandExecution",
+    "fileChange",
+    "mcpToolCall",
+    "dynamicToolCall",
+    "collabAgentToolCall",
+    "webSearch",
+    "imageView",
+    "sleep",
+    "imageGeneration",
+    "subAgentActivity",
+})
+_CODEX_APP_SERVER_STRUCTURED_PROGRESS_FIELDS = {
+    "item/fileChange/patchUpdated": ("patch", "changes"),
+    "item/mcpToolCall/progress": ("message",),
+    "item/commandExecution/terminalInteraction": ("stdin",),
+}
 
 
 def _first_scope_id(*lookups: tuple[Any, str, str]) -> Any:
@@ -125,12 +156,119 @@ def _image_part_to_turn_input(item: dict) -> Optional[dict]:
     return {"type": "localImage", "path": ref}
 
 
-def _build_turn_input(user_input: Any) -> tuple[list[dict], str]:
-    """Build the ``turn/start`` ``input`` list plus the text the wire will echo back.
+def _notification_has_current_turn_identity(
+    note: dict, *, thread_id: Optional[str], turn_id: Optional[str]
+) -> bool:
+    """Require explicit, unambiguous current thread and turn identity for liveness.
 
-    Text parts stay text; image parts ride natively (#51053 — a text marker in their place left the
-    model blind to the attachment). Returns ``(input_items, submitted_text)``.
+    Projection keeps the older permissive fence for protocol/display compatibility,
+    but an unattributable or internally conflicting event can never refresh silence.
     """
+    params = note.get("params") if isinstance(note, dict) else None
+    if not isinstance(params, dict):
+        return False
+    turn = params.get("turn")
+    item = params.get("item")
+    sources = [params]
+    if isinstance(turn, dict):
+        sources.append(turn)
+    if isinstance(item, dict):
+        sources.append(item)
+
+    thread_values = [
+        source[key]
+        for source in sources
+        for key in ("threadId", "thread_id")
+        if key in source
+    ]
+    turn_values = [
+        source[key]
+        for source in sources
+        for key in ("turnId", "turn_id")
+        if key in source
+    ]
+    if isinstance(turn, dict) and "id" in turn:
+        turn_values.append(turn["id"])
+
+    def all_current(values: list[Any], expected: Optional[str]) -> bool:
+        return bool(values) and isinstance(expected, str) and bool(expected) and all(
+            isinstance(value, str) and bool(value) and value == expected for value in values
+        )
+
+    return all_current(thread_values, thread_id) and all_current(turn_values, turn_id)
+
+
+def _codex_app_server_has_nonempty_sequence(value: Any) -> bool:
+    """Whether a protocol list contains at least one real (non-empty) entry."""
+    return isinstance(value, list) and any(
+        (isinstance(entry, str) and entry.strip()) or isinstance(entry, dict) and bool(entry)
+        for entry in value
+    )
+
+
+def _codex_app_server_event_progress(note: dict) -> Optional[str]:
+    """Return an activity label for substantive native turn progress."""
+    if not isinstance(note, dict):
+        return None
+    method = note.get("method")
+    params = note.get("params")
+    if not isinstance(method, str) or not isinstance(params, dict):
+        return None
+
+    if method in _CODEX_APP_SERVER_DELTA_METHODS:
+        delta = params.get("delta")
+        return f"codex app-server progress: {method}" if isinstance(delta, str) and delta.strip() else None
+
+    if method == "turn/diff/updated":
+        return (
+            f"codex app-server progress: {method}"
+            if isinstance(params.get("diff"), str) and params["diff"].strip()
+            else None
+        )
+
+    if method == "turn/plan/updated":
+        return (
+            f"codex app-server progress: {method}"
+            if _codex_app_server_has_nonempty_sequence(params.get("plan"))
+            else None
+        )
+
+    if method in {"item/started", "item/completed"}:
+        item = params.get("item")
+        if not isinstance(item, dict):
+            return None
+        item_type = item.get("type")
+        item_id = item.get("id")
+        if not (isinstance(item_id, str) and item_id.strip()):
+            return None
+        if isinstance(item_type, str) and item_type in _CODEX_APP_SERVER_TOOL_ITEM_TYPES:
+            return f"codex app-server progress: {method} ({item_type})"
+        if method != "item/completed":
+            return None
+        if isinstance(item_type, str) and item_type in {"agentMessage", "plan"}:
+            substantive = isinstance(item.get("text"), str) and bool(item["text"].strip())
+        elif item_type == "reasoning":
+            substantive = (
+                _codex_app_server_has_nonempty_sequence(item.get("summary"))
+                or _codex_app_server_has_nonempty_sequence(item.get("content"))
+            )
+        else:
+            substantive = False
+        return f"codex app-server progress: {method} ({item_type})" if substantive else None
+
+    fields = _CODEX_APP_SERVER_STRUCTURED_PROGRESS_FIELDS.get(method)
+    if fields is None:
+        return None
+    substantive = any(
+        (isinstance(params.get(field), str) and params[field].strip())
+        or (field == "changes" and _codex_app_server_has_nonempty_sequence(params.get(field)))
+        for field in fields
+    )
+    return f"codex app-server progress: {method}" if substantive else None
+
+
+def _build_turn_input(user_input: Any) -> tuple[list[dict], str]:
+    """Build native app-server input items and the text echoed by the wire."""
     if isinstance(user_input, str):
         return [{"type": "text", "text": user_input}], user_input
     if not isinstance(user_input, list):
@@ -213,6 +351,7 @@ class CodexAppServerSession:
         codex_home: Optional[str] = None, permission_profile: Optional[str] = None,
         approval_callback: Optional[Callable[..., str]] = None,
         on_event: Optional[Callable[[dict], None]] = None,
+        on_activity: Optional[Callable[[str], None]] = None,
         request_routing: Optional[_ServerRequestRouting] = None,
         client_factory: Optional[Callable[..., CodexAppServerClient]] = None,
         model: Optional[str] = None, model_provider: Optional[str] = None,
@@ -246,6 +385,7 @@ class CodexAppServerSession:
         )
         self._approval_callback = approval_callback
         self._on_event = on_event  # Display hook (kawaii spinner ticks etc.)
+        self._on_activity = on_activity
         self._routing = request_routing or _ServerRequestRouting()
         self._client_factory = client_factory or CodexAppServerClient
 
@@ -452,6 +592,22 @@ class CodexAppServerSession:
                 result.error = result.error or "codex reported turn_aborted"
         return projection, aborted
 
+    def _record_notification_activity(self, note: dict, result: TurnResult) -> bool:
+        """Refresh liveness only for substantive progress owned by this exact turn."""
+        if not _notification_has_current_turn_identity(
+            note, thread_id=self._thread_id, turn_id=result.turn_id
+        ):
+            return False
+        progress_label = _codex_app_server_event_progress(note)
+        if progress_label is None:
+            return False
+        if self._on_activity is not None:
+            try:
+                self._on_activity(progress_label)
+            except Exception:
+                logger.debug("on_activity callback raised", exc_info=True)
+        return True
+
     def run_turn(
         self, user_input: Any, *, model: Optional[str] = None,
         reasoning_effort: Optional[str] = None, turn_timeout: float = 600.0,
@@ -515,11 +671,12 @@ class CodexAppServerSession:
             )
             return False
 
-        def on_server_request(sreq: dict) -> bool:
+        def on_server_request(sreq: dict) -> tuple[bool, bool]:
             nonlocal last_tool_completion_at
             # Drain pending notifications first (bounded) so _pending_file_changes is
             # current for the approval decision and display events still reach on_event.
             turn_complete = False
+            made_progress = False
             for _ in range(8):
                 pending = client.take_notification(timeout=0)
                 if pending is None:
@@ -527,6 +684,7 @@ class CodexAppServerSession:
                 if not _notification_belongs_to_turn(pending, thread_id=self._thread_id, turn_id=result.turn_id):
                     logger.debug("ignoring foreign codex notification while draining server request: method=%s", pending.get("method"))
                     continue
+                made_progress = self._record_notification_activity(pending, result) or made_progress
                 proj, aborted = self._absorb_notification(result, projector, pending)
                 if proj.is_tool_iteration:
                     last_tool_completion_at = time.monotonic()
@@ -534,14 +692,14 @@ class CodexAppServerSession:
             self._handle_server_request(sreq)
             # An approval round-trip is live signal — don't let it trip the quiet warning.
             last_tool_completion_at = None
-            return turn_complete
+            return turn_complete, made_progress
 
-        def on_note(note: dict, method: str) -> bool:
+        def on_note(note: dict, method: str, made_progress: bool) -> bool:
             nonlocal last_tool_completion_at
             projection, aborted = self._absorb_notification(result, projector, note)
             if projection.is_tool_iteration:
                 last_tool_completion_at = time.monotonic()
-            elif projection.messages or projection.final_text is not None:
+            elif made_progress or projection.messages or projection.final_text is not None:
                 last_tool_completion_at = None
             if method != "turn/completed":
                 return aborted
@@ -555,30 +713,32 @@ class CodexAppServerSession:
         self._drive_turn(
             result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,
             timeout_label="turn", before_poll=warn_if_quiet, on_server_request=on_server_request,
-            on_note=on_note, accept_final_text_at_deadline=True,
+            on_note=on_note, accept_final_text_after_silence=True,
         )
         with self._active_turn_lock:
             self._active_turn_id = None
 
     def _drive_turn(
         self, result: TurnResult, *, turn_timeout: float, notification_poll_timeout: float,
-        timeout_label: str, on_server_request: Callable[[dict], bool],
-        on_note: Callable[[dict, str], bool], before_poll: Optional[Callable[[], bool]] = None,
+        timeout_label: str, on_server_request: Callable[[dict], tuple[bool, bool]],
+        on_note: Callable[[dict, str, bool], bool], before_poll: Optional[Callable[[], bool]] = None,
         pre_scope_filter: Optional[Callable[[dict, str], bool]] = None,
-        accept_final_text_at_deadline: bool = False,
+        accept_final_text_after_silence: bool = False,
     ) -> None:
-        """Shared poll loop for run_turn / compact_thread until turn/completed or deadline.
+        """Shared poll loop for run_turn / compact_thread until completion or silence.
 
         Per iteration: interrupt -> subprocess death -> ``before_poll`` (quiet warning) ->
         server requests (answered first so codex isn't blocked) -> one notification,
         filtered by ``pre_scope_filter`` then turn scope, handed to ``on_note``. Hooks
-        return True to complete the turn. Deadline without completion interrupts and
-        retires the session.
+        ``on_server_request`` returns ``(turn_complete, made_progress)``; ``on_note``
+        receives that same progress decision and returns whether the turn completed.
+        ``turn_timeout`` is an inactivity window:
+        only attributable substantive progress resets it. Silence interrupts and retires.
         """
-        deadline = time.monotonic() + turn_timeout
+        last_progress_at = time.monotonic()
         turn_complete = False
         client = self._client
-        while time.monotonic() < deadline and not turn_complete:
+        while (time.monotonic() - last_progress_at) < turn_timeout and not turn_complete:
             if self._interrupt_event.is_set():
                 self._issue_interrupt(result.turn_id)
                 result.interrupted = True
@@ -590,10 +750,12 @@ class CodexAppServerSession:
             sreq = client.take_server_request(timeout=0)
             if sreq is not None:
                 try:
-                    turn_complete = on_server_request(sreq)
+                    turn_complete, made_progress = on_server_request(sreq)
                 except CodexAppServerTransportError as exc:
                     self._retire(result, self._format_error_with_stderr("codex app-server request response failed", exc))
                     break
+                if made_progress:
+                    last_progress_at = time.monotonic()
                 continue
             note = client.take_notification(timeout=notification_poll_timeout)
             if note is None:
@@ -604,11 +766,14 @@ class CodexAppServerSession:
             if not _notification_belongs_to_turn(note, thread_id=self._thread_id, turn_id=result.turn_id):
                 logger.debug("ignoring foreign codex notification: method=%s", method)
                 continue
-            turn_complete = on_note(note, method)
+            made_progress = self._record_notification_activity(note, result)
+            if made_progress:
+                last_progress_at = time.monotonic()
+            turn_complete = on_note(note, method, made_progress)
 
-        if accept_final_text_at_deadline and not turn_complete and not result.interrupted and result.final_text and result.error is None:
+        if accept_final_text_after_silence and not turn_complete and not result.interrupted and result.final_text and result.error is None:
             logger.warning(
-                "codex app-server turn reached deadline after a completed assistant message but before "
+                "codex app-server turn went silent after a completed assistant message but before "
                 "turn/completed; accepting the assistant text as the terminal response"
             )
             turn_complete = True
@@ -617,7 +782,9 @@ class CodexAppServerSession:
             self._issue_interrupt(result.turn_id)
             result.interrupted = True
             if not result.error:
-                result.error = self._format_error_with_stderr(f"{timeout_label} timed out after {turn_timeout}s")
+                result.error = self._format_error_with_stderr(
+                    f"{timeout_label} made no progress for {turn_timeout}s"
+                )
             result.should_retire = True
 
     def compact_thread(
@@ -655,7 +822,7 @@ class CodexAppServerSession:
                 return False
             return True
 
-        def on_note(note: dict, method: str) -> bool:
+        def on_note(note: dict, method: str, _made_progress: bool) -> bool:
             _, aborted = self._absorb_notification(result, projector, note)
             if method not in {"turn/started", "turn/completed"}:
                 return aborted
@@ -672,9 +839,9 @@ class CodexAppServerSession:
                 self._set_classified_error(result, f"compact turn ended status={turn_status}", err_msg, err_msg)
             return True
 
-        def on_server_request(sreq: dict) -> bool:
+        def on_server_request(sreq: dict) -> tuple[bool, bool]:
             self._handle_server_request(sreq)
-            return False
+            return False, False
 
         self._drive_turn(
             result, turn_timeout=turn_timeout, notification_poll_timeout=notification_poll_timeout,

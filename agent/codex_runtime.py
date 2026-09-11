@@ -268,122 +268,6 @@ _MCP_LIKE_ITEM_TYPES = {"mcpToolCall", "dynamicToolCall"}
 # Item types whose preview is the first 120 chars of one string field.
 _PREVIEW_FIELDS = {"commandExecution": "command", "webSearch": "query"}
 
-# App-server notifications are also the native turn-liveness signal. Keep this
-# allowlist deliberately explicit: transport/lifecycle frames (and unknown
-# future frames) are not evidence that the model or a tool is progressing.
-_CODEX_APP_SERVER_DELTA_METHODS = frozenset({
-    "item/agentMessage/delta",
-    "item/plan/delta",
-    "item/reasoning/delta",  # legacy Codex builds
-    "item/reasoning/summaryDelta",  # legacy Codex builds
-    "item/reasoning/summaryTextDelta",
-    "item/reasoning/textDelta",
-    "item/commandExecution/outputDelta",
-    "item/fileChange/outputDelta",  # deprecated, retained by Codex for compatibility
-})
-_CODEX_APP_SERVER_TOOL_ITEM_TYPES = frozenset({
-    # Tool-shaped ThreadItem variants in the app-server protocol. The bridge
-    # only projects the subset it knows how to display; liveness observes the
-    # full lifecycle so a newly supported native tool cannot look silent.
-    "commandExecution",
-    "fileChange",
-    "mcpToolCall",
-    "dynamicToolCall",
-    "collabAgentToolCall",
-    "webSearch",
-    "imageView",
-    "sleep",
-    "imageGeneration",
-    "subAgentActivity",
-})
-_CODEX_APP_SERVER_STRUCTURED_PROGRESS_FIELDS = {
-    "item/fileChange/patchUpdated": ("patch", "changes"),
-    "item/mcpToolCall/progress": ("message",),
-    "item/commandExecution/terminalInteraction": ("stdin",),
-}
-
-
-def _codex_app_server_has_nonempty_sequence(value: Any) -> bool:
-    """Whether a protocol list contains at least one real (non-empty) entry."""
-    return isinstance(value, list) and any(
-        (isinstance(entry, str) and entry.strip()) or isinstance(entry, dict) and bool(entry)
-        for entry in value
-    )
-
-
-def _codex_app_server_event_progress(note: dict) -> str | None:
-    """Return an activity label for substantive native turn progress.
-
-    This classifier runs in the bridge, before any optional display callback,
-    so liveness does not depend on streaming or a UI hook being installed. It
-    is intentionally conservative: malformed events, empty deltas,
-    boundary-only frames, polling/keepalive, and unknown notifications return
-    ``None``. The session's thread/turn fence runs before this bridge; direct
-    bridge tests therefore only need the substantive payload shape.
-    """
-    if not isinstance(note, dict):
-        return None
-    method = note.get("method")
-    params = note.get("params")
-    if not isinstance(method, str) or not isinstance(params, dict):
-        return None
-
-    if method in _CODEX_APP_SERVER_DELTA_METHODS:
-        delta = params.get("delta")
-        return f"codex app-server progress: {method}" if isinstance(delta, str) and delta.strip() else None
-
-    if method == "turn/diff/updated":
-        return (
-            f"codex app-server progress: {method}"
-            if isinstance(params.get("diff"), str) and params["diff"].strip()
-            else None
-        )
-
-    if method == "turn/plan/updated":
-        return (
-            f"codex app-server progress: {method}"
-            if _codex_app_server_has_nonempty_sequence(params.get("plan"))
-            else None
-        )
-
-    if method == "item/started" or method == "item/completed":
-        item = params.get("item")
-        if not isinstance(item, dict):
-            return None
-        item_type = item.get("type")
-        item_id = item.get("id")
-        if not (isinstance(item_id, str) and item_id.strip()):
-            return None
-        if isinstance(item_type, str) and item_type in _CODEX_APP_SERVER_TOOL_ITEM_TYPES:
-            return f"codex app-server progress: {method} ({item_type})"
-        if method != "item/completed":
-            return None
-        if item_type == "agentMessage":
-            substantive = isinstance(item.get("text"), str) and bool(item["text"].strip())
-        elif item_type == "plan":
-            substantive = isinstance(item.get("text"), str) and bool(item["text"].strip())
-        elif item_type == "reasoning":
-            substantive = (
-                _codex_app_server_has_nonempty_sequence(item.get("summary"))
-                or _codex_app_server_has_nonempty_sequence(item.get("content"))
-            )
-        else:
-            # Context compaction and other lifecycle-only items are boundaries,
-            # not forward progress for the active turn.
-            substantive = False
-        return f"codex app-server progress: {method} ({item_type})" if substantive else None
-
-    fields = _CODEX_APP_SERVER_STRUCTURED_PROGRESS_FIELDS.get(method)
-    if fields is not None:
-        substantive = any(
-            (isinstance(params.get(field), str) and params[field].strip())
-            or (field == "changes" and _codex_app_server_has_nonempty_sequence(params.get(field)))
-            for field in fields
-        )
-        return f"codex app-server progress: {method}" if substantive else None
-    return None
-
-
 def _item_changes(item: dict) -> list[dict]:
     return [c for c in (item.get("changes") or []) if isinstance(c, dict)]
 
@@ -540,16 +424,6 @@ def make_codex_app_server_event_bridge(agent) -> Callable[[dict], None]:
     }
 
     def on_event(note: dict) -> None:
-        # Activity is a native transport concern, not a display concern. The
-        # session invokes this bridge only after its thread/turn ownership
-        # fence, so late foreign notifications cannot refresh a later turn.
-        if (progress_label := _codex_app_server_event_progress(note)) is not None:
-            _call_guarded(
-                getattr(agent, "_touch_activity", None),
-                "_touch_activity raised for Codex app-server progress: %s",
-                progress_label,
-                args=(progress_label,),
-            )
         method = note.get("method") if isinstance(note, dict) else None
         handler = handlers.get(method) if isinstance(method, str) else None
         if handler is not None:
@@ -703,6 +577,7 @@ def _ensure_codex_session(agent, messages: List[Dict[str, Any]] | None = None) -
         model=getattr(agent, "model", None), model_provider=model_provider,
         reasoning_effort=_codex_reasoning_effort(agent), config_overrides=config_overrides,
         resume_thread_id=resume_thread_id, history_seed=history_seed,
+        on_activity=getattr(agent, "_touch_activity", None),
     )
 
 
