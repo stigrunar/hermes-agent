@@ -319,6 +319,19 @@ def _argv_scoped_to_other_home(argv: Sequence[str], db_path: Path) -> bool:
     return other_home_seen
 
 
+def _is_non_file_fd_target(target: str) -> bool:
+    """Return whether procfs identifies *target* as a non-file descriptor.
+
+    ``/proc/<pid>/fd`` renders pipes, sockets, and kernel-backed descriptors as
+    pseudo-targets such as ``pipe:[123]``.  A failed ``stat`` for one of those
+    descriptors carries no state.db identity.  Any ordinary pathname remains
+    unknown when its descriptor cannot be stat'ed and therefore keeps the
+    repair gate closed, including hardlinks and renamed database files.
+    """
+    value = target.removesuffix(" (deleted)")
+    return value.startswith(("pipe:[", "socket:[", "anon_inode:", "memfd:"))
+
+
 def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
     """Return foreign holders of the DB or one of its WAL sidecars.
 
@@ -405,7 +418,7 @@ def foreign_state_db_holders(db_path: Path) -> List[Tuple[int, str]]:
                             holders.append(
                                 (pid, f"uninspectable descriptor: {target}: {exc}")
                             )
-                        else:
+                        elif not _is_non_file_fd_target(target):
                             argv = _read_proc_argv(pid)
                             if (
                                 argv is not None

@@ -403,6 +403,8 @@ def claim_due_deferred(
                     "chat_id": chat_id, "thread_id": thread_id, "content": content,
                     "profile": expected_profile, "attempts": attempts + 1,
                     "retry_not_before": due,
+                    "needs_marker": attempts > 0,
+                    **({"marker": RECONNECTED_MARKER} if attempts > 0 else {}),
                 }
     return None
 
@@ -582,28 +584,51 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     return claimed
 
 
-def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
-    """This process's failed rows that still await redelivery, one entry per adapter identity with the
-    earliest deadline (``not_before``). The runner arms one redelivery timer per entry, so a row adopted
-    at boot, skipped because its wait had not passed, or rejected again is never stranded. Rows past the
-    attempts cap or stale cutoff are left for the sweeps to abandon."""
+def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
+    """Rows that still await deadline-driven redelivery, one entry per adapter identity.
+
+    Failed flood rows remain process-owned because their reconnect retry belongs
+    to the gateway that attempted the send.  Deferred rows are the legacy
+    durable form and may have no owner after an older process exits, so they are
+    discovered by every gateway and claimed atomically by ``claim_due_deferred``.
+    A live foreign claim is still ignored; an ``attempting`` row whose owner is
+    dead is eligible for the same recovery path.
+    Rows past the attempts cap or stale cutoff are left for the sweeps to
+    abandon.
+    """
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
-    if started is None:
-        return []
     with _DB_LOCK, _transaction() as conn:
         rows = conn.execute(
-            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at
+            """SELECT platform, adapter_profile, updated_at, last_error, attempts, created_at,
+                      retry_not_before, state, owner_pid, owner_started_at
                FROM delivery_obligations
-               WHERE state='failed' AND owner_pid IS ? AND owner_started_at IS ?""", (pid, started)).fetchall()
+               WHERE (state='failed' AND owner_pid IS ? AND owner_started_at IS ?
+                      AND last_error IS NOT NULL)
+                  OR (state IN ('deferred', 'attempting')
+                      AND retry_not_before IS NOT NULL)""",
+            (pid, started),
+        ).fetchall()
     earliest: Dict[tuple, float] = {}
-    for platform, adapter_profile, updated_at, last_error, attempts, created_at in rows:
-        # Reconnect-only rows (a claim released because the adapter was gone) are re-claimed by the
-        # reconnect sweep; a timer would claim and release them every tick until the adapter is back.
-        if is_reconnect_only(last_error):
+    for (platform, adapter_profile, updated_at, last_error, attempts, created_at,
+         retry_not_before, state, owner_pid, owner_started_at) in rows:
+        owner_is_current = owner_pid == pid and owner_started_at == started
+        if state == "failed":
+            if started is None or not owner_is_current or not is_flood_error(last_error):
+                continue
+        elif state == "attempting":
+            # A live attempt belongs to another worker; a dead attempt is a
+            # durable deferred obligation that claim_due_deferred can adopt.
+            if owner_is_current or _owner_alive(owner_pid, owner_started_at):
+                continue
+        elif _owner_alive(owner_pid, owner_started_at) and not owner_is_current:
             continue
-        due = retry_not_before(updated_at, last_error, attempts)
-        if due is None or attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
+        if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
             continue
+        due = (
+            float(retry_not_before)
+            if retry_not_before is not None
+            else flood_not_before(updated_at, last_error)
+        )
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:
             earliest[key] = due

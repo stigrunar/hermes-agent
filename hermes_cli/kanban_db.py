@@ -5962,6 +5962,15 @@ def _ctx_header(lines: list[str], task: Task) -> None:
         lines.append(
             f"Continuity proof: {resolved.get('continuity_proof') or 'rollback'}"
         )
+        floor = preflight.get("floor") or {}
+        lines.append(
+            "Invariant floor: "
+            f"mode >= {floor.get('quality_mode') or 'FEATURE'}, "
+            f"risk >= {floor.get('risk_tier') or 'R3'}"
+        )
+        lines.append(
+            "Workers may escalate on concrete evidence, with proportional proof."
+        )
         lines.append("")
     lines.append("")
     if task.body and task.body.strip():

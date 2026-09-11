@@ -344,6 +344,8 @@ def _rule_triage_aux_unavailable(task, events, runs, now, cfg) -> list[Diagnosti
 def _rule_prose_phantom_refs(task, events, runs, now, cfg) -> list[Diagnostic]:
     """Advisory: the completion summary mentions ``t_<hex>`` ids that don't
     resolve. Warning only; clears on a later clean completion."""
+    if _task_field(task, "status") in ("done", "archived", "cancelled"):
+        return []
     hits = _active_hallucination_events(events, "suspected_hallucinated_references")
     if not hits:
         return []
@@ -376,7 +378,7 @@ def _rule_repeated_failures(task, events, runs, now, cfg) -> list[Diagnostic]:
     Exempt: done/archived (a manual done ends no run, so the streak is history)
     and running (a retry in flight must not read as a current failure; re-fires
     if it fails too)."""
-    if _task_field(task, "status") in ("done", "archived", "running"):
+    if _task_field(task, "status") in ("done", "archived", "cancelled", "running"):
         return []
     threshold = _positive_int(_failure_threshold(cfg), 3)
     failure_limit = _positive_int(cfg.get("failure_limit"), threshold)
@@ -475,7 +477,7 @@ def _rule_repeated_crashes(task, events, runs, now, cfg) -> list[Diagnostic]:
             consecutive += 1
             if last_err is None:
                 last_err = _task_field(r, "error")
-        elif outcome in {"completed", "reclaimed"}:
+        elif outcome in {"completed", "reclaimed", "blocked"}:
             break
     if consecutive < threshold:
         return []

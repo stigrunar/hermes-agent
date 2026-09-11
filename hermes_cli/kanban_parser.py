@@ -177,6 +177,8 @@ _SPECS = [
              help="Shared resource required by this execution (repeatable)."),
         _arg("--capability", action="append", dest="required_capabilities",
              help="Explicit worker capability required for dispatch (repeatable)."),
+        _arg("--conversation-lane", dest="conversation_lane_id", help="Bind the task to a conversation lane"),
+        _arg("--topic-target", dest="topic_target", help="Structured conversation target"),
         _TENANT,
         _PRIORITY,
         _arg("--triage", action="store_true",

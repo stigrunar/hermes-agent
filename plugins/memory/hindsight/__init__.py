@@ -722,7 +722,11 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
 
-        if self._mode == "local_embedded":
+        # Tools-only mode exposes explicit Hindsight tools while leaving the
+        # agent turn hooks dormant.  Starting the embedded daemon here would
+        # defeat that contract (and can load the model stack before a tool is
+        # ever used); the client is already lazy and will start on first use.
+        if self._mode == "local_embedded" and self._memory_mode != "tools":
             self._start_embedded_daemon()
 
     def _apply_connection_settings(self, cfg: dict) -> None:
@@ -769,7 +773,7 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def _apply_retain_policy(self, cfg: dict) -> None:
         """Pure-config retain knobs (no env/secret reads; ``{}`` yields the defaults)."""
-        self._auto_retain = cfg.get("auto_retain", True)
+        self._auto_retain = cfg.get("auto_retain", self._memory_mode != "tools")
         self._retain_every_n_turns = max(1, int(cfg.get("retain_every_n_turns", 1)))
         self._retain_context = cfg.get("retain_context", _RETAIN_CONTEXT_DEFAULT)
         self._retain_async = cfg.get("retain_async", True)
