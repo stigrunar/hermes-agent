@@ -201,9 +201,22 @@ def _state_db_health(f: Finding, should_fix: bool, state_db_path: Path, _DHH: st
         # COUNT(*) succeeds even when the FTS index is corrupt and every write fails through the triggers;
         # _db_opens_cleanly drives a rolled-back write to surface that.
         from hermes_state_repair import _db_opens_cleanly
+        from hermes_state_dbfile import collect_state_db_stats
+        logical_size = collect_state_db_stats(state_db_path).get("logical_size_bytes")
+        skip_integrity_check = (
+            not should_fix
+            and logical_size is not None
+            and logical_size > STATE_DB_SIZE_WARN_BYTES
+        )
+        if skip_integrity_check:
+            check_info("PRAGMA integrity_check deferred/skipped due to large DB")
         # `_db_opens_cleanly` now drives a rolled-back write so this otherwise-silent corruption class is
         # surfaced (and repaired in place with --fix). See #50502.
-        _write_reason = _db_opens_cleanly(state_db_path)
+        _write_reason = (
+            _db_opens_cleanly(state_db_path, skip_integrity_check=True)
+            if skip_integrity_check
+            else _db_opens_cleanly(state_db_path)
+        )
         if _write_reason is not None:
             check_warn(f"{_DHH}/state.db fails a write-health probe (FTS index may be corrupt)", f"({_write_reason})")
             _repair_state_db(f, should_fix, state_db_path, "fts")

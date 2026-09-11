@@ -738,33 +738,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     except (TypeError, ValueError):
         timeout = _DEFAULT_TIMEOUT_S
 
-    # Windows: hide the console the .cmd shim would flash (as browser_tool does)
-    popen_extra: dict = {}
-    if os.name == "nt":
-        try:
-            from hermes_cli._subprocess_compat import windows_hide_flags
-
-            popen_extra["creationflags"] = windows_hide_flags()
-            _si = subprocess.STARTUPINFO()
-            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            popen_extra["startupinfo"] = _si
-        except Exception as e:
-            logger.debug("Windows hide-flags unavailable: %s", e)
-
     lease_session = effective_session or "default"
     _touch_browser_session_lease(env, lease_session, task_id)
     started = time.time()
     try:
         try:
-            proc = subprocess.run(
-                cmd,
-                input=code,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                env=env,
-                **popen_extra,
-            )
+            proc = _run_cli_killing_process_group(cmd, code, env, timeout)
         except subprocess.TimeoutExpired:
             return tool_error(
                 f"browser-use exec timed out after {timeout}s. The daemon may "
