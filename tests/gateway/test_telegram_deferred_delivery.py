@@ -289,6 +289,170 @@ async def test_ingress_refusal_is_persisted_then_native_timer_redelivers_ack():
 
 
 @pytest.mark.asyncio
+async def test_ingress_record_cancellation_waits_for_threaded_persistence(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _RecordAdapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+    runner = _runner(MagicMock())
+    adapter = _RecordAdapter.__new__(_RecordAdapter)
+    adapter.gateway_runner = runner
+    adapter._owner_profile = "default"
+    adapter.typed_command_prefix = "!"
+    event = SimpleNamespace(
+        text="question",
+        message_id="m1",
+        source=SimpleNamespace(
+            platform=Platform.TELEGRAM, chat_id="C1", thread_id=None,
+        ),
+    )
+    started = threading.Event()
+    release = threading.Event()
+    original = dl.record_obligation
+
+    def blocking_record(**kwargs):
+        started.set()
+        assert release.wait(timeout=5.0)
+        return original(**kwargs)
+
+    monkeypatch.setattr(dl, "record_obligation", blocking_record)
+    task = asyncio.create_task(
+        adapter._record_delivery_obligation(event, "agent:default:telegram:dm:C1", "answer", adapter, False)
+    )
+    await _wait_for(started.is_set)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "cancellation detached the threaded ledger write"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    obligation_id = dl.compute_obligation_id(
+        "agent:default:telegram:dm:C1", "m1", "answer"
+    )
+    assert _row(obligation_id)[0] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_ingress_finalization_cancellation_waits_for_threaded_ack(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _FinalizeAdapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+    dl.record_obligation(
+        obligation_id="ob-1", session_key="agent:default:telegram:dm:C1",
+        platform="telegram", chat_id="C1", thread_id=None, content="answer ob-1",
+        adapter_profile="default",
+    )
+    dl.mark_attempting("ob-1")
+    runner = _runner(MagicMock())
+    adapter = _FinalizeAdapter.__new__(_FinalizeAdapter)
+    adapter.gateway_runner = runner
+    adapter._owner_profile = "default"
+    event = SimpleNamespace(source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="C1"))
+    started = threading.Event()
+    release = threading.Event()
+    original = dl.mark_delivered
+
+    def blocking_mark_delivered(oid):
+        started.set()
+        assert release.wait(timeout=5.0)
+        return original(oid)
+
+    monkeypatch.setattr(dl, "mark_delivered", blocking_mark_delivered)
+    task = asyncio.create_task(
+        adapter._finalize_delivery_obligation(
+            "ob-1", SendResult(success=True), event, adapter,
+        )
+    )
+    await _wait_for(started.is_set)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done(), "cancellation detached the threaded finalization"
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert _row()[0] == "delivered"
+
+
+@pytest.mark.asyncio
+async def test_flood_finalization_cancellation_still_arms_timer(monkeypatch):
+    from gateway.platforms.base import BasePlatformAdapter
+
+    class _FloodAdapter(BasePlatformAdapter):
+        async def connect(self, *, is_reconnect=False):
+            return True
+
+        async def disconnect(self):
+            return None
+
+        async def send(self, chat_id, content, reply_to=None, metadata=None):
+            return SendResult(success=True)
+
+        async def get_chat_info(self, chat_id):
+            return {}
+
+    dl.record_obligation(
+        obligation_id="ob-1", session_key="agent:default:telegram:dm:C1",
+        platform="telegram", chat_id="C1", thread_id=None, content="answer ob-1",
+        adapter_profile="default",
+    )
+    dl.mark_attempting("ob-1")
+    runner = _runner(MagicMock())
+    schedule = MagicMock()
+    runner._schedule_flood_redelivery = schedule
+    adapter = _FloodAdapter.__new__(_FloodAdapter)
+    adapter.gateway_runner = runner
+    adapter._owner_profile = "default"
+    event = SimpleNamespace(source=SimpleNamespace(platform=Platform.TELEGRAM, chat_id="C1"))
+    started = threading.Event()
+    release = threading.Event()
+    original = dl.mark_failed
+
+    def blocking_mark_failed(oid, error):
+        started.set()
+        assert release.wait(timeout=5.0)
+        return original(oid, error)
+
+    monkeypatch.setattr(dl, "mark_failed", blocking_mark_failed)
+    task = asyncio.create_task(
+        adapter._finalize_delivery_obligation(
+            "ob-1", SendResult(success=False, error="flood_control:30"), event, adapter,
+        )
+    )
+    await _wait_for(started.is_set)
+    task.cancel()
+    await asyncio.sleep(0)
+    assert not task.done()
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    schedule.assert_called_once_with(Platform.TELEGRAM, profile="default")
+    assert _row()[0] == "failed"
+
+
+@pytest.mark.asyncio
 async def test_cancellation_waits_for_real_executor_ledger_call(monkeypatch):
     _record_due()
     started = threading.Event()
