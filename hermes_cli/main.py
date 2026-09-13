@@ -2333,10 +2333,6 @@ def _update_preflight_handled(args) -> bool:
     """Managed-install refusal, --plan, admission gate, --check. True = nothing more to do."""
     from hermes_cli.config import is_managed, managed_error
 
-    if is_managed():
-        managed_error("update Hermes Agent")
-        return True
-
     # --plan is read-only and deployment-kind aware, so it runs BEFORE the
     # docker/nix/apt refusal gates: on an image/package-managed install the
     # plan itself reports "not updatable in place" plus the right mechanism.
@@ -2362,6 +2358,9 @@ def _update_preflight_handled(args) -> bool:
         print(json.dumps(holders, indent=2))
         if holders:
             sys.exit(VENV_HOLDERS_EXIT)
+
+    if is_managed():
+        managed_error("update Hermes Agent")
         return True
 
     # Image/package-managed admission gate: baked provenance marker first
@@ -2381,7 +2380,10 @@ def _update_preflight_handled(args) -> bool:
     refusal = evaluate_update_admission(PROJECT_ROOT)
     if refusal is not None:
         print(refusal.message)
-        record_refusal_receipt(refusal)
+        # A check reports the same admission answer but never creates a
+        # receipt or performs any other write.
+        if not getattr(args, "check", False):
+            record_refusal_receipt(refusal)
         sys.exit(2)
 
     if getattr(args, "check", False):
@@ -2401,6 +2403,12 @@ def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
     from hermes_cli.private_update_adapter import dispatch_private_immutable_update
 
+    # Read-only modes retain the native preflight contract even when the
+    # private external adapter is selected.  The adapter is an activation
+    # boundary and must never reinterpret either option as an activation.
+    if getattr(args, "plan", False) or getattr(args, "check", False):
+        _update_preflight_handled(args)
+        return
     if dispatch_private_immutable_update(args):
         return
     if _update_preflight_handled(args):
