@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -120,6 +121,32 @@ def test_adapter_pins_helper_descriptor_and_passes_exact_candidate(tmp_path, mon
     assert command[command.index("--expected-tree") + 1] == "b" * 40
     assert command[command.index("--expected-request-id") + 1] == "request-1"
     assert "--expected-request-sha256" in command
+
+
+def test_helper_stdin_bootstrap_promotes_helper_path_to_argv_zero(tmp_path):
+    helper_path = tmp_path / "private_release_supervisor.py"
+    source = b"import json, sys; print(json.dumps(sys.argv))\n"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            adapter._HELPER_STDIN_BOOTSTRAP,
+            str(helper_path),
+            "--expected-helper-sha256",
+            "a" * 64,
+        ],
+        input=source,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr.decode()
+    assert json.loads(completed.stdout) == [
+        str(helper_path),
+        "--expected-helper-sha256",
+        "a" * 64,
+    ]
 
 
 def test_external_adapter_fails_closed_without_host_supervisor(tmp_path, monkeypatch):
