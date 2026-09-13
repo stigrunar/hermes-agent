@@ -44,6 +44,200 @@ _GC_INTERVAL_SECONDS = 3600.0
 _HEALTH_WINDOW = 6
 
 
+class _NotificationReceiptError(RuntimeError):
+    """Telegram proof could not be validated or durably stored."""
+
+
+def _verified_telegram_delivery(
+    send_result: Any, requested_thread_id: Any,
+) -> tuple[str, str]:
+    """Validate bounded Telegram Message evidence for the requested target."""
+    message_id = str(getattr(send_result, "message_id", "") or "").strip()
+    if not message_id:
+        raise RuntimeError("Telegram send succeeded without a message_id")
+    raw = getattr(send_result, "raw_response", None)
+    if not isinstance(raw, dict) or "message_thread_id" not in raw:
+        raise RuntimeError("Telegram send returned no concrete thread evidence")
+    returned_thread_ids = [raw["message_thread_id"]]
+    per_message = raw.get("message_receipts")
+    if per_message is not None:
+        if not isinstance(per_message, list) or not per_message:
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if any(
+            not isinstance(item, dict)
+            or not str(item.get("message_id") or "").strip()
+            or "message_thread_id" not in item
+            for item in per_message
+        ):
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if str(per_message[0]["message_id"]).strip() != message_id:
+            raise RuntimeError("Telegram primary message evidence is inconsistent")
+        returned_thread_ids = [item["message_thread_id"] for item in per_message]
+
+    requested = str(requested_thread_id or "").strip()
+    if requested in {"", "1"}:
+        if any(value is not None for value in returned_thread_ids):
+            raise RuntimeError(
+                "Telegram General/root delivery returned unexpected topic evidence"
+            )
+        return message_id, "general_root"
+    try:
+        matches = all(int(value) == int(requested) for value in returned_thread_ids)
+    except (TypeError, ValueError) as exc:
+        raise RuntimeError("Telegram send returned invalid thread evidence") from exc
+    if not matches:
+        raise RuntimeError("Telegram send returned mismatched thread evidence")
+    return message_id, "matched"
+
+
+class _ReceiptAwareKanbanNotification(_KanbanNotification):
+    """Live notifier delivery with durable Telegram target receipts."""
+
+    async def _receipt_exists(self, event_id: int) -> bool:
+        return bool(await _to_thread_process_service(
+            self.runner._kanban_has_notification_receipt,
+            self.sub,
+            event_id,
+            self.board_slug,
+        ))
+
+    async def _record_receipt(
+        self, event_id: int, message_id: str, confirmation: str,
+    ) -> None:
+        await _to_thread_process_service(
+            self.runner._kanban_record_notification_receipt,
+            self.sub,
+            event_id,
+            message_id,
+            confirmation,
+            self.board_slug,
+        )
+
+    async def _send_pings(self) -> bool:
+        """Persist Telegram proof before settling any claimed event cursor."""
+        from gateway.platforms.base import SendResult
+
+        for ev in self.d["events"]:
+            msg = self.format_event(ev)
+            if msg is None:
+                continue
+            if not self.is_push_adapter and self.wake_agent:
+                logger.debug(
+                    "kanban notifier: adapter %s has no push channel; skipping text ping for %s, "
+                    "relying on wake self-post instead",
+                    self.platform_str,
+                    self.task_id,
+                )
+                continue
+            if not self.send_passive:
+                continue
+            try:
+                if self.platform_str == "telegram":
+                    try:
+                        already_receipted = await self._receipt_exists(ev.id)
+                    except Exception as exc:
+                        raise _NotificationReceiptError(
+                            "Telegram notification receipt lookup failed"
+                        ) from exc
+                    if already_receipted:
+                        logger.debug(
+                            "kanban notifier: skipping already-receipted %s event for %s to "
+                            "%s/%s on board %s",
+                            ev.kind,
+                            self.task_id,
+                            self.platform_str,
+                            self.sub["chat_id"],
+                            self.board_slug,
+                        )
+                        self.clear_failures()
+                        continue
+                if ev.id <= self.sub.get("last_ping_event_id", 0):
+                    continue
+
+                delivery_metadata = self.sub.get("delivery_metadata")
+                metadata: dict[str, Any] = (
+                    dict(delivery_metadata)
+                    if isinstance(delivery_metadata, dict)
+                    else {}
+                )
+                if self.sub.get("thread_id") and not metadata.get("thread_id"):
+                    metadata["thread_id"] = self.sub["thread_id"]
+                send_result = await self.adapter.send(
+                    self.sub["chat_id"], msg, metadata=metadata,
+                )
+                if getattr(send_result, "success", True) is False:
+                    raise RuntimeError(
+                        "adapter send() reported failure: "
+                        f"{getattr(send_result, 'error', None) or 'unknown error'}"
+                    )
+                if self.platform_str == "telegram" and isinstance(send_result, SendResult):
+                    try:
+                        message_id, confirmation = _verified_telegram_delivery(
+                            send_result, self.sub.get("thread_id") or "",
+                        )
+                        await self._record_receipt(ev.id, message_id, confirmation)
+                    except Exception as exc:
+                        raise _NotificationReceiptError(
+                            "Telegram notification receipt validation or persistence failed"
+                        ) from exc
+
+                await _to_thread_process_service(partial(
+                    self.runner._kanban_sub_op,
+                    self.board_slug,
+                    "record_notify_ping",
+                    self.sub,
+                    event_id=ev.id,
+                ))
+                logger.debug(
+                    "kanban notifier: delivered %s event for %s to %s/%s on board %s",
+                    ev.kind,
+                    self.task_id,
+                    self.platform_str,
+                    self.sub["chat_id"],
+                    self.board_slug,
+                )
+                if ev.kind == "completed":
+                    try:
+                        await self.runner._deliver_kanban_artifacts(
+                            adapter=self.adapter,
+                            chat_id=self.sub["chat_id"],
+                            metadata=metadata,
+                            event_payload=getattr(ev, "payload", None),
+                            task=self.task,
+                        )
+                    except Exception as exc:
+                        logger.debug(
+                            "kanban notifier: artifact delivery for %s failed: %s",
+                            self.task_id,
+                            exc,
+                        )
+                self.clear_failures()
+            except _NotificationReceiptError as exc:
+                logger.warning(
+                    "kanban notifier: receipt proof failed for %s on %s; rewinding claim: %s",
+                    self.task_id,
+                    self.platform_str,
+                    exc.__cause__ or exc,
+                )
+                await self.rewind()
+                return False
+            except Exception as exc:
+                await self.delivery_failed(
+                    "kanban notifier: send failed for %s on %s (attempt %d/%d): %s",
+                    (self.task_id, self.platform_str),
+                    "kanban notifier: dropping subscription %s on %s after %d consecutive send failures",
+                    exc,
+                    False,
+                )
+                return False
+        return True
+
+
+# Preserve the live split-module notifier while specializing only this facade's
+# delivery construction point.
+_KanbanNotification = _ReceiptAwareKanbanNotification
+
+
 class GatewayKanbanWatchersMixin(GatewayKanbanOwnerMixin):
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
