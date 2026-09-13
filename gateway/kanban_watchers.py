@@ -120,13 +120,13 @@ class GatewayKanbanWatchersMixin:
                 logger.warning("kanban notifier tick failed: %s", exc)
             await self._sleep_between_ticks(interval)
 
-    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> None:
+    def _kanban_sub_op(self, board: Optional[str], op: str, sub: dict, **extra: Any) -> Any:
         """Sync helper (runs in to_thread): call ``kanban_db_notify.<op>`` for one subscription on its board."""
         from hermes_cli import kanban_db_connect as _kbc
         from hermes_cli import kanban_db_notify as _kbn
         conn = _kbc.connect(board=board)
         try:
-            getattr(_kbn, op)(
+            return getattr(_kbn, op)(
                 conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "", **extra,
             )
@@ -138,6 +138,30 @@ class GatewayKanbanWatchersMixin:
 
     def _kanban_unsub(self, sub: dict, board: Optional[str] = None) -> None:
         self._kanban_sub_op(board, "remove_notify_sub", sub)
+
+    def _kanban_has_notification_receipt(
+        self, sub: dict, event_id: int, board: Optional[str] = None,
+    ) -> bool:
+        return bool(self._kanban_sub_op(
+            board, "list_notification_receipts", sub, event_id=event_id,
+        ))
+
+    def _kanban_record_notification_receipt(
+        self,
+        sub: dict,
+        event_id: int,
+        message_id: str,
+        thread_confirmation: str,
+        board: Optional[str] = None,
+    ) -> None:
+        self._kanban_sub_op(
+            board,
+            "record_notification_receipt",
+            sub,
+            event_id=event_id,
+            message_id=message_id,
+            thread_confirmation=thread_confirmation,
+        )
 
     def _kanban_rewind(self, sub: dict, claimed_cursor: int, old_cursor: int, board: Optional[str] = None) -> None:
         """Undo a claimed notification cursor after send failure."""

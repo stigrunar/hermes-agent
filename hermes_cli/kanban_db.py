@@ -1153,6 +1153,23 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Append-only proof that one claimed Kanban event reached one subscription
+-- target. Provider response bodies and credentials never belong here: only
+-- the bounded routing identifiers needed to verify a delivery are retained.
+CREATE TABLE IF NOT EXISTS kanban_notification_receipts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    event_id            INTEGER NOT NULL,
+    platform            TEXT NOT NULL,
+    chat_id             TEXT NOT NULL,
+    thread_id           TEXT NOT NULL DEFAULT '',
+    message_id          TEXT NOT NULL,
+    delivered_at        INTEGER NOT NULL,
+    thread_confirmed    INTEGER NOT NULL CHECK (thread_confirmed IN (0, 1)),
+    thread_confirmation TEXT NOT NULL,
+    UNIQUE (task_id, event_id, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
 CREATE INDEX IF NOT EXISTS idx_links_parent          ON task_links(parent_id);
@@ -1162,6 +1179,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_receipts_task_event
+    ON kanban_notification_receipts(task_id, event_id);
 """
 
 

@@ -451,6 +451,77 @@ def record_notify_ping(
         )
 
 
+def record_notification_receipt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message_id: str,
+    thread_confirmation: str,
+    delivered_at: Optional[int] = None,
+) -> bool:
+    """Append bounded, idempotent delivery proof for one event target."""
+    normalized_message_id = str(message_id).strip()
+    if not normalized_message_id:
+        raise ValueError("notification receipt requires a non-empty message_id")
+    confirmation = str(thread_confirmation).strip()
+    if not confirmation:
+        raise ValueError("notification receipt requires thread confirmation")
+    with _kb.write_txn(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notification_receipts
+                (task_id, event_id, platform, chat_id, thread_id, message_id,
+                 delivered_at, thread_confirmed, thread_confirmation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                task_id,
+                int(event_id),
+                platform,
+                chat_id,
+                thread_id or "",
+                normalized_message_id,
+                int(delivered_at if delivered_at is not None else time.time()),
+                confirmation,
+            ),
+        )
+    return cur.rowcount > 0
+
+
+def list_notification_receipts(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: Optional[int] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> list[dict]:
+    """Read exact bounded receipt rows for task/event/target verification."""
+    clauses = ["task_id = ?"]
+    params: list[Any] = [task_id]
+    for column, value in (
+        ("event_id", event_id),
+        ("platform", platform),
+        ("chat_id", chat_id),
+        ("thread_id", thread_id),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(int(value) if column == "event_id" else value)
+    rows = conn.execute(
+        "SELECT * FROM kanban_notification_receipts WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY id ASC",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def rewind_notify_cursor(
     conn: sqlite3.Connection,
     *,

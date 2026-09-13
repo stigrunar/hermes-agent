@@ -66,6 +66,10 @@ MAX_SEND_FAILURES = 12
 _LOCAL_PATH_RE = re.compile(r"(?<![\w:/])(?:/(?:Users|home|private|tmp|var|etc|workspace)/[^\s,;]+|" r"[A-Za-z]:\\[^\s,;]+)")
 
 
+class _NotificationReceiptPersistenceError(RuntimeError):
+    """Receipt storage failed after a provider send; retry without unsubscribing."""
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -75,6 +79,43 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
     return reason
+
+
+def _verified_telegram_delivery(send_result: Any, requested_thread_id: Any) -> tuple[str, str]:
+    """Return provider-backed ``(message_id, confirmation)`` for a Telegram send."""
+    message_id = str(getattr(send_result, "message_id", "") or "").strip()
+    if not message_id:
+        raise RuntimeError("Telegram send succeeded without a message_id")
+    raw = getattr(send_result, "raw_response", None)
+    if not isinstance(raw, dict) or "message_thread_id" not in raw:
+        raise RuntimeError("Telegram send returned no concrete thread evidence")
+    returned_thread_ids = [raw["message_thread_id"]]
+    per_message = raw.get("message_receipts")
+    if per_message is not None:
+        if not isinstance(per_message, list) or not per_message:
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if any(
+            not isinstance(item, dict)
+            or not str(item.get("message_id") or "").strip()
+            or "message_thread_id" not in item
+            for item in per_message
+        ):
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if str(per_message[0]["message_id"]).strip() != message_id:
+            raise RuntimeError("Telegram primary message evidence is inconsistent")
+        returned_thread_ids = [item["message_thread_id"] for item in per_message]
+    requested = str(requested_thread_id or "").strip()
+    if requested in {"", "1"}:
+        if any(thread_id is not None for thread_id in returned_thread_ids):
+            raise RuntimeError("Telegram General/root delivery returned unexpected topic evidence")
+        return message_id, "general_root"
+    try:
+        matches = all(int(thread_id) == int(requested) for thread_id in returned_thread_ids)
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        raise RuntimeError("Telegram returned thread evidence does not match requested topic")
+    return message_id, "matched"
 
 
 def _wake_scope_id(adapter: Any, sub: dict) -> Optional[str]:
@@ -666,6 +707,20 @@ class _KanbanNotification:
         metadata: dict[str, Any] = dict(delivery_metadata) if isinstance(delivery_metadata, dict) else {}
         if sub.get("thread_id") and not metadata.get("thread_id"):
             metadata["thread_id"] = sub["thread_id"]
+        if self.platform_str == "telegram":
+            try:
+                already_receipted = await _to_thread_process_service(
+                    self.runner._kanban_has_notification_receipt,
+                    sub,
+                    ev.id,
+                    self.board_slug,
+                )
+            except Exception as exc:
+                raise _NotificationReceiptPersistenceError(
+                    "notification receipt lookup failed"
+                ) from exc
+            if already_receipted:
+                return True
         _send_res = None
         async def send_ping():
             nonlocal _send_res
@@ -677,6 +732,26 @@ class _KanbanNotification:
         # "no exception == delivered" contract.
         if getattr(_send_res, "success", True) is False:
             raise RuntimeError(f"adapter send() reported failure: {getattr(_send_res, 'error', None) or 'unknown error'}")
+        if self.platform_str == "telegram":
+            from gateway.platforms.base import SendResult
+
+            if isinstance(_send_res, SendResult):
+                message_id, confirmation = _verified_telegram_delivery(
+                    _send_res, sub.get("thread_id") or ""
+                )
+                try:
+                    await _to_thread_process_service(
+                        self.runner._kanban_record_notification_receipt,
+                        sub,
+                        ev.id,
+                        message_id,
+                        confirmation,
+                        self.board_slug,
+                    )
+                except Exception as exc:
+                    raise _NotificationReceiptPersistenceError(
+                        "notification receipt persistence failed"
+                    ) from exc
         logger.debug("kanban notifier: delivered %s event for %s to %s/%s on board %s",
                      ev.kind, self.task_id, self.platform_str, sub["chat_id"], self.board_slug)
         # Upload artifact paths from the handoff payload / legacy result as
@@ -724,6 +799,15 @@ class _KanbanNotification:
                 ))
                 self.clear_failures()
             except Exception as exc:
+                if isinstance(exc, _NotificationReceiptPersistenceError):
+                    logger.warning(
+                        "kanban notifier: receipt persistence failed for %s on %s; rewinding claim for retry: %s",
+                        self.task_id,
+                        self.platform_str,
+                        exc.__cause__ or exc,
+                    )
+                    await self.rewind()
+                    return False
                 await self.delivery_failed(
                     "kanban notifier: send failed for %s on %s (attempt %d/%d): %s", (self.task_id, self.platform_str),
                     "kanban notifier: dropping subscription %s on %s after %d consecutive send failures", exc, False,

@@ -2,6 +2,7 @@ import asyncio
 import sqlite3
 from pathlib import Path
 
+import pytest
 
 from gateway.config import Platform
 from gateway.kanban_watchers_common import (
@@ -9,6 +10,7 @@ from gateway.kanban_watchers_common import (
     _release_singleton_lock,
 )
 from gateway.run import GatewayRunner
+from gateway.platforms.base import SendResult
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
 from hermes_cli import kanban_db_notify as kbn
@@ -25,6 +27,16 @@ class RecordingAdapter:
     async def handle_message(self, event):
         self.handled.append(event)
         event._gateway_accepted = True
+
+
+class TelegramReceiptAdapter(RecordingAdapter):
+    def __init__(self, result: SendResult):
+        super().__init__()
+        self.result = result
+
+    async def send(self, chat_id, text, metadata=None):
+        await super().send(chat_id, text, metadata=metadata)
+        return self.result
 
 
 class DisconnectedAdapters(dict):
@@ -82,6 +94,239 @@ def _unseen_terminal_events(tid):
         return events
     finally:
         conn.close()
+
+
+def _completed_receipt_case(
+    tmp_path, monkeypatch, result, *, thread_id="42", persistence_fails=False,
+):
+    db_path = tmp_path / "telegram-receipt.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kbc.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="receipt proof", assignee="worker")
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id=thread_id,
+        )
+        kb.complete_task(conn, tid, summary="done")
+        event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (tid,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+    adapter = TelegramReceiptAdapter(result)
+    runner = _make_runner(adapter)
+    if persistence_fails:
+        def fail_persistence(*_args, **_kwargs):
+            raise sqlite3.OperationalError("simulated receipt persistence failure")
+
+        runner._kanban_record_notification_receipt = fail_persistence
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+    return tid, event_id, adapter
+
+
+def test_notifier_persists_matching_telegram_topic_receipt(tmp_path, monkeypatch):
+    tid, event_id, _ = _completed_receipt_case(
+        tmp_path,
+        monkeypatch,
+        SendResult(
+            success=True,
+            message_id="701",
+            raw_response={"message_thread_id": 42},
+        ),
+    )
+
+    conn = kbc.connect()
+    try:
+        receipts = kbn.list_notification_receipts(
+            conn,
+            task_id=tid,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="42",
+        )
+    finally:
+        conn.close()
+    assert len(receipts) == 1
+    assert receipts[0]["message_id"] == "701"
+    assert receipts[0]["thread_confirmed"] == 1
+    assert receipts[0]["thread_confirmation"] == "matched"
+    assert receipts[0]["delivered_at"] > 0
+
+
+def test_batch_retry_skips_event_with_existing_telegram_receipt(tmp_path, monkeypatch):
+    """A later event failure must not resend an earlier proven Telegram event."""
+    db_path = tmp_path / "telegram-batch-retry.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kbc.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="batch retry", assignee="worker")
+        kbn.add_notify_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="42",
+        )
+        kb._append_event(conn, tid, "blocked", {"reason": "first"})
+        kb._append_event(conn, tid, "completed", {"summary": "second"})
+    finally:
+        conn.close()
+
+    class SequenceReceiptAdapter(TelegramReceiptAdapter):
+        def __init__(self):
+            super().__init__(SendResult(success=False, error="unused"))
+            self.results = [
+                SendResult(
+                    success=True,
+                    message_id="801",
+                    raw_response={"message_thread_id": 42},
+                ),
+                SendResult(success=False, error="temporary failure"),
+                SendResult(
+                    success=True,
+                    message_id="802",
+                    raw_response={"message_thread_id": 42},
+                ),
+            ]
+
+        async def send(self, chat_id, text, metadata=None):
+            await super().send(chat_id, text, metadata=metadata)
+            return self.results.pop(0)
+
+    adapter = SequenceReceiptAdapter()
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+    asyncio.run(_run_one_notifier_tick(monkeypatch, _make_runner(adapter)))
+
+    assert len(adapter.sent) == 3
+    conn = kbc.connect()
+    try:
+        receipts = kbn.list_notification_receipts(conn, task_id=tid)
+    finally:
+        conn.close()
+    assert [receipt["message_id"] for receipt in receipts] == ["801", "802"]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        SendResult(success=True, message_id=None, raw_response={"message_thread_id": 42}),
+        SendResult(success=True, message_id="702", raw_response={}),
+        SendResult(success=True, message_id="703", raw_response={"message_thread_id": 99}),
+    ],
+    ids=["missing-message-id", "missing-thread", "mismatched-thread"],
+)
+def test_unproven_telegram_send_rewinds_without_receipt(
+    tmp_path, monkeypatch, result,
+):
+    tid, _, _ = _completed_receipt_case(tmp_path, monkeypatch, result)
+
+    conn = kbc.connect()
+    try:
+        receipts = kbn.list_notification_receipts(conn, task_id=tid)
+        _, unseen = kbn.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="42",
+            kinds=["completed"],
+        )
+    finally:
+        conn.close()
+    assert receipts == []
+    assert [event.kind for event in unseen] == ["completed"]
+
+
+def test_general_root_receipt_requires_explicit_absent_returned_topic(
+    tmp_path, monkeypatch,
+):
+    tid, _, _ = _completed_receipt_case(
+        tmp_path,
+        monkeypatch,
+        SendResult(
+            success=True,
+            message_id="704",
+            raw_response={"message_thread_id": None},
+        ),
+        thread_id="1",
+    )
+    conn = kbc.connect()
+    try:
+        receipts = kbn.list_notification_receipts(conn, task_id=tid)
+    finally:
+        conn.close()
+    assert receipts[0]["thread_id"] == "1"
+    assert receipts[0]["thread_confirmation"] == "general_root"
+
+
+def test_receipt_persistence_failure_rewinds_claim(tmp_path, monkeypatch):
+    tid, _, _ = _completed_receipt_case(
+        tmp_path,
+        monkeypatch,
+        SendResult(
+            success=True,
+            message_id="705",
+            raw_response={"message_thread_id": 42},
+        ),
+        persistence_fails=True,
+    )
+    conn = kbc.connect()
+    try:
+        assert kbn.list_notification_receipts(conn, task_id=tid) == []
+        _, unseen = kbn.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="telegram",
+            chat_id="-100123",
+            thread_id="42",
+            kinds=["completed"],
+        )
+    finally:
+        conn.close()
+    assert [event.kind for event in unseen] == ["completed"]
+
+
+def test_non_telegram_legacy_send_result_contract_remains_accepted(
+    tmp_path, monkeypatch,
+):
+    db_path = tmp_path / "legacy-discord.db"
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(db_path))
+    kbc.init_db()
+    conn = kbc.connect()
+    try:
+        tid = kb.create_task(conn, title="legacy adapter", assignee="worker")
+        kbn.add_notify_sub(
+            conn, task_id=tid, platform="discord", chat_id="channel-1"
+        )
+        kb.complete_task(conn, tid, summary="done")
+    finally:
+        conn.close()
+    adapter = RecordingAdapter()
+    runner = _make_runner(adapter)
+    runner.adapters = {Platform.DISCORD: adapter}
+
+    asyncio.run(_run_one_notifier_tick(monkeypatch, runner))
+
+    assert len(adapter.sent) == 1
+    conn = kbc.connect()
+    try:
+        _, unseen = kbn.unseen_events_for_sub(
+            conn,
+            task_id=tid,
+            platform="discord",
+            chat_id="channel-1",
+            kinds=["completed"],
+        )
+    finally:
+        conn.close()
+    assert unseen == []
 
 
 def test_kanban_notifier_replays_telegram_dm_topic_delivery_metadata(tmp_path, monkeypatch):

@@ -3748,6 +3748,7 @@ class TelegramAdapter(BasePlatformAdapter):
         thread_id = self._metadata_thread_id(metadata)
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
+        message_receipts: List[Dict[str, Any]] = []
         prior = len(delivered)
         for chunk in chunks:
             outcome = await self._send_chunk_with_retries(
@@ -3757,12 +3758,27 @@ class TelegramAdapter(BasePlatformAdapter):
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
-            delivered.append(str(msg.message_id))
+            message_id = str(msg.message_id)
+            returned_thread_id = getattr(msg, "message_thread_id", None)
+            if returned_thread_id is not None:
+                returned_thread_id = int(returned_thread_id)
+            delivered.append(message_id)
+            message_receipts.append({
+                "message_id": message_id,
+                "message_thread_id": returned_thread_id,
+            })
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
             raw_response={
-                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
+                "message_ids": list(delivered),
+                "requested_thread_id": requested_thread_id,
+                "thread_fallback": used_thread_fallback,
+                "message_thread_id": (
+                    message_receipts[0]["message_thread_id"] if message_receipts else None
+                ),
+                "message_receipts": message_receipts,
+            })
 
     @staticmethod
     def _with_partial_send(

@@ -29,6 +29,15 @@ def kanban_home(tmp_path, monkeypatch):
     return home
 
 
+@pytest.fixture(autouse=True)
+def inline_asyncio_to_thread(monkeypatch):
+    """Keep notifier DB offloads deterministic in this hermetic unit module."""
+    async def run_inline(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", run_inline)
+
+
 def _assert_inherited_notify_sub(subs: list[dict]) -> None:
     assert len(subs) == 1
     assert subs[0]["platform"] == "telegram"
@@ -1100,6 +1109,87 @@ def test_migration_backfill_runs_only_on_first_add(kanban_home):
             (task_id,),
         ).fetchone()
     assert row["delivery_mode"] == "notify"
+
+
+def test_notification_receipt_schema_migration_is_additive_and_idempotent(
+    kanban_home,
+):
+    db_path = kb.kanban_db_path()
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="receipt schema migration")
+        kbn.add_notify_sub(
+            conn, task_id=task_id, platform="telegram", chat_id="chat-1"
+        )
+        conn.execute("DROP TABLE kanban_notification_receipts")
+
+    kbc.init_db(db_path)
+    kbc.init_db(db_path)
+
+    with kbc.connect_closing() as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM kanban_notify_subs WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()[0] == 1
+        columns = {
+            row["name"]
+            for row in conn.execute(
+                "PRAGMA table_info(kanban_notification_receipts)"
+            )
+        }
+    assert {
+        "task_id",
+        "event_id",
+        "platform",
+        "chat_id",
+        "thread_id",
+        "message_id",
+        "delivered_at",
+        "thread_confirmed",
+        "thread_confirmation",
+    } <= columns
+
+
+def test_notification_receipt_insert_is_append_only_and_idempotent(kanban_home):
+    with kbc.connect_closing() as conn:
+        task_id = kb.create_task(conn, title="idempotent receipt")
+        kb._append_event(conn, task_id, "completed")
+        event_id = conn.execute(
+            "SELECT MAX(id) FROM task_events WHERE task_id = ?", (task_id,)
+        ).fetchone()[0]
+        assert kbn.record_notification_receipt(
+            conn,
+            task_id=task_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="42",
+            message_id="701",
+            thread_confirmation="matched",
+            delivered_at=100,
+        ) is True
+        assert kbn.record_notification_receipt(
+            conn,
+            task_id=task_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="42",
+            message_id="duplicate-must-not-overwrite",
+            thread_confirmation="matched",
+            delivered_at=200,
+        ) is False
+        receipts = kbn.list_notification_receipts(
+            conn,
+            task_id=task_id,
+            event_id=event_id,
+            platform="telegram",
+            chat_id="chat-1",
+            thread_id="42",
+        )
+
+    assert len(receipts) == 1
+    assert receipts[0]["message_id"] == "701"
+    assert receipts[0]["delivered_at"] == 100
 
 
 # ---------------------------------------------------------------------------
