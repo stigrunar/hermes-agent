@@ -51,6 +51,37 @@ def _owner_wake_first(mapping: Any, *keys: str) -> str:
     return ""
 
 
+def _owner_wake_explicit_lane(
+    odb: Any,
+    conn: Any,
+    *,
+    project_id: str,
+    outcome_id: str,
+    lane_id: Any,
+    topic_target: Any,
+) -> tuple[Optional[Any], str]:
+    """Resolve an explicit task lane without falling back to another route."""
+    lane_token = str(lane_id or "").strip()
+    target = str(topic_target or "").strip()
+    if not lane_token or not target:
+        return None, "explicit conversation lane and topic target are both required"
+    lane = next(
+        (
+            item
+            for item in odb.list_conversation_lanes(conn, project_id)
+            if item.id == lane_token
+        ),
+        None,
+    )
+    if lane is None:
+        return None, "explicit conversation lane does not belong to task project"
+    if lane.outcome_id not in {None, outcome_id}:
+        return None, "explicit conversation lane belongs to another Outcome"
+    if odb.conversation_lane_target(lane) != target:
+        return None, "explicit conversation lane target does not match task topic target"
+    return lane, ""
+
+
 def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
     """Build one bounded, artifact-grounded continuation for Dolly/default."""
     task_id = str(replan.get("task_id") or getattr(task, "id", ""))
@@ -102,7 +133,7 @@ def _owner_wake_prompt(spec: dict[str, Any]) -> str:
         f"Project: {spec.get('project_id') or 'unknown'}",
         f"Outcome: {spec.get('outcome_id') or 'unknown'} ({outcome.get('outcome_key') or 'unknown'})",
         f"Control lane: {lane_target}",
-        f"Lane ID: {lane.get('lane_id') or 'unknown'} · lane_kind=control",
+        f"Lane ID: {lane.get('lane_id') or 'unknown'} · lane_kind={lane.get('lane_kind') or 'unknown'}",
         f"Board/task/event: {spec.get('board') or 'unknown'} / {spec.get('task_id') or 'unknown'} / {spec.get('event_id') or 'unknown'} ({spec.get('event_kind') or 'unknown'})",
         f"Visible owner: {spec.get('visible_owner') or 'unassigned'}",
         f"Current Outcome revision: {spec.get('outcome_revision') or 'unknown'}",
@@ -197,22 +228,45 @@ def _resolve_outcome_owner_wake_spec(
                 elif outcome.archived or str(outcome.state).lower() in {"superseded", "obsolete", "cancelled", "archived"}:
                     status, reason = "stale", "Outcome is archived or superseded"
 
-            controls = [
-                lane for lane in odb.list_conversation_lanes(conn, project_id, outcome_id=outcome.id)
-                if lane.lane_kind == "control"
-            ]
+            task_lane_id = getattr(task, "conversation_lane_id", None)
+            task_topic_target = getattr(task, "topic_target", None)
+            has_explicit_route = bool(
+                str(task_lane_id or "").strip() or str(task_topic_target or "").strip()
+            )
+            lane = None
             owner = str(outcome.visible_owner or "").strip()
             if status == "deliver" and not owner:
                 status, reason = "noop", "Outcome.visible_owner is missing"
-            elif status == "deliver" and len(controls) != 1:
-                status, reason = "noop", "exactly one bound control lane is required"
+            elif status == "deliver" and has_explicit_route:
+                lane, route_error = _owner_wake_explicit_lane(
+                    odb,
+                    conn,
+                    project_id=project_id,
+                    outcome_id=outcome.id,
+                    lane_id=task_lane_id,
+                    topic_target=task_topic_target,
+                )
+                if route_error:
+                    status, reason = "noop", route_error
+            elif status == "deliver":
+                controls = [
+                    item
+                    for item in odb.list_conversation_lanes(
+                        conn, project_id, outcome_id=outcome.id
+                    )
+                    if item.lane_kind == "control"
+                ]
+                if len(controls) != 1:
+                    status, reason = "noop", "exactly one bound control lane is required"
+                else:
+                    lane = controls[0]
             route: dict[str, Any] = {}
-            if controls:
-                lane = controls[0]
+            if lane is not None:
                 route = {
                     "lane_id": lane.id, "platform": lane.platform,
                     "chat_id": lane.chat_id, "thread_id": lane.thread_id or "",
-                    "target": odb.conversation_lane_target(lane), "profile": owner or "",
+                    "target": odb.conversation_lane_target(lane),
+                    "lane_kind": lane.lane_kind, "profile": owner or "",
                 }
             task_data = {
                 "title": str(getattr(task, "title", "") or "")[:512],
@@ -220,8 +274,8 @@ def _resolve_outcome_owner_wake_spec(
                 "mutation_repository": getattr(task, "mutation_repository", None),
                 "mutation_scope": list(getattr(task, "mutation_scope", None) or []),
                 "mutation_base_ref": getattr(task, "mutation_base_ref", None),
-                "topic_target": getattr(task, "topic_target", None),
-                "conversation_lane_id": getattr(task, "conversation_lane_id", None),
+                "topic_target": task_topic_target,
+                "conversation_lane_id": task_lane_id,
             }
             human_gate = any(
                 _owner_wake_truthy(event_payload.get(key)) or _owner_wake_truthy(body_fields.get(key))
@@ -283,17 +337,41 @@ class GatewayKanbanOwnerMixin:
             outcome = odb.get_outcome(conn, spec.get("outcome_id") or "", project_id=spec.get("project_id") or "")
             if outcome is None or odb.outcome_owner_wake_revision(outcome) != str(spec.get("outcome_revision") or ""):
                 return False
-            routes = [lane for lane in odb.list_conversation_lanes(conn, outcome.project_id, outcome_id=outcome.id) if lane.lane_kind == "control"]
             route = spec.get("route") or {}
-            if len(routes) != 1:
+            task = spec.get("task") or {}
+            lane_id = task.get("conversation_lane_id")
+            topic_target = task.get("topic_target")
+            if str(lane_id or "").strip() or str(topic_target or "").strip():
+                lane, route_error = _owner_wake_explicit_lane(
+                    odb,
+                    conn,
+                    project_id=outcome.project_id,
+                    outcome_id=outcome.id,
+                    lane_id=lane_id,
+                    topic_target=topic_target,
+                )
+                if route_error:
+                    return False
+            else:
+                routes = [
+                    item
+                    for item in odb.list_conversation_lanes(
+                        conn, outcome.project_id, outcome_id=outcome.id
+                    )
+                    if item.lane_kind == "control"
+                ]
+                if len(routes) != 1:
+                    return False
+                lane = routes[0]
+            if lane is None:
                 return False
-            lane = routes[0]
             return (
                 str(outcome.visible_owner or "").strip() == str(route.get("profile") or "").strip()
                 and lane.id == str(route.get("lane_id") or "")
                 and lane.platform == str(route.get("platform") or "").strip().lower()
                 and lane.chat_id == str(route.get("chat_id") or "").strip()
                 and (lane.thread_id or "") == str(route.get("thread_id") or "")
+                and odb.conversation_lane_target(lane) == str(route.get("target") or "").strip()
             )
         finally:
             conn.close()
