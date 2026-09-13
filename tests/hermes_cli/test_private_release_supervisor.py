@@ -527,6 +527,54 @@ def test_staged_payload_hash_rejects_concurrent_changes(tmp_path, monkeypatch, b
         supervisor._hash_staged_payload(artifact, "artifact", boundary=boundary)
 
 
+@pytest.mark.parametrize("change", ["replace", "text", "remove", "regular"])
+def test_manifested_symlink_change_during_target_hash_is_rejected(tmp_path, monkeypatch, change):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    state, _, payload, _ = _fixture(tmp_path, "symlink-race")
+    runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"
+    link = runtime / "venv/bin/python"
+    target = link.resolve(strict=True)
+    target_info = target.stat()
+    original_hash = supervisor._hash_staged_payload
+    original_read = supervisor.os.read
+    hashing_link = False
+    changed = False
+
+    def hash_payload(path, label, **kwargs):
+        nonlocal hashing_link
+        hashing_link = label == "resolved staged symlink target venv/bin/python"
+        try:
+            return original_hash(path, label, **kwargs)
+        finally:
+            hashing_link = False
+
+    def read_and_change(fd, size):
+        nonlocal changed
+        block = original_read(fd, size)
+        if block and hashing_link and not changed:
+            info = supervisor.os.fstat(fd)
+            assert (info.st_dev, info.st_ino) == (target_info.st_dev, target_info.st_ino)
+            changed = True
+            replacement = tmp_path / "replacement"
+            if change == "remove":
+                link.unlink()
+            elif change == "regular":
+                _write(replacement, target.read_bytes())
+                replacement.replace(link)
+            else:
+                # Both texts resolve to the unchanged, approved target.
+                replacement.symlink_to("./python3" if change == "text" else "python3")
+                replacement.replace(link)
+        return block
+
+    monkeypatch.setattr(supervisor, "_hash_staged_payload", hash_payload)
+    monkeypatch.setattr(supervisor.os, "read", read_and_change)
+    with pytest.raises(supervisor.RequestValidationError, match="staged symlink changed"):
+        parse_sealed_request(payload, state_dir=state)
+    assert changed
+
+
 def test_manifested_external_dependency_symlink_fails_before_operations(tmp_path):
     state, policy, payload, originals = _fixture(tmp_path, "external-dependency")
     runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"

@@ -497,6 +497,24 @@ def seal_private_release_request(
     }
 
 
+def _staged_symlink_snapshot(path: Path) -> tuple[tuple[int, ...], str]:
+    identity = lambda value: (
+        value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+        value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+    )
+    try:
+        before = path.lstat()
+        target = os.readlink(path)
+        after = path.lstat()
+    except OSError as exc:
+        raise RequestValidationError(f"staged symlink changed while being validated: {path}") from exc
+    if not stat.S_ISLNK(before.st_mode) or identity(before) != identity(after):
+        raise RequestValidationError(f"staged symlink changed while being validated: {path}")
+    if before.st_uid != os.getuid():
+        raise RequestValidationError(f"staged symlink has the wrong owner: {path}")
+    return identity(before), target
+
+
 def _validate_evidence(request: PrivateReleaseRequest) -> None:
     publication = _exact(
         _read_json(
@@ -564,10 +582,8 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
             )
             if link["type"] != "symlink" or not artifact_path.is_symlink():
                 raise RequestValidationError(f"staged symlink artifact mismatch: {relative}")
-            link_info = artifact_path.lstat()
-            if link_info.st_uid != os.getuid():
-                raise RequestValidationError(f"staged symlink has the wrong owner: {relative}")
-            target = os.readlink(artifact_path)
+            link_snapshot = _staged_symlink_snapshot(artifact_path)
+            target = link_snapshot[1]
             if target != _string(link["target"], f"symlink target {relative}"):
                 raise RequestValidationError(f"staged symlink target mismatch: {relative}")
             try:
@@ -581,9 +597,14 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
                     raise RequestValidationError(
                         f"staged symlink crosses an unapproved runtime boundary: {relative}"
                     )
+            # Bind the policy-checked link to the resolved path before hashing it.
+            if _staged_symlink_snapshot(artifact_path) != link_snapshot:
+                raise RequestValidationError(f"staged symlink changed before hashing: {relative}")
             target_digest = _hash_staged_payload(
                 resolved_target, f"resolved staged symlink target {relative}", boundary=True
             )
+            if _staged_symlink_snapshot(artifact_path) != link_snapshot:
+                raise RequestValidationError(f"staged symlink changed while being hashed: {relative}")
             if target_digest != _digest(
                 link["target_sha256"], f"symlink target digest {relative}", sha256=True
             ):
