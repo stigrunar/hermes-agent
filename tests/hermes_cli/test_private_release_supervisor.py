@@ -3,21 +3,28 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
 
 from hermes_cli.private_release_supervisor import (
+    CandidateIdentity,
     POLICY_SCHEMA,
     PUBLICATION_SCHEMA,
     SCHEMA_VERSION,
     STAGE_SCHEMA,
+    PrivateReleaseError,
+    ProductionOperations,
+    PrivateReleaseRequest,
     SupervisorOperations,
     execute_private_release,
     parse_host_policy,
     parse_sealed_request,
     seal_private_release_request,
     sha256_bytes,
+    _validate_private_git_state,
 )
 
 COMMIT = "a" * 40
@@ -32,6 +39,12 @@ def _write(path: Path, data: bytes, mode: int = 0o600) -> str:
 
 
 def _policy_value(root: Path, home: Path) -> dict:
+    gateway_wrapper = root / "scripts/hermes_gateway_with_x11.sh"
+    dispatcher_wrapper = root / "scripts/kanban_safe_dispatch_loop.py"
+    gateway_wrapper_digest = _write(gateway_wrapper, b"#!/bin/sh\nexec \"$@\"\n", 0o700)
+    dispatcher_wrapper_digest = _write(dispatcher_wrapper, b"#!/usr/bin/env python3\n", 0o700)
+    python_path = Path(sys.executable).resolve()
+    python_digest = sha256_bytes(python_path.read_bytes())
     units = [
         ("hermes-gateway.service", "gateway", root),
         ("hermes-gateway-dollydesign.service", "gateway", root / "profiles/dollydesign"),
@@ -45,8 +58,14 @@ def _policy_value(root: Path, home: Path) -> dict:
         "version": SCHEMA_VERSION,
         "os_home": str(home),
         "runtime_root": str(root / "runtime"),
-        "gateway_wrapper": str(root / "scripts/hermes_gateway_with_x11.sh"),
-        "dispatcher_wrapper": str(root / "scripts/kanban_safe_dispatch_loop.py"),
+        "gateway_wrapper": str(gateway_wrapper),
+        "dispatcher_wrapper": str(dispatcher_wrapper),
+        "activation_files": {
+            "gateway_wrapper_sha256": gateway_wrapper_digest,
+            "dispatcher_wrapper_sha256": dispatcher_wrapper_digest,
+            "python_path": str(python_path),
+            "python_sha256": python_digest,
+        },
         "default_state_db": {
             "path": str(root / "state.db"),
             "backup_integrity": "excluded",
@@ -82,6 +101,8 @@ def _fixture(tmp_path: Path, request_id: str = "request-1"):
     identity = json.dumps({"commit": COMMIT, "tree": TREE}, sort_keys=True).encode()
     identity_digest = _write(runtime / "private-release-identity.json", identity)
     artifact_digest = _write(runtime / "candidate.txt", b"candidate artifact\n")
+    python_digest = _write(runtime / "venv/bin/python3", b"candidate interpreter\n", 0o700)
+    (runtime / "venv/bin/python").symlink_to("python3")
     stage_manifest = {
         "schema": STAGE_SCHEMA,
         "version": SCHEMA_VERSION,
@@ -90,6 +111,10 @@ def _fixture(tmp_path: Path, request_id: str = "request-1"):
         "artifacts": {
             "private-release-identity.json": identity_digest,
             "candidate.txt": artifact_digest,
+            "venv/bin/python3": python_digest,
+            "venv/bin/python": {
+                "type": "symlink", "target": "python3", "target_sha256": python_digest,
+            },
         },
     }
     stage_bytes = json.dumps(stage_manifest, sort_keys=True).encode()
@@ -97,12 +122,15 @@ def _fixture(tmp_path: Path, request_id: str = "request-1"):
     publication = {
         "schema": PUBLICATION_SCHEMA,
         "version": SCHEMA_VERSION,
+        "repository": "stigrunar/hermes-agent-review",
+        "ref": "release/stig-tested-r12",
+        "prior_ref": "release/stig-tested-r12",
+        "prior_commit": "c" * 40,
         "commit": COMMIT,
         "tree": TREE,
-        "remote": "private-origin",
-        "ref": "refs/releases/candidate",
-        "private": True,
-        "verified": True,
+        "merge_base": "c" * 40,
+        "fast_forward": True,
+        "forced": False,
     }
     publication_bytes = json.dumps(publication, sort_keys=True).encode()
     publication_digest = _write(
@@ -168,7 +196,9 @@ def _operations(policy, originals, calls, *, fail_unit=None):
         calls.append(("release", "drains"))
         return True
 
-    return SupervisorOperations(prepare, quiesce, replace, restart, health, canary, release)
+    return SupervisorOperations(
+        prepare, quiesce, replace, restart, health, canary, release, lambda _request: True
+    )
 
 
 def test_request_has_only_identity_and_digests_and_derives_every_path(tmp_path):
@@ -212,6 +242,9 @@ def test_success_journals_then_updates_all_six_bindings(tmp_path):
     assert (state / "receipts/success.prestate.json").is_file()
     journal = json.loads((state / "receipts/success.journal.json").read_text())
     assert journal["phase"] == "committed_before_drain_release"
+    rollback = state / "receipts/success.rollback.json"
+    assert rollback.stat().st_mode & 0o777 == 0o600
+    assert journal["rollback_bundle_sha256"] == sha256_bytes(rollback.read_bytes())
     assert result["default_profile_state_db"] == {
         "backup_integrity": "excluded", "restore": "forbidden", "verified": False,
     }
@@ -260,3 +293,282 @@ def test_evidence_symlink_fails_before_operations(tmp_path):
     assert result["status"] == "rejected"
     assert calls == []
     assert result["mutated_units"] == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("repository", "NousResearch/hermes-agent"),
+        ("repository", "origin"),
+        ("ref", "main"),
+        ("forced", True),
+        ("fast_forward", False),
+        ("merge_base", "d" * 40),
+    ],
+)
+def test_publication_evidence_rejects_wrong_destination_or_history(tmp_path, field, value):
+    state, policy, payload, originals = _fixture(tmp_path, f"publication-{field}")
+    publication = state / "receipts" / f"{COMMIT}.private-publication.json"
+    body = json.loads(publication.read_text())
+    body[field] = value
+    raw = json.dumps(body, sort_keys=True).encode()
+    payload["private_publication_sha256"] = _write(publication, raw)
+    calls = []
+    result = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
+    )
+    assert result["status"] == "rejected"
+    assert calls == []
+
+
+def test_assertion_only_publication_receipt_fails_closed(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "assertion-only")
+    publication = state / "receipts" / f"{COMMIT}.private-publication.json"
+    raw = json.dumps({
+        "schema": PUBLICATION_SCHEMA, "version": SCHEMA_VERSION,
+        "commit": COMMIT, "tree": TREE, "remote": "private-origin",
+        "ref": "release/stig-tested-r12", "private": True, "verified": True,
+    }, sort_keys=True).encode()
+    payload["private_publication_sha256"] = _write(publication, raw)
+    calls = []
+    result = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
+    )
+    assert result["status"] == "rejected"
+    assert calls == []
+
+
+def test_publication_is_grounded_in_fixed_private_remote_ref_and_reflog(tmp_path, monkeypatch):
+    root = tmp_path / "hermes"
+    state = root / "private-update"
+    receipts = state / "receipts"
+    runtime = root / "runtime" / "candidate"
+    receipts.mkdir(parents=True)
+    receipts.chmod(0o700)
+    runtime.mkdir(parents=True)
+    repository = root / "hermes-agent"
+    repository.mkdir()
+
+    def git(*args):
+        return subprocess.run(
+            ["git", "-C", str(repository), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8", "LC_ALL": "C.UTF-8"},
+        ).stdout.strip()
+
+    git("init")
+    git("config", "user.name", "R13 Test")
+    git("config", "user.email", "r13@example.invalid")
+    git("config", "core.logAllRefUpdates", "true")
+    git("remote", "add", "private-review", "git@github.com:stigrunar/hermes-agent-review.git")
+    (repository / "artifact").write_text("prior\n")
+    git("add", "artifact")
+    git("commit", "-m", "prior")
+    prior = git("rev-parse", "HEAD")
+    (repository / "artifact").write_text("candidate\n")
+    git("commit", "-am", "candidate")
+    commit = git("rev-parse", "HEAD")
+    tree = git("rev-parse", "HEAD^{tree}")
+    tracking = "refs/remotes/private-review/release/stig-tested-r13"
+    git("update-ref", "-m", "prior", tracking, prior)
+    git("update-ref", "-m", "fast-forward", tracking, commit, prior)
+
+    publication = {
+        "schema": PUBLICATION_SCHEMA, "version": SCHEMA_VERSION,
+        "repository": "stigrunar/hermes-agent-review",
+        "ref": "release/stig-tested-r13", "prior_ref": "release/stig-tested-r13",
+        "prior_commit": prior, "commit": commit, "tree": tree,
+        "merge_base": prior, "fast_forward": True, "forced": False,
+    }
+    publication_bytes = json.dumps(publication, sort_keys=True).encode()
+    publication_path = receipts / f"{commit}.private-publication.json"
+    publication_digest = _write(publication_path, publication_bytes)
+    request = PrivateReleaseRequest(
+        "git-proof", "project", "outcome", "execution", "correlation",
+        CandidateIdentity(commit, tree), publication_digest, "0" * 64,
+        state, runtime, publication_path, runtime / "private-release-manifest.json",
+    )
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "attacker-selected-git-dir"))
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
+    monkeypatch.setenv("GIT_CONFIG_KEY_0", "remote.private-review.url")
+    monkeypatch.setenv(
+        "GIT_CONFIG_VALUE_0", "git@github.com:NousResearch/hermes-agent.git"
+    )
+    _validate_private_git_state(request)
+
+    git("remote", "set-url", "private-review", "git@github.com:NousResearch/hermes-agent.git")
+    with pytest.raises(Exception, match="remote identity"):
+        _validate_private_git_state(request)
+
+
+def test_unmanifested_runtime_file_fails_before_operations(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "extra-runtime")
+    runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"
+    _write(runtime / "unmanifested-executable", b"#!/bin/sh\nexit 0\n", 0o700)
+    calls = []
+    result = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
+    )
+    assert result["status"] == "rejected"
+    assert calls == []
+
+
+def test_standard_virtualenv_interpreter_symlink_is_bound_and_supported(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "venv-symlink")
+    runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"
+    interpreter = runtime / "venv/bin/python"
+    interpreter.unlink()
+    interpreter.symlink_to(policy.python_path)
+    manifest_path = runtime / "private-release-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"]["venv/bin/python"] = {
+        "type": "symlink",
+        "target": str(policy.python_path),
+        "target_sha256": policy.python_sha256,
+    }
+    payload["artifact_manifest_sha256"] = _write(
+        manifest_path, json.dumps(manifest, sort_keys=True).encode()
+    )
+    calls = []
+    result = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
+    )
+    assert result["status"] == "succeeded"
+
+
+def test_manifested_external_dependency_symlink_fails_before_operations(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "external-dependency")
+    runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"
+    outside = tmp_path / "outside-dependency"
+    outside_digest = _write(outside, b"external executable\n", 0o700)
+    dependency = runtime / "candidate.txt"
+    dependency.unlink()
+    dependency.symlink_to(outside)
+    manifest_path = runtime / "private-release-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"]["candidate.txt"] = {
+        "type": "symlink",
+        "target": str(outside),
+        "target_sha256": outside_digest,
+    }
+    payload["artifact_manifest_sha256"] = _write(
+        manifest_path, json.dumps(manifest, sort_keys=True).encode()
+    )
+    calls = []
+    result = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
+    )
+    assert result["status"] == "rejected"
+    assert "unapproved runtime boundary" in result["error"]
+    assert calls == []
+
+
+def test_runtime_dependency_is_revalidated_immediately_before_binding_mutation(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "runtime-drift")
+    calls = []
+    operations = _operations(policy, originals, calls)
+    original_quiesce = operations.quiesce
+
+    def drift_after_parse(request, active_policy, phase):
+        result = original_quiesce(request, active_policy, phase)
+        (request.runtime / "venv/bin/python3").write_bytes(b"changed interpreter\n")
+        return result
+
+    operations.quiesce = drift_after_parse
+    result = execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    assert result["status"] == "rejected"
+    assert not [call for call in calls if call[0] == "binding"]
+    assert all(target.binding.read_bytes() == originals[target.unit] for target in policy.targets)
+
+
+def test_host_wrapper_is_revalidated_immediately_before_binding_mutation(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "wrapper-drift")
+    calls = []
+    operations = _operations(policy, originals, calls)
+    original_quiesce = operations.quiesce
+
+    def drift_after_parse(request, active_policy, phase):
+        result = original_quiesce(request, active_policy, phase)
+        active_policy.gateway_wrapper.write_bytes(b"changed host wrapper\n")
+        return result
+
+    operations.quiesce = drift_after_parse
+    result = execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    assert result["status"] == "rejected"
+    assert not [call for call in calls if call[0] == "binding"]
+    assert all(target.binding.read_bytes() == originals[target.unit] for target in policy.targets)
+
+
+def test_interrupted_binding_recovers_from_durable_rollback_bundle(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path, "crash-recovery")
+    first_calls = []
+    crashing = _operations(policy, originals, first_calls)
+    replace = crashing.replace_binding
+    crashed = False
+
+    def crash_after_first_byte(target, data, mode):
+        nonlocal crashed
+        replace(target, data, mode)
+        if not crashed:
+            crashed = True
+            raise KeyboardInterrupt("simulated process death")
+
+    crashing.replace_binding = crash_after_first_byte
+    with pytest.raises(KeyboardInterrupt):
+        execute_private_release(payload, policy=policy, operations=crashing, state_dir=state)
+    assert policy.targets[0].binding.read_bytes() != originals[policy.targets[0].unit]
+    # Candidate/publication evidence is not rollback authority and may be the
+    # very state lost in a process/filesystem failure.
+    (state.parent / "runtime" / f"downstream-{COMMIT[:10]}" / "private-release-manifest.json").unlink()
+    (state / "receipts" / f"{COMMIT}.private-publication.json").unlink()
+
+    recovery_calls = []
+    recovery_operations = _operations(policy, originals, recovery_calls)
+    recovery_operations.verify_publication = lambda _request: pytest.fail(
+        "crash rollback consulted mutable publication evidence"
+    )
+    recovered = execute_private_release(
+        payload,
+        policy=policy,
+        operations=recovery_operations,
+        state_dir=state,
+    )
+    assert recovered["status"] == "rolled_back"
+    assert recovered["recovery"] == "interrupted_activation"
+    assert recovered["rollback"]["restored_units"] == [policy.targets[0].unit]
+    assert all(target.binding.read_bytes() == originals[target.unit] for target in policy.targets)
+
+
+def test_affected_cgroup_cannot_directly_prepare_activation(tmp_path, monkeypatch):
+    state, policy, payload, _originals = _fixture(tmp_path, "affected-cgroup")
+    request = parse_sealed_request(payload, state_dir=state)
+    original_read_text = Path.read_text
+
+    def fake_read_text(path, *args, **kwargs):
+        if str(path) == "/proc/self/cgroup":
+            return f"0::/user.slice/{policy.targets[0].unit}\n"
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fake_read_text)
+    with pytest.raises(PrivateReleaseError, match="affected target cgroup"):
+        ProductionOperations().prepare(request, policy)
+
+
+def test_dispatcher_canary_is_exact_non_mutating_dry_run(tmp_path, monkeypatch):
+    state, policy, payload, _originals = _fixture(tmp_path, "dry-canary")
+    request = parse_sealed_request(payload, state_dir=state)
+    calls = []
+
+    def fake_run(*args, **kwargs):
+        calls.append((args, kwargs))
+        return "gateway_drain_requested"
+
+    monkeypatch.setattr("hermes_cli.private_release_supervisor._run", fake_run)
+    result = ProductionOperations().canary_probe(request, policy)
+    assert result == {"ok": True, "dispatcher": "non-mutating dry-run"}
+    assert len(calls) == 1
+    assert calls[0][0] == (
+        request.runtime / "venv/bin/python", policy.dispatcher_wrapper, "--once", "--dry-run"
+    )

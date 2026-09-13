@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -24,6 +25,13 @@ from gateway.private_update_request import (
 INSTALLATION_SCHEMA = "hri.private_immutable_release_installation"
 INSTALLATION_VERSION = 1
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_HELPER_STDIN_BOOTSTRAP = (
+    "import sys;"
+    "source=sys.stdin.buffer.read();"
+    "path=sys.argv[1];"
+    "scope={'__name__':'__main__','__file__':path,'__package__':None};"
+    "exec(compile(source,path,'exec'),scope)"
+)
 
 
 class PrivateUpdateAdapterError(RuntimeError):
@@ -84,6 +92,39 @@ def _open_pinned_helper(path: Path, expected_sha256: str) -> tuple[int, str]:
         raise
 
 
+def _open_host_executable(path: Path, label: str) -> tuple[int, Path, str]:
+    try:
+        resolved = path.resolve(strict=True)
+        if label == "systemd-run" and resolved not in {
+            Path("/usr/bin/systemd-run"), Path("/bin/systemd-run")
+        }:
+            raise PrivateUpdateAdapterError("systemd-run escaped the fixed host path")
+        fd = os.open(resolved, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    except OSError as exc:
+        raise PrivateUpdateAdapterError(f"{label} is unavailable") from exc
+    try:
+        info = os.fstat(fd)
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or info.st_uid not in {0, os.getuid(), 65534}
+            or info.st_mode & 0o002
+            or (info.st_uid != os.getuid() and info.st_mode & 0o020)
+            or not info.st_mode & 0o111
+        ):
+            raise PrivateUpdateAdapterError(f"{label} owner/mode validation failed")
+        digest = hashlib.sha256()
+        while True:
+            block = os.read(fd, 1024 * 1024)
+            if not block:
+                break
+            digest.update(block)
+        os.lseek(fd, 0, os.SEEK_SET)
+        return fd, resolved, digest.hexdigest()
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def _identity_args(args: Any) -> list[str]:
     result: list[str] = []
     for attr, flag in (
@@ -98,7 +139,7 @@ def _identity_args(args: Any) -> list[str]:
 
 
 def run_private_update_adapter(args: Any, *, paths: PrivateUpdatePaths | None = None) -> int:
-    """Validate the host installation and synchronously run its pinned helper."""
+    """Validate the installation and run the helper in a host-owned user scope."""
     paths = resolve_private_update_paths() if paths is None else paths
     manifest = _installation_manifest(paths)
     read_private_update_file(
@@ -108,13 +149,40 @@ def run_private_update_adapter(args: Any, *, paths: PrivateUpdatePaths | None = 
     )
     _request, request_digest = read_private_update_file(paths.request_path, kind="request")
     helper_fd, helper_digest = _open_pinned_helper(paths.helper_path, str(manifest["helper_sha256"]))
+    boundary_fds: list[int] = []
     try:
-        proc_path = Path(f"/proc/self/fd/{helper_fd}")
-        if not proc_path.exists():
-            raise PrivateUpdateAdapterError("descriptor-pinned helper launch requires procfs")
-        command = [
-            sys.executable,
-            str(proc_path),
+        helper_chunks: list[bytes] = []
+        while True:
+            block = os.read(helper_fd, 1024 * 1024)
+            if not block:
+                break
+            helper_chunks.append(block)
+        helper_bytes = b"".join(helper_chunks)
+        if hashlib.sha256(helper_bytes).hexdigest() != helper_digest:
+            raise PrivateUpdateAdapterError("private release helper changed after validation")
+        if sys.platform != "linux":
+            raise PrivateUpdateAdapterError("private release supervision requires Linux systemd")
+        systemd_run = shutil.which("systemd-run")
+        if not systemd_run:
+            raise PrivateUpdateAdapterError(
+                "private release supervision requires the host systemd-run boundary"
+            )
+        systemd_fd, systemd_path, _systemd_digest = _open_host_executable(
+            Path(systemd_run), "systemd-run"
+        )
+        python_fd, _python_path, _python_digest = _open_host_executable(
+            Path(sys.executable), "Python interpreter"
+        )
+        boundary_fds.extend((systemd_fd, python_fd))
+        python_descriptor = f"/proc/{os.getpid()}/fd/{python_fd}"
+        systemd_descriptor = f"/proc/self/fd/{systemd_fd}"
+        if not Path(python_descriptor).exists() or not Path(systemd_descriptor).exists():
+            raise PrivateUpdateAdapterError("descriptor-bound external launch requires procfs")
+        helper_command = [
+            python_descriptor,
+            "-c",
+            _HELPER_STDIN_BOOTSTRAP,
+            str(paths.helper_path),
             "--expected-helper-sha256",
             helper_digest,
             "--expected-policy-sha256",
@@ -123,18 +191,29 @@ def run_private_update_adapter(args: Any, *, paths: PrivateUpdatePaths | None = 
             request_digest,
             *_identity_args(args),
         ]
+        # The updater may have been launched by an affected gateway/dashboard
+        # unit.  setsid does not escape that unit's cgroup; a transient user
+        # scope does, and remains owned by the user manager if the caller dies.
+        command = [
+            str(systemd_path), "--user", "--scope", "--quiet", "--collect", "--",
+            *helper_command,
+        ]
         completed = subprocess.run(
             command,
-            pass_fds=(helper_fd,),
-            text=True,
+            executable=systemd_descriptor,
+            pass_fds=tuple(boundary_fds),
+            input=helper_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             check=False,
         )
     finally:
+        for fd in boundary_fds:
+            os.close(fd)
         os.close(helper_fd)
     if completed.stdout:
-        print(completed.stdout.rstrip())
+        output = completed.stdout.decode("utf-8", errors="replace") if isinstance(completed.stdout, bytes) else completed.stdout
+        print(output.rstrip())
     return int(completed.returncode)
 
 

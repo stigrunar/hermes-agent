@@ -8,6 +8,7 @@ immutable evidence digests, never paths, units, commands, or release topology.
 from __future__ import annotations
 
 import argparse
+import base64
 import errno
 import fcntl
 import hashlib
@@ -32,6 +33,7 @@ POLICY_SCHEMA = "hri.private_immutable_release_policy"
 INSTALLATION_SCHEMA = "hri.private_immutable_release_installation"
 STAGE_SCHEMA = "hri.private_immutable_stage_manifest"
 PUBLICATION_SCHEMA = "hri.private_publication_receipt"
+BACKUP_SCHEMA = "hri.private_immutable_rollback_bundle"
 RECEIPT_SCHEMA = "hri.private_immutable_release_receipt"
 SCHEMA_VERSION = 1
 REQUEST_MODE = 0o600
@@ -42,6 +44,15 @@ _HEX_RE = re.compile(r"(?:[0-9a-f]{40}|[0-9a-f]{64})")
 _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 _ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _MAX_FILE_BYTES = 64 * 1024 * 1024
+_PRIVATE_REPOSITORY = "stigrunar/hermes-agent-review"
+_PRIVATE_RELEASE_REF_RE = re.compile(r"release/stig-tested[A-Za-z0-9._/-]*")
+_HOST_GIT = "/usr/bin/git"
+_GIT_ENV = {
+    "PATH": "/usr/bin:/bin",
+    "LANG": "C.UTF-8",
+    "LC_ALL": "C.UTF-8",
+    "GIT_TERMINAL_PROMPT": "0",
+}
 _SAFE_ENV = frozenset({
     "HERMES_HOME", "HERMES_REPO", "PYTHONPATH", "VIRTUAL_ENV", "HERMES_PROFILE",
     "HERMES_PYTHON", "HERMES_WEB_DIST", "HERMES_TUI_DIR", "HERMES_SAFE_DISPATCH_BOARDS",
@@ -82,6 +93,10 @@ class HostPolicy:
     runtime_root: Path
     gateway_wrapper: Path
     dispatcher_wrapper: Path
+    gateway_wrapper_sha256: str
+    dispatcher_wrapper_sha256: str
+    python_path: Path
+    python_sha256: str
     targets: tuple[FixedTarget, ...]
     dashboard_status_url: str
     dashboard_root_url: str
@@ -124,6 +139,10 @@ class PrivateReleaseRequest:
     @property
     def journal_path(self) -> Path:
         return self.receipt_dir / f"{self.request_id}.journal.json"
+
+    @property
+    def backup_path(self) -> Path:
+        return self.receipt_dir / f"{self.request_id}.rollback.json"
 
     @property
     def lock_path(self) -> Path:
@@ -227,6 +246,45 @@ def _read_owned_bytes(path: Path, label: str, *, mode: int | None = None) -> byt
     return _read_owned(path, label, mode=mode)[0]
 
 
+def _read_boundary_bytes(path: Path, label: str) -> bytes:
+    """Read an executable boundary owned by this account or the host root."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RequestValidationError(f"{label} is not readable: {path}") from exc
+    try:
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode):
+            raise RequestValidationError(f"{label} is not a regular file: {path}")
+        if (
+            before.st_uid not in {0, os.getuid()}
+            or before.st_mode & 0o002
+            or (before.st_uid != os.getuid() and before.st_mode & 0o020)
+        ):
+            raise RequestValidationError(f"{label} owner/mode validation failed: {path}")
+        if before.st_size > _MAX_FILE_BYTES:
+            raise RequestValidationError(f"{label} is too large: {path}")
+        chunks, total = [], 0
+        while True:
+            block = os.read(fd, min(1024 * 1024, _MAX_FILE_BYTES + 1 - total))
+            if not block:
+                break
+            chunks.append(block)
+            total += len(block)
+            if total > _MAX_FILE_BYTES:
+                raise RequestValidationError(f"{label} is too large: {path}")
+        after = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns
+        )
+        if identity(before) != identity(after):
+            raise RequestValidationError(f"{label} changed while being read: {path}")
+        return b"".join(chunks)
+    finally:
+        os.close(fd)
+
+
 def _read_json(
     path: Path, label: str, *, mode: int | None = None, expected_sha256: str | None = None
 ) -> Mapping[str, Any]:
@@ -280,7 +338,8 @@ def parse_host_policy(
     )
     policy = _exact(value, {
         "schema", "version", "os_home", "runtime_root", "gateway_wrapper",
-        "dispatcher_wrapper", "default_state_db", "targets", "health", "timeouts",
+        "dispatcher_wrapper", "activation_files", "default_state_db", "targets", "health",
+        "timeouts",
     }, "host policy")
     if policy["schema"] != POLICY_SCHEMA or policy["version"] != SCHEMA_VERSION:
         raise RequestValidationError("host policy schema/version is unsupported")
@@ -301,6 +360,27 @@ def parse_host_policy(
         or dispatcher_wrapper != default_root / "scripts/kanban_safe_dispatch_loop.py"
     ):
         raise RequestValidationError("host policy fixed runtime/wrapper topology mismatch")
+    activation_files = _exact(
+        policy["activation_files"],
+        {
+            "gateway_wrapper_sha256", "dispatcher_wrapper_sha256",
+            "python_path", "python_sha256",
+        },
+        "activation_files",
+    )
+    gateway_wrapper_sha256 = _digest(
+        activation_files["gateway_wrapper_sha256"], "gateway wrapper digest", sha256=True
+    )
+    dispatcher_wrapper_sha256 = _digest(
+        activation_files["dispatcher_wrapper_sha256"], "dispatcher wrapper digest", sha256=True
+    )
+    python_path = _safe_absolute(
+        Path(_string(activation_files["python_path"], "host Python path")),
+        "host Python path",
+    ).resolve(strict=True)
+    python_sha256 = _digest(
+        activation_files["python_sha256"], "host Python digest", sha256=True
+    )
     state_db = _exact(
         policy["default_state_db"], {"path", "backup_integrity", "restore"}, "default_state_db"
     )
@@ -345,7 +425,8 @@ def parse_host_policy(
     if any(type(value) is not int or value <= 0 for value in values):
         raise RequestValidationError("host policy timeouts must be positive integers")
     return HostPolicy(
-        default_root, os_home, runtime_root, gateway_wrapper, dispatcher_wrapper, expected,
+        default_root, os_home, runtime_root, gateway_wrapper, dispatcher_wrapper,
+        gateway_wrapper_sha256, dispatcher_wrapper_sha256, python_path, python_sha256, expected,
         health["dashboard_status_url"], health["dashboard_root_url"], *values,
     )
 
@@ -383,22 +464,30 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
             request.publication_receipt, "private publication receipt", mode=REQUEST_MODE,
             expected_sha256=request.private_publication_sha256,
         ),
-        {"schema", "version", "commit", "tree", "remote", "ref", "private", "verified"},
+        {
+            "schema", "version", "repository", "ref", "prior_ref", "prior_commit",
+            "commit", "tree", "merge_base", "fast_forward", "forced",
+        },
         "private publication receipt",
     )
     if (
         publication["schema"] != PUBLICATION_SCHEMA
         or publication["version"] != SCHEMA_VERSION
-        or publication["private"] is not True
-        or publication["verified"] is not True
+        or publication["repository"] != _PRIVATE_REPOSITORY
+        or type(publication["ref"]) is not str
+        or _PRIVATE_RELEASE_REF_RE.fullmatch(publication["ref"]) is None
+        or publication["prior_ref"] != publication["ref"]
+        or publication["fast_forward"] is not True
+        or publication["forced"] is not False
     ):
-        raise RequestValidationError("private publication receipt does not prove private publication")
+        raise RequestValidationError("private publication receipt does not prove the protected private destination")
     if (publication["commit"], publication["tree"]) != (
         request.candidate.commit, request.candidate.tree
     ):
         raise RequestValidationError("private publication receipt identity mismatch")
-    _string(publication["remote"], "private publication remote", _ID_RE)
-    _string(publication["ref"], "private publication ref")
+    prior_commit = _digest(publication["prior_commit"], "private publication prior_commit")
+    if publication["merge_base"] != prior_commit or prior_commit == request.candidate.commit:
+        raise RequestValidationError("private publication receipt does not prove normal history from its prior base")
     manifest = _exact(
         _read_json(
             request.artifact_manifest, "staged artifact manifest", mode=REQUEST_MODE,
@@ -428,12 +517,45 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
             or ".." in rel_path.parts or "\\" in relative
         ):
             raise RequestValidationError(f"unsafe staged artifact path: {relative}")
-        data = _read_owned_bytes(request.runtime / relative, f"staged artifact {relative}")
-        artifact_bytes[relative] = data
-        if sha256_bytes(data) != _digest(
-            expected_digest, f"artifact digest {relative}", sha256=True
-        ):
-            raise RequestValidationError(f"staged artifact digest mismatch: {relative}")
+        artifact_path = request.runtime / relative
+        if isinstance(expected_digest, Mapping):
+            link = _exact(
+                expected_digest, {"type", "target", "target_sha256"},
+                f"symlink artifact {relative}",
+            )
+            if link["type"] != "symlink" or not artifact_path.is_symlink():
+                raise RequestValidationError(f"staged symlink artifact mismatch: {relative}")
+            link_info = artifact_path.lstat()
+            if link_info.st_uid != os.getuid():
+                raise RequestValidationError(f"staged symlink has the wrong owner: {relative}")
+            target = os.readlink(artifact_path)
+            if target != _string(link["target"], f"symlink target {relative}"):
+                raise RequestValidationError(f"staged symlink target mismatch: {relative}")
+            try:
+                resolved_target = artifact_path.resolve(strict=True)
+            except OSError as exc:
+                raise RequestValidationError(f"staged symlink target is unavailable: {relative}") from exc
+            try:
+                resolved_target.relative_to(request.runtime.resolve(strict=True))
+            except ValueError:
+                if relative != "venv/bin/python":
+                    raise RequestValidationError(
+                        f"staged symlink crosses an unapproved runtime boundary: {relative}"
+                    )
+            target_bytes = _read_boundary_bytes(
+                resolved_target, f"resolved staged symlink target {relative}"
+            )
+            if sha256_bytes(target_bytes) != _digest(
+                link["target_sha256"], f"symlink target digest {relative}", sha256=True
+            ):
+                raise RequestValidationError(f"staged symlink target digest mismatch: {relative}")
+        else:
+            data = _read_owned_bytes(artifact_path, f"staged artifact {relative}")
+            artifact_bytes[relative] = data
+            if sha256_bytes(data) != _digest(
+                expected_digest, f"artifact digest {relative}", sha256=True
+            ):
+                raise RequestValidationError(f"staged artifact digest mismatch: {relative}")
     identity_digest = artifacts.get("private-release-identity.json")
     if identity_digest is None:
         raise RequestValidationError("staged artifact manifest omits private-release-identity.json")
@@ -443,10 +565,134 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
         raise RequestValidationError("staged identity is not valid UTF-8 JSON") from exc
     if dict(identity) != {"commit": request.candidate.commit, "tree": request.candidate.tree}:
         raise RequestValidationError("staged runtime identity mismatch")
+    actual_artifacts: set[str] = set()
+    manifest_name = request.artifact_manifest.relative_to(request.runtime).as_posix()
+    for root, directories, files in os.walk(request.runtime, followlinks=False):
+        root_path = Path(root)
+        _secure_directory(root_path, f"staged runtime directory {root_path}")
+        traversable = []
+        for name in directories:
+            child = root_path / name
+            if child.is_symlink():
+                actual_artifacts.add(child.relative_to(request.runtime).as_posix())
+            else:
+                traversable.append(name)
+        directories[:] = traversable
+        for name in files:
+            child = root_path / name
+            relative = child.relative_to(request.runtime).as_posix()
+            if relative == manifest_name:
+                continue
+            if not child.is_symlink() and not child.is_file():
+                raise RequestValidationError(f"staged runtime contains a non-regular file: {child}")
+            actual_artifacts.add(relative)
+    if actual_artifacts != set(artifacts):
+        missing = sorted(actual_artifacts - set(artifacts))
+        stale = sorted(set(artifacts) - actual_artifacts)
+        raise RequestValidationError(
+            "staged artifact manifest is incomplete"
+            + (f" (unmanifested: {', '.join(missing[:5])})" if missing else "")
+            + (f" (missing: {', '.join(stale[:5])})" if stale else "")
+        )
+
+
+def _validate_activation_boundaries(request: PrivateReleaseRequest, policy: HostPolicy) -> None:
+    wrappers = (
+        (policy.gateway_wrapper, policy.gateway_wrapper_sha256, "gateway wrapper"),
+        (policy.dispatcher_wrapper, policy.dispatcher_wrapper_sha256, "dispatcher wrapper"),
+    )
+    for path, expected, label in wrappers:
+        if sha256_bytes(_read_boundary_bytes(path, label)) != expected:
+            raise RequestValidationError(f"{label} digest does not match host policy")
+    manifest = _read_json(
+        request.artifact_manifest,
+        "staged artifact manifest",
+        mode=REQUEST_MODE,
+        expected_sha256=request.artifact_manifest_sha256,
+    )
+    artifacts = manifest.get("artifacts")
+    if not isinstance(artifacts, Mapping) or "venv/bin/python" not in artifacts:
+        raise RequestValidationError("staged manifest does not bind the candidate interpreter")
+    candidate_python = request.runtime / "venv/bin/python"
+    if candidate_python.is_symlink():
+        resolved = candidate_python.resolve(strict=True)
+        try:
+            resolved.relative_to(request.runtime.resolve(strict=True))
+        except ValueError:
+            if resolved != policy.python_path:
+                raise RequestValidationError("candidate interpreter symlink escaped host policy")
+            if sha256_bytes(_read_boundary_bytes(resolved, "host Python interpreter")) != policy.python_sha256:
+                raise RequestValidationError("host Python interpreter digest mismatch")
+
+
+def _validate_bootstrap_boundary(policy: HostPolicy) -> None:
+    try:
+        executing_python = Path(sys.executable).resolve(strict=True)
+    except OSError as exc:
+        raise RequestValidationError("executing Python interpreter identity is unavailable") from exc
+    if executing_python != policy.python_path:
+        raise RequestValidationError("executing Python interpreter escaped host policy")
+    if sha256_bytes(_read_boundary_bytes(executing_python, "executing Python interpreter")) != policy.python_sha256:
+        raise RequestValidationError("executing Python interpreter digest mismatch")
+
+
+def _git_output(repository: Path, *args: str) -> str:
+    completed = subprocess.run(
+        [_HOST_GIT, "-C", str(repository), *args],
+        capture_output=True,
+        text=True,
+        env=_GIT_ENV,
+        timeout=30,
+    )
+    if completed.returncode:
+        raise RequestValidationError("fixed private Git evidence is unavailable")
+    return completed.stdout.strip()
+
+
+def _validate_private_git_state(request: PrivateReleaseRequest) -> None:
+    """Ground the publication receipt in the fixed host checkout's local Git state."""
+    publication = _read_json(
+        request.publication_receipt,
+        "private publication receipt",
+        mode=REQUEST_MODE,
+        expected_sha256=request.private_publication_sha256,
+    )
+    repository = request.state_dir.parent / "hermes-agent"
+    _secure_directory(repository, "fixed private Git checkout")
+    remote_url = _git_output(repository, "remote", "get-url", "private-review")
+    if remote_url not in {
+        "git@github.com:stigrunar/hermes-agent-review.git",
+        "https://github.com/stigrunar/hermes-agent-review.git",
+    }:
+        raise RequestValidationError("fixed private Git remote identity mismatch")
+    release_ref = _string(publication.get("ref"), "private publication ref")
+    if _PRIVATE_RELEASE_REF_RE.fullmatch(release_ref) is None:
+        raise RequestValidationError("fixed private Git release ref is not allowed")
+    tracking_ref = f"refs/remotes/private-review/{release_ref}"
+    published = _git_output(repository, "rev-parse", "--verify", tracking_ref)
+    if published != request.candidate.commit:
+        raise RequestValidationError("fixed private Git ref does not resolve to the candidate")
+    tree = _git_output(repository, "rev-parse", "--verify", f"{published}^{{tree}}")
+    if tree != request.candidate.tree:
+        raise RequestValidationError("fixed private Git candidate tree mismatch")
+    prior = _digest(publication.get("prior_commit"), "private publication prior_commit")
+    ancestry = subprocess.run(
+        [_HOST_GIT, "-C", str(repository), "merge-base", "--is-ancestor", prior, published],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        env=_GIT_ENV,
+        timeout=30,
+    )
+    if ancestry.returncode != 0:
+        raise RequestValidationError("fixed private Git update is not normal history")
+    reflog = _git_output(repository, "reflog", "show", "-2", "--format=%H", tracking_ref).splitlines()
+    if len(reflog) < 2 or reflog[:2] != [published, prior]:
+        raise RequestValidationError("fixed private Git prior ref transition is not proven")
 
 
 def parse_sealed_request(
-    source: Path | str | bytes | Mapping[str, Any], *, state_dir: Path
+    source: Path | str | bytes | Mapping[str, Any], *, state_dir: Path,
+    validate_evidence: bool = True,
 ) -> PrivateReleaseRequest:
     state_dir = _safe_absolute(Path(state_dir), "private update state directory")
     if isinstance(source, (str, Path)):
@@ -492,7 +738,8 @@ def parse_sealed_request(
         runtime / "private-release-manifest.json",
     )
     _secure_directory(parsed.receipt_dir, "private release receipt directory")
-    _validate_evidence(parsed)
+    if validate_evidence:
+        _validate_evidence(parsed)
     return parsed
 
 
@@ -546,6 +793,75 @@ def atomic_replace_binding(path: Path, data: bytes, mode: int) -> None:
             temporary.unlink()
 
 
+def _write_rollback_bundle(
+    request: PrivateReleaseRequest,
+    policy: HostPolicy,
+    snapshot: Mapping[str, tuple[bytes, int]],
+) -> str:
+    """Persist every pre-mutation binding byte before a journal can name it changed."""
+    bindings = {}
+    for target in policy.targets:
+        data, mode = snapshot[target.unit]
+        bindings[target.unit] = {
+            "sha256": sha256_bytes(data),
+            "mode": mode,
+            "bytes_base64": base64.b64encode(data).decode("ascii"),
+        }
+    bundle = {
+        "schema": BACKUP_SCHEMA,
+        "version": SCHEMA_VERSION,
+        "request_id": request.request_id,
+        "candidate": {"commit": request.candidate.commit, "tree": request.candidate.tree},
+        "bindings": bindings,
+    }
+    _write_json_atomic(request.backup_path, bundle)
+    return sha256_file(request.backup_path)
+
+
+def _read_rollback_bundle(
+    request: PrivateReleaseRequest,
+    policy: HostPolicy,
+    expected_sha256: str,
+) -> dict[str, tuple[bytes, int]]:
+    bundle = _exact(
+        _read_json(
+            request.backup_path, "rollback bundle", mode=RECEIPT_MODE,
+            expected_sha256=_digest(expected_sha256, "rollback bundle digest", sha256=True),
+        ),
+        {"schema", "version", "request_id", "candidate", "bindings"},
+        "rollback bundle",
+    )
+    if (
+        bundle["schema"] != BACKUP_SCHEMA
+        or bundle["version"] != SCHEMA_VERSION
+        or bundle["request_id"] != request.request_id
+        or dict(bundle["candidate"]) != {
+            "commit": request.candidate.commit, "tree": request.candidate.tree,
+        }
+    ):
+        raise RequestValidationError("rollback bundle identity mismatch")
+    raw_bindings = bundle["bindings"]
+    expected_units = {target.unit for target in policy.targets}
+    if not isinstance(raw_bindings, Mapping) or set(raw_bindings) != expected_units:
+        raise RequestValidationError("rollback bundle target set mismatch")
+    snapshot = {}
+    for unit in expected_units:
+        entry = _exact(
+            raw_bindings[unit], {"sha256", "mode", "bytes_base64"},
+            f"rollback bundle binding {unit}",
+        )
+        if type(entry["mode"]) is not int or entry["mode"] & ~0o777:
+            raise RequestValidationError(f"rollback bundle mode is invalid: {unit}")
+        try:
+            data = base64.b64decode(_string(entry["bytes_base64"], "rollback bytes"), validate=True)
+        except (ValueError, TypeError) as exc:
+            raise RequestValidationError(f"rollback bundle bytes are invalid: {unit}") from exc
+        if sha256_bytes(data) != _digest(entry["sha256"], "rollback binding digest", sha256=True):
+            raise RequestValidationError(f"rollback bundle binding digest mismatch: {unit}")
+        snapshot[unit] = (data, entry["mode"])
+    return snapshot
+
+
 @contextmanager
 def _exclusive_lock(path: Path):
     _secure_directory(path.parent, "lock parent")
@@ -578,6 +894,8 @@ class SupervisorOperations:
     health_probe: Callable[[PrivateReleaseRequest, HostPolicy, str], Any]
     canary_probe: Callable[[PrivateReleaseRequest, HostPolicy], Any]
     release_quiescence: Callable[[PrivateReleaseRequest, HostPolicy], Any]
+    verify_publication: Callable[[PrivateReleaseRequest], Any]
+    resume: Callable[[PrivateReleaseRequest, HostPolicy, Mapping[str, Any]], Any] | None = None
 
 
 def _probe_ok(value: Any, label: str) -> None:
@@ -608,6 +926,79 @@ def _receipt(request: PrivateReleaseRequest, policy: HostPolicy, status: str) ->
     }
 
 
+def _journal_payload(
+    request: PrivateReleaseRequest, phase: str, changed: Sequence[FixedTarget], backup_sha256: str
+) -> dict[str, Any]:
+    return {
+        "phase": phase,
+        "changed": [target.unit for target in changed],
+        "candidate": request.candidate.commit,
+        "rollback_bundle_sha256": backup_sha256,
+    }
+
+
+def _recover_interrupted_release(
+    request: PrivateReleaseRequest, policy: HostPolicy, operations: SupervisorOperations
+) -> dict[str, Any]:
+    journal = _exact(
+        _read_json(request.journal_path, "activation journal", mode=RECEIPT_MODE),
+        {"phase", "changed", "candidate", "rollback_bundle_sha256"},
+        "activation journal",
+    )
+    phase = _string(journal["phase"], "activation journal phase")
+    if phase not in {"quiescing", "binding", "committed_before_drain_release"}:
+        raise RequestValidationError("activation journal phase is unsupported")
+    if journal["candidate"] != request.candidate.commit:
+        raise RequestValidationError("activation journal candidate mismatch")
+    changed_units = journal["changed"]
+    if type(changed_units) is not list or any(type(unit) is not str for unit in changed_units):
+        raise RequestValidationError("activation journal changed target list is invalid")
+    targets = {target.unit: target for target in policy.targets}
+    if len(set(changed_units)) != len(changed_units) or not set(changed_units) <= set(targets):
+        raise RequestValidationError("activation journal changed target set is invalid")
+    snapshot = _read_rollback_bundle(
+        request, policy, _string(journal["rollback_bundle_sha256"], "rollback bundle digest")
+    )
+    prestate = _read_json(request.prestate_path, "activation prestate", mode=RECEIPT_MODE)
+    if operations.resume is not None:
+        operations.resume(request, policy, prestate)
+
+    receipt = _receipt(request, policy, "rollback_failed")
+    receipt["recovery"] = "interrupted_activation"
+    restored, errors = [], []
+    try:
+        _probe_ok(operations.quiesce(request, policy, "rollback"), "recovery quiescence")
+    except Exception as exc:
+        errors.append(f"rollback quiescence: {exc}")
+    for unit in reversed(changed_units):
+        try:
+            data, mode = snapshot[unit]
+            operations.replace_binding(targets[unit], data, mode)
+            restored.append(unit)
+        except Exception as exc:
+            errors.append(f"{unit}: {exc}")
+    if not errors:
+        try:
+            if changed_units:
+                operations.restart(policy.targets, "rollback")
+                _probe_ok(operations.health_probe(request, policy, "rollback"), "rollback health")
+            _probe_ok(operations.release_quiescence(request, policy), "rollback drain release")
+            receipt["status"] = "rolled_back"
+        except Exception as exc:
+            errors.append(f"rollback runtime: {exc}")
+    receipt["rollback"] = {
+        "attempted": bool(changed_units),
+        "restored_units": restored,
+        "errors": errors,
+    }
+    if errors:
+        receipt["error"] = "; ".join(errors)
+    receipt["finished_at"] = time.time()
+    _write_json_atomic(request.terminal_receipt_path, receipt)
+    receipt["receipt_path"] = str(request.terminal_receipt_path)
+    return receipt
+
+
 def execute_private_release(
     request_source: Path | str | bytes | Mapping[str, Any] | PrivateReleaseRequest, *, policy: HostPolicy,
     operations: SupervisorOperations, state_dir: Path | None = None,
@@ -618,7 +1009,9 @@ def execute_private_release(
         request = (
             request_source
             if isinstance(request_source, PrivateReleaseRequest)
-            else parse_sealed_request(request_source, state_dir=state_dir)
+            else parse_sealed_request(
+                request_source, state_dir=state_dir, validate_evidence=False
+            )
         )
     except Exception as exc:
         request_id = request_source.get("request_id", "invalid") if isinstance(request_source, Mapping) else "invalid"
@@ -643,26 +1036,49 @@ def execute_private_release(
                 ))
                 existing["admission"] = "replay_rejected"
                 return existing
+            if request.journal_path.exists():
+                return _recover_interrupted_release(request, policy, operations)
+            # Fresh activation validates mutable publication/runtime evidence
+            # only after durable crash recovery has had first ownership.
             receipt = _receipt(request, policy, "failed")
+            try:
+                _validate_evidence(request)
+                _validate_activation_boundaries(request, policy)
+                operations.verify_publication(request)
+            except Exception as exc:
+                receipt["status"] = "rejected"
+                receipt["error"] = str(exc)
+                _write_json_atomic(request.terminal_receipt_path, receipt)
+                receipt["receipt_path"] = str(request.terminal_receipt_path)
+                return receipt
             snapshot: dict[str, tuple[bytes, int]] = {}
             changed: list[FixedTarget] = []
             committed = False
+            quiesced = False
             try:
                 snapshot, prestate = operations.prepare(request, policy)
+                backup_sha256 = _write_rollback_bundle(request, policy, snapshot)
                 _write_json_atomic(request.prestate_path, prestate)
-                _write_json_atomic(request.journal_path, {
-                    "phase": "quiescing", "changed": [], "candidate": request.candidate.commit,
-                })
+                _write_json_atomic(
+                    request.journal_path,
+                    _journal_payload(request, "quiescing", [], backup_sha256),
+                )
                 _probe_ok(operations.quiesce(request, policy, "candidate"), "candidate quiescence")
+                quiesced = True
+                # Re-walk and re-hash the complete staged runtime at the last
+                # boundary before the first persistent service binding byte.
+                _validate_evidence(request)
+                _validate_activation_boundaries(request, policy)
+                operations.verify_publication(request)
                 for target in policy.targets:
                     desired = _render_binding(target, snapshot[target.unit][0], request.runtime, policy)
                     if desired == snapshot[target.unit][0]:
                         continue
                     changed.append(target)
-                    _write_json_atomic(request.journal_path, {
-                        "phase": "binding", "changed": [item.unit for item in changed],
-                        "candidate": request.candidate.commit,
-                    })
+                    _write_json_atomic(
+                        request.journal_path,
+                        _journal_payload(request, "binding", changed, backup_sha256),
+                    )
                     operations.replace_binding(target, desired, snapshot[target.unit][1])
                 receipt["mutated_units"] = [target.unit for target in changed]
                 operations.restart(policy.targets, "candidate")
@@ -670,11 +1086,12 @@ def execute_private_release(
                     operations.health_probe(request, policy, "candidate"), "candidate health"
                 )
                 _probe_ok(operations.canary_probe(request, policy), "candidate canary")
-                _write_json_atomic(request.journal_path, {
-                    "phase": "committed_before_drain_release",
-                    "changed": [item.unit for item in changed],
-                    "candidate": request.candidate.commit,
-                })
+                _write_json_atomic(
+                    request.journal_path,
+                    _journal_payload(
+                        request, "committed_before_drain_release", changed, backup_sha256
+                    ),
+                )
                 committed = True
                 _probe_ok(operations.release_quiescence(request, policy), "drain release")
                 receipt["status"] = "succeeded"
@@ -709,6 +1126,14 @@ def execute_private_release(
                             )
                         except Exception as exc:
                             errors.append(f"rollback runtime: {exc}")
+                elif quiesced:
+                    try:
+                        _probe_ok(
+                            operations.release_quiescence(request, policy),
+                            "failed pre-mutation drain release",
+                        )
+                    except Exception as exc:
+                        errors.append(f"drain release: {exc}")
                 receipt["status"] = (
                     "rollback_failed" if errors else "rolled_back" if changed else "rejected"
                 )
@@ -913,6 +1338,19 @@ class ProductionOperations:
             },
         }
         return snapshot, prestate
+
+    def verify_publication(self, request: PrivateReleaseRequest) -> None:
+        _validate_private_git_state(request)
+
+    def resume(
+        self, request: PrivateReleaseRequest, policy: HostPolicy, prestate: Mapping[str, Any]
+    ) -> None:
+        """Rehydrate process identity needed by crash-time rollback/commit recovery."""
+        baseline = prestate.get("baseline")
+        if not isinstance(baseline, Mapping) or set(baseline) != {target.unit for target in policy.targets}:
+            raise RequestValidationError("activation prestate baseline is incomplete")
+        self.baseline = dict(baseline)
+        self.marker_principal = f"private-release:{request.request_id}"
 
     def _candidate_python(self, request: PrivateReleaseRequest) -> Path:
         return request.runtime / "venv/bin/python"
@@ -1129,31 +1567,17 @@ class ProductionOperations:
         return {"ok": True, "services": first}
 
     def canary_probe(self, request: PrivateReleaseRequest, policy: HostPolicy):
-        dispatcher = next(target for target in policy.targets if target.kind == "dispatcher")
         env = dict(
             os.environ, HERMES_HOME=str(policy.default_root), HERMES_REPO=str(request.runtime),
             PYTHONPATH=str(request.runtime), HERMES_PYTHON=str(self._candidate_python(request)),
         )
-        held = _run(
+        output = _run(
             self._candidate_python(request), policy.dispatcher_wrapper, "--once", "--dry-run",
             cwd=request.runtime, env=env, timeout=120,
         )
-        if "gateway_drain_requested" not in held:
+        if "gateway_drain_requested" not in output:
             raise PrivateReleaseError("held dispatcher dry-run did not acknowledge gateway drain")
-        self.release_quiescence(request, policy)
-        _run("systemctl", "--user", "stop", dispatcher.unit, timeout=60)
-        try:
-            output = _run(
-                self._candidate_python(request), policy.dispatcher_wrapper, "--once",
-                cwd=request.runtime, env=env, timeout=120,
-            )
-            lowered = output.lower()
-            if "lock contention" in lowered or "already running" in lowered:
-                raise PrivateReleaseError("dispatcher canary reported lock contention")
-        finally:
-            _run("systemctl", "--user", "start", dispatcher.unit, timeout=60)
-        self.health_probe(request, policy, "candidate")
-        return {"ok": True, "dispatcher": "exclusive one-shot"}
+        return {"ok": True, "dispatcher": "non-mutating dry-run"}
 
     def release_quiescence(self, request: PrivateReleaseRequest, policy: HostPolicy):
         errors = []
@@ -1233,13 +1657,16 @@ def main(argv: list[str] | None = None) -> int:
     policy_digest = _digest(args.expected_policy_sha256, "expected policy digest", sha256=True)
     state_dir = _installed_state_dir()
     policy = _verify_installation(state_dir, helper_digest, policy_digest)
+    _validate_bootstrap_boundary(policy)
     request_path = state_dir / "request.json"
     request_bytes = _read_owned_bytes(request_path, "private release request", mode=REQUEST_MODE)
     if sha256_bytes(request_bytes) != _digest(
         args.expected_request_sha256, "expected request digest", sha256=True
     ):
         raise RequestValidationError("private release request changed after adapter validation")
-    request = parse_sealed_request(request_bytes, state_dir=state_dir)
+    request = parse_sealed_request(
+        request_bytes, state_dir=state_dir, validate_evidence=False
+    )
     expected = (
         (args.expected_commit, request.candidate.commit, "commit"),
         (args.expected_tree, request.candidate.tree, "tree"),
@@ -1252,7 +1679,8 @@ def main(argv: list[str] | None = None) -> int:
     operations = SupervisorOperations(
         implementation.prepare, implementation.quiesce, implementation.replace_binding,
         implementation.restart, implementation.health_probe, implementation.canary_probe,
-        implementation.release_quiescence,
+        implementation.release_quiescence, implementation.verify_publication,
+        implementation.resume,
     )
     result = execute_private_release(request, policy=policy, operations=operations)
     print(json.dumps(result, sort_keys=True))
