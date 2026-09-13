@@ -29,6 +29,7 @@ _HELPER_STDIN_BOOTSTRAP = (
     "import sys;"
     "source=sys.stdin.buffer.read();"
     "path=sys.argv[1];"
+    "sys.argv=sys.argv[1:];"
     "scope={'__name__':'__main__','__file__':path,'__package__':None};"
     "exec(compile(source,path,'exec'),scope)"
 )
