@@ -1573,10 +1573,9 @@ class ProductionOperations:
         deadline, previous = time.monotonic() + policy.drain_timeout_seconds, None
         while time.monotonic() < deadline:
             sample = self._idle_sample(request, policy, since)
-            if (
-                sample is not None and previous is not None
-                and all(sample[unit]["updated_at"] != previous[unit]["updated_at"] for unit in sample)
-            ):
+            # Each poll re-reads every identity and idle gate; the gateway need
+            # not rewrite an already-fresh state file to make the poll independent.
+            if sample is not None and previous is not None:
                 if phase == "candidate":
                     self._verify_prestate(policy)
                 return {"ok": True, "phase": phase, "samples": 2, "last": sample}
