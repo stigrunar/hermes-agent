@@ -177,8 +177,6 @@ def run_private_update_adapter(args: Any, *, paths: PrivateUpdatePaths | None = 
         boundary_fds.extend((systemd_fd, python_fd))
         python_descriptor = f"/proc/{os.getpid()}/fd/{python_fd}"
         systemd_descriptor = f"/proc/self/fd/{systemd_fd}"
-        if not Path(python_descriptor).exists() or not Path(systemd_descriptor).exists():
-            raise PrivateUpdateAdapterError("descriptor-bound external launch requires procfs")
         helper_command = [
             python_descriptor,
             "-c",
@@ -199,15 +197,20 @@ def run_private_update_adapter(args: Any, *, paths: PrivateUpdatePaths | None = 
             str(systemd_path), "--user", "--scope", "--quiet", "--collect", "--",
             *helper_command,
         ]
-        completed = subprocess.run(
-            command,
-            executable=systemd_descriptor,
-            pass_fds=tuple(boundary_fds),
-            input=helper_bytes,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                executable=systemd_descriptor,
+                pass_fds=tuple(boundary_fds),
+                input=helper_bytes,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                check=False,
+            )
+        except OSError as exc:
+            raise PrivateUpdateAdapterError(
+                "descriptor-bound external launch failed"
+            ) from exc
     finally:
         for fd in boundary_fds:
             os.close(fd)
