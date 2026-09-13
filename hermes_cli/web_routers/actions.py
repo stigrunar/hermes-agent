@@ -219,7 +219,10 @@ def _update_refused(error: str, message: str, update_command: str) -> Dict[str, 
 @router.post("/api/hermes/update")
 async def update_hermes():
     """Kick off ``hermes update`` in the background."""
-    if _dashboard_local_update_managed_externally():
+    from gateway.private_update_request import private_immutable_external_enabled
+
+    private_external = private_immutable_external_enabled()
+    if not private_external and _dashboard_local_update_managed_externally():
         message = _MANAGED_EXTERNALLY_MESSAGE + " The built-in local updater is disabled here."
         return _update_refused("dashboard_update_managed_externally", message, "managed outside dashboard")
 
@@ -227,7 +230,7 @@ async def update_hermes():
     # one decision with the CLI paths.
     from hermes_cli.update_contract import evaluate_update_admission, record_refusal_receipt
 
-    refusal = evaluate_update_admission(_server_path("PROJECT_ROOT"))
+    refusal = None if private_external else evaluate_update_admission(_server_path("PROJECT_ROOT"))
     if refusal is not None:
         response = _update_refused(
             _UPDATE_REFUSAL_ERROR_CODES.get(refusal.code, "update_not_in_place"), refusal.message, refusal.update_command,

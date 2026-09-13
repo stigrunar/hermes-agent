@@ -90,6 +90,37 @@ class TestHandleUpdateCommand:
 
         assert "Not a git repository" in result
 
+    @pytest.mark.asyncio
+    async def test_private_external_mode_still_spawns_hermes_update_without_git(
+        self, tmp_path, monkeypatch
+    ):
+        runner = _make_runner()
+        event = _make_event()
+        hermes_home = tmp_path / "hermes"
+        hermes_home.mkdir()
+        spawned = []
+        monkeypatch.setattr(
+            "gateway.private_update_request.private_immutable_external_enabled", lambda: True
+        )
+        monkeypatch.setattr("hermes_cli.config.is_managed", lambda: True)
+        monkeypatch.setattr("gateway.run._hermes_home", hermes_home)
+        monkeypatch.setattr("gateway.run._resolve_hermes_bin", lambda: ["/fixed/hermes"])
+        monkeypatch.setattr(
+            "gateway.slash_commands._spawn_detached_update",
+            lambda command, output, exit_code: spawned.append((command, output, exit_code)),
+        )
+
+        result = await runner._handle_update_command(event)
+
+        assert "Starting Hermes update" in result
+        assert spawned == [
+            (
+                ["/fixed/hermes"],
+                hermes_home / ".update_output.txt",
+                hermes_home / ".update_exit_code",
+            )
+        ]
+
 
     @pytest.mark.asyncio
     async def test_resolve_hermes_bin_module_argv(self):

@@ -1430,6 +1430,40 @@ class TestWebServerEndpoints:
             (["update"], "hermes-update", {"HERMES_ACTION_ID": "a" * 32})
         ]
 
+    def test_private_external_dashboard_still_spawns_hermes_update(self, monkeypatch):
+        import hermes_cli.web_server as web_server
+
+        class Proc:
+            pid = 54321
+
+        calls = []
+        monkeypatch.setattr(
+            "gateway.private_update_request.private_immutable_external_enabled", lambda: True
+        )
+        monkeypatch.setattr(
+            _web_server_files, "_dashboard_local_update_managed_externally", lambda: True
+        )
+        monkeypatch.setattr(
+            "hermes_cli.update_contract.evaluate_update_admission",
+            lambda _root: pytest.fail("native admission must not run in external mode"),
+        )
+        monkeypatch.setattr(web_server.secrets, "token_hex", lambda _size: "d" * 32)
+        monkeypatch.setattr(
+            _web_server_gateway,
+            "_spawn_hermes_action",
+            lambda command, name, *, env_overrides=None: (
+                calls.append((command, name, env_overrides)) or Proc()
+            ),
+        )
+        _web_server_gateway._ACTION_PROCS.pop("hermes-update", None)
+
+        response = self.client.post("/api/hermes/update")
+
+        assert response.json()["pid"] == 54321
+        assert calls == [
+            (["update"], "hermes-update", {"HERMES_ACTION_ID": "d" * 32})
+        ]
+
     def test_update_hermes_reuses_running_action(self, monkeypatch):
         import hermes_cli.web_server as web_server
 

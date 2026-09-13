@@ -2399,6 +2399,10 @@ def _update_preflight_handled(args) -> bool:
 
 def cmd_update(args):
     """Update Hermes Agent: hangup protection + update lock around ``_cmd_update_impl``."""
+    from hermes_cli.private_update_adapter import dispatch_private_immutable_update
+
+    if dispatch_private_immutable_update(args):
+        return
     if _update_preflight_handled(args):
         return
     gateway_mode = getattr(args, "gateway", False)

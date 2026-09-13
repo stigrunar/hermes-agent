@@ -1282,6 +1282,7 @@ class GatewaySlashCommandsMixin(
         restart it may trigger; marker files let this or the next gateway process notify the user."""
         import json
         from gateway.run import _hermes_home, _resolve_hermes_bin
+        from gateway.private_update_request import private_immutable_external_enabled
         from hermes_cli.config import is_managed, format_managed_message
         # Block non-messaging platforms (API server, webhooks, ACP); plugin platforms with
         # allow_update_command=True are also allowed.
@@ -1294,9 +1295,10 @@ class GatewaySlashCommandsMixin(
                     return t("gateway.update.platform_not_messaging")
             except Exception:
                 return t("gateway.update.platform_not_messaging")
-        if is_managed():
+        private_external = private_immutable_external_enabled()
+        if not private_external and is_managed():
             return f"✗ {format_managed_message('update Hermes Agent')}"
-        if not (Path(__file__).parent.parent.resolve() / '.git').exists():
+        if not private_external and not (Path(__file__).parent.parent.resolve() / '.git').exists():
             return t("gateway.update.not_git_repo")
         hermes_cmd = _resolve_hermes_bin()
         if not hermes_cmd:
