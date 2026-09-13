@@ -25,6 +25,7 @@ def _bound_event(
     lane_kind="control",
     lane_outcome_bound=True,
     task_lane_bound=False,
+    separate_task_lane=False,
 ):
     home = tmp_path / "hermes"
     home.mkdir(parents=True)
@@ -49,6 +50,17 @@ def _bound_event(
             platform="telegram", chat_id="owner-chat", thread_id="owner-topic",
             label=lane_kind, lane_kind=lane_kind,
         )
+        task_lane_id = lane_id
+        if separate_task_lane:
+            task_lane_id = odb.bind_conversation_lane(
+                conn,
+                project_id=project_id,
+                platform="telegram",
+                chat_id="worker-chat",
+                thread_id="worker-topic",
+                label="workstream",
+                lane_kind="workstream",
+            )
     with kbc.connect_closing() as conn:
         task_id = kb.create_task(
             conn, title="terminal implementation", body="project_id: " + project_id,
@@ -56,7 +68,7 @@ def _bound_event(
             parent_execution_id="ex_impl",
             mutation_repository="example/repo", mutation_scope=["src/**"],
             mutation_base_ref="base",
-            conversation_lane_id=lane_id if task_lane_bound else None,
+            conversation_lane_id=task_lane_id if task_lane_bound else None,
         )
         for chat_id in ("origin-one", "origin-two"):
             kbn.add_notify_sub(
@@ -162,6 +174,54 @@ def test_explicit_project_workstream_routes_owner_wake(tmp_path, monkeypatch):
     asyncio.run(runner._deliver_outcome_owner_wakes([spec]))
     assert [item.source.chat_id for item in adapter.handled] == ["owner-chat"]
     assert [item.source.thread_id for item in adapter.handled] == ["owner-topic"]
+
+
+def test_unique_control_lane_wins_over_explicit_task_lane(tmp_path, monkeypatch):
+    _, _, control_lane_id, task, event = _bound_event(
+        tmp_path,
+        monkeypatch,
+        task_lane_bound=True,
+        separate_task_lane=True,
+    )
+
+    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+
+    assert spec is not None and spec["status"] == "deliver"
+    assert spec["route"]["lane_id"] == control_lane_id
+    assert spec["route"]["lane_kind"] == "control"
+    adapter = _OwnerAdapter()
+    runner = _runner(adapter)
+    _inline_to_thread(monkeypatch)
+    asyncio.run(runner._deliver_outcome_owner_wakes([spec]))
+    assert [item.source.chat_id for item in adapter.handled] == ["owner-chat"]
+    assert [item.source.thread_id for item in adapter.handled] == ["owner-topic"]
+
+
+def test_multiple_control_lanes_do_not_fall_back_to_explicit_task_lane(
+    tmp_path, monkeypatch,
+):
+    project_id, outcome_id, _, task, event = _bound_event(
+        tmp_path,
+        monkeypatch,
+        task_lane_bound=True,
+        separate_task_lane=True,
+    )
+    with odb.connect_closing() as conn:
+        odb.bind_conversation_lane(
+            conn,
+            project_id=project_id,
+            outcome_id=outcome_id,
+            platform="telegram",
+            chat_id="other-owner-chat",
+            thread_id="other-owner-topic",
+            label="control",
+            lane_kind="control",
+        )
+
+    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+
+    assert spec is not None and spec["status"] == "noop"
+    assert spec["reason"] == "exactly one bound control lane is required"
 
 
 @pytest.mark.parametrize(
