@@ -2409,10 +2409,6 @@ def cmd_update(args):
     if getattr(args, "plan", False) or getattr(args, "check", False):
         _update_preflight_handled(args)
         return
-    if dispatch_private_immutable_update(args):
-        return
-    if _update_preflight_handled(args):
-        return
     gateway_mode = getattr(args, "gateway", False)
 
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
@@ -2446,6 +2442,10 @@ def cmd_update(args):
     from hermes_cli.update_cmd import _cmd_update_impl
 
     try:
+        if dispatch_private_immutable_update(args):
+            return
+        if _update_preflight_handled(args):
+            return
         _cmd_update_impl(args, gateway_mode=gateway_mode)
     except SystemExit as _update_exit:
         # Receipt boundary: the impl has many early sys.exit paths that never
