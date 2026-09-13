@@ -693,6 +693,163 @@ def test_affected_cgroup_cannot_directly_prepare_activation(tmp_path, monkeypatc
         ProductionOperations().prepare(request, policy)
 
 
+def _prime_idle_gateways(policy, principal, *, updated_at="2100-01-01T00:00:00+00:00"):
+    for target in policy.gateway_targets:
+        _write(
+            target.profile_home / ".drain_request.json",
+            json.dumps({"principal": principal}).encode(),
+        )
+        _write(
+            target.profile_home / "gateway_state.json",
+            json.dumps(
+                {
+                    "pid": 123,
+                    "start_time": 456,
+                    "gateway_state": "draining",
+                    "active_agents": 0,
+                    "active_cron_jobs": 0,
+                    "active_api_runs": 0,
+                    "code_sha": COMMIT,
+                    "updated_at": updated_at,
+                }
+            ).encode(),
+        )
+
+
+def test_quiesce_accepts_two_independent_idle_samples_without_state_rewrite(
+    tmp_path, monkeypatch
+):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    state, policy, payload, _originals = _fixture(tmp_path, "idle-no-rewrite")
+    request = parse_sealed_request(payload, state_dir=state)
+    operations = ProductionOperations()
+    operations.marker_principal = f"private-release:{request.request_id}"
+    _prime_idle_gateways(policy, operations.marker_principal)
+    monkeypatch.setattr(operations, "_drain", lambda *_args, **_kwargs: None)
+    show_calls = []
+    start_calls = []
+
+    def show(unit):
+        show_calls.append(unit)
+        return {"MainPID": "123", "ControlGroup": "/test"}
+
+    def proc_start(pid):
+        start_calls.append(pid)
+        return 456
+
+    monkeypatch.setattr(supervisor, "_show", show)
+    monkeypatch.setattr(supervisor, "_proc_start", proc_start)
+    reads = []
+    read_json = supervisor._read_json
+
+    def tracked_read(path, *args, **kwargs):
+        reads.append(path)
+        return read_json(path, *args, **kwargs)
+
+    monkeypatch.setattr(supervisor, "_read_json", tracked_read)
+    monotonic = iter((0.0, 0.0, 1.0, 31.0))
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+    prestate_checks = []
+    monkeypatch.setattr(
+        operations, "_verify_prestate", lambda checked: prestate_checks.append(checked)
+    )
+
+    result = operations.quiesce(request, policy, "candidate")
+
+    assert result["samples"] == 2
+    assert prestate_checks == [policy]
+    for target in policy.gateway_targets:
+        assert show_calls.count(target.unit) == 2
+        assert reads.count(target.profile_home / "gateway_state.json") == 2
+        assert reads.count(target.profile_home / ".drain_request.json") == 3
+    assert len(start_calls) >= 2 * len(policy.gateway_targets)
+
+
+@pytest.mark.parametrize(
+    "fault,match",
+    [
+        ("stale", "two fresh PID/start-bound samples"),
+        ("pid_drift", "two fresh PID/start-bound samples"),
+        ("start_drift", "two fresh PID/start-bound samples"),
+        ("active", "two fresh PID/start-bound samples"),
+        ("malformed", "not valid UTF-8 JSON"),
+        ("unsafe_mode", "group/other writable"),
+        ("foreign_marker", "foreign drain marker"),
+        ("child_scope", "child scope is not empty"),
+    ],
+)
+def test_quiesce_rejects_unsafe_or_unverified_samples(tmp_path, monkeypatch, fault, match):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    state, policy, payload, _originals = _fixture(tmp_path, f"quiesce-{fault}")
+    request = parse_sealed_request(payload, state_dir=state)
+    operations = ProductionOperations()
+    operations.marker_principal = f"private-release:{request.request_id}"
+    _prime_idle_gateways(policy, operations.marker_principal)
+    gateway = policy.gateway_targets[0]
+    state_path = gateway.profile_home / "gateway_state.json"
+    marker_path = gateway.profile_home / ".drain_request.json"
+    if fault == "stale":
+        _prime_idle_gateways(
+            policy,
+            operations.marker_principal,
+            updated_at="1970-01-01T00:00:00+00:00",
+        )
+    elif fault in {"pid_drift", "start_drift", "active"}:
+        gateway_state = json.loads(state_path.read_text())
+        field = {"pid_drift": "pid", "start_drift": "start_time", "active": "active_agents"}[fault]
+        gateway_state[field] = 999 if fault != "active" else 1
+        _write(state_path, json.dumps(gateway_state).encode())
+    elif fault == "malformed":
+        _write(state_path, b"{")
+    elif fault == "unsafe_mode":
+        state_path.chmod(0o622)
+    elif fault == "foreign_marker":
+        _write(marker_path, json.dumps({"principal": "someone-else"}).encode())
+
+    monkeypatch.setattr(operations, "_drain", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_show",
+        lambda _unit: {"MainPID": "123", "ControlGroup": "/test"},
+    )
+    monkeypatch.setattr(supervisor, "_proc_start", lambda _pid: 456)
+    monkeypatch.setattr(supervisor, "_proc_cmdline", lambda _pid: ["gateway"])
+    monkeypatch.setattr(supervisor, "_proc_env", lambda _pid: {"HERMES_REPO": "/runtime-old"})
+    resolve = Path.resolve
+
+    def resolve_cwd(path, *args, **kwargs):
+        if str(path) == "/proc/123/cwd":
+            return Path("/runtime-old")
+        return resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_cwd)
+    operations.baseline = {
+        target.unit: {
+            "pid": 123,
+            "start_tick": 456,
+            "cwd": "/runtime-old",
+            "argv": ["gateway"],
+            "env": {"HERMES_REPO": "/runtime-old"},
+            "source": "/runtime-old",
+        }
+        for target in policy.targets
+    }
+    monkeypatch.setattr(
+        operations,
+        "_child_scopes_empty",
+        lambda _status: fault != "child_scope",
+    )
+    monotonic = iter((0.0, 0.0, 1.0, 31.0))
+    monkeypatch.setattr(supervisor.time, "monotonic", lambda: next(monotonic))
+    monkeypatch.setattr(supervisor.time, "sleep", lambda _seconds: None)
+
+    with pytest.raises(PrivateReleaseError, match=match):
+        operations.quiesce(request, policy, "candidate")
+
+
 def test_dispatcher_canary_is_exact_non_mutating_dry_run(tmp_path, monkeypatch):
     state, policy, payload, _originals = _fixture(tmp_path, "dry-canary")
     request = parse_sealed_request(payload, state_dir=state)
