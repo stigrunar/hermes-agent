@@ -5549,6 +5549,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 ]
             
             message_ids = []
+            message_receipts = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -5777,7 +5778,15 @@ class TelegramAdapter(BasePlatformAdapter):
                                 await asyncio.sleep(wait)
                                 continue
                         raise
-                message_ids.append(str(msg.message_id))
+                returned_message_id = str(msg.message_id)
+                returned_thread_id = getattr(msg, "message_thread_id", None)
+                if returned_thread_id is not None:
+                    returned_thread_id = int(returned_thread_id)
+                message_ids.append(returned_message_id)
+                message_receipts.append({
+                    "message_id": returned_message_id,
+                    "message_thread_id": returned_thread_id,
+                })
 
             # Re-trigger typing indicator after sending a message.
             # Telegram clears the typing state when a new message is delivered,
@@ -5802,6 +5811,14 @@ class TelegramAdapter(BasePlatformAdapter):
                     "message_ids": message_ids,
                     "requested_thread_id": requested_thread_id,
                     "thread_fallback": used_thread_fallback,
+                    # Concrete bounded evidence from Telegram's returned
+                    # Message objects.  Do not place whole Message objects in
+                    # SendResult: callers need only routing/receipt scalars.
+                    "message_thread_id": (
+                        message_receipts[0]["message_thread_id"]
+                        if message_receipts else None
+                    ),
+                    "message_receipts": message_receipts,
                 },
             )
             

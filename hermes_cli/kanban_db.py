@@ -1778,6 +1778,23 @@ CREATE TABLE IF NOT EXISTS kanban_notify_subs (
     PRIMARY KEY (task_id, platform, chat_id, thread_id)
 );
 
+-- Append-only proof that one claimed Kanban event reached one subscription
+-- target.  Provider response bodies and credentials never belong here: only
+-- the bounded routing identifiers needed to verify a delivery are retained.
+CREATE TABLE IF NOT EXISTS kanban_notification_receipts (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id             TEXT NOT NULL,
+    event_id            INTEGER NOT NULL,
+    platform            TEXT NOT NULL,
+    chat_id             TEXT NOT NULL,
+    thread_id           TEXT NOT NULL DEFAULT '',
+    message_id          TEXT NOT NULL,
+    delivered_at        INTEGER NOT NULL,
+    thread_confirmed    INTEGER NOT NULL CHECK (thread_confirmed IN (0, 1)),
+    thread_confirmation TEXT NOT NULL,
+    UNIQUE (task_id, event_id, platform, chat_id, thread_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_tasks_assignee_status ON tasks(assignee, status);
 CREATE INDEX IF NOT EXISTS idx_tasks_status          ON tasks(status);
 CREATE INDEX IF NOT EXISTS idx_links_child           ON task_links(child_id);
@@ -1788,6 +1805,8 @@ CREATE INDEX IF NOT EXISTS idx_runs_task             ON task_runs(task_id, start
 CREATE INDEX IF NOT EXISTS idx_runs_status           ON task_runs(status);
 CREATE INDEX IF NOT EXISTS idx_attachments_task      ON task_attachments(task_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_notify_task           ON kanban_notify_subs(task_id);
+CREATE INDEX IF NOT EXISTS idx_notify_receipts_task_event
+    ON kanban_notification_receipts(task_id, event_id);
 """
 
 
@@ -18673,6 +18692,83 @@ def list_notify_subs(
             )
         out.append(item)
     return out
+
+
+def record_notification_receipt(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: int,
+    platform: str,
+    chat_id: str,
+    thread_id: Optional[str],
+    message_id: str,
+    thread_confirmation: str,
+    delivered_at: Optional[int] = None,
+) -> bool:
+    """Append bounded delivery proof for one event/subscription target.
+
+    The target tuple is the idempotency key.  A duplicate insert is a no-op
+    and never overwrites the original provider message identifier or delivery
+    time.  Network exactly-once delivery is impossible; this store provides
+    append-only, idempotent database proof after a successful provider send.
+    """
+    normalized_message_id = str(message_id).strip()
+    if not normalized_message_id:
+        raise ValueError("notification receipt requires a non-empty message_id")
+    confirmation = str(thread_confirmation).strip()
+    if not confirmation:
+        raise ValueError("notification receipt requires thread confirmation")
+    with write_txn(conn):
+        cur = conn.execute(
+            """
+            INSERT OR IGNORE INTO kanban_notification_receipts
+                (task_id, event_id, platform, chat_id, thread_id, message_id,
+                 delivered_at, thread_confirmed, thread_confirmation)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?)
+            """,
+            (
+                task_id,
+                int(event_id),
+                platform,
+                chat_id,
+                thread_id or "",
+                normalized_message_id,
+                int(delivered_at if delivered_at is not None else time.time()),
+                confirmation,
+            ),
+        )
+    return cur.rowcount > 0
+
+
+def list_notification_receipts(
+    conn: sqlite3.Connection,
+    *,
+    task_id: str,
+    event_id: Optional[int] = None,
+    platform: Optional[str] = None,
+    chat_id: Optional[str] = None,
+    thread_id: Optional[str] = None,
+) -> list[dict]:
+    """Read exact bounded receipt rows for task/event/target verification."""
+    clauses = ["task_id = ?"]
+    params: list[Any] = [task_id]
+    for column, value in (
+        ("event_id", event_id),
+        ("platform", platform),
+        ("chat_id", chat_id),
+        ("thread_id", thread_id),
+    ):
+        if value is not None:
+            clauses.append(f"{column} = ?")
+            params.append(int(value) if column == "event_id" else value)
+    rows = conn.execute(
+        "SELECT * FROM kanban_notification_receipts WHERE "
+        + " AND ".join(clauses)
+        + " ORDER BY id ASC",
+        params,
+    ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def count_notify_subs(

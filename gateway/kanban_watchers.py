@@ -34,6 +34,10 @@ _LOCAL_PATH_RE = re.compile(
 )
 
 
+class _NotificationReceiptPersistenceError(RuntimeError):
+    """Receipt storage failed after a provider send; retry without unsubscribing."""
+
+
 def _safe_review_reason(value: Any, limit: int = 160) -> str:
     """Return a mobile-friendly review reason safe for external delivery."""
     from agent.redact import redact_sensitive_text
@@ -48,6 +52,55 @@ def _safe_review_reason(value: Any, limit: int = 160) -> str:
     if len(reason) > limit:
         reason = reason[: limit - 1].rstrip() + "…"
     return reason
+
+
+def _verified_telegram_delivery(send_result: Any, requested_thread_id: Any) -> tuple[str, str]:
+    """Return ``(message_id, confirmation)`` from concrete Telegram evidence.
+
+    Telegram's General/root lane is represented by an omitted returned
+    ``message_thread_id``; it is never rewritten to a made-up topic id.  Every
+    other requested topic must be echoed by Telegram's returned Message.
+    """
+    message_id = str(getattr(send_result, "message_id", "") or "").strip()
+    if not message_id:
+        raise RuntimeError("Telegram send succeeded without a message_id")
+    raw = getattr(send_result, "raw_response", None)
+    if not isinstance(raw, dict) or "message_thread_id" not in raw:
+        raise RuntimeError("Telegram send returned no concrete thread evidence")
+    returned_thread_ids = [raw["message_thread_id"]]
+    per_message = raw.get("message_receipts")
+    if per_message is not None:
+        if not isinstance(per_message, list) or not per_message:
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if any(
+            not isinstance(item, dict)
+            or not str(item.get("message_id") or "").strip()
+            or "message_thread_id" not in item
+            for item in per_message
+        ):
+            raise RuntimeError("Telegram send returned invalid per-message evidence")
+        if str(per_message[0]["message_id"]).strip() != message_id:
+            raise RuntimeError("Telegram primary message evidence is inconsistent")
+        returned_thread_ids = [item["message_thread_id"] for item in per_message]
+    requested = str(requested_thread_id or "").strip()
+    if requested in {"", "1"}:
+        if any(returned_thread_id is not None for returned_thread_id in returned_thread_ids):
+            raise RuntimeError(
+                "Telegram General/root delivery returned unexpected topic evidence"
+            )
+        return message_id, "general_root"
+    try:
+        matches = all(
+            int(returned_thread_id) == int(requested)
+            for returned_thread_id in returned_thread_ids
+        )
+    except (TypeError, ValueError):
+        matches = False
+    if not matches:
+        raise RuntimeError(
+            "Telegram returned thread evidence does not match requested topic"
+        )
+    return message_id, "matched"
 
 
 def _resolve_auto_decompose_settings(
@@ -1223,6 +1276,29 @@ class GatewayKanbanWatchersMixin:
                             # outcome there, not by skipping the send here.
                             continue
                         try:
+                            if platform_str == "telegram":
+                                try:
+                                    already_receipted = await _to_thread_process_service(
+                                        self._kanban_has_notification_receipt,
+                                        sub,
+                                        ev.id,
+                                        board_slug,
+                                    )
+                                except Exception as receipt_exc:
+                                    raise _NotificationReceiptPersistenceError(
+                                        "notification receipt lookup failed"
+                                    ) from receipt_exc
+                                if already_receipted:
+                                    logger.debug(
+                                        "kanban notifier: skipping already-receipted %s event "
+                                        "for %s to %s/%s on board %s",
+                                        kind,
+                                        sub["task_id"],
+                                        platform_str,
+                                        sub["chat_id"],
+                                        board_slug,
+                                    )
+                                    continue
                             _send_res = await adapter.send(
                                 sub["chat_id"], msg, metadata=metadata,
                             )
@@ -1238,6 +1314,36 @@ class GatewayKanbanWatchersMixin:
                                     "adapter send() reported failure: "
                                     f"{getattr(_send_res, 'error', None) or 'unknown error'}"
                                 )
+                            # Telegram's SendResult is only proven when its
+                            # returned Message supplies a message id and thread
+                            # evidence for the requested target.  Persist that
+                            # bounded receipt before accepting the pre-claimed
+                            # cursor; any validation/SQLite failure enters the
+                            # existing CAS rewind/retry path below.  Adapters
+                            # with the legacy non-SendResult return contract
+                            # remain behaviorally unchanged.
+                            if platform_str == "telegram":
+                                from gateway.platforms.base import SendResult
+
+                                if isinstance(_send_res, SendResult):
+                                    message_id, thread_confirmation = (
+                                        _verified_telegram_delivery(
+                                            _send_res, sub.get("thread_id") or ""
+                                        )
+                                    )
+                                    try:
+                                        await _to_thread_process_service(
+                                            self._kanban_record_notification_receipt,
+                                            sub,
+                                            ev.id,
+                                            message_id,
+                                            thread_confirmation,
+                                            board_slug,
+                                        )
+                                    except Exception as receipt_exc:
+                                        raise _NotificationReceiptPersistenceError(
+                                            "notification receipt persistence failed"
+                                        ) from receipt_exc
                             logger.debug(
                                 "kanban notifier: delivered %s event for %s to %s/%s on board %s",
                                 kind, sub["task_id"], platform_str, sub["chat_id"], board_slug,
@@ -1268,6 +1374,20 @@ class GatewayKanbanWatchersMixin:
                             # Reset the failure counter on success.
                             sub_fail_counts.pop(sub_key, None)
                         except Exception as exc:
+                            if isinstance(exc, _NotificationReceiptPersistenceError):
+                                logger.warning(
+                                    "kanban notifier: receipt persistence failed for %s "
+                                    "on %s; rewinding claim for retry: %s",
+                                    sub["task_id"], platform_str, exc.__cause__ or exc,
+                                )
+                                await _to_thread_process_service(
+                                    self._kanban_rewind,
+                                    sub,
+                                    d["cursor"],
+                                    d.get("old_cursor", 0),
+                                    board_slug,
+                                )
+                                break
                             fails = sub_fail_counts.get(sub_key, 0) + 1
                             sub_fail_counts[sub_key] = fails
                             logger.warning(
@@ -1977,6 +2097,56 @@ class GatewayKanbanWatchersMixin:
                 platform=sub["platform"],
                 chat_id=sub["chat_id"],
                 thread_id=sub.get("thread_id") or "",
+            )
+        finally:
+            conn.close()
+
+    def _kanban_has_notification_receipt(
+        self,
+        sub: dict,
+        event_id: int,
+        board: Optional[str] = None,
+    ) -> bool:
+        """Return whether this exact Telegram event/target is already proven."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            return bool(
+                _kb.list_notification_receipts(
+                    conn,
+                    task_id=sub["task_id"],
+                    event_id=event_id,
+                    platform=sub["platform"],
+                    chat_id=sub["chat_id"],
+                    thread_id=sub.get("thread_id") or "",
+                )
+            )
+        finally:
+            conn.close()
+
+    def _kanban_record_notification_receipt(
+        self,
+        sub: dict,
+        event_id: int,
+        message_id: str,
+        thread_confirmation: str,
+        board: Optional[str] = None,
+    ) -> None:
+        """Persist bounded provider proof before a claimed cursor is accepted."""
+        from hermes_cli import kanban_db as _kb
+
+        conn = _kb.connect(board=board)
+        try:
+            _kb.record_notification_receipt(
+                conn,
+                task_id=sub["task_id"],
+                event_id=event_id,
+                platform=sub["platform"],
+                chat_id=sub["chat_id"],
+                thread_id=sub.get("thread_id") or "",
+                message_id=message_id,
+                thread_confirmation=thread_confirmation,
             )
         finally:
             conn.close()
