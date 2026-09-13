@@ -82,6 +82,39 @@ def _owner_wake_explicit_lane(
     return lane, ""
 
 
+def _owner_wake_lane(
+    odb: Any,
+    conn: Any,
+    *,
+    project_id: str,
+    outcome_id: str,
+    lane_id: Any,
+    topic_target: Any,
+) -> tuple[Optional[Any], str]:
+    """Prefer the unique Outcome control lane, then an exact task lane."""
+    controls = [
+        item
+        for item in odb.list_conversation_lanes(
+            conn, project_id, outcome_id=outcome_id
+        )
+        if item.lane_kind == "control"
+    ]
+    if len(controls) == 1:
+        return controls[0], ""
+    if len(controls) > 1:
+        return None, "exactly one bound control lane is required"
+    if str(lane_id or "").strip() or str(topic_target or "").strip():
+        return _owner_wake_explicit_lane(
+            odb,
+            conn,
+            project_id=project_id,
+            outcome_id=outcome_id,
+            lane_id=lane_id,
+            topic_target=topic_target,
+        )
+    return None, "exactly one bound control lane is required"
+
+
 def _owner_replan_prompt(task: Any, replan: dict[str, Any]) -> str:
     """Build one bounded, artifact-grounded continuation for Dolly/default."""
     task_id = str(replan.get("task_id") or getattr(task, "id", ""))
@@ -230,15 +263,12 @@ def _resolve_outcome_owner_wake_spec(
 
             task_lane_id = getattr(task, "conversation_lane_id", None)
             task_topic_target = getattr(task, "topic_target", None)
-            has_explicit_route = bool(
-                str(task_lane_id or "").strip() or str(task_topic_target or "").strip()
-            )
             lane = None
             owner = str(outcome.visible_owner or "").strip()
             if status == "deliver" and not owner:
                 status, reason = "noop", "Outcome.visible_owner is missing"
-            elif status == "deliver" and has_explicit_route:
-                lane, route_error = _owner_wake_explicit_lane(
+            elif status == "deliver":
+                lane, route_error = _owner_wake_lane(
                     odb,
                     conn,
                     project_id=project_id,
@@ -248,18 +278,6 @@ def _resolve_outcome_owner_wake_spec(
                 )
                 if route_error:
                     status, reason = "noop", route_error
-            elif status == "deliver":
-                controls = [
-                    item
-                    for item in odb.list_conversation_lanes(
-                        conn, project_id, outcome_id=outcome.id
-                    )
-                    if item.lane_kind == "control"
-                ]
-                if len(controls) != 1:
-                    status, reason = "noop", "exactly one bound control lane is required"
-                else:
-                    lane = controls[0]
             route: dict[str, Any] = {}
             if lane is not None:
                 route = {
@@ -341,28 +359,16 @@ class GatewayKanbanOwnerMixin:
             task = spec.get("task") or {}
             lane_id = task.get("conversation_lane_id")
             topic_target = task.get("topic_target")
-            if str(lane_id or "").strip() or str(topic_target or "").strip():
-                lane, route_error = _owner_wake_explicit_lane(
-                    odb,
-                    conn,
-                    project_id=outcome.project_id,
-                    outcome_id=outcome.id,
-                    lane_id=lane_id,
-                    topic_target=topic_target,
-                )
-                if route_error:
-                    return False
-            else:
-                routes = [
-                    item
-                    for item in odb.list_conversation_lanes(
-                        conn, outcome.project_id, outcome_id=outcome.id
-                    )
-                    if item.lane_kind == "control"
-                ]
-                if len(routes) != 1:
-                    return False
-                lane = routes[0]
+            lane, route_error = _owner_wake_lane(
+                odb,
+                conn,
+                project_id=outcome.project_id,
+                outcome_id=outcome.id,
+                lane_id=lane_id,
+                topic_target=topic_target,
+            )
+            if route_error:
+                return False
             if lane is None:
                 return False
             return (
