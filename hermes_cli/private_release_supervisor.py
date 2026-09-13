@@ -285,6 +285,45 @@ def _read_boundary_bytes(path: Path, label: str) -> bytes:
         os.close(fd)
 
 
+def _hash_staged_payload(path: Path, label: str, *, boundary: bool = False) -> str:
+    """Hash payloads at constant memory cost, binding the digest to a stable file."""
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise RequestValidationError(f"{label} is not readable: {path}") from exc
+    try:
+        before = os.fstat(fd)
+        if boundary:
+            if not stat.S_ISREG(before.st_mode):
+                raise RequestValidationError(f"{label} is not a regular file: {path}")
+            if (
+                before.st_uid not in {0, os.getuid()}
+                or before.st_mode & 0o002
+                or (before.st_uid != os.getuid() and before.st_mode & 0o020)
+            ):
+                raise RequestValidationError(f"{label} owner/mode validation failed: {path}")
+        else:
+            _validate_stat(before, path, label, mode=None, directory=False)
+        digest = hashlib.sha256()
+        while block := os.read(fd, 1024 * 1024):
+            digest.update(block)
+        after = os.fstat(fd)
+        identity = lambda value: (
+            value.st_dev, value.st_ino, value.st_mode, value.st_uid,
+            value.st_size, value.st_mtime_ns, value.st_ctime_ns,
+        )
+        try:
+            current = path.lstat()
+        except OSError as exc:
+            raise RequestValidationError(f"{label} changed while being hashed: {path}") from exc
+        if identity(before) != identity(after) or identity(after) != identity(current):
+            raise RequestValidationError(f"{label} changed while being hashed: {path}")
+        return digest.hexdigest()
+    finally:
+        os.close(fd)
+
+
 def _read_json(
     path: Path, label: str, *, mode: int | None = None, expected_sha256: str | None = None
 ) -> Mapping[str, Any]:
@@ -542,17 +581,21 @@ def _validate_evidence(request: PrivateReleaseRequest) -> None:
                     raise RequestValidationError(
                         f"staged symlink crosses an unapproved runtime boundary: {relative}"
                     )
-            target_bytes = _read_boundary_bytes(
-                resolved_target, f"resolved staged symlink target {relative}"
+            target_digest = _hash_staged_payload(
+                resolved_target, f"resolved staged symlink target {relative}", boundary=True
             )
-            if sha256_bytes(target_bytes) != _digest(
+            if target_digest != _digest(
                 link["target_sha256"], f"symlink target digest {relative}", sha256=True
             ):
                 raise RequestValidationError(f"staged symlink target digest mismatch: {relative}")
         else:
-            data = _read_owned_bytes(artifact_path, f"staged artifact {relative}")
-            artifact_bytes[relative] = data
-            if sha256_bytes(data) != _digest(
+            if relative == "private-release-identity.json":
+                data = _read_owned_bytes(artifact_path, f"staged artifact {relative}")
+                artifact_bytes[relative] = data
+                actual_digest = sha256_bytes(data)
+            else:
+                actual_digest = _hash_staged_payload(artifact_path, f"staged artifact {relative}")
+            if actual_digest != _digest(
                 expected_digest, f"artifact digest {relative}", sha256=True
             ):
                 raise RequestValidationError(f"staged artifact digest mismatch: {relative}")

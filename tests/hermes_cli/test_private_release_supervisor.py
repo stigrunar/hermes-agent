@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import subprocess
 import sys
@@ -436,6 +437,94 @@ def test_standard_virtualenv_interpreter_symlink_is_bound_and_supported(tmp_path
         payload, policy=policy, operations=_operations(policy, originals, calls), state_dir=state
     )
     assert result["status"] == "succeeded"
+
+
+@pytest.mark.parametrize("symlink", [False, True])
+def test_large_staged_payload_digest_is_validated(tmp_path, symlink):
+    from hermes_cli.private_release_supervisor import _MAX_FILE_BYTES, RequestValidationError
+
+    state, _, payload, _ = _fixture(tmp_path, "large-artifact")
+    runtime = state.parent / "runtime" / f"downstream-{COMMIT[:10]}"
+    artifact = runtime / "candidate.txt"
+    size = _MAX_FILE_BYTES + 1
+    with artifact.open("wb") as handle:
+        handle.truncate(size)
+    digest = hashlib.sha256()
+    block = bytes(1024 * 1024)
+    for _ in range(size // len(block)):
+        digest.update(block)
+    digest.update(block[:size % len(block)])
+    manifest_path = runtime / "private-release-manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["artifacts"]["candidate.txt"] = digest.hexdigest()
+    if symlink:
+        (runtime / "dependency-link").symlink_to("candidate.txt")
+        manifest["artifacts"]["dependency-link"] = {
+            "type": "symlink", "target": "candidate.txt",
+            "target_sha256": digest.hexdigest(),
+        }
+    payload["artifact_manifest_sha256"] = _write(
+        manifest_path, json.dumps(manifest, sort_keys=True).encode()
+    )
+    assert parse_sealed_request(payload, state_dir=state).candidate.commit == COMMIT
+
+    if symlink:
+        manifest["artifacts"]["dependency-link"]["target_sha256"] = "0" * 64
+    else:
+        manifest["artifacts"]["candidate.txt"] = "0" * 64
+    payload["artifact_manifest_sha256"] = _write(
+        manifest_path, json.dumps(manifest, sort_keys=True).encode()
+    )
+    with pytest.raises(RequestValidationError, match="digest mismatch"):
+        parse_sealed_request(payload, state_dir=state)
+
+
+@pytest.mark.parametrize("reader", ["_read_owned_bytes", "_read_boundary_bytes", "_read_json"])
+def test_control_file_reads_remain_bounded(tmp_path, reader):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    control = tmp_path / "control.json"
+    with control.open("wb") as handle:
+        handle.truncate(supervisor._MAX_FILE_BYTES + 1)
+    control.chmod(0o600)
+    with pytest.raises(supervisor.RequestValidationError, match="too large"):
+        getattr(supervisor, reader)(control, "control")
+
+
+@pytest.mark.parametrize("boundary", [False, True])
+@pytest.mark.parametrize("change", ["mutate", "replace", "mode", "mtime"])
+def test_staged_payload_hash_rejects_concurrent_changes(tmp_path, monkeypatch, boundary, change):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    artifact = tmp_path / "artifact"
+    _write(artifact, b"original payload")
+    original_read = supervisor.os.read
+    changed = False
+
+    def read_and_change(fd, size):
+        nonlocal changed
+        block = original_read(fd, size)
+        if block and not changed:
+            changed = True
+            if change == "replace":
+                replacement = tmp_path / "replacement"
+                _write(replacement, b"original payload")
+                replacement.replace(artifact)
+            elif change == "mode":
+                artifact.chmod(0o400)
+            elif change == "mtime":
+                before = artifact.stat()
+                artifact.write_bytes(b"modified payload")
+                supervisor.os.utime(
+                    artifact, ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000_000)
+                )
+            else:
+                artifact.write_bytes(b"modified payload with a different size")
+        return block
+
+    monkeypatch.setattr(supervisor.os, "read", read_and_change)
+    with pytest.raises(supervisor.RequestValidationError, match="changed while being hashed"):
+        supervisor._hash_staged_payload(artifact, "artifact", boundary=boundary)
 
 
 def test_manifested_external_dependency_symlink_fails_before_operations(tmp_path):
