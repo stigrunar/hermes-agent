@@ -3448,6 +3448,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     for chunk in chunks
                ]
             message_ids = []
+            message_receipts = []
             thread_id = self._metadata_thread_id(metadata)
             requested_thread_id = self._message_thread_id_for_send(thread_id)
             used_thread_fallback = False
@@ -3457,12 +3458,29 @@ class TelegramAdapter(BasePlatformAdapter):
                 if isinstance(outcome, SendResult):
                     return outcome
                 msg, used_thread_fallback = outcome
-                message_ids.append(str(msg.message_id))
+                returned_message_id = str(msg.message_id)
+                returned_thread_id = getattr(msg, "message_thread_id", None)
+                if returned_thread_id is not None:
+                    returned_thread_id = int(returned_thread_id)
+                message_ids.append(returned_message_id)
+                message_receipts.append({
+                    "message_id": returned_message_id,
+                    "message_thread_id": returned_thread_id,
+                })
             await self._retrigger_typing(chat_id, metadata)
             return SendResult(
                 success=True, message_id=message_ids[0] if message_ids else None,
                 raw_response={
-                    "message_ids": message_ids, "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
+                    "message_ids": message_ids,
+                    "requested_thread_id": requested_thread_id,
+                    "thread_fallback": used_thread_fallback,
+                    "message_thread_id": (
+                        message_receipts[0]["message_thread_id"]
+                        if message_receipts else None
+                    ),
+                    "message_receipts": message_receipts,
+                },
+            )
         except Exception as e:
             safe_error = _redact_telegram_error_text(e)
             logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
