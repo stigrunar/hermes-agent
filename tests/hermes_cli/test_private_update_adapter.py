@@ -162,3 +162,49 @@ def test_validation_failure_finalizes_actionable_update_receipt(tmp_path, monkey
         "at": receipt["steps"][-1]["at"],
     }
     assert receipt["stop_reason"] == "policy digest mismatch"
+
+
+@pytest.mark.parametrize("outcome", ["success", "exit", "error"])
+def test_private_dispatch_holds_shared_lock_and_releases_on_every_exit(tmp_path, monkeypatch, outcome):
+    from hermes_cli import update_lock
+
+    marker = tmp_path / "shared-update-marker"
+    monkeypatch.setattr(update_lock, "update_marker_path", lambda: marker)
+    monkeypatch.delenv(update_lock.HANDOFF_PID_ENV, raising=False)
+    monkeypatch.setattr(cli_main, "_install_hangup_protection", lambda **_kwargs: None)
+    monkeypatch.setattr(cli_main, "_finalize_update_output", lambda _state: None)
+    calls = []
+
+    def dispatch(_args):
+        calls.append("dispatch")
+        contender = update_lock.UpdateLock()
+        assert not contender.acquire()
+        assert contender.holder.pid == os.getpid()
+        if outcome == "exit":
+            raise SystemExit(7)
+        if outcome == "error":
+            raise RuntimeError("adapter failed")
+        return True
+
+    monkeypatch.setattr(adapter, "dispatch_private_immutable_update", dispatch)
+    holder = update_lock.UpdateLock()
+    assert holder.acquire()
+    with pytest.raises(SystemExit) as refused:
+        cli_main.cmd_update(SimpleNamespace())
+    assert refused.value.code == update_lock.UPDATE_EXIT_CONCURRENT
+    assert calls == []
+    assert marker.exists()
+    holder.release()
+    if outcome == "success":
+        cli_main.cmd_update(SimpleNamespace())
+    elif outcome == "exit":
+        with pytest.raises(SystemExit) as exited:
+            cli_main.cmd_update(SimpleNamespace())
+        assert exited.value.code == 7
+    else:
+        with pytest.raises(RuntimeError, match="adapter failed"):
+            cli_main.cmd_update(SimpleNamespace())
+    assert calls == ["dispatch"]
+    assert not marker.exists()
+    with update_lock.UpdateLock() as next_update:
+        assert next_update.acquired

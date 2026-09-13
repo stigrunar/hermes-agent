@@ -242,7 +242,7 @@ def test_success_journals_then_updates_all_six_bindings(tmp_path):
     assert len(result["mutated_units"]) == 6
     assert (state / "receipts/success.prestate.json").is_file()
     journal = json.loads((state / "receipts/success.journal.json").read_text())
-    assert journal["phase"] == "committed_before_drain_release"
+    assert journal["phase"] == "committed_after_drain_release"
     rollback = state / "receipts/success.rollback.json"
     assert rollback.stat().st_mode & 0o777 == 0o600
     assert journal["rollback_bundle_sha256"] == sha256_bytes(rollback.read_bytes())
@@ -709,3 +709,157 @@ def test_dispatcher_canary_is_exact_non_mutating_dry_run(tmp_path, monkeypatch):
     assert calls[0][0] == (
         request.runtime / "venv/bin/python", policy.dispatcher_wrapper, "--once", "--dry-run"
     )
+
+
+@pytest.mark.parametrize("crash_phase", ["before_release", "after_release", "after_journal"])
+@pytest.mark.parametrize("damage", [None, "health", "binding", "evidence"])
+def test_committed_crash_never_rolls_back(tmp_path, monkeypatch, crash_phase, damage):
+    from hermes_cli import private_release_supervisor as supervisor
+
+    state, policy, payload, originals = _fixture(tmp_path)
+    request = parse_sealed_request(payload, state_dir=state)
+    operations = _operations(policy, originals, [])
+    release = operations.release_quiescence
+
+    def crash_at_release(*args):
+        if crash_phase == "after_release":
+            release(*args)
+        raise KeyboardInterrupt("commit crash")
+
+    write = supervisor._write_json_atomic
+
+    def crash_at_terminal(path, value):
+        if path == request.terminal_receipt_path:
+            raise KeyboardInterrupt("terminal crash")
+        write(path, value)
+
+    if crash_phase == "after_journal":
+        monkeypatch.setattr(supervisor, "_write_json_atomic", crash_at_terminal)
+    else:
+        operations.release_quiescence = crash_at_release
+    with pytest.raises(KeyboardInterrupt):
+        execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    monkeypatch.setattr(supervisor, "_write_json_atomic", write)
+    calls = []
+    recovery = _operations(policy, originals, calls)
+    if damage == "health":
+        recovery.health_probe = lambda *_args: False
+    elif damage == "binding":
+        policy.targets[0].binding.write_bytes(originals[policy.targets[0].unit])
+    elif damage == "evidence":
+        request.artifact_manifest.unlink()
+    before = {target.unit: target.binding.read_bytes() for target in policy.targets}
+    result = execute_private_release(payload, policy=policy, operations=recovery, state_dir=state)
+    assert result["status"] == ("reconciliation_required" if damage else "succeeded")
+    assert result["recovery"] == "committed_activation"
+    assert result["mutated_units"] == [target.unit for target in policy.targets]
+    assert not any(call[0] in {"binding", "restart", "quiesce", "canary"} for call in calls)
+    assert all(target.binding.read_bytes() == before[target.unit] for target in policy.targets)
+    if damage:
+        assert "explicit reconciliation" in result["error"]
+        assert ("release", "drains") not in calls
+    else:
+        assert calls == [("health", "candidate"), ("release", "drains")]
+
+
+@pytest.mark.parametrize("state_change", [None, "partial", "mismatched", "unhealthy", "source"])
+def test_different_request_already_bound_candidate_is_no_change(tmp_path, state_change):
+    state, policy, payload, originals = _fixture(tmp_path)
+    first = execute_private_release(
+        payload, policy=policy, operations=_operations(policy, originals, []), state_dir=state
+    )
+    assert first["status"] == "succeeded"
+    payload = dict(payload, request_id="request-2")
+    if state_change == "partial":
+        policy.targets[0].binding.write_bytes(originals[policy.targets[0].unit])
+    elif state_change == "mismatched":
+        target = policy.targets[0]
+        target.binding.write_bytes(target.binding.read_bytes().replace(b"ExecStart=", b"ExecStart=wrong ", 1))
+    calls = []
+    operations = _operations(policy, originals, calls)
+    if state_change == "unhealthy":
+        operations.health_probe = lambda *_args: False
+    elif state_change == "source":
+        request = parse_sealed_request(payload, state_dir=state)
+        (request.runtime / "candidate.txt").write_bytes(b"changed source")
+    before = {target.unit: (target.binding.read_bytes(), target.binding.stat().st_ino) for target in policy.targets}
+    result = execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    if state_change in {"partial", "mismatched"}:
+        assert result["status"] == "succeeded"
+        assert result["mutated_units"] == [policy.targets[0].unit]
+        assert ("restart", "candidate") in calls
+    else:
+        assert result["status"] == ("no_change" if state_change is None else "rejected")
+        assert result["mutated_units"] == []
+        assert not any(call[0] in {"binding", "restart", "quiesce", "release"} for call in calls)
+        assert all((target.binding.read_bytes(), target.binding.stat().st_ino) == before[target.unit] for target in policy.targets)
+        if state_change is None:
+            assert calls == [("health", "no_change")]
+    calls.clear()
+    replay = execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    assert replay["admission"] == "replay_rejected"
+    assert calls == []
+
+
+@pytest.mark.parametrize("mismatch", [None, "source", "command", "gateway"])
+def test_no_change_health_checks_candidate_identity_without_restart(tmp_path, monkeypatch, mismatch):
+    from hermes_cli import private_release_supervisor as supervisor
+    from contextlib import contextmanager
+    from io import BytesIO
+
+    state, policy, payload, _originals = _fixture(tmp_path)
+    request = parse_sealed_request(payload, state_dir=state)
+    operations = ProductionOperations()
+    operations.baseline = {target.unit: {"pid": 123, "start_tick": 456} for target in policy.targets}
+    monkeypatch.setattr(supervisor, "_show", lambda _unit: {
+        "ActiveState": "active", "SubState": "running", "MainPID": "123", "NRestarts": "0",
+    })
+    monkeypatch.setattr(supervisor, "_proc_start", lambda _pid: 456)
+    monkeypatch.setattr(supervisor, "_proc_env", lambda _pid: {
+        "HERMES_REPO": "wrong" if mismatch == "source" else str(request.runtime),
+        "PYTHONPATH": str(request.runtime),
+    })
+    monkeypatch.setattr(supervisor, "_expected_command", lambda *_args: ["candidate"])
+    monkeypatch.setattr(supervisor, "_proc_cmdline", lambda _pid: ["wrong" if mismatch == "command" else "candidate"])
+    monkeypatch.setattr(operations, "_child_scopes_empty", lambda _status: True)
+    resolve = Path.resolve
+
+    def resolve_cwd(path, *args, **kwargs):
+        return request.runtime if str(path) == "/proc/123/cwd" else resolve(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve_cwd)
+    for target in policy.gateway_targets:
+        _write(target.profile_home / "gateway_state.json", json.dumps({
+            "pid": 123, "start_time": 456,
+            "code_sha": "wrong" if mismatch == "gateway" else COMMIT,
+        }).encode())
+
+    @contextmanager
+    def response(url, **_kwargs):
+        body = b'{"gateway_running": true}' if not isinstance(url, str) else b"<html></html>"
+        stream = BytesIO(body)
+        stream.status = 200
+        yield stream
+
+    monkeypatch.setattr(supervisor, "urlopen", response)
+    if mismatch:
+        with pytest.raises(PrivateReleaseError, match="identity mismatch|escaped candidate"):
+            operations._health_once(request, policy, "no_change")
+    else:
+        assert set(operations._health_once(request, policy, "no_change")) == set(operations.baseline)
+        with pytest.raises(PrivateReleaseError, match="did not restart"):
+            operations._health_once(request, policy, "candidate")
+
+
+def test_committed_drain_error_reports_reconciliation_without_rollback(tmp_path):
+    state, policy, payload, originals = _fixture(tmp_path)
+    calls = []
+    operations = _operations(policy, originals, calls)
+    operations.release_quiescence = lambda *_args: False
+    result = execute_private_release(payload, policy=policy, operations=operations, state_dir=state)
+    assert result["status"] == "reconciliation_required"
+    assert result["rollback"]["attempted"] is False
+    assert result["rollback"]["restored_units"] == []
+    assert "automatic rollback forbidden" in result["rollback"]["errors"][0]
+    assert ("restart", "rollback") not in calls
+    assert all(target.binding.read_bytes() != originals[target.unit] for target in policy.targets)

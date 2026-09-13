@@ -1010,7 +1010,7 @@ def _recover_interrupted_release(
         "activation journal",
     )
     phase = _string(journal["phase"], "activation journal phase")
-    if phase not in {"quiescing", "binding", "committed_before_drain_release"}:
+    if phase not in {"quiescing", "binding", "committed_before_drain_release", "committed_after_drain_release"}:
         raise RequestValidationError("activation journal phase is unsupported")
     if journal["candidate"] != request.candidate.commit:
         raise RequestValidationError("activation journal candidate mismatch")
@@ -1020,6 +1020,40 @@ def _recover_interrupted_release(
     targets = {target.unit: target for target in policy.targets}
     if len(set(changed_units)) != len(changed_units) or not set(changed_units) <= set(targets):
         raise RequestValidationError("activation journal changed target set is invalid")
+    if phase.startswith("committed_"):
+        receipt = _receipt(request, policy, "reconciliation_required")
+        receipt["recovery"] = "committed_activation"
+        receipt["mutated_units"] = changed_units
+        try:
+            snapshot = _read_rollback_bundle(
+                request, policy, _string(journal["rollback_bundle_sha256"], "rollback bundle digest")
+            )
+            prestate = _read_json(request.prestate_path, "activation prestate", mode=RECEIPT_MODE)
+            if operations.resume is not None:
+                operations.resume(request, policy, prestate)
+            _validate_evidence(request)
+            _validate_activation_boundaries(request, policy)
+            operations.verify_publication(request)
+            for target in policy.targets:
+                current, current_stat = _read_owned(target.binding, f"binding for {target.unit}")
+                original, mode = snapshot[target.unit]
+                if (
+                    current != _render_binding(target, original, request.runtime, policy)
+                    or stat.S_IMODE(current_stat.st_mode) != mode
+                ):
+                    raise PrivateReleaseError(f"committed binding mismatch: {target.unit}")
+            # The durable commit records successful health and held canary proof.
+            # Re-prove runtime identity; never re-run the drain-dependent canary
+            # after a crash that may already have released those drains.
+            _probe_ok(operations.health_probe(request, policy, "candidate"), "committed health")
+            _probe_ok(operations.release_quiescence(request, policy), "committed drain release")
+            receipt["status"] = "succeeded"
+        except Exception as exc:
+            receipt["error"] = f"committed candidate requires explicit reconciliation: {exc}"
+        receipt["finished_at"] = time.time()
+        _write_json_atomic(request.terminal_receipt_path, receipt)
+        receipt["receipt_path"] = str(request.terminal_receipt_path)
+        return receipt
     snapshot = _read_rollback_bundle(
         request, policy, _string(journal["rollback_bundle_sha256"], "rollback bundle digest")
     )
@@ -1121,6 +1155,17 @@ def execute_private_release(
             quiesced = False
             try:
                 snapshot, prestate = operations.prepare(request, policy)
+                if all(
+                    _render_binding(target, snapshot[target.unit][0], request.runtime, policy)
+                    == snapshot[target.unit][0]
+                    for target in policy.targets
+                ):
+                    _probe_ok(operations.health_probe(request, policy, "no_change"), "current candidate health")
+                    receipt["status"] = "no_change"
+                    receipt["finished_at"] = time.time()
+                    _write_json_atomic(request.terminal_receipt_path, receipt)
+                    receipt["receipt_path"] = str(request.terminal_receipt_path)
+                    return receipt
                 backup_sha256 = _write_rollback_bundle(request, policy, snapshot)
                 _write_json_atomic(request.prestate_path, prestate)
                 _write_json_atomic(
@@ -1158,6 +1203,10 @@ def execute_private_release(
                 )
                 committed = True
                 _probe_ok(operations.release_quiescence(request, policy), "drain release")
+                _write_json_atomic(
+                    request.journal_path,
+                    _journal_payload(request, "committed_after_drain_release", changed, backup_sha256),
+                )
                 receipt["status"] = "succeeded"
             except Exception as failure:
                 errors, restored = [], []
@@ -1199,11 +1248,13 @@ def execute_private_release(
                     except Exception as exc:
                         errors.append(f"drain release: {exc}")
                 receipt["status"] = (
-                    "rollback_failed" if errors else "rolled_back" if changed else "rejected"
+                    "reconciliation_required" if committed
+                    else "rollback_failed" if errors else "rolled_back" if changed else "rejected"
                 )
                 receipt["error"] = str(failure)
                 receipt["rollback"] = {
-                    "attempted": bool(changed), "restored_units": restored, "errors": errors,
+                    "attempted": bool(changed) and not committed,
+                    "restored_units": restored, "errors": errors,
                 }
             receipt["finished_at"] = time.time()
             _write_json_atomic(request.terminal_receipt_path, receipt)
@@ -1558,9 +1609,9 @@ class ProductionOperations:
             pid = int(status.get("MainPID", "0"))
             if status.get("ActiveState") != "active" or status.get("SubState") != "running" or pid <= 0:
                 raise PrivateReleaseError(f"{target.unit} is not active/running")
-            if phase == "candidate":
+            if phase in {"candidate", "no_change"}:
                 old = self.baseline[target.unit]
-                if pid == old["pid"] and _proc_start(pid) == old["start_tick"]:
+                if phase == "candidate" and pid == old["pid"] and _proc_start(pid) == old["start_tick"]:
                     raise PrivateReleaseError(f"{target.unit} did not restart")
                 if (Path("/proc") / str(pid) / "cwd").resolve() != request.runtime.resolve():
                     raise PrivateReleaseError(f"{target.unit} working directory escaped candidate")
@@ -1600,7 +1651,7 @@ class ProductionOperations:
                 "pid": pid, "start_tick": _proc_start(pid),
                 "NRestarts": status.get("NRestarts"),
             }
-        if phase == "candidate":
+        if phase in {"candidate", "no_change"}:
             status_request = Request(policy.dashboard_status_url, headers={"Accept": "application/json"})
             with urlopen(status_request, timeout=10) as response:
                 payload = json.loads(response.read().decode())
@@ -1623,7 +1674,7 @@ class ProductionOperations:
                 time.sleep(3)
         if first is None:
             raise PrivateReleaseError(f"{phase} health deadline expired: {last_error}")
-        if phase == "candidate":
+        if phase in {"candidate", "no_change"}:
             time.sleep(policy.sustained_seconds)
             second = self._health_once(request, policy, phase)
             if any(first[unit] != second[unit] for unit in first):
@@ -1748,7 +1799,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     result = execute_private_release(request, policy=policy, operations=operations)
     print(json.dumps(result, sort_keys=True))
-    return 0 if result.get("status") == "succeeded" else 1
+    return 0 if result.get("status") in {"succeeded", "no_change"} else 1
 
 
 if __name__ == "__main__":
