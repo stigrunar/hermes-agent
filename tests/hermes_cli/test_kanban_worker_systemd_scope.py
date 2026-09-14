@@ -698,7 +698,12 @@ def test_dead_scope_leader_with_active_descendant_scope_is_not_reaped(
     monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
     monkeypatch.setattr(kb, "_systemd_scope_state", lambda *args, **kwargs: "active")
     monkeypatch.setattr(kb, "_systemd_scope_process_ids", lambda path: (9876,))
-    monkeypatch.setattr(kb, "_stop_systemd_scope", lambda *args, **kwargs: True)
+    stop_calls = []
+    monkeypatch.setattr(
+        kb,
+        "_stop_systemd_scope",
+        lambda *args, **kwargs: stop_calls.append(args) or True,
+    )
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="descendant", assignee="worker")
@@ -710,6 +715,7 @@ def test_dead_scope_leader_with_active_descendant_scope_is_not_reaped(
         assert kb.detect_crashed_workers(conn) == []
         current = kb.get_task(conn, task_id)
         assert current is not None and current.status == "running"
+    assert stop_calls == []
 
 
 def test_dry_run_does_not_reconcile_pending_scoped_terminal(

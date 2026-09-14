@@ -930,9 +930,24 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
             if started_at is not None and time.time() - started_at < _kb._resolve_crash_grace_seconds():
                 continue
             run_id = row["current_run_id"]
-            scope_release = _kb._scope_release_result(
+            receipt = _persisted_worker_scope(
                 conn, row["id"], int(run_id) if run_id is not None else None,
             )
+            if receipt.mode is _WorkerScopeMode.SCOPED:
+                scope_status = _worker_scope_runtime_status(receipt)
+                if scope_status not in {"absent", "reapable"}:
+                    # Crash detection is observational.  An active or
+                    # unreadable exact scope is still authoritative even when
+                    # its recorded leader PID is gone; terminal reconciliation
+                    # owns intentional scope stops.
+                    continue
+                scope_release = _scope_release_result_for_receipt(
+                    receipt, observed_status=scope_status,
+                )
+            else:
+                scope_release = _kb._scope_release_result(
+                    conn, row["id"], int(run_id) if run_id is not None else None,
+                )
             if not scope_release.can_release:
                 # Unknown/active scoped occupancy remains fenced; a host PID
                 # being dead does not prove descendants are gone.
@@ -991,7 +1006,12 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     return sweep
 
 
-def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]:
+def _account_crashes(
+    conn: sqlite3.Connection,
+    crash_details: list,
+    *,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[str]:
     """Count each crash against the breaker; returns the task ids it tripped.
 
     Protocol violations get a BOUNDED violation-only budget independent of
@@ -1041,7 +1061,7 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
                 conn, tid,
                 error=error_text,
                 outcome="crashed",
-                failure_limit=1 if is_systemic else None,
+                failure_limit=1 if is_systemic else failure_limit,
                 release_claim=False,
                 end_run=False,
                 event_payload_extra={"pid": pid, "claimer": claimer},
@@ -1051,7 +1071,10 @@ def _account_crashes(conn: sqlite3.Connection, crash_details: list) -> list[str]
     return auto_blocked
 
 
-def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
+def detect_crashed_workers(
+    conn: sqlite3.Connection,
+    failure_limit: int = DEFAULT_FAILURE_LIMIT,
+) -> list[str]:
     """Reclaim ``running`` tasks whose worker PID is no longer alive.
 
     Restores the source phase immediately (no waiting for the claim TTL), for
@@ -1063,7 +1086,12 @@ def detect_crashed_workers(conn: sqlite3.Connection) -> list[str]:
     """
     sweep = _reclaim_dead_workers(conn)
     # Outside the main txn: account each crash and maybe trip the breaker.
-    auto_blocked = _account_crashes(conn, sweep.crash_details) if sweep.crash_details else []
+    auto_blocked = (
+        _account_crashes(
+            conn, sweep.crash_details, failure_limit=failure_limit,
+        )
+        if sweep.crash_details else []
+    )
     # Side-channel attributes keep the public ``list[str]`` return stable;
     # ``dispatch_once`` reads them to populate ``DispatchResult``. Rate-limited
     # requeues did NOT count a failure and are NOT crashes.
@@ -2820,7 +2848,7 @@ def _run_reclaim_phase(
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
     result.stale = detect_stale_running(conn, stale_timeout_seconds=stale_timeout_seconds)
-    result.crashed = detect_crashed_workers(conn)
+    result.crashed = detect_crashed_workers(conn, failure_limit=failure_limit)
     # Side-channel attributes (see detect_crashed_workers); rate-limited tasks
     # went back to ``ready`` and the respawn guard defers them until quota clears.
     result.auto_blocked.extend(getattr(detect_crashed_workers, "_last_auto_blocked", []))
