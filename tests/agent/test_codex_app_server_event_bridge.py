@@ -28,6 +28,7 @@ from agent.codex_runtime import (
     _codex_item_to_tool_name,
     make_codex_app_server_event_bridge,
 )
+from agent.transports.codex_app_server_session import _codex_app_server_event_progress
 
 
 def _make_stub_agent() -> SimpleNamespace:
@@ -39,6 +40,7 @@ def _make_stub_agent() -> SimpleNamespace:
         _emit_interim_assistant_message=MagicMock(
             name="_emit_interim_assistant_message"
         ),
+        _touch_activity=MagicMock(name="_touch_activity"),
     )
 
 
@@ -309,6 +311,107 @@ class TestBridgeRobustness:
         }))
 
 
+class TestNativeProgressActivity:
+    """Only substantive native payloads classify as turn progress."""
+
+    @pytest.mark.parametrize("note", [
+        {"method": "item/agentMessage/delta", "params": {"delta": "answer"}},
+        {"method": "item/reasoning/summaryTextDelta", "params": {"delta": "thinking"}},
+        {"method": "item/reasoning/textDelta", "params": {"delta": "analysis"}},
+        {"method": "item/plan/delta", "params": {"delta": "step"}},
+        {"method": "item/commandExecution/outputDelta", "params": {"delta": "stdout"}},
+        {"method": "item/fileChange/outputDelta", "params": {"delta": "patch output"}},
+        {"method": "item/mcpToolCall/progress", "params": {"message": "2 / 5"}},
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@ -1 +1 @@", "kind": {"type": "update"}}]
+            },
+        },
+        {"method": "item/fileChange/patchUpdated", "params": {"patch": "@@ -1 +1 @@"}},
+        {"method": "item/commandExecution/terminalInteraction", "params": {"stdin": "y\n"}},
+        {"method": "turn/diff/updated", "params": {"diff": "@@ -1 +1 @@"}},
+        {
+            "method": "turn/plan/updated",
+            "params": {"plan": [{"step": "run tests", "status": "inProgress"}]},
+        },
+        {"method": "item/started", "params": {"item": {"type": "commandExecution", "id": "exec-1"}}},
+        {"method": "item/completed", "params": {"item": {"type": "mcpToolCall", "id": "mcp-1"}}},
+        {"method": "item/completed", "params": {"item": {"type": "agentMessage", "id": "msg-1", "text": "done"}}},
+    ])
+    def test_substantive_native_events_are_progress(self, note):
+        progress = _codex_app_server_event_progress(note)
+
+        assert progress is not None
+        assert note["method"] in progress
+
+    @pytest.mark.parametrize("note", [
+        {"method": "item/agentMessage/delta", "params": {"delta": ""}},
+        {"method": "item/reasoning/summaryTextDelta", "params": {"delta": "   "}},
+        {"method": "item/commandExecution/outputDelta", "params": {"delta": None}},
+        {"method": "item/mcpToolCall/progress", "params": {"message": ""}},
+        {"method": "item/fileChange/patchUpdated", "params": {"changes": []}},
+        {"method": "item/fileChange/patchUpdated", "params": {"changes": [{"path": "a.py"}]}},
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@", "kind": {"type": []}}]
+            },
+        },
+        {
+            "method": "item/fileChange/patchUpdated",
+            "params": {
+                "changes": [{"path": "a.py", "diff": "@@", "kind": {"type": {}}}]
+            },
+        },
+        {"method": "turn/plan/updated", "params": {"plan": [{"garbage": True}]}},
+        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests", "status": []}]}},
+        {"method": "turn/plan/updated", "params": {"plan": [{"step": "run tests", "status": {}}]}},
+        {"method": "turn/diff/updated", "params": {"diff": ""}},
+        {"method": "turn/plan/updated", "params": {"plan": []}},
+        {"method": "item/reasoning/summaryPartAdded", "params": {"itemId": "r1"}},
+        {"method": "turn/started", "params": {"turn": {"id": "t1"}}},
+        {"method": "keepalive", "params": {}},
+        {"method": "item/started", "params": {"item": {"type": "commandExecution"}}},
+        {"method": "item/completed", "params": {"item": {"type": "contextCompaction", "id": "c1"}}},
+        {"method": "item/completed", "params": {"item": {"type": [], "id": "bad"}}},
+        {"method": "totally/unknown", "params": {"delta": "not progress"}},
+        None,
+    ])
+    def test_empty_boundary_malformed_and_unknown_events_are_not_progress(self, note):
+        assert _codex_app_server_event_progress(note) is None
+
+    def test_display_callback_absence_does_not_change_progress_classification(self):
+        assert _codex_app_server_event_progress({
+            "method": "item/agentMessage/delta", "params": {"delta": "hello"}
+        }) == "codex app-server progress: item/agentMessage/delta"
+
+    def test_display_callback_raising_is_isolated_by_bridge(self):
+        agent = _make_stub_agent()
+        agent._fire_stream_delta.side_effect = RuntimeError("display boom")
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
+
+        agent._touch_activity.assert_not_called()
+        agent._fire_stream_delta.assert_called_once_with("hello")
+
+    def test_display_bridge_never_calls_activity_directly(self):
+        agent = _make_stub_agent()
+        agent._touch_activity = MagicMock(side_effect=RuntimeError("touch boom"))
+        bridge = make_codex_app_server_event_bridge(agent)
+
+        bridge({"method": "item/agentMessage/delta", "params": {"delta": "hello"}})
+
+        agent._touch_activity.assert_not_called()
+        agent._fire_stream_delta.assert_called_once_with("hello")
+
+    def test_classifier_requires_tool_item_ids(self):
+        assert _codex_app_server_event_progress({
+            "method": "item/started", "params": {"item": {"type": "commandExecution"}}
+        }) is None
+
+
 
 
 # ---------- end-to-end: bridge is wired in run_codex_app_server_turn ----------
@@ -371,6 +474,7 @@ class TestBridgeWiredInRuntime:
             context_compressor=None,
             event_callback=None,
             _session_db=None,
+            _touch_activity=MagicMock(),
         )
 
         codex_runtime.run_codex_app_server_turn(
@@ -388,6 +492,7 @@ class TestBridgeWiredInRuntime:
         assert callable(captured["on_event"]), (
             "on_event must be the bridge callable, not None or a sentinel"
         )
+        assert captured["on_activity"] is agent._touch_activity
 
         # And the bridge must actually drive the agent's callbacks when
         # fed a representative notification.

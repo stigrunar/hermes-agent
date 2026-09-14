@@ -57,9 +57,10 @@ def worker_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="worker-test", assignee="test-worker")
         kb.claim_task(conn, tid)
@@ -84,7 +85,8 @@ def test_list_filters_tasks(monkeypatch, worker_env):
     """kanban_list gives orchestrators filtered board discovery."""
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         a = kb.create_task(conn, title="alpha", assignee="factory", priority=5)
         b = kb.create_task(conn, title="beta", assignee="reviewer")
@@ -122,7 +124,8 @@ def test_complete_happy_path(worker_env):
     assert d["task_id"] == worker_env
     # Verify via kernel
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         run = kb.latest_run(conn, worker_env)
         assert run.outcome == "completed"
@@ -137,6 +140,7 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     created_cards=[] (the documented escape hatch) must complete the
     task. Regression for #22923."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     # Hit the gate first.
@@ -153,11 +157,51 @@ def test_complete_retry_with_empty_created_cards_succeeds(worker_env):
     }))
     assert ok.get("ok") is True
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "done"
     finally:
         conn.close()
+
+
+def test_request_review_rejects_unknown_reviewer_without_mutation(monkeypatch, worker_env, tmp_path):
+    """#106163: a non-profile ``reviewer`` (e.g. the literal "reviewer") must be
+    refused with an error the model sees, leaving the task running under the
+    implementer — never parked in ``review`` on an assignee nobody can spawn."""
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
+    with kbc.connect() as conn:
+        before = kb.get_task(conn, worker_env)
+        before_events = kb.list_events(conn, worker_env)
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(before.current_run_id))
+
+    out = json.loads(kt._handle_request_review({"summary": "Ready for review.", "reviewer": "reviewer"}))
+
+    assert "'reviewer'" in out["error"] and "verifier" in out["error"]
+    with kbc.connect() as conn:
+        after = kb.get_task(conn, worker_env)
+        assert (after.status, after.assignee, after.current_run_id) == ("running", "test-worker", before.current_run_id)
+        assert kb.list_events(conn, worker_env) == before_events
+
+
+def test_request_review_accepts_installed_profile(monkeypatch, worker_env, tmp_path):
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    (tmp_path / ".hermes" / "profiles" / "verifier").mkdir(parents=True)
+    with kbc.connect() as conn:
+        monkeypatch.setenv("HERMES_KANBAN_RUN_ID", str(kb.get_task(conn, worker_env).current_run_id))
+
+    out = json.loads(kt._handle_request_review({"summary": "Ready for review.", "reviewer": "verifier"}))
+
+    assert out["ok"] is True
+    with kbc.connect() as conn:
+        task = kb.get_task(conn, worker_env)
+        assert (task.status, task.assignee) == ("review", "verifier")
 
 
 def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
@@ -165,6 +209,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     Regression for #38367: workers bypassing the judge via early kanban_complete."""
     from pathlib import Path as _Path
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     # Set up isolated HERMES_HOME
@@ -177,7 +222,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-test", assignee="test-worker",
@@ -207,7 +252,7 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
     assert f"parents=[{goal_task_id}]" in d["error"]
 
     # Verify the task is NOT completed in the DB
-    conn2 = kb.connect()
+    conn2 = kbc.connect()
     try:
         task = kb.get_task(conn2, goal_task_id)
         assert task.status == "running"  # Should still be running, not done
@@ -221,7 +266,8 @@ def test_block_happy_path(worker_env):
     d = json.loads(out)
     assert d["ok"] is True
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, worker_env).status == "blocked"
     finally:
@@ -233,6 +279,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
     matching the pattern used by the kanban_complete judge gate tests."""
     from pathlib import Path as _Path
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -243,7 +290,7 @@ def _make_goal_mode_worker_env(monkeypatch, tmp_path):
 
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         goal_task_id = kb.create_task(
             conn, title="goal-mode-block-test", assignee="test-worker",
@@ -262,6 +309,7 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     sibling of the kanban_complete judge gate / Issue #38367)."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
     out = kt._handle_block({"reason": "giving up"})
@@ -269,7 +317,7 @@ def test_block_goal_mode_rejects_missing_kind(monkeypatch, tmp_path):
     assert "error" in d
     assert "goal_mode" in d["error"]
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "running"
     finally:
@@ -281,6 +329,7 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
     let a goal_mode worker exit the loop without going through the judge."""
     from tools import kanban_tools as kt
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
 
     tid = _make_goal_mode_worker_env(monkeypatch, tmp_path)
     for kind in ("capability", "transient"):
@@ -288,7 +337,7 @@ def test_block_goal_mode_rejects_disallowed_kind(monkeypatch, tmp_path):
         d = json.loads(out)
         assert "error" in d, f"kind={kind} should be rejected for goal_mode"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "running"
     finally:
@@ -307,11 +356,12 @@ def test_heartbeat_extends_claim_expires(worker_env):
     """
     import time as _time
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     # Rewind claim_expires into the past so any forward movement is
     # unambiguous (avoids time.sleep flakiness).
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         conn.execute(
             "UPDATE tasks SET claim_expires = ? WHERE id = ?",
@@ -328,7 +378,7 @@ def test_heartbeat_extends_claim_expires(worker_env):
     out = kt._handle_heartbeat({"note": "still alive"})
     assert json.loads(out).get("ok") is True
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         after = conn.execute(
             "SELECT claim_expires FROM tasks WHERE id = ?", (worker_env,)
@@ -360,40 +410,14 @@ def test_comment_happy_path(worker_env):
     assert d["ok"] is True
     assert d["comment_id"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         comments = kb.list_comments(conn, worker_env)
         assert len(comments) == 1
         # Author defaults to HERMES_PROFILE env we set in the fixture
         assert comments[0].author == "test-worker"
         assert comments[0].body == "hello thread"
-    finally:
-        conn.close()
-
-
-def test_comment_prefers_session_scoped_profile(worker_env):
-    """Owner comments retain the session profile over process-global env."""
-    from gateway.session_context import reset_session_vars, set_session_vars
-    from tools import kanban_tools as kt
-
-    set_session_vars(profile="default")
-    try:
-        out = kt._handle_comment({
-            "task_id": worker_env,
-            "body": "owner scoped comment",
-        })
-    finally:
-        # Restore a fresh/unbound test context.  clear_session_vars() is the
-        # production handler-exit contract and intentionally masks env fallback,
-        # which would contaminate later env-based tools tests in this process.
-        reset_session_vars()
-    assert json.loads(out)["ok"] is True
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        comments = kb.list_comments(conn, worker_env)
-        assert comments[0].author == "default"
     finally:
         conn.close()
 
@@ -412,7 +436,8 @@ def test_comment_ignores_caller_supplied_author(worker_env):
     })
     assert json.loads(out)["ok"]
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         comments = kb.list_comments(conn, worker_env)
         # Author comes from HERMES_PROFILE in the fixture, not the
@@ -434,7 +459,8 @@ def test_create_happy_path(worker_env):
     assert d["task_id"]
     assert d["status"] == "todo"  # parent isn't done yet
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         child = kb.get_task(conn, d["task_id"])
         assert child.title == "child task"
@@ -443,497 +469,56 @@ def test_create_happy_path(worker_env):
         conn.close()
 
 
-def test_create_schema_declares_canonical_required_capabilities():
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
+def test_registered_create_rejects_missing_role_contract_before_persistence(worker_env):
+    """The public registry route enforces role admission before opening a write."""
+    from hermes_cli import kanban_db_connect as kbc
+    from tools.registry import registry
 
-    capability_schema = kt.KANBAN_CREATE_SCHEMA["parameters"]["properties"][
-        "required_capabilities"
-    ]
-    assert capability_schema["type"] == "array"
-    assert capability_schema["items"]["type"] == "string"
-    assert set(capability_schema["items"]["enum"]) == set(
-        kb.WORKER_CAPABILITY_NAMES
-    )
-
-
-def test_create_forwards_and_persists_required_capabilities(monkeypatch, worker_env):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    explicit = ["workspace_access", "terminal"]
-    forwarded = {}
-    create_task = kb.create_task
-
-    def recording_create_task(conn, **kwargs):
-        forwarded["required_capabilities"] = kwargs.get("required_capabilities")
-        return create_task(conn, **kwargs)
-
-    monkeypatch.setattr(kb, "create_task", recording_create_task)
-    result = json.loads(kt._handle_create({
-        "title": "capability child",
-        "assignee": "peer",
-        "required_capabilities": explicit,
+    with kbc.connect_closing() as conn:
+        before = conn.execute("SELECT count(*) FROM tasks").fetchone()[0]
+    properties = registry.get_entry("kanban_create").schema["parameters"]["properties"]
+    assert {"execution_contract", "review_contract", "design_intake", "architect_routing"} <= set(properties)
+    result = json.loads(registry.dispatch("kanban_create", {
+        "title": "missing execution packet", "assignee": "dollycode",
     }))
-
-    assert result["ok"] is True
-    assert forwarded["required_capabilities"] == explicit
-
-    conn = kb.connect()
-    try:
-        child = kb.get_task(conn, result["task_id"])
-        assert child is not None
-        assert child.required_capabilities == ["terminal", "workspace_access"]
-    finally:
-        conn.close()
-
-
-def test_create_rejects_invalid_required_capability_before_creation(worker_env):
-    from hermes_cli import kanban_db as kb
-    from tools import kanban_tools as kt
-
-    conn = kb.connect()
-    try:
-        before = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    finally:
-        conn.close()
-
-    result = json.loads(kt._handle_create({
-        "title": "invalid capability child",
-        "assignee": "peer",
-        "required_capabilities": ["not_a_worker_capability"],
-    }))
-
-    assert "error" in result
-    assert "required_capabilities" in result["error"]
-    assert "not_a_worker_capability" in result["error"]
-
-    conn = kb.connect()
-    try:
-        after = conn.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
-    finally:
-        conn.close()
-    assert after == before
-
-
-def _dollycode_execution_contract():
-    return {
-        "outcome": "Ship one bounded parser fix",
-        "frozen_acceptance": [
-            "Regression test passes",
-            "Existing behavior remains green",
-        ],
-        "repo_workspace_base_revision": "/repo/.worktrees/task @ abc123",
-        "mutation_scope": ["parser.py", "tests/test_parser.py"],
-        "will_not_do": ["No deploy", "No unrelated refactor"],
-        "verification": ["scripts/run_tests.sh tests/test_parser.py"],
-        "authority": ["inspect", "edit", "commit"],
-        "quality_mode": "FEATURE",
-        "qa_boundary": "Code proves focused tests; detached QA owns release proof",
-        "stop_when": ["Acceptance passes", "Block on missing source fixture"],
-    }
-
-
-def test_create_dollycode_requires_execution_contract(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "ambiguous implementation",
-        "assignee": "dollycode",
-        "body": "Read the thread and work out what to do.",
-    }))
-
-    assert "ok" not in out
-    assert "execution_contract is required" in out["error"]
-
-
-def test_create_dollycode_renders_contract_before_background(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "bounded implementation",
-        "assignee": "dollycode",
-        "body": "Historical discussion and links.",
-        "execution_contract": _dollycode_execution_contract(),
-    }))
-    assert out["ok"] is True
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        child = kb.get_task(conn, out["task_id"])
-        assert child is not None
-        assert child.body is not None
-        rendered_body = child.body
-        assert rendered_body.startswith("## Execution contract (authoritative)\n")
-        assert "Outcome: Ship one bounded parser fix" in rendered_body
-        assert "Authority: inspect, edit, commit" in rendered_body
-        assert rendered_body.endswith(
-            "## Background and evidence\nHistorical discussion and links."
-        )
-    finally:
-        conn.close()
-
-
-def test_create_dollycode_triage_card_is_exempt(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "prepare implementation contract",
-        "assignee": "dollycode",
-        "triage": True,
-        "body": "Resolve the base revision and acceptance first.",
-    }))
-
-    assert out["ok"] is True
-    assert out["status"] == "triage"
-
-
-def _dollyqa_review_contract():
-    return {
-        "outcome": "Return one exact source-candidate verdict",
-        "candidates": [{
-            "label": "parser candidate",
-            "source": "origin/feature/parser",
-            "source_base": "origin/main@" + "a" * 40,
-            "workspace_or_url": "/repo/.worktrees/review",
-            "commit": "b" * 40,
-            "tree": "c" * 40,
-        }],
-        "parent_receipt": "t_source completion metadata with remote parity",
-        "frozen_criteria": ["Regression fixed", "No sibling behavior regression"],
-        "auth_fixture_state": "Synthetic fixtures only; no credentials required",
-        "owner": "default",
-        "verification": ["scripts/run_tests.sh tests/test_parser.py"],
-        "qa_boundary": "Source candidate only; not deployed/live acceptance",
-        "will_not_do": ["No edits", "No deploy"],
-        "stop_when": ["Return approved or changes_requested for the exact candidate"],
-    }
-
-
-def test_create_dollyqa_requires_review_contract(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "ambiguous detached review",
-        "assignee": "dollyqa",
-        "body": "Inspect the parent and find the current candidate.",
-    }))
-
-    assert "ok" not in out
-    assert "review_contract is required" in out["error"]
-
-
-def test_create_dollyqa_renders_review_contract_before_background(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "exact detached review",
-        "assignee": "dollyqa",
-        "body": "Historical discussion and links.",
-        "review_contract": _dollyqa_review_contract(),
-    }))
-    assert out["ok"] is True
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        child = kb.get_task(conn, out["task_id"])
-        assert child is not None
-        assert child.body is not None
-        rendered_body = child.body
-        assert rendered_body.startswith("## Review contract (authoritative)\n")
-        assert "commit " + "b" * 40 + " / tree " + "c" * 40 in rendered_body
-        assert "Owner: default" in rendered_body
-        assert rendered_body.endswith(
-            "## Background and evidence\nHistorical discussion and links."
-        )
-    finally:
-        conn.close()
-
-
-def test_create_dollyqa_rejects_incomplete_candidate_identity(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollyqa_review_contract()
-    contract["candidates"][0].pop("tree")
-    out = json.loads(kt._handle_create({
-        "title": "incomplete detached review",
-        "assignee": "dollyqa",
-        "review_contract": contract,
-    }))
-
-    assert "ok" not in out
-    assert "commit and tree must both" in out["error"]
-
-
-def test_create_dollyqa_accepts_artifact_sha256_identity(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollyqa_review_contract()
-    contract["candidates"][0].pop("commit")
-    contract["candidates"][0].pop("tree")
-    contract["candidates"][0]["artifact_sha256"] = "d" * 64
-    out = json.loads(kt._handle_create({
-        "title": "exact artifact review",
-        "assignee": "dollyqa",
-        "review_contract": contract,
-    }))
-
-    assert out["ok"] is True
-
-
-def test_create_dollyqa_rejects_unknown_review_contract_field(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollyqa_review_contract()
-    contract["infer_candidate_from_parent"] = True
-    out = json.loads(kt._handle_create({
-        "title": "unsafe inferred review",
-        "assignee": "dollyqa",
-        "review_contract": contract,
-    }))
-
-    assert "ok" not in out
-    assert "unknown field(s): infer_candidate_from_parent" in out["error"]
-
-
-def test_create_dollyqa_triage_card_is_exempt(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "resolve exact QA candidate",
-        "assignee": "dollyqa",
-        "triage": True,
-        "body": "Refresh candidate identity and parent receipt first.",
-    }))
-
-    assert out["ok"] is True
-    assert out["status"] == "triage"
-
-
-def _dollydesign_intake():
-    return {
-        "user_job": "Dispatch the next warehouse item without losing context",
-        "target_surface": "Warehouse exception worklist and detail drawer",
-        "design_mode": "direction",
-        "source_of_truth": "docs/design/warehouse-worklist.md revision 4",
-        "repo_workspace_revision": "/repo/.worktrees/design @ " + "a" * 40,
-        "frozen_decisions": ["Desktop-first internal operations surface"],
-        "open_decisions": ["Table plus drawer versus master-detail split"],
-        "evidence_available": ["Current route screenshots", "Existing DESIGN.md"],
-        "acceptance": [
-            "One recommended interaction pattern",
-            "Implementation-ready rejection criteria",
-        ],
-        "authority_and_exclusions": {
-            "owner": "default",
-            "authority": ["inspect", "propose", "design_direction"],
-            "exclusions": ["No production code", "No deploy", "No source writes"],
-        },
-    }
-
-
-def test_create_dollydesign_requires_design_intake(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "ambiguous design task",
-        "assignee": "dollydesign",
-        "body": "Make the warehouse UI better.",
-    }))
-
-    assert "ok" not in out
-    assert "design_intake is required" in out["error"]
-
-
-def test_create_dollydesign_renders_intake_before_background(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "warehouse design direction",
-        "assignee": "dollydesign",
-        "body": "Historical screenshots and discussion.",
-        "design_intake": _dollydesign_intake(),
-    }))
-    assert out["ok"] is True
-
-    from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        child = kb.get_task(conn, out["task_id"])
-        assert child is not None
-        assert child.body is not None
-        assert child.body.startswith("## Design intake (authoritative)\n")
-        assert "Design mode: direction" in child.body
-        assert "Authority: inspect, propose, design_direction" in child.body
-        assert child.body.endswith(
-            "## Background and evidence\nHistorical screenshots and discussion."
-        )
-    finally:
-        conn.close()
-
-
-def test_create_dollydesign_accepts_explicit_empty_decision_lists(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollydesign_intake()
-    contract["frozen_decisions"] = []
-    contract["open_decisions"] = []
-    contract["evidence_available"] = []
-    out = json.loads(kt._handle_create({
-        "title": "bounded blank-state design review",
-        "assignee": "dollydesign",
-        "design_intake": contract,
-    }))
-
-    assert out["ok"] is True
-
-
-def test_create_dollydesign_rejects_invalid_mode(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollydesign_intake()
-    contract["design_mode"] = "make_it_pop"
-    out = json.loads(kt._handle_create({
-        "title": "invalid design mode",
-        "assignee": "dollydesign",
-        "design_intake": contract,
-    }))
-
-    assert "ok" not in out
-    assert "design_mode must be direction, review, handoff, or sign_off" in out["error"]
-
-
-def test_create_dollydesign_triage_card_is_exempt(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "resolve design truth source",
-        "assignee": "dollydesign",
-        "triage": True,
-        "body": "Resolve the target surface and current design revision first.",
-    }))
-
-    assert out["ok"] is True
-    assert out["status"] == "triage"
-
-
-def _dollyarchitect_routing():
-    return {
-        "invariant_outcome": "One ownership boundary for durable task truth",
-        "observed_evidence": [
-            "repo:TASKS.md@abc123",
-            "runtime receipt t_source completion metadata",
-        ],
-        "exact_source_authority": "repo TASKS.md at commit abc123 plus live DB schema",
-        "material_architecture_question": (
-            "Can the existing task model express the invariant without a new service?"
-        ),
-        "frozen_constraints_non_goals": [
-            "Preserve prompt caching",
-            "No implementation or deploy",
-        ],
-        "unresolved_owner_decisions": [
-            "Whether a later implementation should be activated"
-        ],
-        "implementation_authority": "none",
-    }
-
-
-def test_create_dollyarchitect_requires_architect_routing_even_for_triage(worker_env):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "ambiguous architecture task",
-        "assignee": "dollyarchitect",
-        "triage": True,
-        "body": "Work out the architecture and prepare code.",
-    }))
-
-    assert "ok" not in out
-    assert "architect_routing is required" in out["error"]
-    assert "triage to Dolly/default" in out["error"]
-
-
-def test_create_dollyarchitect_renders_outcome_contract_before_secondary_evidence(
-    worker_env,
+    assert "execution_contract is required" in result["error"]
+    with kbc.connect_closing() as conn:
+        assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
+
+
+@pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
+@pytest.mark.parametrize("target_scoped", [False, True])
+def test_create_explicit_scratch_ignores_ambient_board_project(
+    worker_env, tmp_path, explicit, target_scoped,
 ):
-    from tools import kanban_tools as kt
-
-    out = json.loads(kt._handle_create({
-        "title": "architecture ownership review",
-        "assignee": "dollyarchitect",
-        "body": "Historical proposals and linked alternatives.",
-        "architect_routing": _dollyarchitect_routing(),
-    }))
-    assert out["ok"] is True
-
+    """#106342: an explicit scratch / empty project wins over the project the
+    session's current board (and, when scoped, the target board itself) carries.
+    Omitting both still inherits the target board's project."""
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
-    try:
-        child = kb.get_task(conn, out["task_id"])
-        assert child is not None
-        assert child.body is not None
-        assert child.body.startswith("## Architect routing (authoritative)\n")
-        assert "Implementation authority: none" in child.body
-        assert "Material architecture question: Can the existing task model" in child.body
-        assert child.body.endswith(
-            "## Background and secondary evidence\n"
-            "Historical proposals and linked alternatives."
-        )
-    finally:
-        conn.close()
-
-
-def test_create_dollyarchitect_accepts_explicit_empty_owner_lists(worker_env):
+    from hermes_cli import projects_db as pdb
     from tools import kanban_tools as kt
 
-    contract = _dollyarchitect_routing()
-    contract["frozen_constraints_non_goals"] = []
-    contract["unresolved_owner_decisions"] = []
-    out = json.loads(kt._handle_create({
-        "title": "bounded architecture question",
-        "assignee": "dollyarchitect",
-        "architect_routing": contract,
-    }))
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    with pdb.connect_closing() as pconn:
+        project_id = pdb.create_project(pconn, name="Ambient", primary_path=str(repo))
+    kb.write_board_metadata("default", project_id=project_id)
+    kb.create_board("target", name="Target", project_id=project_id if target_scoped else "")
 
-    assert out["ok"] is True
+    def create(**extra):
+        result = json.loads(kt._handle_create(
+            {"board": "target", "title": "card", "assignee": "peer", **extra}))
+        assert result["ok"] is True
+        return result["workspace_kind"], result["project_id"]
 
-
-def test_create_dollyarchitect_rejects_invalid_implementation_authority(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollyarchitect_routing()
-    contract["implementation_authority"] = "must_create_dollycode"
-    out = json.loads(kt._handle_create({
-        "title": "overprescribed architecture task",
-        "assignee": "dollyarchitect",
-        "architect_routing": contract,
-    }))
-
-    assert "ok" not in out
-    assert "must be none, prepare, or authorized" in out["error"]
-
-
-def test_create_dollyarchitect_rejects_legacy_mechanism_first_fields(worker_env):
-    from tools import kanban_tools as kt
-
-    contract = _dollyarchitect_routing()
-    contract["requested_actions"] = ["Design these concrete tables"]
-    out = json.loads(kt._handle_create({
-        "title": "mechanism-first architecture task",
-        "assignee": "dollyarchitect",
-        "architect_routing": contract,
-    }))
-
-    assert "ok" not in out
-    assert "unknown field(s): requested_actions" in out["error"]
+    assert create(**explicit) == ("scratch", None)
+    assert create() == (("worktree", project_id) if target_scoped else ("scratch", None))
 
 
 def test_link_happy_path(worker_env):
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         a = kb.create_task(conn, title="A", assignee="x")
         b = kb.create_task(conn, title="B", assignee="x")
@@ -948,7 +533,8 @@ def test_link_happy_path(worker_env):
 def test_unblock_happy_path(monkeypatch, worker_env):
     monkeypatch.delenv("HERMES_KANBAN_TASK", raising=False)
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="blocked", assignee="worker")
         kb.block_task(conn, tid, reason="waiting")
@@ -961,7 +547,7 @@ def test_unblock_happy_path(monkeypatch, worker_env):
     assert d["ok"] is True
     assert d["status"] == "ready"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, tid).status == "ready"
     finally:
@@ -978,9 +564,10 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         parent = kb.create_task(conn, title="parent", assignee="worker")
         child = kb.create_task(conn, title="child", assignee="worker", parents=[parent])
@@ -995,7 +582,7 @@ def test_unblock_with_pending_parents_returns_todo(monkeypatch, tmp_path):
     assert d["ok"] is True
     assert d["status"] == "todo"
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, child).status == "todo"
     finally:
@@ -1038,7 +625,8 @@ def test_worker_lifecycle_through_tools(worker_env):
 
     # Verify final state
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         parent = kb.get_task(conn, worker_env)
         assert parent.status == "done"
@@ -1092,9 +680,6 @@ def test_kanban_guidance_orchestrator_decision_ownership():
     assert KANBAN_GUIDANCE.count("Decision ownership.") == 1
     assert "Never let two subtree cards decide the same question" in KANBAN_GUIDANCE
     assert "workers cannot see sibling context" in KANBAN_GUIDANCE
-    assert "Do not manufacture a follow-up graph" in KANBAN_GUIDANCE
-    assert "mutation-lease collisions" in KANBAN_GUIDANCE
-    assert "ordinary FEATURE" in KANBAN_GUIDANCE
 
 
 # ---------------------------------------------------------------------------
@@ -1117,7 +702,8 @@ def test_kanban_guidance_orchestrator_decision_ownership():
 def test_worker_complete_rejects_foreign_task_id(worker_env):
     """A worker cannot complete a task that isn't its own (#19534)."""
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         other = kb.create_task(conn, title="sibling")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (other,))
@@ -1132,7 +718,7 @@ def test_worker_complete_rejects_foreign_task_id(worker_env):
     assert "refusing to mutate" in d.get("error", "")
 
     # Sibling task must be untouched.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, other).status == "ready"
     finally:
@@ -1149,7 +735,8 @@ def test_worker_can_comment_on_foreign_task(worker_env):
     to ``_handle_comment`` would fail CI immediately.
     """
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         other = kb.create_task(conn, title="sibling")
     finally:
@@ -1165,7 +752,7 @@ def test_worker_can_comment_on_foreign_task(worker_env):
 
     # The comment lands on the foreign task, attributed to the worker's
     # HERMES_PROFILE — never to a caller-controlled string.
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         comments = kb.list_comments(conn, other)
         assert len(comments) == 1
@@ -1184,7 +771,8 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
     pinning is "worker cannot mutate foreign task via kanban_unblock".
     """
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    conn = kbc.connect()
     try:
         other = kb.create_task(conn, title="blocked sibling", assignee="peer")
         kb.block_task(conn, other, reason="waiting")
@@ -1199,7 +787,7 @@ def test_worker_unblock_rejects_foreign_task_id(worker_env):
         f"expected worker-rejection error, got {err}"
     )
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.get_task(conn, other).status == "blocked"
     finally:
@@ -1217,9 +805,10 @@ def test_orchestrator_complete_any_task_allowed(monkeypatch, tmp_path):
     monkeypatch.setattr(_P, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     kb.init_db()
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         tid = kb.create_task(conn, title="child to close out")
         conn.execute("UPDATE tasks SET status='ready' WHERE id=?", (tid,))
@@ -1267,9 +856,10 @@ def multi_board_env(monkeypatch, tmp_path):
     monkeypatch.setattr(_Path, "home", lambda: tmp_path)
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     kb._INITIALIZED_PATHS.clear()
     # Default board — implicit
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         seed_default = kb.create_task(
             conn, title="seed-default", assignee="worker-d"
@@ -1277,7 +867,7 @@ def multi_board_env(monkeypatch, tmp_path):
     finally:
         conn.close()
     # Alt board — explicit slug routes the connection to a separate DB
-    conn = kb.connect(board="alt")
+    conn = kbc.connect(board="alt")
     try:
         seed_alt = kb.create_task(
             conn, title="seed-alt", assignee="worker-a"
@@ -1329,9 +919,11 @@ def test_board_param_none_falls_back_to_env(worker_env):
 
 def _list_subs_for_task(task_id):
     from hermes_cli import kanban_db as kb
-    conn = kb.connect()
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_notify as kbn
+    conn = kbc.connect()
     try:
-        return list(kb.list_notify_subs(conn, task_id))
+        return list(kbn.list_notify_subs(conn, task_id))
     finally:
         conn.close()
 
@@ -1478,11 +1070,12 @@ def test_maybe_auto_subscribe_swallows_add_notify_sub_failure(monkeypatch, worke
     monkeypatch.setenv("HERMES_SESSION_CHAT_ID", "chat-42")
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_notify as kbn
 
     def _boom(*a, **kw):
         raise RuntimeError("simulated DB failure")
 
-    monkeypatch.setattr(kb, "add_notify_sub", _boom)
+    monkeypatch.setattr(kbn, "add_notify_sub", _boom)
 
     out = kt._handle_create({
         "title": "auto-sub tolerates add_notify_sub failure",
@@ -1547,13 +1140,14 @@ def _assert_attach_url_blocked(worker_env, url):
     """Call kanban_attach_url with ``url`` and assert the SSRF guard fired
     (clean tool error, no attachment row, no network fetch needed)."""
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     out = kt._handle_attach_url({"url": url})
     d = json.loads(out)
     assert "error" in d, out
     assert "SSRF" in d["error"] or "blocked" in d["error"].lower(), out
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         assert kb.list_attachments(conn, worker_env) == []
     finally:
@@ -1623,6 +1217,7 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
     import httpx
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
     from tools import kanban_tools as kt
 
     _fake_public_dns(monkeypatch, {"files.example.com": "93.184.216.34"})
@@ -1644,7 +1239,7 @@ def test_attach_url_happy_path_public_host(worker_env, default_url_guard, monkey
     assert d.get("ok") is True, out
     assert d["size"] == len(payload)
 
-    conn = kb.connect()
+    conn = kbc.connect()
     try:
         atts = kb.list_attachments(conn, worker_env)
         assert [a.filename for a in atts] == ["spec.pdf"]

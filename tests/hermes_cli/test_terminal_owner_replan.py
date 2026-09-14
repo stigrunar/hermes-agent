@@ -467,3 +467,20 @@ def test_successor_created_after_intent_suppresses_claim(isolated_home):
             conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
         ) is None
         assert len(_events(conn, tid, "owner_replan_suppressed")) == 1
+
+
+def test_structured_obsolete_row_suppresses_existing_owner_intent(isolated_home):
+    with kb.connect() as conn:
+        tid, _ = _terminal_task(conn)
+        kb._record_iteration_exhaustion(conn, tid, budget_used=60, budget_max=60)
+        assert _events(conn, tid, "needs_owner_replan")
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(tasks)")}
+        if "hygiene_class" not in columns:
+            conn.execute("ALTER TABLE tasks ADD COLUMN hygiene_class TEXT")
+        conn.execute("UPDATE tasks SET hygiene_class='obsolete' WHERE id=?", (tid,))
+
+        assert kb.claim_owner_replan_for_route(
+            conn, task_id=tid, platform="telegram", chat_id="-1001", thread_id="87",
+        ) is None
+        [suppressed] = _events(conn, tid, "owner_replan_suppressed")
+        assert suppressed["payload"]["reason"] == "superseded_or_obsolete"

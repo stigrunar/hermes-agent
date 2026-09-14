@@ -73,6 +73,17 @@ def test_handler_persists_and_returns_exact_identity(context, use_aliases):
     assert task.status == 'triage'
 
 
+def test_registry_handler_roundtrips_structured_identity(context):
+    from tools.registry import registry
+
+    result = json.loads(registry.dispatch("kanban_create", payload(context)))
+    assert result.get("ok") is True, result
+    assert result["project_id"] == context["project"]
+    assert result["outcome_id"] == context["outcome"]
+    assert result["conversation_lane_id"] == context["lane"]
+    assert result["topic_target"] == context["target"]
+
+
 @pytest.mark.parametrize('origin_chat,origin_thread', [('555000', ''), ('-1000000000001', '3')])
 def test_dm_or_project_origin_subscribes_only_to_exact_project(context, monkeypatch, origin_chat, origin_thread):
     from gateway import session_context

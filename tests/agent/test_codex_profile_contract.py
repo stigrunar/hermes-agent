@@ -152,3 +152,23 @@ def test_worker_scope_and_child_defaults_are_thread_local(monkeypatch):
     assert config["agents.default_subagent_reasoning_effort"] == "xhigh"
     assert config["agents.max_concurrent_threads_per_session"] == 2
     assert not any("config_file" in key for key in config)
+
+
+def test_non_dispatcher_runtime_does_not_inherit_worker_write_identity(monkeypatch):
+    from agent.delegation_context import non_dispatcher_owned_context
+
+    monkeypatch.setenv("HERMES_KANBAN_TASK", "parent-worker")
+    monkeypatch.setenv("HERMES_KANBAN_RUN_ID", "7")
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: {})
+    monkeypatch.setattr(
+        "hermes_cli.codex_runtime_plugin_migration._build_hermes_tools_mcp_entry",
+        lambda: {"command": "python", "env": {}},
+    )
+    agent = SimpleNamespace(model="gpt-5.6-sol", reasoning_config={"effort": "high"})
+
+    with non_dispatcher_owned_context():
+        contract, _ = _codex_runtime_contract(agent, [], "/workspace")
+
+    env = contract["config_overrides"]["mcp_servers.hermes-tools"]["env"]
+    assert "HERMES_KANBAN_TASK" not in env
+    assert "HERMES_KANBAN_RUN_ID" not in env

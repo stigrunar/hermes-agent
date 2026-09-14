@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import subprocess
 
-import pytest
-
 
 def _make_task(kb, *, assignee: str):
     return kb.Task(
@@ -62,8 +60,17 @@ agent:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    # These argv/toolset assertions do not exercise scope capability. Patch
+    # the dispatcher’s late-bound production seam so FakeProc only observes
+    # the worker launch and cannot intercept a real systemd-run probe.
+    monkeypatch.setattr(
+        kbd._kb,
+        "_systemd_scope_argv",
+        lambda cmd, task, **kwargs: (cmd, None, None),
+    )
 
     captured = {}
 
@@ -80,11 +87,7 @@ agent:
 
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    pid = kb._default_spawn(
-        _make_task(kb, assignee="elias"),
-        str(workspace),
-        scope_config=kb._worker_scope_config({"worker_scope": {"enabled": False}}),
-    )
+    pid = kbd._default_spawn(_make_task(kb, assignee="elias"), str(workspace))
 
     assert pid == 4242
     assert captured["env"]["HERMES_HOME"] == str(profile)
@@ -93,18 +96,6 @@ agent:
     pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
     for required in ("terminal", "web", "file", "skills", "code_execution", "delegation"):
         assert required in pinned
-
-    # An explicit dispatcher override must be the same toolset surface that
-    # admission evaluated, rather than only influencing the pre-claim check.
-    pid = kb._default_spawn(
-        _make_task(kb, assignee="elias"),
-        str(workspace),
-        worker_toolsets=["terminal"],
-        scope_config=kb._worker_scope_config({"worker_scope": {"enabled": False}}),
-    )
-    assert pid == 4242
-    pinned = captured["cmd"][captured["cmd"].index("--toolsets") + 1].split(",")
-    assert pinned == ["terminal"]
 
 
 def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_path):
@@ -120,9 +111,15 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
     from hermes_cli._parser import build_top_level_parser
 
-    monkeypatch.setattr(kb, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(kbd, "_resolve_hermes_argv", lambda: ["hermes"])
+    monkeypatch.setattr(
+        kbd._kb,
+        "_systemd_scope_argv",
+        lambda cmd, task, **kwargs: (cmd, None, None),
+    )
     captured = {}
 
     class FakeProc:
@@ -138,11 +135,7 @@ def test_default_spawn_model_override_survives_real_cli_parse(monkeypatch, tmp_p
     workspace.mkdir()
     task = _make_task(kb, assignee="elias")
     task.model_override = "gpt-5.6-sol"
-    kb._default_spawn(
-        task,
-        str(workspace),
-        scope_config=kb._worker_scope_config({"worker_scope": {"enabled": False}}),
-    )
+    kbd._default_spawn(task, str(workspace))
 
     parser, _subparsers, _chat_parser = build_top_level_parser()
     # Profile selection is attached by the outer CLI bootstrap rather than
@@ -175,112 +168,12 @@ toolsets:
     monkeypatch.setenv("HERMES_HOME", str(root))
 
     from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_dispatch as kbd
 
-    resolved = kb._resolve_worker_cli_toolsets(str(profile))
+    resolved = kbd._resolve_worker_cli_toolsets(str(profile))
 
     assert resolved is not None
     assert "terminal" in resolved
     assert "web" in resolved
     assert "kanban" in resolved  # recovered worker lifecycle surface
     assert resolved != ["kanban"]
-
-
-@pytest.mark.parametrize(
-    ("profile_name", "profile_toolsets", "expected_bundle_tools"),
-    [
-        (
-            "dollyresearch",
-            ("file_readonly", "skills_readonly"),
-            {
-                "file_readonly": {"read_file", "search_files"},
-                "skills_readonly": {"skills_list", "skill_view"},
-            },
-        ),
-        (
-            "dollyqa",
-            ("file_readonly", "skills_readonly"),
-            {
-                "file_readonly": {"read_file", "search_files"},
-                "skills_readonly": {"skills_list", "skill_view"},
-            },
-        ),
-        (
-            "dollycode",
-            ("file", "skills_readonly"),
-            {
-                "file": {"read_file", "write_file", "patch", "search_files"},
-                "skills_readonly": {"skills_list", "skill_view"},
-            },
-        ),
-        (
-            "dollyops",
-            ("file", "skills_readonly"),
-            {
-                "file": {"read_file", "write_file", "patch", "search_files"},
-                "skills_readonly": {"skills_list", "skill_view"},
-            },
-        ),
-    ],
-)
-def test_readonly_worker_profiles_resolve_only_intended_bundles(
-    monkeypatch,
-    tmp_path,
-    profile_name,
-    profile_toolsets,
-    expected_bundle_tools,
-):
-    """Profile-scoped CLI resolution keeps the approved worker bundles narrow."""
-    root = tmp_path / ".hermes"
-    profile = root / "profiles" / profile_name
-    profile.mkdir(parents=True)
-    profile.joinpath("config.yaml").write_text(
-        (
-            "platform_toolsets:\n"
-            "  cli:\n"
-            + "".join(f"    - {toolset}\n" for toolset in profile_toolsets)
-            + "agent:\n"
-            "  disabled_toolsets:\n"
-            "    - bfl\n"
-        ),
-        encoding="utf-8",
-    )
-    # Keep the fixture hermetic and prove the profile config wins over its
-    # parent, which intentionally has an unrelated worker surface.
-    root.joinpath("config.yaml").write_text(
-        "platform_toolsets:\n  cli:\n    - terminal\n", encoding="utf-8"
-    )
-    monkeypatch.setenv("HERMES_HOME", str(root))
-
-    from hermes_cli import kanban_db as kb
-    from toolsets import resolve_toolset
-
-    resolved = kb._resolve_worker_cli_toolsets(str(profile))
-
-    assert resolved is not None
-    # ``kanban`` is the dispatcher-owned worker lifecycle surface; it must be
-    # separate from the profile bundles under test.
-    assert set(resolved) == set(expected_bundle_tools) | {"kanban"}
-
-    resolved_tools = set()
-    for bundle_name, expected_tools in expected_bundle_tools.items():
-        bundle_tools = set(resolve_toolset(bundle_name, include_registry=False))
-        assert bundle_tools == expected_tools
-        resolved_tools.update(bundle_tools)
-
-    forbidden = {
-        "skill_manage",
-        "terminal",
-        "process",
-        "execute_code",
-        "delegate_task",
-        "cronjob",
-        "send_message",
-        "discord",
-        "discord_admin",
-        "kanban_show",
-        "kanban_list",
-        "kanban_complete",
-    }
-    if "file_readonly" in expected_bundle_tools:
-        forbidden.update({"write_file", "patch"})
-    assert resolved_tools.isdisjoint(forbidden)

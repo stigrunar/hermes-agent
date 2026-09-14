@@ -5,6 +5,7 @@ into ``<project_root>/.hermes_build_sha``.  These tests cover the read-side
 helper: missing file, malformed file, truncation, and error tolerance.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,3 +34,70 @@ def test_get_build_sha_respects_short_argument(tmp_path):
         assert build_info.get_build_sha(short=-1) == full_sha
 
 
+def test_get_code_identity_uses_sealed_private_release_identity_without_git(tmp_path):
+    from hermes_cli import build_info
+
+    commit, tree = "a" * 40, "b" * 40
+    identity_file = tmp_path / "private-release-identity.json"
+    identity_file.write_text(json.dumps({"commit": commit, "tree": tree}))
+
+    with (
+        patch.object(build_info, "_PRIVATE_RELEASE_IDENTITY_FILE", identity_file),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", tmp_path / ".hermes_build_sha"),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
+
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
+    assert identity["sha"] == commit
+    assert identity["source"] == "private-release"
+    assert private_release == {"sha": commit, "tree": tree}
+
+
+def test_get_code_identity_missing_private_release_identity_uses_build_fallback(tmp_path):
+    from hermes_cli import build_info
+
+    fallback = "c" * 40
+    build_file = tmp_path / ".hermes_build_sha"
+    build_file.write_text(fallback)
+
+    with (
+        patch.object(
+            build_info,
+            "_PRIVATE_RELEASE_IDENTITY_FILE",
+            tmp_path / "missing-private-release-identity.json",
+        ),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", build_file),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
+
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
+    assert identity["sha"] == fallback
+    assert identity["source"] == "build-file"
+    assert private_release is None
+
+
+def test_get_code_identity_malformed_private_release_identity_is_unknown(tmp_path):
+    from hermes_cli import build_info
+
+    identity_file = tmp_path / "private-release-identity.json"
+    identity_file.write_text("{")
+
+    with (
+        patch.object(build_info, "_PRIVATE_RELEASE_IDENTITY_FILE", identity_file),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", tmp_path / ".hermes_build_sha"),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
+
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
+    assert identity["sha"] is None
+    assert identity["source"] == "unknown"
+    assert private_release is None

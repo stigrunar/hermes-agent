@@ -448,6 +448,61 @@ def test_max_spawn_alone_is_not_host_adaptive_policy(
     assert kb._parallel_dispatch_required(snapshot) is False
 
 
+def test_serial_zero_new_spawn_budget_leaves_ready_and_review_unclaimed(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    spawn_calls = []
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="ready", assignee="alice")
+        review_id = kb.create_task(conn, title="review", assignee="alice")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id) or os.getpid(),
+            max_spawn=1,
+            max_in_progress=1,
+            max_new_spawns=0,
+        )
+
+        assert result.spawned == []
+        assert spawn_calls == []
+        for task_id, status in ((ready_id, "ready"), (review_id, "review")):
+            task = kb.get_task(conn, task_id)
+            assert task is not None and task.status == status
+            assert task.claim_lock is None
+            assert task.current_run_id is None
+            assert task.workspace_path is None
+        assert conn.execute("SELECT COUNT(*) FROM task_runs").fetchone()[0] == 0
+
+
+def test_serial_positive_new_spawn_budget_caps_ready_and_review_together(
+    isolated_home, monkeypatch,
+):
+    monkeypatch.setattr("hermes_cli.profiles.profile_exists", lambda _name: True)
+    spawn_calls = []
+    with kb.connect() as conn:
+        ready_id = kb.create_task(conn, title="ready", assignee="alice")
+        review_id = kb.create_task(conn, title="review", assignee="alice")
+        conn.execute("UPDATE tasks SET status = 'review' WHERE id = ?", (review_id,))
+        conn.commit()
+
+        result = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda task, _workspace: spawn_calls.append(task.id) or os.getpid(),
+            max_spawn=1,
+            max_in_progress=1,
+            max_new_spawns=1,
+        )
+
+        assert len(result.spawned) == 1
+        assert spawn_calls == [review_id]
+        assert kb.get_task(conn, ready_id).status == "ready"
+        assert kb.get_task(conn, review_id).status == "running"
+
+
 def test_canonical_policy_rejects_widening_and_allows_narrowing(
     isolated_home, monkeypatch,
 ):

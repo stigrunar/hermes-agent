@@ -14,6 +14,7 @@ from typing import cast
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli.project_execution_policy import (
     canonical_execution_preflight,
     resolve_project_execution_policy,
@@ -200,6 +201,112 @@ def test_existing_worktree_with_unrelated_history_rejects_bound_base(
             kb._ensure_git_worktree(
                 repo, target, "test/unrelated-task", start_point=base_commit,
             )
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(target)],
+            cwd=repo, check=False, capture_output=True, text=True,
+        )
+
+
+def test_bound_workspace_fails_closed_when_canonical_path_is_occupied(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str, cwd: Path = repo) -> str:
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Roadmap Binding Test")
+    git("config", "user.email", "roadmap-binding@example.invalid")
+    (repo / "tracked.txt").write_text("bound base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "bound base")
+    base_commit = git("rev-parse", "HEAD")
+    unrelated_commit = git("commit-tree", git("rev-parse", "HEAD^{tree}"), "-m", "unrelated root")
+    target = repo / ".worktrees" / "bound-task"
+    git("worktree", "add", "-q", "-b", "other-task", str(target), unrelated_commit)
+    task = cast(kb.Task, SimpleNamespace(
+        id="bound-task",
+        workspace_kind="worktree",
+        workspace_path=str(target),
+        branch_name="expected-task",
+        execution_preflight={"roadmap_binding": {"base_commit": base_commit}},
+    ))
+    try:
+        with pytest.raises(RuntimeError, match="no safe fallback"):
+            kbw.resolve_workspace(task)
+        assert git("branch", "--show-current", cwd=target) == "other-task"
+
+        # Legacy, unbound tasks still reuse the occupied checkout.
+        unbound = cast(kb.Task, SimpleNamespace(
+            id="unbound-task",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="expected-task",
+            execution_preflight=None,
+        ))
+        unbound_workspace = kbw.resolve_workspace(unbound)
+        assert unbound_workspace == (repo / ".worktrees" / "unbound-task").resolve()
+    finally:
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(target)],
+            cwd=repo, check=False, capture_output=True, text=True,
+        )
+        subprocess.run(
+            ["git", "worktree", "remove", "--force", str(repo / ".worktrees" / "unbound-task")],
+            cwd=repo, check=False, capture_output=True, text=True,
+        )
+
+
+def test_bound_workspace_fails_closed_when_no_fallback_repo_is_available(
+    tmp_path: Path,
+) -> None:
+    repo = tmp_path / "repo"
+    repo.mkdir()
+
+    def git(*args: str, cwd: Path = repo) -> str:
+        completed = subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        )
+        return completed.stdout.strip()
+
+    git("init", "-q")
+    git("config", "user.name", "Roadmap Binding Test")
+    git("config", "user.email", "roadmap-binding@example.invalid")
+    (repo / "tracked.txt").write_text("bound base\n", encoding="utf-8")
+    git("add", "tracked.txt")
+    git("commit", "-qm", "bound base")
+    base_commit = git("rev-parse", "HEAD")
+    unrelated_commit = git("commit-tree", git("rev-parse", "HEAD^{tree}"), "-m", "unrelated root")
+    target = tmp_path / "occupied-outside-repo"
+    git("worktree", "add", "-q", "-b", "other-task", str(target), unrelated_commit)
+    task = cast(kb.Task, SimpleNamespace(
+        id="bound-task",
+        workspace_kind="worktree",
+        workspace_path=str(target),
+        branch_name="expected-task",
+        execution_preflight={"roadmap_binding": {"base_commit": base_commit}},
+    ))
+    try:
+        with pytest.raises(RuntimeError, match="no safe fallback"):
+            kbw.resolve_workspace(task)
+        assert git("branch", "--show-current", cwd=target) == "other-task"
+
+        # An unbound task keeps the legacy occupied-path reuse when there is
+        # no repository from which to make its own fallback worktree.
+        unbound = cast(kb.Task, SimpleNamespace(
+            id="unbound-task",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            branch_name="expected-task",
+            execution_preflight=None,
+        ))
+        assert kbw.resolve_workspace(unbound) == target.resolve()
     finally:
         subprocess.run(
             ["git", "worktree", "remove", "--force", str(target)],
@@ -472,6 +579,76 @@ def test_claim_drift_blocks_without_retry_and_deduplicates_owner_replan(tmp_path
             return SimpleNamespace(returncode=0, stdout="", stderr="")
         monkeypatch.setattr("hermes_cli.kanban_db.subprocess.run", accepted)
         assert kb.claim_task(conn, task_id, claimer="after-owner-repair") is not None
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize(
+    ("column", "row_value"),
+    [("hygiene_class", "obsolete"), ("superseded_by", "newer-task")],
+)
+def test_owner_replan_uses_structured_row_hygiene_precedence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, column: str, row_value: str,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    kb._INITIALIZED_PATHS.clear()
+    conn = kb.connect(db_path=home / "kanban.db")
+    try:
+        conn.execute(f"ALTER TABLE tasks ADD COLUMN {column} TEXT")
+        conn.commit()
+
+        obsolete_id = kb.create_task(
+            conn, title="structured obsolete task", assignee="default",
+            body=f"{column}: active",
+        )
+        kb.add_notify_sub(
+            conn, task_id=obsolete_id, platform="telegram", chat_id="c",
+            chat_type="group", thread_id="t", notifier_profile="default",
+        )
+        conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (row_value, obsolete_id))
+        conn.commit()
+        obsolete_snapshot = dict(
+            conn.execute("SELECT * FROM tasks WHERE id=?", (obsolete_id,)).fetchone()
+        )
+        with kb.write_txn(conn):
+            assert kb._ensure_owner_replan_event(
+                conn, obsolete_snapshot, terminal_run_id=None,
+                end_reason="roadmap_binding_drift",
+            ) is None
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='needs_owner_replan'",
+            (obsolete_id,),
+        ).fetchone()[0] == 0
+
+        current_id = kb.create_task(
+            conn, title="current task", assignee="default",
+            body="contract_id: shared-contract\nrevision: r1",
+        )
+        kb.add_notify_sub(
+            conn, task_id=current_id, platform="telegram", chat_id="c",
+            chat_type="group", thread_id="t", notifier_profile="default",
+        )
+        successor_id = kb.create_task(
+            conn, title="obsolete successor", assignee="default",
+            body=f"continuation_of: {current_id}\n{column}: active",
+        )
+        conn.execute(f"UPDATE tasks SET {column}=? WHERE id=?", (row_value, successor_id))
+        conn.commit()
+        current_snapshot = dict(
+            conn.execute("SELECT * FROM tasks WHERE id=?", (current_id,)).fetchone()
+        )
+        assert kb._owner_replan_active_successor(conn, current_snapshot) is None
+        with kb.write_txn(conn):
+            assert kb._ensure_owner_replan_event(
+                conn, current_snapshot, terminal_run_id=None,
+                end_reason="roadmap_binding_drift",
+            )
+        assert conn.execute(
+            "SELECT COUNT(*) FROM task_events WHERE task_id=? AND kind='needs_owner_replan'",
+            (current_id,),
+        ).fetchone()[0] == 1
     finally:
         conn.close()
 

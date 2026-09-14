@@ -14,11 +14,8 @@ full credential environment. Two tiers:
 import os
 from unittest.mock import patch
 
-from tools.environments.local import (
-    hermes_subprocess_env,
-    _ALWAYS_STRIP_KEYS,
-    _HERMES_PROVIDER_ENV_FORCE_PREFIX,
-)
+from tools.environments.local import hermes_subprocess_env
+from tools.environments.local_env_policy import _ALWAYS_STRIP_KEYS, _HERMES_PROVIDER_ENV_FORCE_PREFIX
 
 
 _TIER1_SAMPLE = {
@@ -172,35 +169,54 @@ class TestDelegatedChildMarker:
                 env = hermes_subprocess_env(inherit_credentials=True)
 
         assert env["HERMES_DELEGATED_CHILD_CONTEXT"] == "1"
+        # Worker identity is scrubbed; board location and workspace routing survive so the
+        # fenced descendant can still read the board it belongs to.
         assert "HERMES_KANBAN_TASK" not in env
         assert "HERMES_KANBAN_RUN_ID" not in env
-        assert "HERMES_KANBAN_DB" not in env
-        assert "HERMES_KANBAN_WORKSPACE" not in env
+        assert env["HERMES_KANBAN_DB"] == "/tmp/parent-kanban.db"
+        assert env["HERMES_KANBAN_WORKSPACE"] == "/tmp/parent-workspace"
         assert env["MY_APP_VAR"] == "keep-me"
 
-    def test_non_delegated_worker_keeps_kanban_env_for_runtime(self):
-        """A worker's codex/ACP runtime subprocess keeps HERMES_KANBAN_*.
+    def test_native_child_denies_worker_scope_but_preserves_routing_and_credentials(self):
+        """Native executor descendants cannot inherit dispatcher authority.
 
-        ``hermes_subprocess_env`` feeds the codex app server and copilot ACP
-        runtimes, which are the worker's OWN execution surface — they must
-        retain ``HERMES_KANBAN_TASK`` so the runtime can write completion /
-        block back to the board (#81508 fixes the terminal-tool boundary; the
-        non-terminal runtime boundary is intentionally unchanged).
+        The child keeps only Kanban read-location hints and the lineage fence;
+        the managed MCP endpoint receives task scope separately. Provider
+        credentials remain available to the model-driving runtime, while Tier-1
+        gateway credentials stay stripped.
         """
         env = _build(
             {
                 "HERMES_KANBAN_TASK": "t_parent",
                 "HERMES_KANBAN_RUN_ID": "123",
+                "HERMES_KANBAN_CLAIM_LOCK": "/tmp/parent-claim.lock",
+                "HERMES_KANBAN_GOAL_MODE": "1",
+                "HERMES_KANBAN_GOAL_MAX_TURNS": "3",
                 "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
+                "HERMES_KANBAN_BOARD": "parent-board",
                 "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+                "OPENAI_API_KEY": "sk-native",
+                "TELEGRAM_BOT_TOKEN": "gateway-secret",
             },
             inherit_credentials=True,
         )
-        assert env["HERMES_KANBAN_TASK"] == "t_parent"
-        assert env["HERMES_KANBAN_RUN_ID"] == "123"
-        assert env["HERMES_KANBAN_DB"] == "/tmp/parent-kanban.db"
-        # Plain (non-delegated) spawns must not receive the lineage marker.
-        assert env.get("HERMES_DELEGATED_CHILD_CONTEXT") is None
+        from agent.delegation_context import (
+            DELEGATED_CHILD_ENV_MARKER,
+            KANBAN_ENV_KEYS,
+            KANBAN_READ_LOCATION_KEYS,
+        )
+
+        assert not (set(KANBAN_ENV_KEYS) & env.keys())
+        assert {
+            key: env[key] for key in KANBAN_READ_LOCATION_KEYS
+        } == {
+            "HERMES_KANBAN_DB": "/tmp/parent-kanban.db",
+            "HERMES_KANBAN_BOARD": "parent-board",
+            "HERMES_KANBAN_WORKSPACE": "/tmp/parent-workspace",
+        }
+        assert env[DELEGATED_CHILD_ENV_MARKER] == "1"
+        assert env["OPENAI_API_KEY"] == "sk-native"
+        assert "TELEGRAM_BOT_TOKEN" not in env
 
 
 _INTERNAL_DYNAMIC_SAMPLE = {

@@ -390,8 +390,13 @@ def test_native_scope_fences_fast_terminal_before_popen(
         task = kb.get_task(conn, task_id)
         run = kb.latest_run(conn, task_id)
         assert run is not None and run.reap_state == "terminal_requested"
-        reconciled = kb.reconcile_worker_scope_terminals(conn)
+        next_tick = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: None,
+            max_new_spawns=0,
+        )
         final = kb.get_task(conn, task_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, task_id)]
 
     assert observed == {"mode": "launching", "completed": True}
     assert result.spawned and result.spawned[0][0] == task_id
@@ -399,8 +404,9 @@ def test_native_scope_fences_fast_terminal_before_popen(
     assert task.current_run_id == run.id
     assert run is not None and run.verification_status == "verified"
     assert run.worker_pid == 2468
-    assert reconciled == [task_id]
+    assert next_tick.crashed == []
     assert final is not None and final.status == "done"
+    assert "crashed" not in event_kinds
 
 
 def test_launching_terminal_request_is_idempotent_and_conflicts_fail(
@@ -698,7 +704,12 @@ def test_dead_scope_leader_with_active_descendant_scope_is_not_reaped(
     monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
     monkeypatch.setattr(kb, "_systemd_scope_state", lambda *args, **kwargs: "active")
     monkeypatch.setattr(kb, "_systemd_scope_process_ids", lambda path: (9876,))
-    monkeypatch.setattr(kb, "_stop_systemd_scope", lambda *args, **kwargs: True)
+    stop_calls = []
+    monkeypatch.setattr(
+        kb,
+        "_stop_systemd_scope",
+        lambda *args, **kwargs: stop_calls.append(args) or True,
+    )
 
     with kb.connect() as conn:
         task_id = kb.create_task(conn, title="descendant", assignee="worker")
@@ -710,6 +721,7 @@ def test_dead_scope_leader_with_active_descendant_scope_is_not_reaped(
         assert kb.detect_crashed_workers(conn) == []
         current = kb.get_task(conn, task_id)
         assert current is not None and current.status == "running"
+    assert stop_calls == []
 
 
 def test_dry_run_does_not_reconcile_pending_scoped_terminal(
@@ -1568,6 +1580,52 @@ def test_dashboard_running_noop_does_not_cleanup_or_mutate_identity(
         before.worker_pid,
         before.claim_lock,
     )
+
+
+@pytest.mark.parametrize("cleanup", ["unknown", "failed"])
+def test_dashboard_failed_or_unknown_scope_cleanup_preserves_identity_without_pid_signal(
+    isolated_scope_home, monkeypatch, cleanup,
+):
+    from plugins.kanban.dashboard import plugin_api as dashboard_api
+
+    release_calls = []
+    signals = []
+    monkeypatch.setattr(
+        kb,
+        "_scope_release_result",
+        lambda conn, task_id, run_id: (
+            release_calls.append((task_id, run_id))
+            or SimpleNamespace(can_release=False, cleanup=cleanup, pid_signal_allowed=False)
+        ),
+    )
+    monkeypatch.setattr(
+        kb,
+        "_terminate_reclaimed_worker",
+        lambda *args, **kwargs: signals.append((args, kwargs)),
+    )
+
+    with kb.connect() as conn:
+        task_id = kb.create_task(conn, title=f"{cleanup} cleanup", assignee="worker")
+        claimed = kb.claim_task(conn, task_id)
+        assert claimed is not None and claimed.current_run_id is not None
+        run_id = int(claimed.current_run_id)
+        kb._set_worker_pid(conn, task_id, 5432)
+        before = kb.get_task(conn, task_id)
+
+        assert not dashboard_api._set_status_direct(conn, task_id, "ready")
+        after = kb.get_task(conn, task_id)
+        run = kb.get_run(conn, run_id)
+
+    assert release_calls == [(task_id, run_id)]
+    assert before is not None and after is not None and run is not None
+    assert (after.status, after.current_run_id, after.worker_pid, after.claim_lock) == (
+        before.status,
+        before.current_run_id,
+        before.worker_pid,
+        before.claim_lock,
+    )
+    assert run.ended_at is None
+    assert signals == []
 
 
 def test_dashboard_actual_running_to_ready_direct_keeps_pid_signal(

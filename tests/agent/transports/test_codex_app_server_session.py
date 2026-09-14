@@ -8,7 +8,8 @@ deadline timeouts. These tests pin all of that without spawning real codex.
 from __future__ import annotations
 
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 from typing import Any, Optional
 
 import pytest
@@ -211,6 +212,21 @@ class TestRunTurn:
 
 
 
+    def test_result_records_the_exact_submitted_input(self):
+        client = FakeClient()
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        rich_input = [
+            {"type": "text", "text": "caption"},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+        ]
+        result = make_session(client).run_turn(rich_input, turn_timeout=2.0)
+        _, params = next(request for request in client.requests if request[0] == "turn/start")
+        assert result.submitted_user_text == params["input"][0]["text"]
+        assert result.submitted_user_text != rich_input
+
     def test_foreign_completion_in_server_request_drain_is_ignored(self):
         """Approval draining must not project a child result into the parent."""
         client = FakeClient()
@@ -277,6 +293,363 @@ class TestRunTurn:
         assert result.projected_messages == [
             {"role": "assistant", "content": "parent after approval"}
         ]
+
+    def test_foreign_progress_never_reaches_activity_bridge(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+
+        client = FakeClient()
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-child-001", turnId="turn-child-001",
+            itemId="child-message", delta="stale child progress",
+        )
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-fake-001", turnId="turn-fake-001",
+            itemId="parent-message", delta="current progress",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        agent = SimpleNamespace(_touch_activity=MagicMock())
+        session = make_session(
+            client,
+            on_event=make_codex_app_server_event_bridge(agent),
+            on_activity=agent._touch_activity,
+        )
+
+        result = session.run_turn("keep going", turn_timeout=1.0)
+
+        assert result.error is None
+        agent._touch_activity.assert_called_once_with(
+            "codex app-server progress: item/agentMessage/delta"
+        )
+
+    def test_display_failure_does_not_interrupt_current_turn_or_activity(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+
+        client = FakeClient()
+        client.queue_notification(
+            "item/agentMessage/delta", threadId="thread-fake-001", turnId="turn-fake-001",
+            itemId="parent-message", delta="current progress",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        agent = SimpleNamespace(
+            _touch_activity=MagicMock(),
+            _fire_stream_delta=MagicMock(side_effect=RuntimeError("display boom")),
+        )
+        session = make_session(
+            client,
+            on_event=make_codex_app_server_event_bridge(agent),
+            on_activity=agent._touch_activity,
+        )
+
+        result = session.run_turn("keep going", turn_timeout=1.0)
+
+        assert result.error is None
+        assert result.interrupted is False
+        agent._touch_activity.assert_called_once()
+
+    def test_activity_callback_failure_does_not_disable_display_or_turn(self):
+        from agent.codex_runtime import make_codex_app_server_event_bridge
+
+        client = FakeClient()
+        client.queue_notification(
+            "item/agentMessage/delta",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            delta="current progress",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        agent = SimpleNamespace(
+            _touch_activity=MagicMock(side_effect=RuntimeError("activity boom")),
+            _fire_stream_delta=MagicMock(),
+        )
+        session = make_session(
+            client,
+            on_event=make_codex_app_server_event_bridge(agent),
+            on_activity=agent._touch_activity,
+        )
+
+        result = session.run_turn("keep going", turn_timeout=1.0)
+
+        assert result.error is None
+        assert result.interrupted is False
+        agent._touch_activity.assert_called_once()
+        agent._fire_stream_delta.assert_called_once_with("current progress")
+
+    @pytest.mark.parametrize("note", [
+        pytest.param(
+            {"method": "item/agentMessage/delta", "params": {"delta": "unscoped"}},
+            id="unscoped",
+        ),
+        pytest.param(
+            {"method": "item/agentMessage/delta", "params": []},
+            id="malformed-params",
+        ),
+        pytest.param(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-child-001",
+                    "turnId": "turn-fake-001",
+                    "delta": "foreign thread",
+                },
+            },
+            id="foreign-thread",
+        ),
+        pytest.param(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-child-001",
+                    "delta": "foreign turn",
+                },
+            },
+            id="foreign-turn",
+        ),
+        pytest.param(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-old-001",
+                    "delta": "late old turn",
+                },
+            },
+            id="late-old-turn",
+        ),
+        pytest.param(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-fake-001",
+                    "item": {"threadId": [], "turnId": "turn-fake-001"},
+                    "delta": "conflicting malformed identity",
+                },
+            },
+            id="malformed-nested-identity",
+        ),
+        pytest.param(
+            {
+                "method": "turn/started",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turn": {"id": "turn-fake-001"},
+                },
+            },
+            id="boundary",
+        ),
+        pytest.param(
+            {
+                "method": "item/agentMessage/delta",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-fake-001",
+                    "delta": "",
+                },
+            },
+            id="empty",
+        ),
+        pytest.param(
+            {
+                "method": "unknown/progress",
+                "params": {
+                    "threadId": "thread-fake-001",
+                    "turnId": "turn-fake-001",
+                    "delta": "looks busy",
+                },
+            },
+            id="unknown",
+        ),
+    ])
+    def test_non_current_or_non_substantive_events_never_touch_activity(self, note):
+        client = FakeClient()
+        client._notifications.append(note)
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        touch_activity = MagicMock()
+
+        result = make_session(client, on_activity=touch_activity).run_turn(
+            "keep going", turn_timeout=1.0
+        )
+
+        assert result.error is None
+        touch_activity.assert_not_called()
+
+    def test_unscoped_completed_message_cannot_be_terminal_projection(self):
+        """A compatibility display event must not defeat the silence retirement path."""
+        client = FakeClient()
+        client._notifications.append({
+            "method": "item/completed",
+            "params": {"item": {"type": "agentMessage", "id": "unscoped-1", "text": "UNSCOPED"}},
+        })
+        clock = [0.0]
+        original_take_notification = client.take_notification
+
+        def take_notification(timeout=0.0):
+            clock[0] += 0.06
+            return original_take_notification(0.0)
+
+        client.take_notification = take_notification
+        touch_activity = MagicMock()
+        session = make_session(client, on_activity=touch_activity)
+
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = session.run_turn(
+                "ignore unattributed output",
+                turn_timeout=0.05,
+                notification_poll_timeout=0.0,
+            )
+
+        assert result.final_text == ""
+        assert result.projected_messages == []
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert session._active_turn_id is None
+        touch_activity.assert_not_called()
+        assert ("turn/interrupt", {
+            "threadId": "thread-fake-001", "turnId": "turn-fake-001"
+        }) in client.requests
+
+    def test_substantive_progress_crosses_original_timeout_boundary(self):
+        client = FakeClient()
+        for delta in ("one", "two", "three"):
+            client.queue_notification(
+                "item/agentMessage/delta",
+                threadId="thread-fake-001",
+                turnId="turn-fake-001",
+                delta=delta,
+            )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        clock = [0.0]
+        original_take_notification = client.take_notification
+
+        def take_notification(timeout=0.0):
+            clock[0] += 0.04
+            return original_take_notification(0.0)
+
+        client.take_notification = take_notification
+        touch_activity = MagicMock()
+        session = make_session(client, on_activity=touch_activity)
+
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = session.run_turn(
+                "keep progressing",
+                turn_timeout=0.05,
+                notification_poll_timeout=0.0,
+            )
+
+        assert clock[0] == pytest.approx(0.16)
+        assert result.error is None
+        assert result.interrupted is False
+        assert result.should_retire is False
+        assert session._active_turn_id is None
+        assert touch_activity.call_count == 3
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_silence_timeout_interrupts_retires_and_cleans_up(self):
+        client = FakeClient()
+        clock = [0.0]
+
+        def take_notification(timeout=0.0):
+            clock[0] += 0.06
+            return None
+
+        client.take_notification = take_notification
+        session = make_session(client, on_activity=MagicMock())
+
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = session.run_turn(
+                "go silent",
+                turn_timeout=0.05,
+                notification_poll_timeout=0.0,
+            )
+
+        assert result.interrupted is True
+        assert result.should_retire is True
+        assert result.error and "made no progress for 0.05s" in result.error
+        assert session._active_turn_id is None
+        assert ("turn/interrupt", {
+            "threadId": "thread-fake-001", "turnId": "turn-fake-001"
+        }) in client.requests
+
+    def test_substantive_delta_clears_post_tool_silence_watchdog(self):
+        client = FakeClient()
+        client.queue_notification(
+            "item/completed",
+            item={
+                "type": "commandExecution",
+                "id": "exec-1",
+                "command": "echo hi",
+                "cwd": "/tmp",
+                "status": "completed",
+                "aggregatedOutput": "hi",
+                "exitCode": 0,
+                "commandActions": [],
+            },
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+        )
+        client.queue_notification(
+            "item/reasoning/textDelta",
+            threadId="thread-fake-001",
+            turnId="turn-fake-001",
+            delta="still reasoning",
+        )
+        client.queue_notification(
+            "turn/completed",
+            threadId="thread-fake-001",
+            turn={"id": "turn-fake-001", "status": "completed", "error": None},
+        )
+        clock = [0.0]
+        original_take_notification = client.take_notification
+
+        def take_notification(timeout=0.0):
+            clock[0] += 0.04
+            return original_take_notification(0.0)
+
+        client.take_notification = take_notification
+
+        with patch.object(session_mod.time, "monotonic", side_effect=lambda: clock[0]):
+            result = make_session(client).run_turn(
+                "tool then reasoning",
+                turn_timeout=0.05,
+                notification_poll_timeout=0.0,
+                post_tool_quiet_timeout=0.05,
+            )
+
+        assert clock[0] == pytest.approx(0.12)
+        assert result.interrupted is False
+        assert result.should_retire is False
+        assert not any(method == "turn/interrupt" for method, _ in client.requests)
+
+    def test_request_interrupt_is_consumed_and_active_turn_is_cleaned_up(self):
+        client = FakeClient()
+        session = make_session(client)
+        session.request_interrupt()
+
+        result = session.run_turn("cancel me", turn_timeout=1.0)
+
+        assert result.interrupted is True
+        assert not any(method == "turn/start" for method, _ in client.requests)
+        assert session._interrupt_event.is_set() is False
+        assert session._active_turn_id is None
 
 
 
@@ -564,6 +937,7 @@ class TestServerRequestRouting:
             client,
             approval_callback=cb,
             on_event=events.append,
+            on_activity=MagicMock(),
         )
         s.run_turn("hi", turn_timeout=1.0)
 
@@ -579,6 +953,7 @@ class TestServerRequestRouting:
             "forwarded to on_event — display will miss tool bubbles "
             "around approvals"
         )
+        s._on_activity.assert_not_called()
 
 
 
@@ -595,6 +970,21 @@ class TestServerRequestRouting:
             auto_approve_exec=True))
         s.run_turn("hi", turn_timeout=1.0)
         assert ("r1", {"decision": "accept"}) in client.responses
+
+    def test_approval_without_callback_fails_closed(self):
+        client = FakeClient()
+        client.queue_server_request(
+            "item/commandExecution/requestApproval", request_id="r-deny",
+            command="touch /tmp/nope", cwd="/tmp",
+        )
+        client.queue_notification(
+            "turn/completed", threadId="t",
+            turn={"id": "tu1", "status": "completed", "error": None},
+        )
+
+        make_session(client).run_turn("hi", turn_timeout=0.05)
+
+        assert ("r-deny", {"decision": "decline"}) in client.responses
 
 
 
@@ -745,7 +1135,7 @@ class TestSessionRetirement:
             threadId="t", turnId="tu1",
         )
         s = make_session(client)
-        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 1000.2])
+        monotonic_values = iter([1000.0, 999.0, 999.0, 999.0, 999.0, 1000.2])
         with patch.object(
             session_mod.time,
             "monotonic",
@@ -895,4 +1285,3 @@ class TestClassifyOAuthFailure:
         assert _classify_oauth_failure() is None
         assert _classify_oauth_failure("") is None
         assert _classify_oauth_failure("", None) is None  # type: ignore[arg-type]
-
