@@ -86,24 +86,19 @@ def test_served_named_profile_reports_running_without_default_pid_file(monkeypat
     assert _run_status().startswith("✓ Gateway is running via the default-profile multiplexer")
 
 
-def test_gateway_code_identity_carries_private_release_tree(monkeypatch):
+def test_gateway_code_identity_carries_private_release_tree(monkeypatch, tmp_path):
     import gateway.status as status
     from hermes_cli import build_info
 
     commit, tree = "a" * 40, "b" * 40
-    monkeypatch.setattr(
-        build_info,
-        "get_code_identity",
-        lambda: {
-            "sha": commit,
-            "tree": tree,
-            "version": "1.2.3",
-            "source": "private-release",
-        },
-    )
+    identity_file = tmp_path / "private-release-identity.json"
+    identity_file.write_text(f'{{"commit": "{commit}", "tree": "{tree}"}}')
+    monkeypatch.setattr(build_info, "_PRIVATE_RELEASE_IDENTITY_FILE", identity_file)
+    monkeypatch.setattr(build_info, "_resolve_git_head_sha", lambda _root: None)
+    monkeypatch.setattr(build_info, "_BUILD_SHA_FILE", tmp_path / ".hermes_build_sha")
+    monkeypatch.setattr(build_info, "_code_identity_cache", None)
 
-    assert status._get_code_identity_fields() == {
-        "code_sha": commit,
-        "code_tree": tree,
-        "code_version": "1.2.3",
-    }
+    fields = status._get_code_identity_fields()
+    assert fields["code_sha"] == commit
+    assert fields["code_tree"] == tree
+    assert isinstance(fields["code_version"], str)

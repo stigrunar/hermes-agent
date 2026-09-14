@@ -694,11 +694,16 @@ def _get_code_identity_fields() -> dict[str, Any]:
     degrades to absent fields.
     """
     try:
-        from hermes_cli.build_info import get_code_identity
+        from hermes_cli.build_info import get_code_identity, get_private_release_identity
         identity = get_code_identity()
+        private_release = (
+            get_private_release_identity()
+            if identity.get("source") == "private-release"
+            else None
+        )
         return {
             "code_sha": identity.get("sha"),
-            "code_tree": identity.get("tree"),
+            "code_tree": private_release.get("tree") if private_release else None,
             "code_version": identity.get("version"),
         }
     except Exception:

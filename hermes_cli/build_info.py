@@ -15,6 +15,7 @@ from typing import Optional
 _BUILD_SHA_FILE = Path(__file__).parent.parent / ".hermes_build_sha"
 _PRIVATE_RELEASE_IDENTITY_FILE = Path(__file__).parent.parent / "private-release-identity.json"
 _code_identity_cache: Optional[dict] = None
+_CODE_IDENTITY_FIELDS = ("sha", "short_sha", "version", "source")
 
 
 def _read_stripped(path: Path) -> str:
@@ -92,8 +93,12 @@ def _resolve_private_release_identity(path: Path) -> Optional[dict[str, str]]:
     return {"sha": commit, "tree": tree}
 
 
+def _public_code_identity(identity: dict) -> dict:
+    return {field: identity.get(field) for field in _CODE_IDENTITY_FIELDS}
+
+
 def get_code_identity(refresh: bool = False) -> dict:
-    """``{sha, tree, short_sha, version, source}`` for the running checkout; never raises.
+    """``{sha, short_sha, version, source}`` for the running checkout; never raises.
 
     Resolution uses live git for source installs, the sealed identity in an immutable private
     runtime, then the baked ``.hermes_build_sha`` for Docker images. Cached per process — code
@@ -102,7 +107,7 @@ def get_code_identity(refresh: bool = False) -> dict:
     """
     global _code_identity_cache
     if _code_identity_cache is not None and not refresh:
-        return dict(_code_identity_cache)
+        return _public_code_identity(_code_identity_cache)
     project_root = Path(__file__).parent.parent
     source = "unknown"
     tree: Optional[str] = None
@@ -132,7 +137,19 @@ def get_code_identity(refresh: bool = False) -> dict:
         "short_sha": sha[:8] if sha else None,
         "version": version,
         "source": source}
-    return dict(_code_identity_cache)
+    return _public_code_identity(_code_identity_cache)
+
+
+def get_private_release_identity(refresh: bool = False) -> Optional[dict[str, str]]:
+    """Sealed commit/tree identity for this private runtime, or None for other installs."""
+    get_code_identity(refresh=refresh)
+    cached = _code_identity_cache
+    if not cached or cached.get("source") != "private-release":
+        return None
+    sha, tree = cached.get("sha"), cached.get("tree")
+    if not isinstance(sha, str) or not isinstance(tree, str):
+        return None
+    return {"sha": sha, "tree": tree}
 
 
 def get_build_sha(short: int = 8) -> Optional[str]:

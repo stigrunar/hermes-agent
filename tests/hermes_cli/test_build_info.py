@@ -48,7 +48,56 @@ def test_get_code_identity_uses_sealed_private_release_identity_without_git(tmp_
         patch.object(build_info, "_code_identity_cache", None),
     ):
         identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
 
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
     assert identity["sha"] == commit
-    assert identity["tree"] == tree
     assert identity["source"] == "private-release"
+    assert private_release == {"sha": commit, "tree": tree}
+
+
+def test_get_code_identity_missing_private_release_identity_uses_build_fallback(tmp_path):
+    from hermes_cli import build_info
+
+    fallback = "c" * 40
+    build_file = tmp_path / ".hermes_build_sha"
+    build_file.write_text(fallback)
+
+    with (
+        patch.object(
+            build_info,
+            "_PRIVATE_RELEASE_IDENTITY_FILE",
+            tmp_path / "missing-private-release-identity.json",
+        ),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", build_file),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
+
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
+    assert identity["sha"] == fallback
+    assert identity["source"] == "build-file"
+    assert private_release is None
+
+
+def test_get_code_identity_malformed_private_release_identity_is_unknown(tmp_path):
+    from hermes_cli import build_info
+
+    identity_file = tmp_path / "private-release-identity.json"
+    identity_file.write_text("{")
+
+    with (
+        patch.object(build_info, "_PRIVATE_RELEASE_IDENTITY_FILE", identity_file),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", tmp_path / ".hermes_build_sha"),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+        private_release = build_info.get_private_release_identity()
+
+    assert set(identity) == {"sha", "short_sha", "version", "source"}
+    assert identity["sha"] is None
+    assert identity["source"] == "unknown"
+    assert private_release is None
