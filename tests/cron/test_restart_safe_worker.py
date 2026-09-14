@@ -581,7 +581,7 @@ def test_terminal_early_return_reaps_a_real_worker_process(monkeypatch):
     assert process.returncode == 0
 
 
-def test_launch_external_worker_stays_in_process_outside_managed_gateway(
+def test_launch_external_worker_stays_in_process_for_stateful_standalone_caller(
     monkeypatch,
 ):
     import cron.scheduler as scheduler
@@ -696,6 +696,69 @@ def test_launch_external_worker_pin_extends_the_sanitized_env_not_os_environ(
     untouched = {"PYTHONPATH": str(tmp_path / "kept-by-sanitizer")}
     assert worker_env_mod.pin_hermes_tree_on_pythonpath(dict(untouched), repo_root) == untouched
     assert "PYTHONPATH" not in worker_env_mod.pin_hermes_tree_on_pythonpath({}, repo_root)
+
+
+def test_launch_external_worker_detaches_for_stateless_standalone_caller(
+    monkeypatch,
+):
+    import cron.scheduler as scheduler
+    from tools.process_registry import GatewayChildDispatch
+
+    command_calls = []
+
+    def unchanged(command, *, unit_suffix, require_restart_safe_scope=False):
+        command_calls.append((command, unit_suffix))
+        return GatewayChildDispatch("in_process", command)
+
+    monkeypatch.setattr(
+        "tools.process_registry.restart_safe_gateway_child_argv", unchanged
+    )
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported", lambda: False
+    )
+    handoff = Mock(return_value={"id": "exec-1", "handoff_pending": 1})
+    monkeypatch.setattr(scheduler, "mark_execution_handoff_pending", handoff)
+
+    class FakeProcess:
+        returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=0.0):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired(cmd="worker", timeout=timeout)
+            return self.returncode
+
+    spawned = []
+
+    def popen(command, **kwargs):
+        spawned.append((command, kwargs))
+        ack_index = command.index("--ack-file") + 1
+        Path(command[ack_index]).write_text(
+            json.dumps({"pid": 4321, "execution_id": "exec-1"}),
+            encoding="utf-8",
+        )
+        return FakeProcess()
+
+    monkeypatch.setattr(scheduler.subprocess, "Popen", popen)
+    statuses = iter(
+        [
+            {"id": "exec-1", "status": "running"},
+            {"id": "exec-1", "status": "completed"},
+        ]
+    )
+    monkeypatch.setattr(
+        scheduler, "get_execution", lambda _execution_id: next(statuses)
+    )
+
+    assert scheduler._launch_external_cron_worker(
+        {"id": "job-1", "execution_id": "exec-1"}
+    ) is True
+    assert command_calls
+    assert spawned[0][0] == command_calls[0][0]
+    assert spawned[0][1]["start_new_session"] is True
+    handoff.assert_called_once_with("exec-1")
 
 
 def test_shared_run_path_hands_gateway_fire_to_external_worker(monkeypatch):
@@ -830,6 +893,116 @@ def test_lost_execution_start_cas_prevents_side_effects(monkeypatch):
         {"id": "job-1", "execution_id": "exec-1"}, adapters=None
     ) is True
     run.assert_not_called()
+
+
+@pytest.mark.linux_only
+@pytest.mark.live_system_guard_bypass
+def test_direct_cli_exit_keeps_no_agent_execution_owned_until_child_result(
+    tmp_path, monkeypatch
+):
+    """A one-shot CLI may disappear after its script starts without orphaning
+    the durable attempt owned by the restart-safe child."""
+    import cron.executions as executions
+    from cron.jobs import create_job, use_cron_store
+    from gateway.status import _pid_exists
+
+    repo = Path(__file__).resolve().parents[2]
+    home = tmp_path / "profile"
+    scripts_dir = home / "scripts"
+    scripts_dir.mkdir(parents=True)
+    started = tmp_path / "script-started"
+    release = tmp_path / "release-script"
+    finished = tmp_path / "script-finished"
+    script = scripts_dir / "terminalization_probe.py"
+    script.write_text(
+        "import os, pathlib, time\n"
+        f"started = pathlib.Path({str(started)!r})\n"
+        f"release = pathlib.Path({str(release)!r})\n"
+        f"finished = pathlib.Path({str(finished)!r})\n"
+        "started.write_text(str(os.getpid()))\n"
+        "deadline = time.monotonic() + 15\n"
+        "while not release.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.05)\n"
+        "if not release.exists():\n"
+        "    raise SystemExit('release timeout')\n"
+        "finished.write_text('actual-child-result')\n",
+        encoding="utf-8",
+    )
+
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with use_cron_store(home):
+        job = create_job(
+            prompt=None,
+            schedule="every 1h",
+            name="terminalization probe",
+            script=script.name,
+            no_agent=True,
+            deliver="local",
+        )
+
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(home)
+    env["PYTHONPATH"] = str(repo)
+    for inherited_gateway_marker in ("_HERMES_GATEWAY", "INVOCATION_ID"):
+        env.pop(inherited_gateway_marker, None)
+
+    owner = subprocess.Popen(
+        [sys.executable, str(repo / "hermes"), "cron", "run", job["id"]],
+        cwd=repo,
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    script_pid = None
+    execution_pid = None
+    try:
+        deadline = time.monotonic() + 10
+        current = None
+        while time.monotonic() < deadline:
+            current = executions.latest_execution(job["id"])
+            if started.exists() and current and current["status"] == "running":
+                break
+            if owner.poll() is not None:
+                stdout, stderr = owner.communicate()
+                pytest.fail(
+                    f"direct cron owner exited before script start ({owner.returncode}): "
+                    f"stdout={stdout!r} stderr={stderr!r}"
+                )
+            time.sleep(0.05)
+        assert started.exists(), "deterministic no-agent child did not start"
+        assert current is not None and current["status"] == "running"
+        script_pid = int(started.read_text(encoding="utf-8"))
+        execution_pid = int(current["pid"])
+
+        owner.terminate()
+        owner.wait(timeout=5)
+        assert _pid_exists(script_pid), "owner exit killed the detached no-agent child"
+
+        release.write_text("continue", encoding="utf-8")
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            current = executions.latest_execution(job["id"])
+            if current and current["status"] in {"completed", "failed", "unknown"}:
+                break
+            time.sleep(0.05)
+
+        assert finished.read_text(encoding="utf-8") == "actual-child-result"
+        records = executions.list_executions(job_id=job["id"])
+        assert len(records) == 1
+        assert records[0]["status"] == "completed"
+        assert executions.recover_interrupted_executions() == 0
+        assert executions.latest_execution(job["id"])["status"] == "completed"
+    finally:
+        release.touch(exist_ok=True)
+        if owner.poll() is None:
+            owner.terminate()
+            owner.wait(timeout=5)
+        for pid in (script_pid, execution_pid):
+            if pid and pid != owner.pid and _pid_exists(pid):
+                os.kill(pid, signal.SIGKILL)
 
 
 @pytest.mark.linux_only
