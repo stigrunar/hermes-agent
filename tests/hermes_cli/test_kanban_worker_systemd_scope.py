@@ -390,8 +390,13 @@ def test_native_scope_fences_fast_terminal_before_popen(
         task = kb.get_task(conn, task_id)
         run = kb.latest_run(conn, task_id)
         assert run is not None and run.reap_state == "terminal_requested"
-        reconciled = kb.reconcile_worker_scope_terminals(conn)
+        next_tick = kb.dispatch_once(
+            conn,
+            spawn_fn=lambda *_args, **_kwargs: None,
+            max_new_spawns=0,
+        )
         final = kb.get_task(conn, task_id)
+        event_kinds = [event.kind for event in kb.list_events(conn, task_id)]
 
     assert observed == {"mode": "launching", "completed": True}
     assert result.spawned and result.spawned[0][0] == task_id
@@ -399,8 +404,9 @@ def test_native_scope_fences_fast_terminal_before_popen(
     assert task.current_run_id == run.id
     assert run is not None and run.verification_status == "verified"
     assert run.worker_pid == 2468
-    assert reconciled == [task_id]
+    assert next_tick.crashed == []
     assert final is not None and final.status == "done"
+    assert "crashed" not in event_kinds
 
 
 def test_launching_terminal_request_is_idempotent_and_conflicts_fail(

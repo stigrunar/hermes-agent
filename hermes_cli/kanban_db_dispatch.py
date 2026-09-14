@@ -2844,6 +2844,11 @@ def _run_reclaim_phase(
 ) -> None:
     """Reclaim stale/orphaned/crashed/timed-out running tasks, then promote."""
     reap_worker_zombies()
+    # Worker terminal tools persist an intent first, then the dispatcher owns
+    # exact scope shutdown and final state publication.  Reconcile those
+    # intents before generic crash detection; otherwise a correctly completed
+    # scoped worker is reclassified as a dead PID and requeued.
+    reconcile_worker_scope_terminals(conn)
     result.reclaimed = _kb.release_stale_claims(conn)
     if reconcile_orphans:
         result.reconciled_orphans = reconcile_orphaned_running(conn)
