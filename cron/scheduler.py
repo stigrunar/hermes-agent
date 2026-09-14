@@ -3043,12 +3043,15 @@ def _wait_for_external_cron_worker(
 
 
 def _launch_external_cron_worker(job: dict) -> bool:
-    """Launch *job* outside a managed gateway cgroup when required.
+    """Launch *job* in a durable worker outside its calling owner.
 
-    Returns ``False`` when the caller is not a managed systemd gateway and the
-    existing in-process path should be used.  In managed topology, failure to
-    establish the transient scope raises: falling back would recreate the
-    restart interruption this handoff exists to prevent.
+    Managed systemd gateways require a transient scope outside their service
+    cgroup.  Stateless standalone callers use the direct command in a new
+    session so a one-shot CLI exiting cannot strand the execution row after
+    the child has produced side effects.  Stateful embedding/test callers keep
+    the existing in-process path.  In managed topology, failure to establish
+    the transient scope still raises: falling back would recreate the restart
+    interruption this handoff exists to prevent.
     """
     execution_id = str(job["execution_id"])
     job_id = str(job["id"])
@@ -3078,7 +3081,10 @@ def _launch_external_cron_worker(job: dict) -> bool:
         unit_suffix=f"cron-{job_id}-exec-{execution_id}",
     )
     if scoped_command == command:
-        return False
+        from gateway.session_context import async_delivery_supported
+
+        if async_delivery_supported():
+            return False
 
     if mark_execution_handoff_pending(execution_id) is None:
         raise RuntimeError(
