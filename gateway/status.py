@@ -696,7 +696,11 @@ def _get_code_identity_fields() -> dict[str, Any]:
     try:
         from hermes_cli.build_info import get_code_identity
         identity = get_code_identity()
-        return {"code_sha": identity.get("sha"), "code_version": identity.get("version")}
+        return {
+            "code_sha": identity.get("sha"),
+            "code_tree": identity.get("tree"),
+            "code_version": identity.get("version"),
+        }
     except Exception:
         return {}
 

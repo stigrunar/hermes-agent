@@ -958,7 +958,7 @@ def test_different_request_already_bound_candidate_is_no_change(tmp_path, state_
     assert calls == []
 
 
-@pytest.mark.parametrize("mismatch", [None, "source", "command", "gateway"])
+@pytest.mark.parametrize("mismatch", [None, "source", "command", "gateway-sha", "gateway-tree"])
 def test_no_change_health_checks_candidate_identity_without_restart(tmp_path, monkeypatch, mismatch):
     from hermes_cli import private_release_supervisor as supervisor
     from contextlib import contextmanager
@@ -988,7 +988,8 @@ def test_no_change_health_checks_candidate_identity_without_restart(tmp_path, mo
     for target in policy.gateway_targets:
         _write(target.profile_home / "gateway_state.json", json.dumps({
             "pid": 123, "start_time": 456,
-            "code_sha": "wrong" if mismatch == "gateway" else COMMIT,
+            "code_sha": "wrong" if mismatch == "gateway-sha" else COMMIT,
+            "code_tree": "wrong" if mismatch == "gateway-tree" else TREE,
         }).encode())
 
     @contextmanager

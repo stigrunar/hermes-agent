@@ -84,3 +84,26 @@ def test_served_named_profile_reports_running_without_default_pid_file(monkeypat
     beta = next(p for p in list_profiles() if p.name == "beta")
     assert beta.gateway_running is True
     assert _run_status().startswith("✓ Gateway is running via the default-profile multiplexer")
+
+
+def test_gateway_code_identity_carries_private_release_tree(monkeypatch):
+    import gateway.status as status
+    from hermes_cli import build_info
+
+    commit, tree = "a" * 40, "b" * 40
+    monkeypatch.setattr(
+        build_info,
+        "get_code_identity",
+        lambda: {
+            "sha": commit,
+            "tree": tree,
+            "version": "1.2.3",
+            "source": "private-release",
+        },
+    )
+
+    assert status._get_code_identity_fields() == {
+        "code_sha": commit,
+        "code_tree": tree,
+        "code_version": "1.2.3",
+    }
