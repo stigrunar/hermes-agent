@@ -7,11 +7,13 @@ so those callsites fall back to the ``.hermes_build_sha`` file written by the Do
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Optional
 
 # Resolved relative to this module so it works regardless of cwd (as banner._resolve_repo_dir).
 _BUILD_SHA_FILE = Path(__file__).parent.parent / ".hermes_build_sha"
+_PRIVATE_RELEASE_IDENTITY_FILE = Path(__file__).parent.parent / "private-release-identity.json"
 _code_identity_cache: Optional[dict] = None
 
 
@@ -71,26 +73,51 @@ def _resolve_git_head_sha(project_root: Path) -> Optional[str]:
     return None
 
 
-def get_code_identity(refresh: bool = False) -> dict:
-    """``{sha, short_sha, version, source}`` for the running checkout; never raises.
+def _resolve_private_release_identity(path: Path) -> Optional[dict[str, str]]:
+    """Read the sealed commit/tree identity carried by an immutable private runtime."""
+    try:
+        identity = json.loads(_read_stripped(path))
+    except Exception:
+        return None
+    if not isinstance(identity, dict) or set(identity) != {"commit", "tree"}:
+        return None
+    commit, tree = identity["commit"], identity["tree"]
+    if not all(
+        isinstance(value, str)
+        and len(value) in {40, 64}
+        and all(character in "0123456789abcdef" for character in value)
+        for value in (commit, tree)
+    ):
+        return None
+    return {"sha": commit, "tree": tree}
 
-    Resolution mirrors the banner/dump callsites: live git for source installs, the baked
-    ``.hermes_build_sha`` for Docker images, else unknown. Cached per process — code identity
-    cannot change while a process runs (an updated checkout needs a restart), which is exactly
-    the property fleet version verification relies on. Each field degrades to None independently.
+
+def get_code_identity(refresh: bool = False) -> dict:
+    """``{sha, tree, short_sha, version, source}`` for the running checkout; never raises.
+
+    Resolution uses live git for source installs, the sealed identity in an immutable private
+    runtime, then the baked ``.hermes_build_sha`` for Docker images. Cached per process — code
+    identity cannot change while a process runs (an updated checkout needs a restart), which is
+    exactly the property fleet version verification relies on.
     """
     global _code_identity_cache
     if _code_identity_cache is not None and not refresh:
         return dict(_code_identity_cache)
     project_root = Path(__file__).parent.parent
     source = "unknown"
+    tree: Optional[str] = None
     sha = _resolve_git_head_sha(project_root)
     if sha:
         source = "git"
     else:
-        sha = get_build_sha(short=0)
-        if sha:
-            source = "build-file"
+        private_release = _resolve_private_release_identity(_PRIVATE_RELEASE_IDENTITY_FILE)
+        if private_release:
+            sha, tree = private_release["sha"], private_release["tree"]
+            source = "private-release"
+        else:
+            sha = get_build_sha(short=0)
+            if sha:
+                source = "build-file"
     version: Optional[str] = None
     try:
         import tomllib
@@ -101,6 +128,7 @@ def get_code_identity(refresh: bool = False) -> dict:
         version = None
     _code_identity_cache = {
         "sha": sha,
+        "tree": tree,
         "short_sha": sha[:8] if sha else None,
         "version": version,
         "source": source}

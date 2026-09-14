@@ -5,6 +5,7 @@ into ``<project_root>/.hermes_build_sha``.  These tests cover the read-side
 helper: missing file, malformed file, truncation, and error tolerance.
 """
 
+import json
 from pathlib import Path
 from unittest.mock import patch
 
@@ -33,3 +34,21 @@ def test_get_build_sha_respects_short_argument(tmp_path):
         assert build_info.get_build_sha(short=-1) == full_sha
 
 
+def test_get_code_identity_uses_sealed_private_release_identity_without_git(tmp_path):
+    from hermes_cli import build_info
+
+    commit, tree = "a" * 40, "b" * 40
+    identity_file = tmp_path / "private-release-identity.json"
+    identity_file.write_text(json.dumps({"commit": commit, "tree": tree}))
+
+    with (
+        patch.object(build_info, "_PRIVATE_RELEASE_IDENTITY_FILE", identity_file),
+        patch.object(build_info, "_resolve_git_head_sha", return_value=None),
+        patch.object(build_info, "_BUILD_SHA_FILE", tmp_path / ".hermes_build_sha"),
+        patch.object(build_info, "_code_identity_cache", None),
+    ):
+        identity = build_info.get_code_identity()
+
+    assert identity["sha"] == commit
+    assert identity["tree"] == tree
+    assert identity["source"] == "private-release"

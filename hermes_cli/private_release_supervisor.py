@@ -1631,6 +1631,7 @@ class ProductionOperations:
                         state.get("pid") != pid
                         or state.get("start_time") != _proc_start(pid)
                         or state.get("code_sha") != request.candidate.commit
+                        or state.get("code_tree") != request.candidate.tree
                     ):
                         raise PrivateReleaseError(
                             f"{target.unit} gateway source/PID/start identity mismatch"
