@@ -668,6 +668,40 @@ def test_recompute_ready_honours_dispatcher_failure_limit(kanban_home):
         assert kb.get_task(conn, t2).status == "blocked"
 
 
+def test_dispatch_crash_accounting_uses_same_failure_limit_as_promotion(
+    kanban_home, monkeypatch
+):
+    """Crash accounting and post-crash promotion must share one threshold.
+
+    With the old split (crash default 2, dispatcher config 5), attempt two
+    emitted ``gave_up`` and then immediately promoted the same task back to
+    ``ready``, producing a burst of duplicate-looking spawn failures.
+    """
+    monkeypatch.setattr(kb, "_pid_alive", lambda _pid: False)
+    monkeypatch.setattr(kb, "_resolve_crash_grace_seconds", lambda: 0)
+
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="crash threshold", assignee="a")
+        for pid in (41001, 41002):
+            claimed = kb.claim_task(conn, task_id)
+            assert claimed is not None
+            kb._set_worker_pid(conn, task_id, pid)
+            result = kb.dispatch_once(
+                conn,
+                spawn_fn=lambda *_args, **_kwargs: None,
+                max_new_spawns=0,
+                failure_limit=5,
+            )
+            assert result.auto_blocked == []
+
+        task = kb.get_task(conn, task_id)
+        assert task is not None
+        assert task.status == "ready"
+        assert task.consecutive_failures == 2
+        kinds = [event.kind for event in kb.list_events(conn, task_id)]
+        assert "gave_up" not in kinds
+
+
 
 
 # ---------------------------------------------------------------------------
