@@ -360,6 +360,63 @@ def _codex_entry_tracks_singleton(entry: PooledCredential, singleton_tokens: Dic
     return entry_identity is not None and entry_identity == _codex_principal_identity(singleton_tokens.get("access_token"))
 
 
+def credential_account_metadata(entry: PooledCredential) -> Dict[str, Any]:
+    """Return secret-free account identity metadata for picker/status surfaces.
+
+    The fingerprint is deliberately non-reversible. Account claims win over
+    token fingerprints so two grants for the same account collapse into one
+    visible account; providers whose credentials carry no account identity
+    fall back to the secret fingerprint already used at the persistence
+    boundary. Raw claims, labels derived from email and token material never
+    leave this function.
+    """
+    claims = _decode_jwt_claims(entry.access_token)
+    nested = claims.get("https://api.openai.com/auth")
+    nested = nested if isinstance(nested, dict) else {}
+    identity = next((
+        str(value).strip()
+        for value in (
+            nested.get("chatgpt_account_id"), claims.get("account_id"),
+            claims.get("org_id"), claims.get("sub"), claims.get("email"),
+        )
+        if isinstance(value, (str, int)) and str(value).strip()
+    ), "")
+    identity_fingerprint = fingerprint_secret_value(identity) if identity else None
+    secret_fingerprint = entry.extra.get("secret_fingerprint") or fingerprint_secret_value(
+        entry.access_token or entry.refresh_token or entry.agent_key
+    )
+    fingerprint = identity_fingerprint or secret_fingerprint
+    short_fingerprint = fingerprint.split(":", 1)[-1][:10] if fingerprint else entry.id[:10]
+
+    plan = next((
+        str(value).strip()
+        for value in (
+            nested.get("chatgpt_plan_type"), claims.get("plan_type"),
+            claims.get("plan"), claims.get("subscription_tier"),
+        )
+        if isinstance(value, (str, int)) and str(value).strip()
+    ), "") or None
+    return {
+        "fingerprint": short_fingerprint,
+        "identity_verified": bool(identity),
+        "plan": plan,
+        "plan_verified": bool(plan),
+    }
+
+
+def credential_is_available(entry: PooledCredential, *, now: Optional[float] = None) -> bool:
+    """Whether *entry* can be selected now, without refresh or persistence."""
+    if entry.last_status == STATUS_DEAD:
+        return False
+    if entry.last_status == STATUS_EXHAUSTED:
+        until = _exhausted_until(entry)
+        if until is None or until > (time.time() if now is None else now):
+            return False
+    if entry.auth_type == AUTH_TYPE_API_KEY:
+        return bool(entry.runtime_api_key)
+    return bool((entry.access_token or "").strip())
+
+
 def _next_priority(entries: List[PooledCredential]) -> int:
     return max((entry.priority for entry in entries), default=-1) + 1
 
@@ -1076,6 +1133,20 @@ class CredentialPool(CredentialPoolAdminMixin, CredentialPoolModelCooldownMixin)
     def current(self) -> Optional[PooledCredential]:
         with self._lock:
             return self._current_unlocked()
+
+    def activate(self, credential_id: str) -> Optional[PooledCredential]:
+        """Persist *credential_id* as this provider's first-choice account.
+
+        Priority remains the native durable selection contract. The local
+        cursor is updated too so a newly loaded pool reports the same account
+        immediately; existing agent pools are invalidated by their caller.
+        """
+        moved = self.move_entry(credential_id, 0)
+        if moved is None:
+            return None
+        with self._lock:
+            self._current_id = moved.id
+        return moved
 
     def entry_id_for_api_key(self, api_key_hint: Any = None) -> Optional[str]:
         """Stable id for the runtime credential in use.
