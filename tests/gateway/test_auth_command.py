@@ -149,6 +149,7 @@ async def test_typed_use_requires_confirmation_before_native_action():
     assert result == "confirmation pending"
     runner._run_auth_native_action.assert_not_awaited()
     assert "credential-pool priority" in confirmation["message"]
+    assert "credential-id" not in confirmation["message"]
 
     applied = await confirmation["handler"]("once")
     assert applied == "selected"
@@ -176,10 +177,18 @@ async def test_native_use_evicts_idle_provider_agents_and_preserves_running_agen
             "credential_id": target,
         },
     )
+    offloaded = []
+
+    async def _inline_to_thread(func, /, *args, **kwargs):
+        offloaded.append(func)
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("gateway.slash_commands.asyncio.to_thread", _inline_to_thread)
 
     result = await runner._run_auth_native_action(
         _event(), "use", {"provider": "grok-oauth", "target_id": "credential-id"})
 
+    assert len(offloaded) == 1
     assert evicted == ["idle"]
     assert "Invalidated 1 idle cached agent" in result
     assert "1 in-flight session" in result
