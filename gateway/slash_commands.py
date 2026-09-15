@@ -534,7 +534,8 @@ class GatewaySlashCommandsMixin(
             return await self._request_slash_confirm(
                 event=event, command="auth", title="Use authentication account",
                 message=(
-                    f"Use `{target}` for provider `{provider}`? This changes native credential-pool priority.\n\n"
+                    f"Use the selected account for provider `{provider}`? "
+                    "This changes native credential-pool priority.\n\n"
                     "Text fallback: reply `/approve` to continue or `/cancel` to keep the current account."
                 ), handler=_confirm,
             )

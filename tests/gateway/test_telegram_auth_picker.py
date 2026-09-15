@@ -11,6 +11,30 @@ from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
+class _FakeInlineKeyboardButton:
+    def __init__(self, text, callback_data=None, **_kwargs):
+        self.text = text
+        self.callback_data = callback_data
+
+
+class _FakeInlineKeyboardMarkup:
+    def __init__(self, inline_keyboard):
+        self.inline_keyboard = inline_keyboard
+
+
+@pytest.fixture(autouse=True)
+def _telegram_keyboard_stubs(monkeypatch):
+    """Keep keyboard assertions PTB-shaped under the shared Telegram mock."""
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardButton",
+        _FakeInlineKeyboardButton,
+    )
+    monkeypatch.setattr(
+        "plugins.platforms.telegram.adapter.InlineKeyboardMarkup",
+        _FakeInlineKeyboardMarkup,
+    )
+
+
 def _account(**overrides):
     account = {
         "provider": "openai-codex",
