@@ -328,6 +328,212 @@ class GatewaySlashCommandsMixin(
         runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
         return head + f"Tier: user\nSlash commands you can run: {runnable_str}"
 
+    @staticmethod
+    def _auth_private_source(source) -> bool:
+        return str(getattr(source, "chat_type", "") or "").strip().lower() in {
+            "", "dm", "direct", "private",
+        }
+
+    def _auth_source_is_admin(self, source) -> bool:
+        from gateway.slash_access import policy_for_source
+
+        return policy_for_source(self.config, source).is_admin(getattr(source, "user_id", None))
+
+    async def _auth_picker_payload(self, event: MessageEvent, session_key: str) -> dict:
+        """Build the native auth view under the source profile's credential scope."""
+        agent = self._resident_agent_for(session_key)
+        active_provider = getattr(agent, "provider", None)
+        active_credential_id = getattr(agent, "_credential_pool_entry_id", None)
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(event.source)
+
+        def _build():
+            from hermes_cli.auth_commands import build_auth_account_picker
+
+            if profile_home is None:
+                return build_auth_account_picker(
+                    active_provider=active_provider, active_credential_id=active_credential_id)
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(profile_home):
+                return build_auth_account_picker(
+                    active_provider=active_provider, active_credential_id=active_credential_id)
+
+        return await asyncio.to_thread(_build)
+
+    def _invalidate_auth_agent_credentials(self, provider: str) -> tuple[int, int]:
+        """Evict idle cached agents using *provider*; never tear down an in-flight turn."""
+        cache = getattr(self, "_agent_cache", None)
+        if cache is None:
+            return 0, 0
+        lock = getattr(self, "_agent_cache_lock", None)
+        try:
+            if lock:
+                with lock:
+                    snapshot = list(cache.items())
+            else:
+                snapshot = list(cache.items())
+        except Exception:
+            return 0, 0
+        running_ids = self._running_agent_ids()
+        evict: list[str] = []
+        skipped = 0
+        for key, wrapped in snapshot:
+            agent = wrapped[0] if isinstance(wrapped, (tuple, list)) and wrapped else wrapped
+            pool = getattr(agent, "_credential_pool", None)
+            matches = str(getattr(agent, "provider", "") or "").strip().lower() == provider
+            matches = matches or str(getattr(pool, "provider", "") or "").strip().lower() == provider
+            if not matches:
+                continue
+            if id(agent) in running_ids:
+                skipped += 1
+            else:
+                evict.append(key)
+        for key in evict:
+            self._evict_cached_agent(key)
+        return len(evict), skipped
+
+    async def _run_auth_native_action(
+        self, event: MessageEvent, action: str, selection: dict,
+    ) -> str:
+        """Execute a native credential operation off-loop and return a redacted receipt."""
+        from hermes_cli.auth_commands import (
+            add_auth_account, reauthenticate_auth_account, use_auth_account,
+        )
+
+        provider = str(selection.get("provider") or "").strip().lower()
+        if not provider:
+            raise RuntimeError("Missing provider")
+        profile_home = None
+        if getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            profile_home = self._resolve_profile_home_for_source(event.source)
+        adapter = self._adapter_for_source(event.source)
+        loop = asyncio.get_running_loop()
+
+        def _verification(url: str, code: str) -> None:
+            """Provider callback runs in the auth worker thread; deliver only to the bound DM."""
+            if adapter is None or not self._auth_private_source(event.source):
+                return
+            message = (
+                "🔐 Native authentication\n\n"
+                f"Open: {url}\n"
+                f"Code: `{code}`\n\n"
+                "This code was sent only in your private chat."
+            )
+            future = asyncio.run_coroutine_threadsafe(
+                adapter.send(
+                    str(event.source.chat_id), message,
+                    metadata=self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))),
+                loop,
+            )
+            future.result(timeout=15)
+
+        def _run():
+            def _dispatch():
+                if action == "use":
+                    return use_auth_account(provider, str(selection.get("target_id") or ""))
+                if action == "reauth":
+                    return reauthenticate_auth_account(
+                        provider, str(selection.get("target_id") or ""), on_verification=_verification)
+                if action == "add":
+                    return add_auth_account(provider, on_verification=_verification)
+                raise RuntimeError(f"Unknown auth action: {action}")
+
+            if profile_home is None:
+                return _dispatch()
+            from gateway.run import _profile_runtime_scope
+            with _profile_runtime_scope(profile_home):
+                return _dispatch()
+
+        try:
+            result = await asyncio.to_thread(_run)
+        except (Exception, SystemExit) as exc:
+            logger.error("Native auth action failed (%s)", type(exc).__name__)
+            return "❌ Account action failed. No credential details were returned; run `/auth` to retry."
+        provider = str(result["provider"])
+        evicted, skipped = self._invalidate_auth_agent_credentials(provider)
+        label = result["label"]
+        fingerprint = result["fingerprint"]
+        verb = {"use": "Using", "reauth": "Reauthenticated", "add": "Added"}[action]
+        lifecycle = "No /new or gateway restart is required; the next idle request reloads credentials."
+        if skipped:
+            lifecycle = (
+                f"{skipped} in-flight session(s) keep their current credential for that turn; "
+                "use /new afterward if an immediate switch is required. No gateway restart is required."
+            )
+        return (
+            f"✅ {verb} {label} · {provider} · acct:{fingerprint}.\n"
+            f"Invalidated {evicted} idle cached agent(s). {lifecycle}"
+        )
+
+    @staticmethod
+    def _auth_private_handoff() -> str:
+        return "🔒 Account details and changes are private. Open a direct chat with this bot and run `/auth`."
+
+    async def _handle_auth_command(self, event: MessageEvent) -> Optional[str]:
+        """Handle `/auth` natively; Telegram gets an inline account picker."""
+        source = event.source
+        if not self._auth_private_source(source):
+            return self._auth_private_handoff()
+        if not getattr(source, "user_id", None):
+            return "⛔ Account access requires an authenticated private user."
+        raw = event.get_command_args().strip()
+        try:
+            tokens = shlex.split(raw)
+        except ValueError as exc:
+            return f"❌ Invalid /auth arguments: {exc}"
+        action = tokens[0].lower() if tokens else ""
+        adapter = self._adapter_for_source(source)
+        session_key = self._session_key_for_source(source)
+        admin = self._auth_source_is_admin(source)
+
+        if action in {"", "status"}:
+            payload = await self._auth_picker_payload(event, session_key)
+            if not action and source.platform == Platform.TELEGRAM and adapter is not None:
+                send_picker = getattr(adapter, "send_auth_picker", None)
+                if callable(send_picker):
+                    async def _on_action(picker_action: str, selection: dict) -> str:
+                        if not admin:
+                            return "⛔ Only a gateway admin can change authentication accounts."
+                        return await self._run_auth_native_action(event, picker_action, selection)
+
+                    result = await send_picker(
+                        chat_id=source.chat_id, accounts=payload["accounts"],
+                        add_providers=payload["add_providers"], session_key=session_key,
+                        requester_user_id=str(source.user_id), on_auth_action=_on_action,
+                        can_mutate=admin, metadata=self._reply_metadata(event),
+                    )
+                    if result and getattr(result, "success", False):
+                        return None
+            from hermes_cli.auth_commands import format_auth_account_status
+            return format_auth_account_status(payload)
+
+        if action not in {"use", "reauth", "add"}:
+            return "Usage: /auth [status|use <provider> <account>|reauth <provider> [account]|add <provider>]"
+        if not admin:
+            return "⛔ Only a gateway admin can change authentication accounts."
+        if len(tokens) < 2:
+            return f"Usage: /auth {action} <provider>" + (" <account>" if action == "use" else " [account]")
+        provider = tokens[1]
+        target = " ".join(tokens[2:]).strip()
+        if action == "use" and not target:
+            return "Usage: /auth use <provider> <account>"
+        selection = {"provider": provider, "target_id": target}
+        if action == "use":
+            async def _confirm(choice: str) -> str:
+                if choice == "cancel":
+                    return "🟡 Account selection cancelled."
+                return await self._run_auth_native_action(event, "use", selection)
+
+            return await self._request_slash_confirm(
+                event=event, command="auth", title="Use authentication account",
+                message=(
+                    f"Use `{target}` for provider `{provider}`? This changes native credential-pool priority.\n\n"
+                    "Text fallback: reply `/approve` to continue or `/cancel` to keep the current account."
+                ), handler=_confirm,
+            )
+        return await self._run_auth_native_action(event, action, selection)
+
     async def _handle_kanban_command(self, event: MessageEvent) -> str:
         """Handle /kanban — delegate to the shared kanban CLI (DB work in a thread pool). Allowed
         while an agent runs: the board is profile-agnostic and never touches agent state."""

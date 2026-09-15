@@ -48,6 +48,18 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_priority.add_argument("provider", help="Provider id")
     auth_priority.add_argument("target", help="Credential index, entry id, or exact label")
     auth_priority.add_argument("priority", type=int, help="New priority; others are renumbered")
+    auth_use = auth_subparsers.add_parser(
+        "use", help="Make one pooled account the first choice for its provider")
+    auth_use.add_argument("provider", help="Provider id")
+    auth_use.add_argument("target", help="Credential index, entry id, or exact label")
+    auth_reauth = auth_subparsers.add_parser(
+        "reauth", help="Reauthenticate an OAuth account with its provider-native flow")
+    auth_reauth.add_argument("provider", help="Provider id")
+    auth_reauth.add_argument(
+        "target", nargs="?",
+        help="Credential index, entry id, or exact label (optional for a one-account pool)")
+    auth_reauth.add_argument(
+        "--no-browser", action="store_true", help="Do not auto-open a browser for OAuth login")
     auth_refresh = auth_subparsers.add_parser(
         "refresh", help="Refresh a pooled OAuth credential's tokens and clear its cooldown")
     auth_refresh.add_argument("provider", help="Provider id")
@@ -55,7 +67,7 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
         "target", nargs="?",
         help="Credential index, entry id, or exact label (required when the pool holds more than one)")
     auth_status = auth_subparsers.add_parser("status", help="Show auth status for a provider")
-    auth_status.add_argument("provider", help="Provider id")
+    auth_status.add_argument("provider", nargs="?", help="Optional provider id; omitted lists accounts")
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state")
     auth_logout.add_argument("provider", help="Provider id")

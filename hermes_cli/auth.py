@@ -1072,6 +1072,23 @@ def get_active_provider() -> Optional[str]:
     return _load_auth_store().get("active_provider")
 
 
+def set_active_provider(provider_id: str) -> None:
+    """Persist the provider selected by a native account picker.
+
+    This intentionally does not rewrite ``config.yaml`` or choose a model.
+    Explicit model/provider configuration keeps its normal precedence; the
+    selection becomes the auth fallback and the target pool's priority picks
+    the concrete account.
+    """
+    normalized = str(provider_id or "").strip().lower()
+    if not normalized:
+        raise AuthError("Provider is required.", code="invalid_provider")
+    with _auth_store_lock():
+        auth_store = _load_auth_store()
+        auth_store["active_provider"] = normalized
+        _save_auth_store(auth_store)
+
+
 def _active_provider_is(normalized: str) -> bool:
     active = (_load_auth_store().get("active_provider") or "").strip().lower()
     return bool(active) and active == normalized

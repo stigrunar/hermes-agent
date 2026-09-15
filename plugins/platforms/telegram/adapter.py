@@ -10,6 +10,7 @@ import math
 import os
 import html as _html
 import re
+import secrets
 import time
 from contextvars import ContextVar
 from datetime import datetime, timezone
@@ -523,6 +524,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self._max_doc_bytes: int = 2 * 1024 * 1024 * 1024 if extra.get("base_url") else 20 * 1024 * 1024
         self._model_picker_state: Dict[str, dict] = {}  # per-chat interactive picker state
         self._choice_picker_state: Dict[str, dict] = {}
+        self._auth_picker_state: Dict[str, dict] = {}  # nonce -> requester/chat/session-bound state
         self._approval_state: Dict[int, str] = {}  # message_id → session_key
         self._slash_confirm_state: Dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: Dict[str, str] = {}  # clarify_id → session_key
@@ -3985,6 +3987,237 @@ class TelegramAdapter(BasePlatformAdapter):
             "send_model_picker", chat_id, metadata, build, thread_id=metadata.get("thread_id") if metadata else None,
             reply_to_mode=self._reply_to_mode)
 
+    _AUTH_PICKER_TTL_SECONDS = 300.0
+
+    @staticmethod
+    def _auth_account_button(account: dict, nonce: str, index: int) -> "InlineKeyboardButton":
+        marker = "✓ " if account.get("active") else ""
+        availability = "available" if account.get("available") else "unavailable"
+        label = f"{marker}{account.get('label', 'Account')} · {account.get('provider_label', account.get('provider', ''))} · {availability}"
+        return InlineKeyboardButton(label[:60], callback_data=f"ap:{nonce}:o:{index}")
+
+    @staticmethod
+    def _auth_root_text(accounts: list) -> str:
+        active = next((account for account in accounts if account.get("active")), None)
+        lines = ["🔐 <b>Authentication accounts</b>"]
+        if active is None:
+            lines.append("Active: none")
+        else:
+            plan = f" · plan {_html.escape(str(active['plan']))}" if active.get("plan_verified") else ""
+            lines.append(
+                f"Active: <b>{_html.escape(str(active['label']))}</b> · "
+                f"{_html.escape(str(active['provider_label']))} · "
+                f"<code>acct:{_html.escape(str(active['fingerprint']))}</code>{plan} · "
+                f"{_html.escape(str(active['availability']))}"
+            )
+        lines.append("")
+        for account in accounts:
+            marker = "✓" if account.get("active") else "•"
+            plan = f" · plan {_html.escape(str(account['plan']))}" if account.get("plan_verified") else ""
+            duplicate = (
+                f" · {int(account.get('duplicate_count', 1))} grouped aliases"
+                if int(account.get("duplicate_count", 1)) > 1 else ""
+            )
+            lines.append(
+                f"{marker} <b>{_html.escape(str(account.get('label', 'Account')))}</b> · "
+                f"{_html.escape(str(account.get('provider_label', account.get('provider', ''))))} · "
+                f"<code>acct:{_html.escape(str(account.get('fingerprint', 'unknown')))}</code> · "
+                f"{_html.escape(str(account.get('availability', 'unavailable')))}{plan}{duplicate}"
+            )
+        lines.extend(("", "Select an account:"))
+        return "\n".join(lines)
+
+    def _auth_root_keyboard(self, state: dict):
+        nonce = state["nonce"]
+        rows = [[self._auth_account_button(account, nonce, index)]
+                for index, account in enumerate(state["accounts"])]
+        if state.get("can_mutate"):
+            rows.append([InlineKeyboardButton("＋ Add account", callback_data=f"ap:{nonce}:a:0")])
+        rows.append([InlineKeyboardButton("✗ Close", callback_data=f"ap:{nonce}:x:0")])
+        return InlineKeyboardMarkup(rows)
+
+    async def send_auth_picker(
+        self, chat_id: str, accounts: list, add_providers: list, session_key: str,
+        requester_user_id: str, on_auth_action, *, can_mutate: bool = True,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> SendResult:
+        """Send a requester-bound, expiring native account picker."""
+        self._prune_auth_picker_state()
+        nonce = secrets.token_hex(5)
+        state = {
+            "nonce": nonce, "created_at": time.monotonic(), "accounts": accounts,
+            "add_providers": add_providers, "session_key": session_key,
+            "requester_user_id": str(requester_user_id), "chat_id": str(chat_id),
+            "thread_id": str(metadata.get("thread_id")) if metadata and metadata.get("thread_id") is not None else None,
+            "on_auth_action": on_auth_action, "can_mutate": bool(can_mutate),
+        }
+
+        def build():
+            keyboard = self._auth_root_keyboard(state)
+
+            def _remember(msg):
+                state["msg_id"] = str(msg.message_id)
+                self._auth_picker_state[nonce] = state
+            return self._auth_root_text(accounts), keyboard, _remember
+
+        return await self._send_prompt(
+            "send_auth_picker", chat_id, metadata, build, parse_mode=ParseMode.HTML,
+            thread_id=metadata.get("thread_id") if metadata else None, reply_to_mode=self._reply_to_mode)
+
+    def _prune_auth_picker_state(self) -> None:
+        now = time.monotonic()
+        state = getattr(self, "_auth_picker_state", None)
+        if not isinstance(state, dict):
+            self._auth_picker_state = {}
+            return
+        for nonce, pending in list(state.items()):
+            if now - float(pending.get("created_at", 0.0)) > self._AUTH_PICKER_TTL_SECONDS:
+                state.pop(nonce, None)
+
+    async def _auth_picker_claim(self, query, nonce: str) -> Optional[dict]:
+        """Validate nonce expiry plus exact requester/chat/thread/message binding."""
+        self._prune_auth_picker_state()
+        state = self._auth_picker_state.get(nonce)
+        if state is None:
+            await query.answer(text="Picker expired or already used — run /auth again.")
+            return None
+        cb = self._callback_ctx(query)
+        if not await self._callback_authorized(
+            query, cb, "⛔ You are not authorized to use this account picker."):
+            return None
+        message = getattr(query, "message", None)
+        exact_binding = (
+            str(getattr(getattr(query, "from_user", None), "id", "")) == state["requester_user_id"]
+            and str(getattr(message, "chat_id", "")) == state["chat_id"]
+            and str(getattr(message, "message_id", "")) == state.get("msg_id")
+            and (str(cb["thread_id"]) if cb["thread_id"] is not None else None) == state["thread_id"]
+        )
+        if not exact_binding:
+            await query.answer(text="This account picker belongs to another private session.")
+            return None
+        return state
+
+    @staticmethod
+    def _auth_account_detail(account: dict) -> str:
+        plan = f"\nPlan: <b>{_html.escape(str(account['plan']))}</b> (verified credential claim)" if account.get("plan_verified") else ""
+        aliases = account.get("aliases") or []
+        alias_lines = "\n".join(
+            f"• {_html.escape(str(alias.get('label', 'Account')))} · {_html.escape(str(alias.get('source', '')))}"
+            for alias in aliases
+        )
+        duplicate = f"\n\nGrouped aliases ({len(aliases)}):\n{alias_lines}" if len(aliases) > 1 else ""
+        return (
+            "🔐 <b>Account</b>\n\n"
+            f"Label: <b>{_html.escape(str(account.get('label', 'Account')))}</b>\n"
+            f"Provider: {_html.escape(str(account.get('provider_label', account.get('provider', ''))))}\n"
+            f"Fingerprint: <code>acct:{_html.escape(str(account.get('fingerprint', 'unknown')))}</code>\n"
+            f"Availability: {_html.escape(str(account.get('availability', 'unavailable')))}"
+            f"{plan}{duplicate}"
+        )
+
+    async def _auth_picker_execute(self, query, nonce: str, state: dict, action: str, selection: dict) -> None:
+        self._auth_picker_state.pop(nonce, None)  # one-shot claim; replay fails closed
+        await query.answer(text="Starting native authentication…" if action != "use" else "Applying account…")
+        await query.edit_message_text(
+            text="Working in this private chat…", parse_mode=None, reply_markup=None)
+        callback = state.get("on_auth_action")
+        try:
+            if callback is None:
+                raise RuntimeError("Picker expired")
+            result = await callback(action, selection)
+        except Exception as exc:
+            logger.error("Telegram auth picker action failed (%s)", type(exc).__name__)
+            result = "❌ Account action failed. No credential details were returned; run /auth to retry."
+        await self._edit_html_quiet(query, _html.escape(str(result)))
+
+    async def _handle_auth_picker_callback(self, query, data: str, _chat_id: str) -> None:
+        """Handle ``ap:<nonce>:<verb>:<index>`` without exposing account ids in callback data."""
+        parts = data.split(":", 3)
+        if len(parts) != 4:
+            await query.answer(text="Invalid account picker data.")
+            return
+        _prefix, nonce, verb, raw_index = parts
+        state = await self._auth_picker_claim(query, nonce)
+        if state is None:
+            return
+        if verb == "x":
+            self._auth_picker_state.pop(nonce, None)
+            await query.answer(text="Closed")
+            await self._edit_html_quiet(query, "Account picker closed.")
+            return
+        if verb == "b":
+            await query.edit_message_text(
+                text=self._auth_root_text(state["accounts"]), parse_mode=ParseMode.HTML,
+                reply_markup=self._auth_root_keyboard(state))
+            await query.answer()
+            return
+        if verb == "a":
+            if not state.get("can_mutate"):
+                await query.answer(text="Only a gateway admin can add accounts.")
+                return
+            rows = [[InlineKeyboardButton(
+                str(provider["label"])[:60], callback_data=f"ap:{nonce}:p:{index}")]
+                for index, provider in enumerate(state.get("add_providers") or [])]
+            rows.append([InlineKeyboardButton("◀ Back", callback_data=f"ap:{nonce}:b:0")])
+            await query.edit_message_text(
+                text="🔐 <b>Add account</b>\n\nSelect a provider. Its native OAuth/device flow runs outside the model context.",
+                parse_mode=ParseMode.HTML, reply_markup=InlineKeyboardMarkup(rows))
+            await query.answer()
+            return
+        try:
+            index = int(raw_index)
+        except ValueError:
+            await query.answer(text="Invalid account selection.")
+            return
+        if verb == "p":
+            providers = state.get("add_providers") or []
+            if not state.get("can_mutate") or index < 0 or index >= len(providers):
+                await query.answer(text="Invalid provider selection.")
+                return
+            await self._auth_picker_execute(query, nonce, state, "add", providers[index])
+            return
+        accounts = state.get("accounts") or []
+        if index < 0 or index >= len(accounts):
+            await query.answer(text="Invalid account selection.")
+            return
+        account = accounts[index]
+        if verb == "o":
+            rows = []
+            if state.get("can_mutate"):
+                rows.append([
+                    InlineKeyboardButton("Use", callback_data=f"ap:{nonce}:u:{index}"),
+                    InlineKeyboardButton("Reauthenticate", callback_data=f"ap:{nonce}:r:{index}"),
+                ])
+            rows.append([InlineKeyboardButton("◀ Back", callback_data=f"ap:{nonce}:b:0")])
+            await query.edit_message_text(
+                text=self._auth_account_detail(account), parse_mode=ParseMode.HTML,
+                reply_markup=InlineKeyboardMarkup(rows))
+            await query.answer()
+            return
+        if not state.get("can_mutate"):
+            await query.answer(text="Only a gateway admin can change accounts.")
+            return
+        if verb == "u":
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("Confirm Use", callback_data=f"ap:{nonce}:c:{index}"),
+                InlineKeyboardButton("◀ Back", callback_data=f"ap:{nonce}:o:{index}"),
+            ]])
+            await query.edit_message_text(
+                text=self._auth_account_detail(account) + "\n\n<b>Confirm using this account?</b>",
+                parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            await query.answer(text="Confirmation required")
+            return
+        if verb == "c":
+            await self._auth_picker_execute(query, nonce, state, "use", account)
+            return
+        if verb == "r":
+            if not account.get("can_reauthenticate"):
+                await query.answer(text="This account has no native reauthentication flow.")
+                return
+            await self._auth_picker_execute(query, nonce, state, "reauth", account)
+            return
+        await query.answer(text="Unknown account action.")
+
     _PROVIDER_PAGE_SIZE = 10
 
     async def send_choice_picker(
@@ -4351,6 +4584,7 @@ class TelegramAdapter(BasePlatformAdapter):
         cb = self._callback_ctx(query)
         # Model picker / generic choice picker (/reasoning, /fast) need a chat id.
         for prefixes, handler in (
+            (("ap:",), self._handle_auth_picker_callback),
             (("mp:", "mpg:", "mpv:", "mm:", "mc:", "mb", "mx", "mg:"), self._handle_model_picker_callback),
             (("cp:",), self._handle_choice_picker_callback)):
             if data.startswith(prefixes):

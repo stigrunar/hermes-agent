@@ -4,6 +4,7 @@ from __future__ import annotations
 from hermes_cli.cli_output import line_input
 
 import math
+import re
 import sys
 import time
 from dataclasses import dataclass
@@ -130,6 +131,208 @@ def _is_known_provider(provider: str, configured_provider: dict | None) -> bool:
 
 def _display_source(source: str) -> str:
     return source.split(":", 1)[1] if source.startswith("manual:") else source
+
+
+_EMAIL_LABEL = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
+_SECRETISH_LABEL = re.compile(r"(?i)^(?:sk-|gh[opu]_|eyJ|bearer\s|token[:_-])")
+
+
+def _safe_account_label(label: str, fingerprint: str) -> str:
+    """Return a compact label that cannot reveal an email or token-shaped value."""
+    cleaned = " ".join(str(label or "").replace("\x00", "").split()).strip()
+    if not cleaned or _EMAIL_LABEL.fullmatch(cleaned) or _SECRETISH_LABEL.match(cleaned):
+        return f"Account {fingerprint}"
+    return cleaned[:40]
+
+
+def _picker_provider_ids() -> list[str]:
+    """Provider pool ids worth enumerating, including configured custom pools."""
+    store_pool = auth_mod._load_auth_store().get("credential_pool")
+    stored = set(store_pool) if isinstance(store_pool, dict) else set()
+    configured = {e["provider_key"] for e in _get_custom_provider_entries() if e["provider_key"]}
+    return sorted({*PROVIDER_REGISTRY, "openrouter", *list_custom_pool_providers(), *configured, *stored})
+
+
+def build_auth_account_picker(
+    *, active_provider: str | None = None, active_credential_id: str | None = None,
+) -> dict[str, Any]:
+    """Build the secret-free account-picker payload used by CLI and gateways.
+
+    Duplicate rows are grouped only within one canonical provider because
+    priority/selection is provider-scoped. Account claims or the credential
+    fingerprint establish the group; labels never establish identity.
+    """
+    from agent.credential_pool import credential_account_metadata, credential_is_available
+
+    active_provider = _normalize_provider(active_provider or auth_mod.get_active_provider() or "")
+    grouped: dict[tuple[str, str], dict[str, Any]] = {}
+    for provider in _picker_provider_ids():
+        try:
+            pool = load_pool(provider)
+            entries = pool.entries()
+            preferred = pool.peek()
+        except Exception:
+            continue
+        preferred_id = active_credential_id if provider == active_provider and active_credential_id else (
+            preferred.id if provider == active_provider and preferred is not None else None
+        )
+        pconfig = PROVIDER_REGISTRY.get(provider)
+        provider_label = pconfig.name if pconfig is not None else provider
+        for entry in entries:
+            metadata = credential_account_metadata(entry)
+            group_key = (provider, metadata["fingerprint"])
+            account = grouped.setdefault(group_key, {
+                "provider": provider,
+                "provider_label": provider_label,
+                "fingerprint": metadata["fingerprint"],
+                "plan": metadata["plan"],
+                "plan_verified": metadata["plan_verified"],
+                "identity_verified": metadata["identity_verified"],
+                "aliases": [],
+                "available": False,
+                "active": False,
+                "target_id": entry.id,
+                "priority": entry.priority,
+                "auth_type": entry.auth_type,
+                "can_reauthenticate": provider in _OAUTH_CAPABLE_PROVIDERS and entry.auth_type == AUTH_TYPE_OAUTH,
+            })
+            available = credential_is_available(entry)
+            account["aliases"].append({
+                "id": entry.id,
+                "label": _safe_account_label(entry.label, metadata["fingerprint"]),
+                "source": _display_source(entry.source),
+                "available": available,
+                "priority": entry.priority,
+            })
+            account["available"] = bool(account["available"] or available)
+            if available and (not account.get("target_available") or entry.priority < account["priority"]):
+                account["target_id"] = entry.id
+                account["priority"] = entry.priority
+                account["target_available"] = True
+            account["active"] = bool(account["active"] or entry.id == preferred_id)
+            if account["plan"] is None and metadata["plan"] is not None:
+                account["plan"] = metadata["plan"]
+                account["plan_verified"] = metadata["plan_verified"]
+
+    accounts = sorted(grouped.values(), key=lambda item: (
+        not item["active"], item["provider_label"].lower(), item["priority"], item["fingerprint"]))
+    for account in accounts:
+        account.pop("target_available", None)
+        account["aliases"].sort(key=lambda alias: (alias["priority"], alias["label"].lower()))
+        account["label"] = account["aliases"][0]["label"]
+        account["duplicate_count"] = len(account["aliases"])
+        account["availability"] = "available" if account["available"] else "unavailable"
+    add_providers = [
+        {"provider": provider, "label": PROVIDER_REGISTRY[provider].name}
+        for provider in sorted(_OAUTH_CAPABLE_PROVIDERS)
+        if provider in PROVIDER_REGISTRY
+    ]
+    return {"accounts": accounts, "active_provider": active_provider or None, "add_providers": add_providers}
+
+
+def format_auth_account_status(payload: dict[str, Any]) -> str:
+    """Render an account picker payload without exposing credential material."""
+    accounts = list(payload.get("accounts") or [])
+    if not accounts:
+        return "No configured inference accounts. Use `/auth add <provider>` in a private chat."
+    lines = ["🔐 **Authentication accounts**"]
+    active = next((account for account in accounts if account.get("active")), None)
+    if active is not None:
+        lines.append(
+            f"Active: **{active['label']}** · {active['provider_label']} · "
+            f"`acct:{active['fingerprint']}` · {active['availability']}"
+        )
+    lines.append("")
+    for account in accounts:
+        marker = "✓" if account.get("active") else "•"
+        plan = f" · plan {account['plan']} (verified claim)" if account.get("plan_verified") else ""
+        duplicate = f" · {account['duplicate_count']} grouped aliases" if account.get("duplicate_count", 1) > 1 else ""
+        lines.append(
+            f"{marker} **{account['label']}** · {account['provider_label']} · "
+            f"`acct:{account['fingerprint']}` · {account['availability']}{plan}{duplicate}"
+        )
+    return "\n".join(lines)
+
+
+def use_auth_account(provider: str, target: str) -> dict[str, Any]:
+    """Promote one available pool entry using native durable priority semantics."""
+    from agent.credential_pool import credential_account_metadata, credential_is_available
+
+    normalized = _normalize_provider(provider)
+    pool = load_pool(normalized)
+    _index, entry, error = pool.resolve_target(target)
+    if entry is None:
+        raise SystemExit(f"{error} Provider: {normalized}.")
+    if not credential_is_available(entry):
+        raise SystemExit(
+            f'{normalized} credential "{_safe_account_label(entry.label, credential_account_metadata(entry)["fingerprint"])}" '
+            "is currently unavailable; reauthenticate it or wait for its cooldown."
+        )
+    selected = pool.activate(entry.id)
+    if selected is None:
+        raise SystemExit(f'No credential matching "{target}" for provider {normalized}.')
+    auth_mod.set_active_provider(normalized)
+    metadata = credential_account_metadata(selected)
+    return {
+        "provider": normalized,
+        "label": _safe_account_label(selected.label, metadata["fingerprint"]),
+        "fingerprint": metadata["fingerprint"],
+        "strategy": get_pool_strategy(normalized),
+        "credential_id": selected.id,
+    }
+
+
+def add_auth_account(
+    provider: str, *, label: str | None = None, no_browser: bool = False,
+    on_verification: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """Run a provider-native OAuth flow and promote the resulting pool entry."""
+    normalized = _normalize_provider(provider)
+    if normalized not in _OAUTH_CAPABLE_PROVIDERS:
+        raise SystemExit(f"{normalized or 'This provider'} does not expose a native OAuth/device flow.")
+    pool = load_pool(normalized)
+    args = SimpleNamespace(
+        provider=normalized, auth_type=AUTH_TYPE_OAUTH, label=label,
+        portal_url=None, inference_url=None, client_id=None, scope=None,
+        no_browser=no_browser, timeout=None, insecure=False, ca_bundle=None,
+        on_verification=on_verification,
+    )
+    _unsuppress_provider_sources(normalized)
+    entry = _add_credential(args, normalized, pool, AUTH_TYPE_OAUTH)
+    promoted = load_pool(normalized).activate(entry.id)
+    auth_mod.set_active_provider(normalized)
+    from agent.credential_pool import credential_account_metadata
+    metadata = credential_account_metadata(promoted or entry)
+    return {
+        "provider": normalized,
+        "label": _safe_account_label((promoted or entry).label, metadata["fingerprint"]),
+        "fingerprint": metadata["fingerprint"],
+        "credential_id": (promoted or entry).id,
+    }
+
+
+def reauthenticate_auth_account(
+    provider: str, target: str | None = None, *, no_browser: bool = False,
+    on_verification: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """Authenticate a fresh grant for an existing account label, preserving the old grant as an alias."""
+    normalized = _normalize_provider(provider)
+    pool = load_pool(normalized)
+    entries = pool.entries()
+    if target:
+        _index, entry, error = pool.resolve_target(target)
+        if entry is None:
+            raise SystemExit(f"{error} Provider: {normalized}.")
+    elif len(entries) == 1:
+        entry = entries[0]
+    else:
+        raise SystemExit(
+            f"{normalized} has {len(entries)} credentials; pass an index, entry id, or exact label."
+        )
+    if entry.auth_type != AUTH_TYPE_OAUTH:
+        raise SystemExit(f"{normalized} credential {entry.id} is not OAuth-backed.")
+    return add_auth_account(
+        normalized, label=entry.label, no_browser=no_browser, on_verification=on_verification)
 
 
 # (label, show_retry_window, http codes, reason substrings, message substrings) — first match wins.
@@ -296,7 +499,8 @@ def _add_nous_oauth_credential(args, provider: str) -> PooledCredential:
         inference_base_url=getattr(args, "inference_url", None),
         client_id=getattr(args, "client_id", None), scope=getattr(args, "scope", None),
         open_browser=not getattr(args, "no_browser", False), timeout_seconds=timeout,
-        insecure=bool(getattr(args, "insecure", False)), ca_bundle=getattr(args, "ca_bundle", None))
+        insecure=bool(getattr(args, "insecure", False)), ca_bundle=getattr(args, "ca_bundle", None),
+        on_verification=getattr(args, "on_verification", None))
     return _persist(creds, "Saved")
 
 
@@ -418,6 +622,27 @@ def auth_priority_command(args) -> None:
     if moved is None:
         raise SystemExit(f'No credential matching "{getattr(args, "target", None)}" for provider {provider}.')
     _report_priority(provider, pool, moved, requested, "Set", "to")
+
+
+def auth_use_command(args) -> None:
+    """`hermes auth use <provider> <target>`: select one native pool account."""
+    selected = use_auth_account(
+        getattr(args, "provider", ""), getattr(args, "target", ""))
+    print(
+        f"Using {selected['provider']} account {selected['label']} "
+        f"(acct:{selected['fingerprint']}); effective on the next request."
+    )
+
+
+def auth_reauth_command(args) -> None:
+    """`hermes auth reauth <provider> [target]`: run its native OAuth flow."""
+    selected = reauthenticate_auth_account(
+        getattr(args, "provider", ""), getattr(args, "target", None),
+        no_browser=bool(getattr(args, "no_browser", False)))
+    print(
+        f"Reauthenticated {selected['provider']} account {selected['label']} "
+        f"(acct:{selected['fingerprint']})."
+    )
 
 
 def auth_list_command(args) -> None:
@@ -557,7 +782,8 @@ def auth_refresh_command(args) -> None:
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
     if not provider:
-        raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
+        print(format_auth_account_status(build_auth_account_picker()))
+        return
     if provider in auth_mod.SINGLE_USE_REFRESH_POOL_PROVIDERS:
         load_pool(provider)  # runs the forked-grant heal first so the report reflects the consolidated grant
     status = auth_mod.get_auth_status(provider)
@@ -758,7 +984,8 @@ def _interactive_strategy() -> None:
 
 _AUTH_ACTIONS = {
     "add": auth_add_command, "list": auth_list_command, "remove": auth_remove_command,
-    "reset": auth_reset_command, "priority": auth_priority_command, "refresh": auth_refresh_command, "status": auth_status_command,
+    "reset": auth_reset_command, "priority": auth_priority_command, "use": auth_use_command,
+    "reauth": auth_reauth_command, "refresh": auth_refresh_command, "status": auth_status_command,
     "logout": auth_logout_command,
     "spotify": auth_spotify_command}
 
