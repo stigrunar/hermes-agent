@@ -420,7 +420,8 @@ def _codex_runtime_contract(agent, messages, cwd):
     # worker (never a delegated child or a cron run inside the worker).
     from agent.delegation_context import is_dispatcher_owned_worker_context
 
-    if os.environ.get("HERMES_KANBAN_TASK") and is_dispatcher_owned_worker_context():
+    owns_worker = bool(os.environ.get("HERMES_KANBAN_TASK")) and is_dispatcher_owned_worker_context()
+    if owns_worker:
         for key, value in os.environ.items():
             if key.startswith("HERMES_KANBAN_") and value:
                 scope_env[key] = value
@@ -440,6 +441,10 @@ def _codex_runtime_contract(agent, messages, cwd):
     ):
         if scope_env.get(key):
             callback.setdefault("env", {})[key] = scope_env[key]
+    if owns_worker:
+        # This managed callback is the owner itself, not a generic subprocess.
+        # Explicitly override the scrubber marker, including inherited values.
+        callback.setdefault("env", {})["HERMES_DELEGATED_CHILD_CONTEXT"] = ""
     callback.setdefault("env", {})["PYTHONPATH"] = os.pathsep.join(
         dict.fromkeys(
             filter(
