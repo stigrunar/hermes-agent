@@ -264,6 +264,48 @@ class TestSpawnEnvIsolation:
         assert "sandbox_workspace_write.network_access=false" in cmd
         assert all("danger" not in part for part in cmd)
 
+    def test_explicit_full_access_kanban_worker_disables_workspace_sandbox(
+        self, monkeypatch
+    ):
+        import subprocess
+        from agent.transports import codex_app_server as cas
+
+        captured = {}
+
+        class FakePopen:
+            def __init__(self, cmd, *args, **kwargs):
+                captured["cmd"] = list(cmd)
+                self.stdin = None
+                self.stdout = None
+                self.stderr = None
+                self.pid = 1
+                self.returncode = None
+
+            def poll(self):
+                return None
+
+            def terminate(self):
+                pass
+
+            def wait(self, timeout=None):
+                return 0
+
+            def kill(self):
+                pass
+
+        monkeypatch.setattr(subprocess, "Popen", FakePopen)
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "t_smoke")
+
+        client = cas.CodexAppServerClient(
+            codex_bin="codex", kanban_sandbox_mode="danger-full-access"
+        )
+        client._closed = True
+
+        cmd = captured["cmd"]
+        assert 'sandbox_mode="danger-full-access"' in cmd
+        assert 'sandbox_mode="workspace-write"' not in cmd
+        assert all("sandbox_workspace_write" not in part for part in cmd)
+
 
 class TestSpawnEnvSecretStripping:
     """codex app-server routes its spawn env through hermes_subprocess_env(

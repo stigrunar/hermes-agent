@@ -729,6 +729,7 @@ def _codex_runtime_contract(agent, messages, cwd):
     # the shared ~/.codex/config.toml or change unrelated Codex sessions.
     overrides = {"mcp_servers.hermes-tools": callback}
     profile_runtime = cfg.get("codex_app_server", {})
+    kanban_sandbox_mode = "workspace-write"
     if isinstance(profile_runtime, dict):
         for key in ("default_subagent_model", "default_subagent_reasoning_effort"):
             value = profile_runtime.get(key)
@@ -736,6 +737,9 @@ def _codex_runtime_contract(agent, messages, cwd):
                 overrides[f"agents.{key}"] = value.strip()
         if profile_runtime.get("default_subagent_model"):
             overrides["agents.max_concurrent_threads_per_session"] = 2
+        configured_sandbox = profile_runtime.get("kanban_sandbox_mode")
+        if configured_sandbox == "danger-full-access":
+            kanban_sandbox_mode = configured_sandbox
     try:
         timeout = float(cfg.get("agent", {}).get("gateway_timeout", 600))
     except (TypeError, ValueError):
@@ -743,7 +747,8 @@ def _codex_runtime_contract(agent, messages, cwd):
     timeout = max(1.0, timeout - min(60.0, timeout / 10))
     return dict(model=model, reasoning_effort=effort,
                 developer_instructions=prompt or None,
-                config_overrides=overrides), timeout
+                config_overrides=overrides,
+                kanban_sandbox_mode=kanban_sandbox_mode), timeout
 
 
 def _codex_thread_binding(agent, cwd):

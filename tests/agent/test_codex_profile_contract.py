@@ -101,6 +101,7 @@ def test_runtime_uses_rendered_instructions_and_thread_local_callback(monkeypatc
     callback = contract["config_overrides"]["mcp_servers.hermes-tools"]
     assert callback["env"]["HERMES_HOME"] == "/profile"
     assert "PYTHONPATH" in callback["env"]
+    assert contract["kanban_sandbox_mode"] == "workspace-write"
     assert timeout == 1740
 
 
@@ -135,7 +136,8 @@ def test_worker_scope_and_child_defaults_are_thread_local(monkeypatch):
     monkeypatch.setenv("HERMES_KANBAN_DB", "/isolated/kanban.db")
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: {
         "codex_app_server": {"default_subagent_model": "gpt-5.6-luna",
-                             "default_subagent_reasoning_effort": "xhigh"}
+                             "default_subagent_reasoning_effort": "xhigh",
+                             "kanban_sandbox_mode": "danger-full-access"}
     })
     monkeypatch.setattr(
         "hermes_cli.codex_runtime_plugin_migration._build_hermes_tools_mcp_entry",
@@ -151,4 +153,5 @@ def test_worker_scope_and_child_defaults_are_thread_local(monkeypatch):
     assert config["agents.default_subagent_model"] == "gpt-5.6-luna"
     assert config["agents.default_subagent_reasoning_effort"] == "xhigh"
     assert config["agents.max_concurrent_threads_per_session"] == 2
+    assert contract["kanban_sandbox_mode"] == "danger-full-access"
     assert not any("config_file" in key for key in config)

@@ -282,6 +282,7 @@ class CodexAppServerSession:
         reasoning_effort: Optional[str] = None,
         developer_instructions: Optional[str] = None,
         config_overrides: Optional[dict[str, Any]] = None,
+        kanban_sandbox_mode: str = "workspace-write",
         resume_thread_id: Optional[str] = None,
         on_thread_ready: Optional[Callable[[str], None]] = None,
         approval_callback: Optional[Callable[..., str]] = None,
@@ -296,6 +297,7 @@ class CodexAppServerSession:
         self._reasoning_effort = reasoning_effort
         self._developer_instructions = developer_instructions
         self._config_overrides = dict(config_overrides or {})
+        self._kanban_sandbox_mode = kanban_sandbox_mode
         self._resume_thread_id = resume_thread_id
         self._on_thread_ready = on_thread_ready
         self._permission_profile = (
@@ -332,7 +334,9 @@ class CodexAppServerSession:
             return self._thread_id
         if self._client is None:
             self._client = self._client_factory(
-                codex_bin=self._codex_bin, codex_home=self._codex_home
+                codex_bin=self._codex_bin,
+                codex_home=self._codex_home,
+                kanban_sandbox_mode=self._kanban_sandbox_mode,
             )
         self._client.initialize(
             client_name="hermes",

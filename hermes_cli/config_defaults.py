@@ -10,6 +10,14 @@ DEFAULT_CONFIG = {
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],
+    "codex_app_server": {
+        # Optional profile-scoped defaults for the native Codex runtime.
+        "default_subagent_model": None,
+        "default_subagent_reasoning_effort": None,
+        # Fail closed unless a specialist profile explicitly opts into full
+        # host access for Kanban browser/system integration proof.
+        "kanban_sandbox_mode": "workspace-write",
+    },
     # SQLite journal mode used by every Hermes database opener. WAL is the
     # normal default; set DELETE for weak-fsync/shared filesystems where WAL is
     # not crash-safe (for example macOS virtiofs, NFS, or SMB).
