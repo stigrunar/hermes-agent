@@ -4811,6 +4811,15 @@ def _build_job_prompt(
                 if not output_files:
                     continue  # silent skip — no output yet
                 latest_output = output_files[0].read_text(encoding="utf-8").strip()
+                # A failed cron output document contains a copy of the assembled
+                # prompt under "## Prompt". Feeding that section back through
+                # context_from=self recursively nests old cron guidance and old
+                # failures on every tick. Preserve the failure/result summary,
+                # but never recycle the copied prompt as continuity state.
+                if is_self and latest_output.startswith("# Cron Job:"):
+                    _prompt_marker = "\n## Prompt\n"
+                    if _prompt_marker in latest_output:
+                        latest_output = latest_output.split(_prompt_marker, 1)[0].rstrip()
                 # Truncate to 8K characters to avoid prompt bloat
                 _MAX_CONTEXT_CHARS = 8000
                 if len(latest_output) > _MAX_CONTEXT_CHARS:
@@ -4852,18 +4861,33 @@ def _build_job_prompt(
         has_injected_data = True
 
     # Always prepend cron execution guidance so the agent knows how
-    # delivery works and can suppress delivery when appropriate.
-    cron_hint = (
-        "[IMPORTANT: You are running as a scheduled cron job. "
-        "DELIVERY: Your final response will be automatically delivered "
-        "to the user — do NOT use send_message or try to deliver "
-        "the output yourself. Just produce your report/output as your "
-        "final response and the system handles the rest. "
-        "SILENT: If there is genuinely nothing new to report, respond "
-        "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
-        "Never combine [SILENT] with content — either report your "
-        "findings normally, or say [SILENT] and nothing more.]\n\n"
-    )
+    # delivery works and can suppress delivery when appropriate. A local-only
+    # job is intentionally NOT auto-delivered to the user, so it must not be
+    # told that send_message is forbidden when its own prompt requires explicit
+    # project-topic writeback.
+    if str(job.get("deliver") or "").strip().lower() == "local":
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Scheduler final delivery is local-only; your final "
+            "response is not automatically sent to the user. Follow any "
+            "explicit delivery or writeback instructions in the job prompt; "
+            "otherwise leave the result local. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else). Never combine "
+            "[SILENT] with content.]\n\n"
+        )
+    else:
+        cron_hint = (
+            "[IMPORTANT: You are running as a scheduled cron job. "
+            "DELIVERY: Your final response will be automatically delivered "
+            "to the user — do NOT use send_message or try to deliver "
+            "the output yourself. Just produce your report/output as your "
+            "final response and the system handles the rest. "
+            "SILENT: If there is genuinely nothing new to report, respond "
+            "with exactly \"[SILENT]\" (nothing else) to suppress delivery. "
+            "Never combine [SILENT] with content — either report your "
+            "findings normally, or say [SILENT] and nothing more.]\n\n"
+        )
     prompt = cron_hint + prompt
     if skills is None:
         legacy = job.get("skill")

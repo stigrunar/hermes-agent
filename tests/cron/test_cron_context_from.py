@@ -244,6 +244,43 @@ class TestSelfContext:
         # Self-context uses continuity framing, not the upstream-job framing.
         assert f"Output from job '{job['id']}'" not in prompt
 
+    def test_self_failed_output_does_not_reinject_copied_prompt(self, cron_env):
+        from cron.jobs import create_job, OUTPUT_DIR
+        from cron.scheduler import _build_job_prompt
+
+        job = create_job(
+            prompt="Current owner action", schedule="every 1h", context_from="self"
+        )
+        out_dir = OUTPUT_DIR / job["id"]
+        out_dir.mkdir(parents=True, exist_ok=True)
+        (out_dir / "2026-09-17_21-00-00.md").write_text(
+            "# Cron Job: owner followthrough (FAILED)\n\n"
+            "Error: HTTP 429 usage limit reached\n\n"
+            "## Prompt\n\n"
+            "[IMPORTANT: old cron wrapper]\n"
+            "OLD FULL PROMPT MUST NOT RECURSE",
+            encoding="utf-8",
+        )
+
+        prompt = _build_job_prompt(job)
+        assert "HTTP 429 usage limit reached" in prompt
+        assert "OLD FULL PROMPT MUST NOT RECURSE" not in prompt
+        assert "Current owner action" in prompt
+
+    def test_local_delivery_hint_does_not_forbid_explicit_writeback(self, cron_env):
+        from cron.jobs import create_job
+        from cron.scheduler import _build_job_prompt
+
+        job = create_job(
+            prompt="Use send_message for exact project-topic writeback.",
+            schedule="every 1h",
+            deliver="local",
+        )
+        prompt = _build_job_prompt(job)
+        assert "Scheduler final delivery is local-only" in prompt
+        assert "do NOT use send_message" not in prompt
+        assert "Use send_message for exact project-topic writeback." in prompt
+
     def test_self_case_insensitive(self, cron_env):
         from cron.jobs import create_job, OUTPUT_DIR
         from cron.scheduler import _build_job_prompt
