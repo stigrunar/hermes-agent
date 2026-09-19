@@ -16,9 +16,14 @@ from gateway.session import SessionSource
 class _PickerAdapter:
     def __init__(self):
         self.calls = []
+        self.sent = []
 
     async def send_auth_picker(self, **kwargs):
         self.calls.append(kwargs)
+        return SimpleNamespace(success=True)
+
+    async def send(self, chat_id, message, metadata=None):
+        self.sent.append({"chat_id": chat_id, "message": message, "metadata": metadata})
         return SimpleNamespace(success=True)
 
 
@@ -193,3 +198,43 @@ async def test_native_use_evicts_idle_provider_agents_and_preserves_running_agen
     assert "Invalidated 1 idle cached agent" in result
     assert "1 in-flight session" in result
     assert "No gateway restart is required" in result
+
+
+@pytest.mark.asyncio
+async def test_native_codex_add_delivers_device_verification_to_private_chat(monkeypatch):
+    adapter = _PickerAdapter()
+    runner = _runner(adapter)
+    runner._running_agent_ids = lambda: set()
+    runner._thread_metadata_for_source = lambda source, anchor: {
+        "thread_id": source.thread_id,
+        "reply_to_message_id": anchor,
+    }
+    runner._reply_anchor_for_event = lambda event: event.message_id
+
+    def _fake_add(provider, *, label=None, no_browser=False, on_verification=None):
+        assert provider == "openai-codex"
+        assert on_verification is not None
+        on_verification("https://auth.openai.com/codex/device", "ABCD-EFGH")
+        return {
+            "provider": "openai-codex",
+            "label": "pro-hermes",
+            "fingerprint": "0123456789",
+            "credential_id": "new-account",
+        }
+
+    monkeypatch.setattr("hermes_cli.auth_commands.add_auth_account", _fake_add)
+
+    result = await runner._run_auth_native_action(
+        _event(), "add", {"provider": "openai-codex"})
+
+    assert "Added pro-hermes" in result
+    assert len(adapter.sent) == 1
+    delivery = adapter.sent[0]
+    assert delivery["chat_id"] == "chat-1"
+    assert "https://auth.openai.com/codex/device" in delivery["message"]
+    assert "ABCD-EFGH" in delivery["message"]
+    assert "private chat" in delivery["message"]
+    assert delivery["metadata"] == {
+        "thread_id": "topic-1",
+        "reply_to_message_id": "message-1",
+    }
