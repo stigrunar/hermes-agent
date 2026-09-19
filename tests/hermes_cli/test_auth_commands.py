@@ -571,7 +571,10 @@ def test_auth_add_codex_oauth_keeps_distinct_pool_accounts(tmp_path, monkeypatch
             },
         ]
     )
-    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", lambda: next(logins))
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda **_kwargs: next(logins),
+    )
 
     from hermes_cli.auth_commands import auth_add_command
     from agent.credential_pool import load_pool

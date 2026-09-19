@@ -75,7 +75,9 @@ def codex_oauth_login(args: Any) -> Dict[str, Any]:
     print("Signing in to OpenAI Codex...")
     print("(Hermes creates its own session — won't affect Codex CLI or VS Code)")
     print()
-    return auth_mod._codex_device_code_login()
+    return auth_mod._codex_device_code_login(
+        on_verification=getattr(args, "on_verification", None),
+    )
 
 
 def _codex_browser_authorize_url(*, redirect_uri: str, state: str, code_challenge: str) -> str:
