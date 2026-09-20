@@ -28,10 +28,12 @@ through the board.
 """
 from __future__ import annotations
 
+import contextvars
 import json
 import logging
 import os
 import re
+import threading
 from typing import Any, Optional
 
 from agent.redact import redact_sensitive_text
@@ -76,12 +78,11 @@ def _observe_dollycode_task_with_jev(
     execution_contract: Any,
     task_id: str,
 ) -> None:
-    """Run the optional Jev classifier as non-authoritative shadow telemetry.
+    """Schedule optional Jev shadow telemetry after a DollyCode card is created.
 
-    This function is intentionally called only after ``create_task`` succeeds.
-    Its return value is discarded and every error is swallowed, so Jev cannot
-    change task persistence, assignee, model, permissions, execution mode,
-    leases, budgets, status, or dispatch.
+    The evaluation runs in a daemon thread with the caller's contextvars copied
+    into it so profile-scoped credentials remain isolated. Task creation never
+    waits for Jev and the result has no routing/admission authority.
     """
     if (
         triage
@@ -100,6 +101,8 @@ def _observe_dollycode_task_with_jev(
                 default=False,
             )
         )
+        if not enabled:
+            return
         timeout_seconds = float(
             cfg_get(
                 cfg,
@@ -111,15 +114,29 @@ def _observe_dollycode_task_with_jev(
         )
         from agent.jev_evaluation import evaluate_dollycode_task_shadow
 
-        evaluate_dollycode_task_shadow(
-            title=title,
-            execution_contract=execution_contract,
-            task_id=task_id,
-            enabled=enabled,
-            timeout_seconds=max(0.1, min(timeout_seconds, 30.0)),
-        )
+        def run_shadow() -> None:
+            try:
+                evaluate_dollycode_task_shadow(
+                    title=title,
+                    execution_contract=execution_contract,
+                    task_id=task_id,
+                    enabled=True,
+                    timeout_seconds=max(0.1, min(timeout_seconds, 30.0)),
+                )
+            except Exception:
+                logger.debug(
+                    "DollyCode Jev shadow observation failed open", exc_info=True
+                )
+
+        context = contextvars.copy_context()
+        threading.Thread(
+            target=context.run,
+            args=(run_shadow,),
+            name="hermes-jev-dollycode-shadow",
+            daemon=True,
+        ).start()
     except Exception:
-        logger.debug("DollyCode Jev shadow observation failed open", exc_info=True)
+        logger.debug("DollyCode Jev shadow scheduling failed open", exc_info=True)
 
 
 def _prepare_execution_contract(

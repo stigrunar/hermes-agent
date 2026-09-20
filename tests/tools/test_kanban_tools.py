@@ -595,6 +595,16 @@ def test_create_dollycode_jev_shadow_cannot_change_routing(monkeypatch, worker_e
 
     observed = {}
 
+    class ImmediateThread:
+        def __init__(self, *, target, args=(), **_kwargs):
+            self.target = target
+            self.args = args
+
+        def start(self):
+            self.target(*self.args)
+
+    monkeypatch.setattr(kt.threading, "Thread", ImmediateThread)
+
     def fake_shadow(**kwargs):
         observed.update(kwargs)
         return {

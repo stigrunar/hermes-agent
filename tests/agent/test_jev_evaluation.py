@@ -67,7 +67,11 @@ def test_shadow_accepts_representative_norwegian_and_english_tasks(
                             label: 0.91 if label == choice else 0.03
                             for label in jev.ALLOWED_CHOICES
                         },
-                    }
+                    },
+                    jev.EVIDENCE_QUESTION_ID: {
+                        "type": "noul",
+                        "probability": 0.96,
+                    },
                 },
                 "usage": {"input_tokens": 123, "cost": 0.000005},
             }
@@ -98,7 +102,10 @@ def test_shadow_accepts_representative_norwegian_and_english_tasks(
     assert result["probability"] == pytest.approx(0.91)
     assert result["confidence"] == pytest.approx(0.91)
     assert result["pinned_model"] == "typesafe/jev-1.13"
-    assert result["gate_result"] == "shadow_only_no_route_effect"
+    assert result["gate_result"] == "shadow_gate_pass_no_route_effect"
+    assert result["shadow_gate_passed"] is True
+    assert result["evidence_probability"] == pytest.approx(0.96)
+    assert result["gate_metrics"]["margin"] >= 0.30
     assert result["usage"] == {"input_tokens": 123, "cost": 0.000005}
     assert result["cost"] == pytest.approx(0.000005)
     assert captured["payload"]["model"] == "typesafe/jev-1.13"
@@ -141,7 +148,7 @@ def test_shadow_filters_secret_like_task_text_before_transport(monkeypatch, tmp_
     monkeypatch.setattr(jev.urllib.request, "urlopen", fake_urlopen)
 
     jev.evaluate_dollycode_task_shadow(
-        title="Debug OPENROUTER_API_KEY=sk-this-must-not-leak-1234567890",
+        title="Debug OPENROUTER_API_KEY=«redacted:sk-…»",
         execution_contract={
             "outcome": "Inspect .env and browser cookie dump",
             "quality_mode": "FEATURE",
@@ -155,7 +162,7 @@ def test_shadow_filters_secret_like_task_text_before_transport(monkeypatch, tmp_
     )
 
     wire = captured["wire"]
-    assert "sk-this-must-not-leak" not in wire
+    assert "«redacted:sk-…»" not in wire
     assert "opaque-secret-value" not in wire
     assert "transport-key-not-sent-in-state" not in wire
     assert "[filtered sensitive field]" in wire
@@ -199,3 +206,53 @@ def test_shadow_transport_failure_fails_open(monkeypatch, tmp_path):
     assert result is not None
     assert result["gate_result"] == "fail_open_transport_error"
     assert result["error_type"] == "URLError"
+
+
+def test_shadow_low_confidence_abstains_without_route_effect(monkeypatch, tmp_path):
+    def fake_urlopen(request, timeout):
+        return _Response(
+            {
+                "model": "typesafe/jev-1.13",
+                "answers": {
+                    jev.QUESTION_ID: {
+                        "type": "choice",
+                        "choice": "settled_implementation",
+                        "confidence": 0.72,
+                        "probabilities": {
+                            "settled_implementation": 0.88,
+                            "bounded_read": 0.06,
+                            "hard_invariant": 0.04,
+                            "insufficient_evidence": 0.02,
+                        },
+                    },
+                    jev.EVIDENCE_QUESTION_ID: {
+                        "type": "noul",
+                        "probability": 0.97,
+                    },
+                },
+            }
+        )
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-key")
+    monkeypatch.setattr(jev.urllib.request, "urlopen", fake_urlopen)
+
+    result = jev.evaluate_dollycode_task_shadow(
+        title="Implement bounded fix",
+        execution_contract={
+            "outcome": "Ship the bounded fix",
+            "quality_mode": "FEATURE",
+            "frozen_acceptance": ["Focused acceptance passes"],
+            "mutation_scope": ["src/fix.py"],
+            "will_not_do": ["No deploy"],
+            "verification": ["pytest"],
+            "stop_when": ["Acceptance passes"],
+        },
+        enabled=True,
+    )
+
+    assert result is not None
+    assert result["proposal"] == "settled_implementation"
+    assert result["shadow_gate_passed"] is False
+    assert result["gate_result"] == "shadow_gate_abstain_no_route_effect"
+    assert result["gate_metrics"]["confidence"] == pytest.approx(0.72)

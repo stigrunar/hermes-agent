@@ -1,9 +1,9 @@
 """Central, fail-open Jev decision evaluation for Hermes shadow pilots.
 
-This module deliberately has no routing authority.  Its first consumer observes
-new DollyCode technical task contracts, writes a metadata-only JSONL receipt,
-and returns the existing Hermes result unchanged on success, timeout, malformed
-response, or transport failure.
+This module has no routing authority. Its first consumer observes new DollyCode
+technical task contracts, writes metadata-only JSONL receipts, and leaves the
+existing Hermes result unchanged on success, timeout, malformed response, or
+transport failure.
 """
 from __future__ import annotations
 
@@ -23,6 +23,7 @@ from hermes_constants import get_default_hermes_root
 OPENROUTER_DECISIONS_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = "typesafe/jev-1.13"
 QUESTION_ID = "technical_task_classification"
+EVIDENCE_QUESTION_ID = "enough_evidence"
 ALLOWED_CHOICES = frozenset({
     "settled_implementation",
     "bounded_read",
@@ -30,9 +31,14 @@ ALLOWED_CHOICES = frozenset({
     "insufficient_evidence",
 })
 
-# This is intentionally stricter than ordinary log redaction.  Jev never needs
-# credential-bearing assignments, browser/cookie dumps, or raw environment
-# material to classify a technical task.
+CHOICE_PROBABILITY_THRESHOLD = 0.90
+CHOICE_MARGIN_THRESHOLD = 0.30
+CHOICE_CONFIDENCE_THRESHOLD = 0.80
+EVIDENCE_THRESHOLD = 0.90
+
+# Stricter than ordinary log redaction. Jev never needs credential-bearing
+# assignments, browser/cookie dumps, or raw environment material to classify a
+# technical task.
 _SENSITIVE_LINE = re.compile(
     r"(?i)(?:^|\b)(?:[A-Z0-9_]*(?:API_KEY|TOKEN|SECRET|PASSWORD|COOKIE)|"
     r"authorization|set-cookie|\.env)(?:\b|\s*[:=])"
@@ -43,7 +49,7 @@ _MAX_LIST_ITEMS = 12
 
 
 def _filtered_text(value: Any) -> str:
-    """Return bounded task text with secret-like lines removed."""
+    """Return bounded task text with secret-like material removed."""
     compact = " ".join(str(value or "").split())[:_MAX_ITEM_CHARS]
     if not compact:
         return ""
@@ -96,20 +102,23 @@ def _snapshot(state: Mapping[str, Any]) -> tuple[str, str, bytes]:
 
 
 def _load_openrouter_key() -> str:
-    """Resolve the existing default/root OpenRouter credential without output."""
-    key = os.environ.get("OPENROUTER_API_KEY", "").strip()
-    if key:
-        return key
+    """Resolve the caller's profile-scoped OpenRouter credential.
+
+    Shadow evaluation must honor Hermes secret isolation. In multiplex mode an
+    unscoped read fails closed instead of reading another profile's environment.
+    """
     try:
-        from hermes_cli.env_loader import load_hermes_dotenv
+        from agent.secret_scope import UnscopedSecretError, get_secret
 
-        load_hermes_dotenv(hermes_home=get_default_hermes_root())
+        try:
+            return str(get_secret("OPENROUTER_API_KEY") or "").strip()
+        except UnscopedSecretError:
+            return ""
     except Exception:
-        return ""
-    return os.environ.get("OPENROUTER_API_KEY", "").strip()
+        return str(os.environ.get("OPENROUTER_API_KEY") or "").strip()
 
 
-def _question() -> dict[str, Any]:
+def _choice_question() -> dict[str, Any]:
     return {
         "type": "choice",
         "instructions": (
@@ -139,6 +148,25 @@ def _question() -> dict[str, Any]:
     }
 
 
+def _evidence_question() -> dict[str, Any]:
+    return {
+        "type": "noul",
+        "instructions": (
+            "Does the supplied state contain enough concrete technical evidence "
+            "to distinguish the execution class without assuming absent facts?"
+        ),
+        "criteria": {
+            "true": (
+                "The requested outcome, scope and completion conditions are "
+                "sufficiently bounded for classification."
+            ),
+            "false": (
+                "A decisive fact is absent, contradictory, or only assumed."
+            ),
+        },
+    }
+
+
 def _numeric_usage(value: Any) -> dict[str, int | float]:
     """Keep only numeric usage/cost fields actually reported by the API."""
     if not isinstance(value, Mapping):
@@ -161,8 +189,58 @@ def _numeric_usage(value: Any) -> dict[str, int | float]:
     }
 
 
+def _noul_probability(value: Any) -> float | None:
+    """Extract a true-probability from known Jev/OpenRouter Noul shapes."""
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, Mapping):
+        return None
+    for key in ("noul", "probability", "value", "true_probability", "true"):
+        item = value.get(key)
+        if isinstance(item, (int, float)) and not isinstance(item, bool):
+            return float(item)
+    probabilities = value.get("probabilities")
+    if isinstance(probabilities, Mapping):
+        for key in ("true", "yes", "1"):
+            item = probabilities.get(key)
+            if isinstance(item, (int, float)) and not isinstance(item, bool):
+                return float(item)
+    return None
+
+
+def _decision_gate(
+    *, proposal: str, probabilities: Mapping[str, float], confidence: float | None,
+    evidence_probability: float | None
+) -> tuple[bool, dict[str, float | None]]:
+    p1 = probabilities.get(proposal)
+    ordered = sorted(probabilities.values(), reverse=True)
+    p2 = ordered[1] if len(ordered) > 1 else 0.0
+    margin = (p1 - p2) if p1 is not None else None
+    passed = (
+        p1 is not None
+        and p1 >= CHOICE_PROBABILITY_THRESHOLD
+        and margin is not None
+        and margin >= CHOICE_MARGIN_THRESHOLD
+        and confidence is not None
+        and confidence >= CHOICE_CONFIDENCE_THRESHOLD
+        and evidence_probability is not None
+        and evidence_probability >= EVIDENCE_THRESHOLD
+    )
+    return passed, {
+        "p1": p1,
+        "margin": margin,
+        "confidence": confidence,
+        "evidence_probability": evidence_probability,
+    }
+
+
 def _log_path() -> Path:
-    return get_default_hermes_root() / "logs" / "jev-shadow" / "dollycode-technical-task.jsonl"
+    return (
+        get_default_hermes_root()
+        / "logs"
+        / "jev-shadow"
+        / "dollycode-technical-task.jsonl"
+    )
 
 
 def _append_receipt(receipt: Mapping[str, Any]) -> None:
@@ -195,11 +273,7 @@ def evaluate_dollycode_task_shadow(
     enabled: bool = False,
     timeout_seconds: float = 5.0,
 ) -> dict[str, Any] | None:
-    """Evaluate and log one DollyCode task without affecting its creation.
-
-    The caller must ignore the return value for routing.  Every operational
-    failure is converted into a metadata-only fail-open receipt.
-    """
+    """Evaluate and log one DollyCode task without affecting its creation."""
     if not enabled:
         return None
 
@@ -219,6 +293,9 @@ def evaluate_dollycode_task_shadow(
         "probability": None,
         "confidence": None,
         "probabilities": {},
+        "evidence_probability": None,
+        "shadow_gate_passed": False,
+        "gate_metrics": {},
         "latency_ms": None,
         "gate_result": "fail_open_unclassified",
         "usage": {},
@@ -235,7 +312,10 @@ def evaluate_dollycode_task_shadow(
         payload = {
             "model": JEV_MODEL,
             "state": state,
-            "questions": {QUESTION_ID: _question()},
+            "questions": {
+                QUESTION_ID: _choice_question(),
+                EVIDENCE_QUESTION_ID: _evidence_question(),
+            },
         }
         request = urllib.request.Request(
             OPENROUTER_DECISIONS_URL,
@@ -249,12 +329,15 @@ def evaluate_dollycode_task_shadow(
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=max(0.1, timeout_seconds)) as response:
+        with urllib.request.urlopen(
+            request, timeout=max(0.1, timeout_seconds)
+        ) as response:
             parsed = json.loads(response.read().decode("utf-8"))
 
-        answer = (parsed.get("answers") or {}).get(QUESTION_ID) or {}
+        answers = parsed.get("answers") or {}
+        answer = answers.get(QUESTION_ID) or {}
         proposal = answer.get("choice")
-        if answer.get("type") != "choice" or proposal not in ALLOWED_CHOICES:
+        if answer.get("type") not in (None, "choice") or proposal not in ALLOWED_CHOICES:
             raise ValueError("malformed Jev choice response")
         probabilities = answer.get("probabilities") or {}
         normalized_probabilities = {
@@ -266,6 +349,18 @@ def evaluate_dollycode_task_shadow(
         confidence = answer.get("confidence")
         if not isinstance(confidence, (int, float)) or isinstance(confidence, bool):
             confidence = None
+        else:
+            confidence = float(confidence)
+
+        evidence_probability = _noul_probability(
+            answers.get(EVIDENCE_QUESTION_ID)
+        )
+        gate_passed, gate_metrics = _decision_gate(
+            proposal=proposal,
+            probabilities=normalized_probabilities,
+            confidence=confidence,
+            evidence_probability=evidence_probability,
+        )
         usage = _numeric_usage(parsed.get("usage"))
         cost = usage.get("cost", usage.get("total_cost"))
 
@@ -274,9 +369,16 @@ def evaluate_dollycode_task_shadow(
                 "resolved_model": str(parsed.get("model") or JEV_MODEL),
                 "proposal": proposal,
                 "probability": normalized_probabilities.get(proposal),
-                "confidence": float(confidence) if confidence is not None else None,
+                "confidence": confidence,
                 "probabilities": normalized_probabilities,
-                "gate_result": "shadow_only_no_route_effect",
+                "evidence_probability": evidence_probability,
+                "shadow_gate_passed": gate_passed,
+                "gate_metrics": gate_metrics,
+                "gate_result": (
+                    "shadow_gate_pass_no_route_effect"
+                    if gate_passed
+                    else "shadow_gate_abstain_no_route_effect"
+                ),
                 "usage": usage,
                 "cost": cost,
             }
