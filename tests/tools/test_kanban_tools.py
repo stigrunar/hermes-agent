@@ -632,6 +632,74 @@ def test_registered_create_rejects_missing_role_contract_before_persistence(work
         assert conn.execute("SELECT count(*) FROM tasks").fetchone()[0] == before
 
 
+def test_create_dollycode_jev_shadow_cannot_change_routing(monkeypatch, worker_env):
+    from agent import jev_evaluation
+    from hermes_cli import kanban_db as kb
+    from hermes_cli import kanban_db_connect as kbc
+    from tools import kanban_tools as kt
+
+    observed = {}
+
+    def fake_shadow(**kwargs):
+        observed.update(kwargs)
+        return {
+            "proposal": "bounded_read",
+            "gate_result": "shadow_only_no_route_effect",
+        }
+
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {
+            "decision_evaluation": {
+                "jev_shadow": {
+                    "dollycode_technical_task": True,
+                    "timeout_seconds": 1.25,
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        jev_evaluation, "evaluate_dollycode_task_shadow", fake_shadow
+    )
+    contract = {
+        "outcome": "Ship one bounded parser fix",
+        "frozen_acceptance": ["Regression test passes"],
+        "repo_workspace_base_revision": "/repo/.worktrees/task @ abc123",
+        "mutation_scope": ["parser.py", "tests/test_parser.py"],
+        "will_not_do": ["No deploy"],
+        "verification": ["scripts/run_tests.sh tests/test_parser.py"],
+        "authority": ["inspect", "edit", "commit"],
+        "quality_mode": "FEATURE",
+        "qa_boundary": "Implementation owner proves focused tests",
+        "stop_when": ["Acceptance passes"],
+    }
+    out = json.loads(kt._handle_create({
+        "title": "ordinary implementation",
+        "assignee": "dollycode",
+        "execution_contract": contract,
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "workspace_kind": "scratch",
+    }))
+
+    assert out["ok"] is True
+    assert observed == {
+        "title": "ordinary implementation",
+        "execution_contract": contract,
+        "task_id": out["task_id"],
+        "enabled": True,
+        "timeout_seconds": 1.25,
+    }
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.assignee == "dollycode"
+        assert task.model_override == "gpt-5.6-sol"
+        assert task.provider_override == "openai-codex"
+        assert task.workspace_kind == "scratch"
+
+
 @pytest.mark.parametrize("explicit", [{"workspace_kind": "scratch"}, {"project": ""}])
 @pytest.mark.parametrize("target_scoped", [False, True])
 def test_create_explicit_scratch_ignores_ambient_board_project(
