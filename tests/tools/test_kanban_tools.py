@@ -589,6 +589,68 @@ def test_create_dollycode_triage_card_is_exempt(worker_env):
     assert out["status"] == "triage"
 
 
+def test_create_dollycode_jev_shadow_cannot_change_routing(monkeypatch, worker_env):
+    from tools import kanban_tools as kt
+    from agent import jev_evaluation
+
+    observed = {}
+
+    def fake_shadow(**kwargs):
+        observed.update(kwargs)
+        return {
+            "proposal": "bounded_read",
+            "gate_result": "shadow_only_no_route_effect",
+        }
+
+    monkeypatch.setattr(
+        kt,
+        "load_config",
+        lambda: {
+            "decision_evaluation": {
+                "jev_shadow": {
+                    "dollycode_technical_task": True,
+                    "timeout_seconds": 1.25,
+                }
+            }
+        },
+    )
+    monkeypatch.setattr(
+        jev_evaluation, "evaluate_dollycode_task_shadow", fake_shadow
+    )
+
+    contract = _dollycode_execution_contract()
+    out = json.loads(kt._handle_create({
+        "title": "ordinary implementation",
+        "assignee": "dollycode",
+        "execution_contract": contract,
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "workspace_kind": "scratch",
+    }))
+
+    assert out["ok"] is True
+    assert observed == {
+        "title": "ordinary implementation",
+        "execution_contract": contract,
+        "task_id": out["task_id"],
+        "enabled": True,
+        "timeout_seconds": 1.25,
+    }
+
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        task = kb.get_task(conn, out["task_id"])
+        assert task is not None
+        assert task.assignee == "dollycode"
+        assert task.model_override == "gpt-5.6-sol"
+        assert task.provider_override == "openai-codex"
+        assert task.workspace_kind == "scratch"
+        assert task.status == "ready"
+    finally:
+        conn.close()
+
+
 def _dollyqa_review_contract():
     return {
         "outcome": "Return one exact source-candidate verdict",

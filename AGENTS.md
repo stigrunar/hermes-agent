@@ -43,18 +43,18 @@ commit.
   lane operates in project mode under the same profile. Do not introduce a standing
   Project Lead profile. Specialist profiles remain worker lanes behind Outcome
   routing and return receipts to Dolly/default for visible closeout.
-- **Direct Codex is the default bounded FEATURE inner loop.** Keep edit -> test ->
-  inspect -> adjust coherent in one execution/worktree. Under Cross-Project
-  Orchestration V1, launch the normal mutating route through `hermes project
-  direct-codex-run` (or the equivalent API) so root admission, heartbeat and
-  terminal receipt wrap the Codex process; do not start an untracked raw writer.
-  Kanban is optional for durable waiting/restart continuity, real cross-authority
-  handoffs, genuinely independent non-overlapping work, or required independent
-  review/release gates. Do not manufacture owner -> architect -> controller ->
-  code -> QA graphs for ordinary feature work. If an otherwise-direct execution
-  cannot immediately acquire a required shared resource, do not leave an
-  untracked direct process waiting: retain the same Outcome and route the waiting
-  continuation through the durable Kanban path.
+- **DollyCode is the default durable owner for new Hermes-initiated technical development.**
+  Keep investigation -> implementation -> test/repair -> integration -> receipt
+  coherent under one DollyCode execution and Outcome. DollyCode may use its
+  existing native Codex roles internally under Model Routing R2; do not insert a
+  mandatory DollyCode -> Direct Codex hop or manufacture owner -> architect ->
+  code -> QA graphs for ordinary feature work. Direct Codex is an explicit
+  exception for already-adopted active Direct-Codex work, an explicit user request
+  for direct Codex, a small one-off operation where durable DollyCode would be
+  disproportionate overhead, or the narrow self-hosting/recovery boundary below.
+  Any such mutating exception still uses `hermes project direct-codex-run` (or the
+  equivalent tracked API) for admission, heartbeat and terminal receipt; never
+  start an untracked raw writer. Do not migrate or interrupt an active writer.
 - **Cross-backend capacity and shared resources are root coordination state.**
   Direct Codex, Kanban and external mutating executions consume the same configured
   mutation budget. Repository/path collisions use mutation leases; scarce shared
