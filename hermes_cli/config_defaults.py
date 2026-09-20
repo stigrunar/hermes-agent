@@ -1690,6 +1690,17 @@ DEFAULT_CONFIG = {
         # Keep in sync with cron.scheduler._DEFAULT_MEDIA_SEND_TIMEOUT.
         "media_send_timeout_seconds": 300,
     },
+    # Optional non-authoritative decision evaluation. The first consumer is a
+    # Jev/OpenRouter Decisions shadow classifier for new DollyCode technical
+    # task contracts. It never participates in routing or admission. Disabled
+    # by default; operators opt into the bounded pilot in config.yaml.
+    "decision_evaluation": {
+        "jev_shadow": {
+            "dollycode_technical_task": False,
+            "timeout_seconds": 5.0,
+        },
+    },
+
     # Kanban multi-agent coordination. The dispatcher ticks every N seconds, reclaims stale claims,
     # promotes dependency-satisfied todos to ready, and fires `hermes -p <assignee> chat -q ...` per
     # claimable task. Run ONE dispatcher per profile; two on the same kanban.db race for claims.

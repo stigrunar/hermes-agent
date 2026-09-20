@@ -47,6 +47,59 @@ def _compact_contract_text(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
+def _observe_dollycode_task_with_jev(
+    *,
+    title: Any,
+    assignee: Any,
+    triage: bool,
+    execution_contract: Any,
+    task_id: str,
+) -> None:
+    """Run optional Jev classification as non-authoritative shadow telemetry.
+
+    The observation happens only after task creation. Its return value is
+    discarded and every error is swallowed, so it cannot change persistence,
+    routing, permissions, leases, budgets, status, or dispatch.
+    """
+    if (
+        triage
+        or _compact_contract_text(assignee).casefold() not in _DOLLYCODE_ASSIGNEES
+        or not isinstance(execution_contract, dict)
+    ):
+        return
+    try:
+        cfg = load_config()
+        enabled = bool(
+            cfg_get(
+                cfg,
+                "decision_evaluation",
+                "jev_shadow",
+                "dollycode_technical_task",
+                default=False,
+            )
+        )
+        timeout_seconds = float(
+            cfg_get(
+                cfg,
+                "decision_evaluation",
+                "jev_shadow",
+                "timeout_seconds",
+                default=5.0,
+            )
+        )
+        from agent.jev_evaluation import evaluate_dollycode_task_shadow
+
+        evaluate_dollycode_task_shadow(
+            title=title,
+            execution_contract=execution_contract,
+            task_id=task_id,
+            enabled=enabled,
+            timeout_seconds=max(0.1, min(timeout_seconds, 30.0)),
+        )
+    except Exception:
+        logger.debug("DollyCode Jev shadow observation failed open", exc_info=True)
+
+
 def _prepare_execution_contract(*, assignee: Any, triage: bool, contract: Any,
                                 body: Any) -> tuple[Optional[str], Optional[str]]:
     """Validate and prepend the authoritative DollyCode execution packet."""
@@ -1433,6 +1486,13 @@ def _handle_create(args: dict, **kw) -> str:
             initial_status=str(args.get("initial_status") or "running"),
             created_by=os.environ.get("HERMES_PROFILE") or "worker", session_id=session_id)
         landed = _fields(kb.get_task(conn, new_tid), _CREATED_FIELDS)
+        _observe_dollycode_task_with_jev(
+            title=title,
+            assignee=assignee,
+            triage=triage,
+            execution_contract=execution_contract,
+            task_id=new_tid,
+        )
         return _ok(task_id=new_tid, **landed, subscribed=_maybe_auto_subscribe(conn, new_tid))
 
 
