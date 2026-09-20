@@ -911,6 +911,12 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
         configured = user_providers.get(hermes_slug) or user_providers.get(pid) if isinstance(user_providers, dict) else None
         if isinstance(configured, dict):
             model_ids = list(dict.fromkeys([*_declared_model_ids(configured.get("models")), *model_ids]))
+        if hermes_slug == "openai-codex":
+            # Config-declared Codex bases use the same picker-only variants as live/curated rows.
+            # In particular, an account-approved Astra opt-in should not have to duplicate the
+            # transport-only ``-900k`` alias in config; the wire path still strips that suffix.
+            from hermes_cli.codex_models import _finalize_codex_models
+            model_ids = _finalize_codex_models(model_ids)
         b.add_builtin_row(
             hermes_slug, get_label(hermes_slug), b.current_provider in (hermes_slug, pid), model_ids, "hermes")
         b.seen_slugs.add(pid.lower())
