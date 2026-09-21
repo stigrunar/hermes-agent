@@ -45,7 +45,8 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content, last_error
+            """SELECT state, attempts, owner_pid, content, last_error,
+                      retry_not_before
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
@@ -55,6 +56,7 @@ def _row(oid):
         "owner_pid": r[2],
         "content": r[3],
         "last_error": r[4],
+        "retry_not_before": r[5],
     }
 
 
@@ -232,7 +234,7 @@ class TestDeferredTelegramQueue:
         assert _row("explicit")["attempts"] == 0
 
         _orphan("legacy")
-        assert dl.pending_flood_retries(now=100.0) == [
+        assert dl.pending_retries(now=100.0) == [
             {"platform": "telegram", "profile": "default", "not_before": 100.0}
         ]
 

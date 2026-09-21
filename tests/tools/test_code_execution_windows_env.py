@@ -427,6 +427,9 @@ class TestPosixEquivalence:
         skill-registered case), and everything-passes (edge case that
         could expose precedence bugs)."""
         expected = _legacy_posix_scrubber(env, pt)
+        # Kanban routing is an authority-bearing exception to general
+        # passthrough: ordinary execute_code children never inherit it.
+        expected.pop("HERMES_KANBAN_DB", None)
         actual = _scrub_child_env(env, is_passthrough=pt, is_windows=False)
         assert actual == expected, (
             f"POSIX behavior regressed for env={env_name}, passthrough={pt_name}\n"

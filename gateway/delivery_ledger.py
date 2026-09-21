@@ -36,6 +36,8 @@ MAX_ATTEMPTS = 3
 STALE_AFTER_SECONDS = 24 * 60 * 60
 _RETENTION_SECONDS = 7 * 24 * 60 * 60
 _MAX_ROWS = 500
+_MAX_DEFER_JITTER_SECONDS = 1.0
+_ERROR_KIND_RE = re.compile(r"^[a-z][a-z0-9_]{0,63}$")
 
 # Visible prefixes for redeliveries that might duplicate an already-received message (crash mid-send /
 # post-rejection retry) — honest at-least-once. Runtime recovery uses a distinct marker: no restart
@@ -170,6 +172,12 @@ def retry_not_before(updated_at: Any, last_error: Any, attempts: Any) -> Optiona
     return _failed_stamp(updated_at) + _RETRY_BACKOFF_SECONDS[spent]
 
 
+def _sanitize_error_kind(value: Any, fallback: str) -> str:
+    """Keep durable receipts machine-categorical and free of raw error text."""
+    candidate = str(value or "")
+    return candidate if _ERROR_KIND_RE.fullmatch(candidate) else fallback
+
+
 def _db_path():
     return get_hermes_home() / "state.db"
 
@@ -297,6 +305,51 @@ def mark_delivered(obligation_id: str) -> None:
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
     _update_state(obligation_id, "failed", error=error)
+
+
+def mark_deferred(
+    obligation_id: str,
+    retry_after: float,
+    *,
+    now: Optional[float] = None,
+    error_kind: str = "flood_control",
+) -> float:
+    """Persist an explicit unsent Telegram rejection for bounded later retry."""
+    try:
+        delay = float(retry_after)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("retry_after must be finite and nonnegative") from exc
+    if not math.isfinite(delay) or delay < 0:
+        raise ValueError("retry_after must be finite and nonnegative")
+    current = time.time() if now is None else float(now)
+    if not math.isfinite(current):
+        raise ValueError("now must be finite")
+    jitter = random.uniform(0.0, _MAX_DEFER_JITTER_SECONDS)
+    due = current + delay + max(
+        0.0, min(float(jitter), _MAX_DEFER_JITTER_SECONDS),
+    )
+    sanitized_error = _sanitize_error_kind(error_kind, "deferred_retry")
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='deferred', retry_not_before=?, updated_at=?, last_error=?
+               WHERE obligation_id=? AND state != 'delivered'""",
+            (due, current, sanitized_error, obligation_id),
+        )
+    return due
+
+
+def mark_deferred_failed(obligation_id: str, error_kind: str) -> None:
+    """Make a claimed deferred retry terminal without exposing raw errors."""
+    sanitized = _sanitize_error_kind(error_kind, "deferred_send_failed")
+    with _DB_LOCK, _transaction() as conn:
+        conn.execute(
+            """UPDATE delivery_obligations
+               SET state='failed', updated_at=?, last_error=?
+               WHERE obligation_id=? AND state != 'delivered'
+                 AND retry_not_before IS NOT NULL""",
+            (time.time(), sanitized, obligation_id),
+        )
 
 
 def release_runtime_claim(obligation_id: str, error: str = "") -> bool:
@@ -477,7 +530,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at
                FROM delivery_obligations
-               WHERE state IN ('pending', 'attempting', 'failed')"""
+               WHERE state IN ('pending', 'attempting', 'failed')
+                 AND NOT (platform='telegram' AND retry_not_before IS NOT NULL)"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at) in rows:
@@ -587,7 +641,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
     return claimed
 
 
-def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
+def pending_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
     """Rows that still await deadline-driven redelivery, one entry per adapter identity.
 
     Failed flood rows remain process-owned because their reconnect retry belongs
@@ -596,8 +650,9 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
     discovered by every gateway and claimed atomically by ``claim_due_deferred``.
     A live foreign claim is still ignored; an ``attempting`` row whose owner is
     dead is eligible for the same recovery path.
-    Rows past the attempts cap or stale cutoff are left for the sweeps to
-    abandon.
+    Rejected process-owned rows use the generic retry schedule; reconnect-only
+    rows wait for the reconnect sweep. Rows past the attempts cap or stale
+    cutoff are left for the sweeps to abandon.
     """
     now, (pid, started) = now if now is not None else time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -613,10 +668,10 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         ).fetchall()
     earliest: Dict[tuple, float] = {}
     for (platform, adapter_profile, updated_at, last_error, attempts, created_at,
-         retry_not_before, state, owner_pid, owner_started_at) in rows:
+         stored_not_before, state, owner_pid, owner_started_at) in rows:
         owner_is_current = owner_pid == pid and owner_started_at == started
         if state == "failed":
-            if started is None or not owner_is_current or not is_flood_error(last_error):
+            if started is None or not owner_is_current or is_reconnect_only(last_error):
                 continue
         elif state == "attempting":
             # A live attempt belongs to another worker; a dead attempt is a
@@ -628,10 +683,12 @@ def pending_flood_retries(now: Optional[float] = None) -> List[Dict[str, Any]]:
         if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
             continue
         due = (
-            float(retry_not_before)
-            if retry_not_before is not None
-            else flood_not_before(updated_at, last_error)
+            float(stored_not_before)
+            if stored_not_before is not None
+            else retry_not_before(updated_at, last_error, attempts)
         )
+        if due is None:
+            continue
         key = (platform, adapter_profile or "default")
         if key not in earliest or due < earliest[key]:
             earliest[key] = due

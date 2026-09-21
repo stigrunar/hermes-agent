@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import pytest
 
+from agent.conversation_loop import (
+    KANBAN_CLOSEOUT_RESERVE_NOTICE,
+    _maybe_inject_kanban_closeout_reserve,
+)
 from agent.kanban_stop import (
     build_kanban_stop_nudge,
     kanban_stop_nudge_enabled,
@@ -172,3 +176,43 @@ def test_nudge_still_fires_for_non_terminal_kanban_tool(clear_kanban_env):
     # The nudge offers every worker exit, not just close-out; a card that must go
     # through review must never be steered to ``kanban_complete`` alone.
     assert "kanban_request_review" in nudge and "kanban_block" in nudge
+
+
+def test_closeout_reserve_injects_once_into_current_tool_tail(clear_kanban_env):
+    from types import SimpleNamespace
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_closeout")
+    messages = [{"role": "tool", "name": "terminal", "content": "proof"}]
+    agent = SimpleNamespace(
+        max_iterations=60,
+        _kanban_closeout_reserve_injected=False,
+        _session_messages=None,
+    )
+
+    assert _maybe_inject_kanban_closeout_reserve(
+        agent=agent, messages=messages, api_call_count=54,
+    ) is True
+    assert messages[0]["content"] == "proof\n\n" + KANBAN_CLOSEOUT_RESERVE_NOTICE
+    assert _maybe_inject_kanban_closeout_reserve(
+        agent=agent, messages=messages, api_call_count=55,
+    ) is False
+
+
+def test_closeout_reserve_respects_terminal_transition(clear_kanban_env):
+    from types import SimpleNamespace
+
+    clear_kanban_env.setenv("HERMES_KANBAN_TASK", "t_closed")
+    messages = [
+        {"role": "assistant", "tool_calls": [{"function": {"name": "kanban_complete"}}]},
+        {"role": "tool", "name": "kanban_complete", "content": "done"},
+    ]
+    agent = SimpleNamespace(
+        max_iterations=60,
+        _kanban_closeout_reserve_injected=False,
+        _session_messages=None,
+    )
+
+    assert _maybe_inject_kanban_closeout_reserve(
+        agent=agent, messages=messages, api_call_count=54,
+    ) is False
+    assert messages[-1]["content"] == "done"

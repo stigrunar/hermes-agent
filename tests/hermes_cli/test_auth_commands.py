@@ -627,7 +627,10 @@ def _add_codex_twice(tmp_path, monkeypatch, capsys, second_token: str) -> str:
         {"tokens": {"access_token": _codex_jwt("me@example.com", "acct-A", "user-1"), "refresh_token": "rt-1"}, **codex_login},
         {"tokens": {"access_token": second_token, "refresh_token": "rt-2"}, **codex_login},
     ])
-    monkeypatch.setattr("hermes_cli.auth._codex_device_code_login", lambda: next(logins))
+    monkeypatch.setattr(
+        "hermes_cli.auth._codex_device_code_login",
+        lambda **_kwargs: next(logins),
+    )
     from hermes_cli.auth_commands import auth_add_command
 
     class _Args:

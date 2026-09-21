@@ -1160,7 +1160,6 @@ _REBUILD_SPECS = {
         " oom_policy TEXT, control_group TEXT, terminal_action TEXT,"
         " terminal_payload TEXT, reap_state TEXT, reap_requested_at INTEGER,"
         " reap_completed_at INTEGER, reap_error TEXT,"
-        " max_runtime_seconds INTEGER,"
         " last_heartbeat_at INTEGER, started_at INTEGER NOT NULL,"
         " ended_at INTEGER, outcome TEXT, summary TEXT, metadata TEXT,"
         " error TEXT)",

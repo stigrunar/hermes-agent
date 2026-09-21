@@ -51,7 +51,7 @@ def _set_worker_launching(
                 item for item in conn.execute("PRAGMA database_list").fetchall()
                 if item[1] == "main"
             )
-            expected_unit = _kb._systemd_scope_unit_name(
+            expected_unit = _systemd_scope_unit_name(
                 task_id, int(run_id), db_path=db_row[2],
             )
         except (OSError, StopIteration, TypeError, ValueError, IndexError):
@@ -593,7 +593,7 @@ def _systemd_scope_argv(
         return unavailable("host is not Linux")
     if task.current_run_id is None:
         return unavailable("task has no active run identity")
-    ready, reason, target = _kb._systemd_scope_preflight(
+    ready, reason, target = _systemd_scope_preflight(
         require_scope=require_scope,
         force_probe=True,
         scope_config=config,
@@ -608,7 +608,7 @@ def _systemd_scope_argv(
     if target is None or runner is None:
         return unavailable("authenticated user manager or systemd-run is unavailable")
     try:
-        unit = _kb._systemd_scope_unit_name(task.id, int(task.current_run_id), board=board)
+        unit = _systemd_scope_unit_name(task.id, int(task.current_run_id), board=board)
     except (OSError, TypeError, ValueError):
         return unavailable("opaque unit identity could not be derived")
     return (
@@ -840,7 +840,7 @@ def _persisted_worker_scope(
             item for item in conn.execute("PRAGMA database_list").fetchall()
             if item[1] == "main"
         )
-        expected = _kb._systemd_scope_unit_name(
+        expected = _systemd_scope_unit_name(
             task_id, int(run_id), db_path=db_row[2],
         )
     except (OSError, StopIteration, TypeError, ValueError, IndexError):

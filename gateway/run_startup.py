@@ -424,7 +424,7 @@ class GatewayStartupMixin:
         """Wake one deadline-driven ledger worker per bot identity, never sleep in a send."""
         if not getattr(self, "_running", False):
             return None
-        from gateway.delivery_ledger import flood_retry_delay, pending_flood_retries
+        from gateway.delivery_ledger import flood_retry_delay, pending_retries
         target = platform if isinstance(platform, Platform) else Platform(str(platform))
         key = (target.value, profile or "default")
         pending = getattr(self, "_flood_redelivery_tasks", None)
@@ -443,7 +443,7 @@ class GatewayStartupMixin:
             try:
                 while getattr(self, "_running", False):
                     wake.clear()
-                    waiting = await self._ledger_call(pending_flood_retries)
+                    waiting = await self._ledger_call(pending_retries)
                     deadlines = [r["not_before"] for r in waiting
                                  if (r["platform"], r["profile"]) == key]
                     if not deadlines:
@@ -471,8 +471,8 @@ class GatewayStartupMixin:
 
     async def _arm_flood_timers_for_waiting_rows(self) -> None:
         """Recover adopted, newly refused and unsent released rows without blocking the loop."""
-        from gateway.delivery_ledger import pending_flood_retries
-        for row in await self._ledger_call(pending_flood_retries):
+        from gateway.delivery_ledger import pending_retries
+        for row in await self._ledger_call(pending_retries):
             self._schedule_flood_redelivery(row["platform"], profile=row["profile"])
 
     async def _redeliver_deferred_obligations_for_profile(self, profile: Optional[str]) -> int:

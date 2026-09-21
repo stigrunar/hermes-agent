@@ -5,6 +5,8 @@ import json
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_notify as kbn
 from hermes_cli import outcomes_db as odb
 from hermes_cli import projects_db as pdb
 
@@ -25,8 +27,8 @@ def stores(tmp_path, monkeypatch):
             project_id=project.id,
             outcome_key="STAFFING-TEST-ENABLER-R1",
         )
-    a = kb.connect(db_path=tmp_path / "board-a.db")
-    b = kb.connect(db_path=tmp_path / "board-b.db")
+    a = kbc.connect(db_path=tmp_path / "board-a.db")
+    b = kbc.connect(db_path=tmp_path / "board-b.db")
     try:
         yield project, oid, a, b
     finally:
@@ -278,7 +280,7 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
 
     # Simulate creation from Dolly main-DM. Structured target must win and the
     # origin DM must not remain as a duplicate visible subscription.
-    kb.add_notify_sub(
+    kbn.add_notify_sub(
         first_db,
         task_id=parent,
         platform="telegram",
@@ -287,7 +289,7 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
         notifier_profile="default",
         delivery_mode="notify+wake",
     )
-    subs = kb.list_notify_subs(first_db, parent)
+    subs = kbn.list_notify_subs(first_db, parent)
     assert [(s["platform"], s["chat_id"], s["thread_id"]) for s in subs] == [
         ("telegram", "-100123", "42")
     ]
@@ -302,7 +304,7 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
     assert child_task.topic_target == "telegram:-100123:42"
     assert child_task.parent_execution_id == kb.kanban_execution_id(parent)
 
-    kb.add_notify_sub(
+    kbn.add_notify_sub(
         first_db,
         task_id=child,
         platform="telegram",
@@ -311,7 +313,7 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
         notifier_profile="default",
         delivery_mode="notify+wake",
     )
-    assert [(s["chat_id"], s["thread_id"]) for s in kb.list_notify_subs(first_db, child)] == [
+    assert [(s["chat_id"], s["thread_id"]) for s in kbn.list_notify_subs(first_db, child)] == [
         ("-100123", "42")
     ]
 
@@ -322,7 +324,7 @@ def test_structured_topic_binding_overrides_origin_and_inherits(stores):
     assert rebound is not None
     assert rebound.conversation_lane_id == lane2
     assert rebound.topic_target == "telegram:-100123:43"
-    assert [(s["chat_id"], s["thread_id"]) for s in kb.list_notify_subs(first_db, child)] == [
+    assert [(s["chat_id"], s["thread_id"]) for s in kbn.list_notify_subs(first_db, child)] == [
         ("-100123", "43")
     ]
 
@@ -331,7 +333,7 @@ def test_child_parent_execution_identity_uses_connection_board(stores, tmp_path)
     project, outcome, _first_db, _ = stores
     board_db = tmp_path / ".hermes" / "kanban" / "boards" / "hermes" / "kanban.db"
     board_db.parent.mkdir(parents=True, exist_ok=True)
-    conn = kb.connect(db_path=board_db)
+    conn = kbc.connect(db_path=board_db)
     try:
         with odb.connect_closing() as oc:
             lane = odb.bind_conversation_lane(

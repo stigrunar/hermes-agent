@@ -55,4 +55,3 @@ process normally, but owner verdict is **CHANGES_REQUIRED**, not an accepted
 source slice. Preserve the partial patch; a new bounded owner revision must
 restore the missing lease path and prove both feature-flag modes before
 roadmap/base and owner-wake preservation continue. No live change occurred.
-

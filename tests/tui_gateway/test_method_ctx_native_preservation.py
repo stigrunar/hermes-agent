@@ -34,6 +34,7 @@ def _named_helper_module(name: str, marker: str) -> dict:
 
 def test_anonymous_registered_handlers_bind_without_helper_collision():
     server = SimpleNamespace(_methods={})
+    server.register_method = lambda name, fn: server._methods.__setitem__(name, fn)
 
     bind_module(_anonymous_module("synthetic.subagents", "subagent.list", "subagents"), server)
     bind_module(_anonymous_module("synthetic.profiles", "profiles.list", "profiles"), server)

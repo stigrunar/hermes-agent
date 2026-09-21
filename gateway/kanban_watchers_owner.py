@@ -447,7 +447,8 @@ class GatewayKanbanOwnerMixin:
 
     def _kanban_claim_owner_replan(self, board: Optional[str], sub: dict) -> Optional[dict[str, Any]]:
         from hermes_cli import kanban_db as kb
-        conn = kb.connect(board=board)
+        from hermes_cli import kanban_db_connect as kbc
+        conn = kbc.connect(board=board)
         try:
             return kb.claim_owner_replan_for_route(
                 conn, task_id=sub["task_id"], platform=sub["platform"], chat_id=sub["chat_id"],
@@ -458,7 +459,8 @@ class GatewayKanbanOwnerMixin:
 
     def _kanban_owner_replan_outcome(self, board: Optional[str], task_id: str, fingerprint: str, replan_event_id: int, error: Optional[str]) -> None:
         from hermes_cli import kanban_db as kb
-        conn = kb.connect(board=board)
+        from hermes_cli import kanban_db_connect as kbc
+        conn = kbc.connect(board=board)
         try:
             if error is None:
                 kb.mark_owner_replan_delivered(conn, task_id, fingerprint=fingerprint, replan_event_id=replan_event_id)

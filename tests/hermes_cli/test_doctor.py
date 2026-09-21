@@ -54,9 +54,7 @@ def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
     )
     monkeypatch.setitem(sys.modules, "model_tools", fake_model_tools)
 
-    import tools.browser_tool as browser_tool
-
-    monkeypatch.setattr(browser_tool, "warm_agent_browser_npx_cache", lambda: False)
+    monkeypatch.setattr(bt_install, "warm_agent_browser_npx_cache", lambda: False)
 
     probe_calls = []
 
@@ -79,7 +77,7 @@ def _run_doctor_for_state_db_probe(monkeypatch, tmp_path, *, logical_size, fix):
 
 
 def test_run_doctor_defers_integrity_scan_above_size_threshold(monkeypatch, tmp_path):
-    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES
 
     calls, output = _run_doctor_for_state_db_probe(
         monkeypatch,
@@ -95,7 +93,7 @@ def test_run_doctor_defers_integrity_scan_above_size_threshold(monkeypatch, tmp_
 def test_run_doctor_keeps_integrity_scan_for_fix_above_size_threshold(
     monkeypatch, tmp_path
 ):
-    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES
 
     calls, output = _run_doctor_for_state_db_probe(
         monkeypatch,
@@ -104,12 +102,12 @@ def test_run_doctor_keeps_integrity_scan_for_fix_above_size_threshold(
         fix=True,
     )
 
-    assert calls == [{}]
+    assert calls == [{"skip_integrity_check": False}]
     assert "PRAGMA integrity_check deferred/skipped due to large DB" not in output
 
 
 def test_run_doctor_keeps_integrity_scan_at_size_threshold(monkeypatch, tmp_path):
-    from hermes_cli.doctor import STATE_DB_SIZE_WARN_BYTES
+    from hermes_cli.doctor_state import STATE_DB_SIZE_WARN_BYTES
 
     calls, output = _run_doctor_for_state_db_probe(
         monkeypatch,
@@ -118,7 +116,7 @@ def test_run_doctor_keeps_integrity_scan_at_size_threshold(monkeypatch, tmp_path
         fix=False,
     )
 
-    assert calls == [{}]
+    assert calls == [{"skip_integrity_check": False}]
     assert "PRAGMA integrity_check deferred/skipped due to large DB" not in output
 
 

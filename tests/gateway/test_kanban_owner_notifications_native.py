@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 
 from hermes_cli import outcomes_db as odb
-from gateway.kanban_watchers import _resolve_outcome_owner_wake_spec
+from gateway.kanban_outcome_owner_wake import resolve_outcome_owner_wake_spec
 from tests.gateway.test_kanban_outcome_owner_wake import (
     _OwnerAdapter,
     _bound_event,
@@ -14,6 +14,7 @@ from tests.gateway.test_kanban_outcome_owner_wake import (
 )
 from tests.gateway.test_kanban_owner_replan import RecordingAdapter, _one_tick, _semantic_fixture
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
 
 
 def test_native_watcher_preserves_origins_and_sends_one_bound_owner(tmp_path, monkeypatch):
@@ -41,7 +42,7 @@ def test_native_watcher_preserves_origins_and_sends_one_bound_owner(tmp_path, mo
 
 def test_native_owner_wake_does_not_retarget_after_route_revision_change(tmp_path, monkeypatch):
     _, outcome_id, _, task, event = _bound_event(tmp_path, monkeypatch)
-    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    spec = resolve_outcome_owner_wake_spec("hermes", task, event)
     assert spec is not None
     with odb.connect_closing() as conn:
         odb.update_outcome(conn, outcome_id, current_candidate_ref="replacement")
@@ -60,7 +61,7 @@ def test_native_semantic_completion_keeps_passive_notice_and_one_replan(tmp_path
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setenv("HERMES_KANBAN_DB", str(home / "semantic.db"))
     kb.init_db()
-    with kb.connect() as conn:
+    with kbc.connect() as conn:
         task_id = _semantic_fixture(conn)
     adapter = RecordingAdapter()
     runner = _runner(adapter)

@@ -686,7 +686,7 @@ def test_dispatch_crash_accounting_uses_same_failure_limit_as_promotion(
             claimed = kb.claim_task(conn, task_id)
             assert claimed is not None
             kb._set_worker_pid(conn, task_id, pid)
-            result = kb.dispatch_once(
+            result = kbd.dispatch_once(
                 conn,
                 spawn_fn=lambda *_args, **_kwargs: None,
                 max_new_spawns=0,

@@ -1257,7 +1257,7 @@ def dispatch(
         cfg = load_config()
         if not isinstance(cfg, dict):
             raise ValueError("effective Hermes config must be a mapping")
-        admission_config = kanban_db.prepare_dispatch_admission(
+        admission_config = kbd.prepare_dispatch_admission(
             cfg,
             max_spawn=max_n,
         )
@@ -1270,7 +1270,7 @@ def dispatch(
     )
     try:
         with connection_scope as conn:
-            result = kanban_db.dispatch_once(
+            result = kbd.dispatch_once(
                 conn,
                 dry_run=dry_run,
                 max_spawn=max_n,

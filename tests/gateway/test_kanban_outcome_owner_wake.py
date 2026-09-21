@@ -161,7 +161,7 @@ def test_explicit_project_workstream_routes_owner_wake(tmp_path, monkeypatch):
         task_lane_bound=True,
     )
 
-    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    spec = resolve_outcome_owner_wake_spec("hermes", task, event)
 
     assert spec is not None and spec["status"] == "deliver"
     assert spec["route"]["lane_id"] == lane_id
@@ -184,7 +184,7 @@ def test_unique_control_lane_wins_over_explicit_task_lane(tmp_path, monkeypatch)
         separate_task_lane=True,
     )
 
-    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    spec = resolve_outcome_owner_wake_spec("hermes", task, event)
 
     assert spec is not None and spec["status"] == "deliver"
     assert spec["route"]["lane_id"] == control_lane_id
@@ -218,7 +218,7 @@ def test_multiple_control_lanes_do_not_fall_back_to_explicit_task_lane(
             lane_kind="control",
         )
 
-    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    spec = resolve_outcome_owner_wake_spec("hermes", task, event)
 
     assert spec is not None and spec["status"] == "noop"
     assert spec["reason"] == "exactly one bound control lane is required"
@@ -275,7 +275,7 @@ def test_explicit_owner_route_fails_closed(tmp_path, monkeypatch, invalid_bindin
         else:
             task.topic_target = None
 
-    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    spec = resolve_outcome_owner_wake_spec("hermes", task, event)
 
     assert spec is not None and spec["status"] == "noop"
     assert spec["reason"]

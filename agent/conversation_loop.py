@@ -118,6 +118,94 @@ def _review_input_budget_exhausted(agent: Any) -> bool:
     return isinstance(used, int) and not isinstance(used, bool) and used >= budget
 
 
+KANBAN_CLOSEOUT_RESERVE_NOTICE = (
+    "[SYSTEM NOTICE — Kanban closeout reserve active] "
+    "Stop expanding scope now. Use the evidence already gathered and preserve "
+    "the current candidate/checkpoint. Run at most one decisive directly "
+    "affected check if one is still missing, then make exactly one lifecycle "
+    "transition: `kanban_complete`, `kanban_request_review`, or `kanban_block`."
+)
+
+_KANBAN_TERMINAL_LIFECYCLE_TOOLS = frozenset(
+    {"kanban_complete", "kanban_request_review", "kanban_block"}
+)
+
+
+def _kanban_tool_call_name(tool_call: Any) -> str:
+    """Return a tool-call name from either dict or SDK-shaped call data."""
+    if isinstance(tool_call, dict):
+        function = tool_call.get("function")
+        if isinstance(function, dict):
+            return str(function.get("name") or "")
+        return str(tool_call.get("name") or "")
+    function = getattr(tool_call, "function", None)
+    if function is not None:
+        return str(getattr(function, "name", "") or "")
+    return str(getattr(tool_call, "name", "") or "")
+
+
+def _kanban_terminal_lifecycle_called(messages: List[Dict[str, Any]]) -> bool:
+    """Return whether the transcript already contains a lifecycle transition."""
+    for message in messages or []:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "assistant":
+            if any(
+                _kanban_tool_call_name(tool_call) in _KANBAN_TERMINAL_LIFECYCLE_TOOLS
+                for tool_call in (message.get("tool_calls") or [])
+            ):
+                return True
+        elif message.get("role") == "tool":
+            if str(message.get("name") or "") in _KANBAN_TERMINAL_LIFECYCLE_TOOLS:
+                return True
+    return False
+
+
+def _maybe_inject_kanban_closeout_reserve(
+    *,
+    agent: Any,
+    messages: List[Dict[str, Any]],
+    api_call_count: int,
+) -> bool:
+    """Append one cache-safe closeout notice to the current tool-result tail."""
+    from agent.delegation_context import owned_kanban_task
+
+    task_id = owned_kanban_task()
+    if not task_id or getattr(agent, "_kanban_closeout_reserve_injected", False):
+        return False
+    if _kanban_terminal_lifecycle_called(messages):
+        return False
+    try:
+        maximum = int(agent.max_iterations)
+        used = int(api_call_count)
+    except (AttributeError, TypeError, ValueError):
+        return False
+    if maximum < 10 or used < maximum - 6:
+        return False
+    message = messages[-1] if messages else None
+    if not isinstance(message, dict) or message.get("role") != "tool":
+        return False
+    content = message.get("content")
+    if isinstance(content, str):
+        message["content"] = content + "\n\n" + KANBAN_CLOSEOUT_RESERVE_NOTICE
+    elif isinstance(content, list):
+        message["content"] = [
+            *content,
+            {"type": "text", "text": KANBAN_CLOSEOUT_RESERVE_NOTICE},
+        ]
+    else:
+        return False
+    agent._kanban_closeout_reserve_injected = True
+    agent._session_messages = messages
+    logger.info(
+        "Kanban closeout reserve notice injected at %d/%d task=%s",
+        used,
+        maximum,
+        task_id,
+    )
+    return True
+
+
 def _maybe_inject_run_budget_wrapup(agent: Any, messages: List[Dict[str, Any]]) -> bool:
     """Inject the one-time wall-clock wrap-up notice when past 80% of budget.
 

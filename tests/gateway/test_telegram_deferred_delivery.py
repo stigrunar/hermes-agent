@@ -523,5 +523,5 @@ async def test_native_deferred_path_routes_ledger_operations_through_wrapper():
     await _wait_for(lambda: _row()[0] == "delivered")
     await _cancel(task)
     assert {
-        "pending_flood_retries", "claim_due_deferred", "mark_delivered",
+        "pending_retries", "claim_due_deferred", "mark_delivered",
     } <= set(calls)

@@ -157,7 +157,7 @@ def _cli_dispatch_admission(args: argparse.Namespace) -> tuple[dict, object, Opt
     per_profile = kbd._positive_dispatch_cap(
         section.get("max_in_progress_per_profile"), "kanban.max_in_progress_per_profile"
     )
-    prepared = kb.prepare_dispatch_admission(
+    prepared = kbd.prepare_dispatch_admission(
         cfg,
         max_spawn=max_spawn,
         max_in_progress=max_in_progress,
@@ -175,16 +175,8 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     max_new_spawns = getattr(args, "spawn_budget", None)
     connector = (kbc.connect_readonly_closing if bool(getattr(args, "dry_run", False))
                  else kbc.connect_closing)
-    dispatch_fn = kb.dispatch_once
-    # Native split tests historically patch either facade or sibling binding;
-    # preserve both seams while production resolves to the facade.
-    if (getattr(dispatch_fn, "__module__", None) == kbd.__name__
-            and kbd.dispatch_once is not dispatch_fn):
-        dispatch_fn = kbd.dispatch_once
     with connector() as conn:
-        # Keep the facade seam: gateway/tests can replace the admitted
-        # dispatcher without changing this CLI module's binding.
-        res = dispatch_fn(
+        res = kbd.dispatch_once(
             conn,
             dry_run=bool(getattr(args, "dry_run", False)),
             max_spawn=max_spawn,

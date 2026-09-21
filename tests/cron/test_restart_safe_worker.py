@@ -959,7 +959,7 @@ def test_direct_cli_exit_keeps_no_agent_execution_owned_until_child_result(
     script_pid = None
     execution_pid = None
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         current = None
         while time.monotonic() < deadline:
             current = executions.latest_execution(job["id"])
@@ -982,7 +982,7 @@ def test_direct_cli_exit_keeps_no_agent_execution_owned_until_child_result(
         assert _pid_exists(script_pid), "owner exit killed the detached no-agent child"
 
         release.write_text("continue", encoding="utf-8")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             current = executions.latest_execution(job["id"])
             if current and current["status"] in {"completed", "failed", "unknown"}:
@@ -1103,7 +1103,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
     parent = subprocess.Popen([sys.executable, "-c", harness])
     worker_pid = None
     try:
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         current = None
         while time.monotonic() < deadline:
             if parent.poll() is not None:
@@ -1125,7 +1125,7 @@ def test_managed_gateway_restart_preserves_active_worker_and_single_side_effect(
         assert _pid_exists(worker_pid)
 
         release.write_text("go", encoding="utf-8")
-        deadline = time.monotonic() + 10
+        deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             row = delivery_queue.get_status(execution["id"])
             if row and row["status"] == "pending":

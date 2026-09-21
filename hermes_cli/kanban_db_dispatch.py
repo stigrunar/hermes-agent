@@ -1673,7 +1673,7 @@ def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int) -> None:
         if launch_mode == "systemd-user-scope":
             try:
                 db_row = next(item for item in conn.execute("PRAGMA database_list").fetchall() if item[1] == "main")
-                expected_unit = _kb._systemd_scope_unit_name(task_id, run_id, db_path=db_row[2])
+                expected_unit = _systemd_scope_unit_name(task_id, run_id, db_path=db_row[2])
             except (OSError, StopIteration, TypeError, ValueError, IndexError):
                 expected_unit = None
             if not (
@@ -2656,7 +2656,7 @@ def _canonical_dispatch_config(
     allowed = validate_allowed_worker_profiles(value) if value is not _ADMISSION_ARGUMENT_MISSING else None
     policy_present = "safe_dispatch_admission" in section
     if policy_present and canonical_progress is None:
-        canonical_progress = _kb.resolve_max_in_progress(None)
+        canonical_progress = resolve_max_in_progress(None)
         if canonical_progress is not None:
             section["max_in_progress"] = canonical_progress
     authorized = bool(policy_present or (canonical_progress is not None and canonical_progress > 1))
@@ -2897,14 +2897,13 @@ def dispatch_once(
         # Dry-run previews never claim/spawn work, but terminal worker cleanup
         # is lifecycle maintenance rather than dispatch mutation and remains
         # active just as it did on the pre-admission path.
-        _kb.reconcile_worker_scope_terminals(conn)
+        reconcile_worker_scope_terminals(conn)
         result.reaped_terminal_workers = reap_terminal_workers(conn)
         return result
 
     native_spawn = (
         spawn_fn is None
         or spawn_fn is _default_spawn
-        or spawn_fn is _kb._default_spawn
     )
 
     def _locked_tick(*, native_admission_held: bool) -> DispatchResult:
@@ -3097,18 +3096,19 @@ def _dispatch_lane_task(
         # Force-load sdlc-review; the kanban lifecycle is already in every
         # worker's system prompt via KANBAN_GUIDANCE.
         claimed.skills = list(dict.fromkeys([*(claimed.skills or []), "sdlc-review"]))
+    pid = None
     try:
-        effective_spawn = spawn_fn if spawn_fn is not None else _kb._default_spawn
+        effective_spawn = spawn_fn if spawn_fn is not None else _default_spawn
         launch_config = scope_config
-        if launch_config is None and effective_spawn is _kb._default_spawn:
+        if launch_config is None and effective_spawn is _default_spawn:
             with contextlib.suppress(Exception):
-                launch_config = _kb._worker_scope_config()
+                launch_config = _worker_scope_config()
         pid = _call_spawn_fn(
             effective_spawn, claimed, str(workspace), board,
             worker_toolsets=worker_toolsets, require_scope=require_scope,
             scope_config=launch_config,
             launch_intent_fn=(
-                lambda unit, target, config: _kb._set_worker_launching(
+                lambda unit, target, config: _set_worker_launching(
                     conn, claimed.id, scope_unit=unit, target=target, scope_config=config,
                 )
             ) if launch_config is not None else None,
@@ -3738,18 +3738,18 @@ def _dispatch_adaptive_locked(
     allowed = frozenset(allowed_worker_profiles) if allowed_worker_profiles is not None else None
     per_profile_cap = max_in_progress_per_profile if isinstance(max_in_progress_per_profile, int) and max_in_progress_per_profile > 0 else None
     profile_exists = _profile_exists_fn()
-    native_spawn = spawn_fn is None or spawn_fn is _default_spawn or spawn_fn is _kb._default_spawn
+    native_spawn = spawn_fn is None or spawn_fn is _default_spawn
     require_scope = False
     scope_config = None
     if native_spawn:
         try:
-            scope_config = _kb._worker_scope_config()
+            scope_config = _worker_scope_config()
         except Exception as exc:
             result.admission_blocked = True
             result.admission_reason = "scope_config_invalid"
             result.admission_metrics = {"error": f"{type(exc).__name__}: {exc}"}
             return result
-        capable, reason, _target = _kb._systemd_scope_preflight(
+        capable, reason, _target = _systemd_scope_preflight(
             require_scope=True, force_probe=True, scope_config=scope_config,
         )
         if not capable:
@@ -3847,11 +3847,10 @@ def _dispatch_once_locked(
     native_spawn = (
         spawn_fn is None
         or spawn_fn is _default_spawn
-        or spawn_fn is _kb._default_spawn
     )
     native_scope_config = _native_scope_snapshot
     if native_spawn and not dry_run and native_scope_config is None:
-        native_scope_config = _kb._worker_scope_config()
+        native_scope_config = _worker_scope_config()
 
     # A required scope is an admission prerequisite.  Do this before any
     # reclaim/recompute mutation so an unavailable required manager cannot
@@ -3863,7 +3862,7 @@ def _dispatch_once_locked(
         and native_scope_config is not None
         and native_scope_config.required
     ):
-        capable, reason, _target = _kb._systemd_scope_preflight(
+        capable, reason, _target = _systemd_scope_preflight(
             require_scope=True,
             force_probe=True,
             scope_config=native_scope_config,
@@ -3970,7 +3969,7 @@ def _dispatch_once_locked(
             or strict_other.has_independent_db
         )
         if native_scope_required:
-            capable, reason, _target = _kb._systemd_scope_preflight(
+            capable, reason, _target = _systemd_scope_preflight(
                 require_scope=True,
                 force_probe=True,
                 scope_config=native_scope_config,
@@ -4657,8 +4656,8 @@ def _default_spawn(
         task, profile_arg, env.get("HERMES_HOME"), worker_toolsets=worker_toolsets,
     )
     if scope_config is None:
-        scope_config = _kb._worker_scope_config()
-    cmd, scope_unit, scope_target = _kb._systemd_scope_argv(
+        scope_config = _worker_scope_config()
+    cmd, scope_unit, scope_target = _systemd_scope_argv(
         worker_cmd, task, board=board, require_scope=require_scope,
         scope_config=scope_config,
     )
@@ -4675,7 +4674,7 @@ def _default_spawn(
             launch_intent_fn(scope_unit, scope_target, scope_config)
         for key in ("DBUS_STARTER_ADDRESS", "DBUS_STARTER_BUS_TYPE"):
             env.pop(key, None)
-        env.update(_kb._systemd_user_manager_environment(scope_target))
+        env.update(_systemd_user_manager_environment(scope_target))
     log_f = _open_worker_log(task, board)
     try:
         proc = subprocess.Popen(  # noqa: S603 -- argv is a fixed list built above

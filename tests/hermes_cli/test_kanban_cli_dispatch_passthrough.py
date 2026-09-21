@@ -49,6 +49,7 @@ def test_cli_dispatch_passes_max_in_progress_from_config(isolated_kanban_home, m
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: fake_config
     )
+    monkeypatch.setattr(kbd, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg)
 
     captured = {}
 
@@ -81,6 +82,7 @@ def test_cli_max_flag_overrides_config_max_spawn(isolated_kanban_home, monkeypat
 
     fake_config = {"kanban": {"max_spawn": 10}}
     monkeypatch.setattr("hermes_cli.config.load_config", lambda: fake_config)
+    monkeypatch.setattr(kbd, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg)
 
     captured = {}
     monkeypatch.setattr(
@@ -100,18 +102,18 @@ def test_cli_spawn_budget_is_separate_from_live_cap(
     isolated_kanban_home, monkeypatch,
 ):
     from hermes_cli import kanban as kb_cli
-    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_dispatch as kbd
 
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: {"kanban": {"max_spawn": 4}}
     )
     monkeypatch.setattr(
-        kanban_db, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg
+        kbd, "prepare_dispatch_admission", lambda cfg, **_kwargs: cfg
     )
     captured = {}
     monkeypatch.setattr(
-        kanban_db, "dispatch_once",
-        lambda conn, **kw: (captured.update(kw), kanban_db.DispatchResult())[1],
+        kbd, "dispatch_once",
+        lambda conn, **kw: (captured.update(kw), kbd.DispatchResult())[1],
     )
     args = argparse.Namespace(
         dry_run=True, max=3, spawn_budget=1, failure_limit=2, json=False
@@ -149,6 +151,7 @@ def test_cli_dispatch_pregates_canonical_policy_before_init_or_connect(
 ):
     from hermes_cli import kanban as kb_cli
     from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_connect as kbc
 
     monkeypatch.delenv("HERMES_DELEGATED_CHILD_CONTEXT", raising=False)
     monkeypatch.delenv("HERMES_KANBAN_DB", raising=False)
@@ -161,12 +164,12 @@ def test_cli_dispatch_pregates_canonical_policy_before_init_or_connect(
         lambda *_args, **_kwargs: pytest.fail("CLI initialized DB before admission"),
     )
     monkeypatch.setattr(
-        kanban_db,
+        kbc,
         "connect_closing",
         lambda *_args, **_kwargs: pytest.fail("CLI opened DB before admission"),
     )
     monkeypatch.setattr(
-        kanban_db,
+        kbc,
         "connect_readonly_closing",
         lambda *_args, **_kwargs: pytest.fail("CLI opened preview DB before admission"),
     )
@@ -187,14 +190,15 @@ def test_cli_dispatch_passes_the_prepared_snapshot_by_identity(
     isolated_kanban_home, monkeypatch,
 ):
     from hermes_cli import kanban as kb_cli
-    from hermes_cli import kanban_db
+    from hermes_cli import kanban_db_connect as kbc
+    from hermes_cli import kanban_db_dispatch as kbd
 
     snapshot = {"kanban": {"_canonical_parallel_dispatch": True}}
     monkeypatch.setattr(
         "hermes_cli.config.load_config", lambda: {"kanban": {}}
     )
     monkeypatch.setattr(
-        kanban_db, "prepare_dispatch_admission", lambda *_a, **_k: snapshot
+        kbd, "prepare_dispatch_admission", lambda *_a, **_k: snapshot
     )
 
     class Scope:
@@ -205,12 +209,12 @@ def test_cli_dispatch_passes_the_prepared_snapshot_by_identity(
             return None
 
     received = {}
-    monkeypatch.setattr(kanban_db, "connect_readonly_closing", lambda: Scope())
+    monkeypatch.setattr(kbc, "connect_readonly_closing", lambda: Scope())
     monkeypatch.setattr(
-        kanban_db,
+        kbd,
         "dispatch_once",
         lambda _conn, **kwargs: (
-            received.update(kwargs), kanban_db.DispatchResult()
+            received.update(kwargs), kbd.DispatchResult()
         )[1],
     )
     args = argparse.Namespace(
