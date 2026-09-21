@@ -76,7 +76,10 @@ def write_drain_request(
         "action": "drain", "requested_at": datetime.now(timezone.utc).isoformat(), "principal": principal,
         "epoch": current_instantiation_epoch(), "suppress_notification": bool(suppress_notification),
     }
-    atomic_json_write(drain_request_path(home), payload)
+    # Drain markers control process admission and are read by release tooling
+    # that deliberately rejects group/other-writable control files.  Set the
+    # mode at temp-file creation time rather than chmodding after replace.
+    atomic_json_write(drain_request_path(home), payload, mode=0o600)
     return payload
 
 

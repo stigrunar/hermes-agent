@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -48,6 +49,11 @@ class TestMarkerContract:
         assert payload["principal"] == "nas"
         body = dc.read_drain_request()
         assert body is not None and body["principal"] == "nas"
+
+    @pytest.mark.skipif(os.name != "posix", reason="POSIX file modes")
+    def test_write_creates_owner_only_control_file(self, home):
+        dc.write_drain_request(principal="release-supervisor")
+        assert dc.drain_request_path().stat().st_mode & 0o777 == 0o600
 
 
 class TestSuppressNotification:
