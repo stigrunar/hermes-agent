@@ -153,12 +153,15 @@ def test_bound_terminal_routes_owner_lane_and_dedupes_replay(tmp_path, monkeypat
     assert rows[0]["attempts"] == 1
 
 
-def test_rendered_contract_prose_does_not_override_bound_identity(tmp_path, monkeypatch):
-    body = """## Execution contract (authoritative)
+@pytest.mark.parametrize("candidate_label", ["exact downstream candidate", "approved", "exact"])
+def test_rendered_contract_prose_does_not_override_bound_identity(
+    tmp_path, monkeypatch, candidate_label,
+):
+    body = f"""## Execution contract (authoritative)
 Outcome: Close Sol-confirmed owner-wake regression on the downstream candidate.
 Owner: DollyCode
 Repo/workspace + base revision: example/repo at 12553c0ba3
-Candidate: exact downstream candidate
+Candidate: {candidate_label}
 
 ## Review contract
 Source/base: exact downstream candidate; no runtime activation
@@ -175,20 +178,31 @@ Source/base: exact downstream candidate; no runtime activation
     assert spec["route"]["lane_id"] == lane_id
 
 
-def test_explicit_body_identity_mismatch_stays_stale(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("field", "reason"),
+    [
+        ("outcome_id", "terminal event identity mismatches task binding"),
+        ("candidate_ref", "terminal event candidate/base is not current"),
+        ("current_candidate_ref", "terminal event candidate/base is not current"),
+    ],
+)
+def test_explicit_body_identity_mismatch_stays_stale(
+    tmp_path, monkeypatch, field, reason,
+):
     _, _, _, task, event = _bound_event(
-        tmp_path / "machine-field", monkeypatch, body="outcome_id: o_deadbeef",
+        tmp_path, monkeypatch, body=f"{field}: wrong-ref",
     )
     machine_field = _resolve_outcome_owner_wake_spec("hermes", task, event)
     assert machine_field is not None and machine_field["status"] == "stale"
-    assert machine_field["reason"] == "terminal event identity mismatches task binding"
+    assert machine_field["reason"] == reason
 
+
+def test_rendered_outcome_label_does_not_override_bound_identity(tmp_path, monkeypatch):
     _, _, _, task, event = _bound_event(
-        tmp_path / "canonical-label", monkeypatch, body="Outcome: o_deadbeef",
+        tmp_path, monkeypatch, body="Outcome: o_deadbeef",
     )
     canonical_label = _resolve_outcome_owner_wake_spec("hermes", task, event)
-    assert canonical_label is not None and canonical_label["status"] == "stale"
-    assert canonical_label["reason"] == "terminal event identity mismatches task binding"
+    assert canonical_label is not None and canonical_label["status"] == "deliver"
 
 
 def test_explicit_project_workstream_routes_owner_wake(tmp_path, monkeypatch):

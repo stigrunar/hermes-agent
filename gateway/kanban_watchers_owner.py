@@ -20,10 +20,6 @@ _OUTCOME_OWNER_WAKE_KINDS = frozenset({
 })
 
 _OWNER_WAKE_PROJECT_ID_RE = re.compile(r"^p_[0-9a-f]{8}$")
-_OWNER_WAKE_OUTCOME_ID_RE = re.compile(r"^o_[0-9a-f]{8}$")
-_OWNER_WAKE_REF_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._/@+-]*$")
-
-
 def _owner_wake_body_fields(body: Any) -> dict[str, str]:
     if not isinstance(body, str):
         return {}
@@ -244,9 +240,7 @@ def _resolve_outcome_owner_wake_spec(
             body_project = _owner_wake_first(body_fields, "project_id") or _owner_wake_body_alias(
                 body_fields, "project", _OWNER_WAKE_PROJECT_ID_RE
             )
-            body_outcome = _owner_wake_first(body_fields, "outcome_id") or _owner_wake_body_alias(
-                body_fields, "outcome", _OWNER_WAKE_OUTCOME_ID_RE
-            )
+            body_outcome = _owner_wake_first(body_fields, "outcome_id")
             explicit_revision = _owner_wake_first(event_payload, "outcome_revision", "revision")
             if (
                 (explicit_project and explicit_project != project_id)
@@ -262,7 +256,7 @@ def _resolve_outcome_owner_wake_spec(
                 body_base = _owner_wake_first(body_fields, "current_base_ref", "base_ref", "mutation_base_ref")
                 body_candidate = _owner_wake_first(
                     body_fields, "current_candidate_ref", "candidate_ref"
-                ) or _owner_wake_body_alias(body_fields, "candidate", _OWNER_WAKE_REF_RE)
+                )
                 status, reason = "deliver", ""
                 if _owner_wake_truthy(event_payload.get("superseded")) or _owner_wake_first(
                     event_payload, "superseded_by", "supersession_id"
