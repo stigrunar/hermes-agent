@@ -16,7 +16,7 @@ from hermes_cli import outcomes_db as odb
 from hermes_cli import projects_db as pdb
 
 
-def _bound_event(tmp_path: Path, monkeypatch, *, payload=None):
+def _bound_event(tmp_path: Path, monkeypatch, *, payload=None, body=None):
     home = tmp_path / "hermes"
     home.mkdir(parents=True)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -41,7 +41,8 @@ def _bound_event(tmp_path: Path, monkeypatch, *, payload=None):
         )
     with kb.connect() as conn:
         task_id = kb.create_task(
-            conn, title="terminal implementation", body="project_id: " + project_id,
+            conn, title="terminal implementation",
+            body=body if body is not None else "project_id: " + project_id,
             assignee="worker", project_id=project_id, outcome_id=outcome_id,
             parent_execution_id="ex_impl",
             mutation_repository="example/repo", mutation_scope=["src/**"],
@@ -122,6 +123,44 @@ def test_bound_terminal_routes_owner_lane_and_dedupes_replay(tmp_path, monkeypat
     assert len(rows) == 1
     assert rows[0]["status"] == "delivered"
     assert rows[0]["attempts"] == 1
+
+
+def test_rendered_contract_prose_does_not_override_bound_identity(tmp_path, monkeypatch):
+    body = """## Execution contract (authoritative)
+Outcome: Close Sol-confirmed owner-wake regression on the downstream candidate.
+Owner: DollyCode
+Repo/workspace + base revision: example/repo at 12553c0ba3
+Candidate: exact downstream candidate
+
+## Review contract
+Source/base: exact downstream candidate; no runtime activation
+"""
+    project_id, outcome_id, lane_id, task, event = _bound_event(
+        tmp_path, monkeypatch, body=body,
+    )
+
+    spec = _resolve_outcome_owner_wake_spec("hermes", task, event)
+
+    assert spec is not None and spec["status"] == "deliver"
+    assert spec["project_id"] == project_id
+    assert spec["outcome_id"] == outcome_id
+    assert spec["route"]["lane_id"] == lane_id
+
+
+def test_explicit_body_identity_mismatch_stays_stale(tmp_path, monkeypatch):
+    _, _, _, task, event = _bound_event(
+        tmp_path / "machine-field", monkeypatch, body="outcome_id: o_deadbeef",
+    )
+    machine_field = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    assert machine_field is not None and machine_field["status"] == "stale"
+    assert machine_field["reason"] == "terminal event identity mismatches task binding"
+
+    _, _, _, task, event = _bound_event(
+        tmp_path / "canonical-label", monkeypatch, body="Outcome: o_deadbeef",
+    )
+    canonical_label = _resolve_outcome_owner_wake_spec("hermes", task, event)
+    assert canonical_label is not None and canonical_label["status"] == "stale"
+    assert canonical_label["reason"] == "terminal event identity mismatches task binding"
 
 
 def test_failed_owner_ack_is_retryable_without_duplicate_text(tmp_path, monkeypatch):

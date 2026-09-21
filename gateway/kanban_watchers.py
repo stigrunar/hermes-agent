@@ -298,6 +298,10 @@ _OUTCOME_OWNER_WAKE_KINDS = frozenset({
     "block_loop_detected",
 })
 
+_OWNER_WAKE_PROJECT_ID_RE = re.compile(r"^p_[0-9a-f]{8}$")
+_OWNER_WAKE_OUTCOME_ID_RE = re.compile(r"^o_[0-9a-f]{8}$")
+_OWNER_WAKE_REF_RE = re.compile(r"^[0-9A-Za-z][0-9A-Za-z._/@+-]*$")
+
 
 def _owner_wake_body_fields(body: Any) -> dict[str, str]:
     """Read only simple structured task-body fields used for stale fencing."""
@@ -330,6 +334,12 @@ def _owner_wake_first(mapping: Any, *keys: str) -> str:
         if value is not None and str(value).strip():
             return str(value).strip()
     return ""
+
+
+def _owner_wake_body_alias(mapping: Any, key: str, pattern: re.Pattern[str]) -> str:
+    """Return a rendered-label value only when it has canonical machine shape."""
+    value = _owner_wake_first(mapping, key)
+    return value if pattern.fullmatch(value) else ""
 
 
 def _owner_wake_prompt(spec: dict[str, Any]) -> str:
@@ -421,8 +431,12 @@ def _resolve_outcome_owner_wake_spec(
             body_fields = _owner_wake_body_fields(getattr(task, "body", None))
             explicit_project = _owner_wake_first(event_payload, "project_id", "project")
             explicit_outcome = _owner_wake_first(event_payload, "outcome_id", "outcome")
-            body_project = _owner_wake_first(body_fields, "project_id", "project")
-            body_outcome = _owner_wake_first(body_fields, "outcome_id", "outcome")
+            body_project = _owner_wake_first(body_fields, "project_id") or _owner_wake_body_alias(
+                body_fields, "project", _OWNER_WAKE_PROJECT_ID_RE
+            )
+            body_outcome = _owner_wake_first(body_fields, "outcome_id") or _owner_wake_body_alias(
+                body_fields, "outcome", _OWNER_WAKE_OUTCOME_ID_RE
+            )
             explicit_revision = _owner_wake_first(event_payload, "outcome_revision", "revision")
             if (
                 (explicit_project and explicit_project != project_id)
@@ -443,8 +457,8 @@ def _resolve_outcome_owner_wake_spec(
                     body_fields, "current_base_ref", "base_ref", "mutation_base_ref"
                 )
                 body_candidate = _owner_wake_first(
-                    body_fields, "current_candidate_ref", "candidate_ref", "candidate"
-                )
+                    body_fields, "current_candidate_ref", "candidate_ref"
+                ) or _owner_wake_body_alias(body_fields, "candidate", _OWNER_WAKE_REF_RE)
                 status, reason = "deliver", ""
                 if _owner_wake_truthy(event_payload.get("superseded")) or _owner_wake_first(
                     event_payload, "superseded_by", "supersession_id"
