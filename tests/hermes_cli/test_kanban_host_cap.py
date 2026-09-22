@@ -381,3 +381,38 @@ def test_review_budget_still_bounded_by_shared_cap(
 
     # Budget 2 total across both lanes, reservation notwithstanding.
     assert len(res.spawned) == 2
+
+
+def test_parallel_dispatch_passes_connection_to_review_probe(
+    kanban_home, all_assignees_spawnable, monkeypatch,
+):
+    """Parallel dispatch reaches the review probe without a missing-conn crash."""
+    from types import SimpleNamespace
+
+    (kanban_home / "config.yaml").write_text(
+        "kanban:\n"
+        "  max_in_progress: 2\n"
+        "  safe_dispatch_admission:\n"
+        "    allowed_worker_profiles: [alice, reviewer]\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(kb, "_read_live_worker_scopes", lambda: {"total": 0})
+    monkeypatch.setattr(
+        kb,
+        "observe_running_tasks_other_boards",
+        lambda _board=None: SimpleNamespace(running_count=0, per_profile_running={}),
+    )
+    monkeypatch.setattr(kb, "_memory_pressure_level", lambda: "normal")
+
+    spawns: list = []
+    with kbc.connect() as conn:
+        task_id = kb.create_task(conn, title="parallel-ready", assignee="alice")
+        res = kbd.dispatch_once(
+            conn,
+            spawn_fn=_fake_spawn_factory(spawns),
+            max_in_progress=2,
+        )
+
+    assert spawns == [task_id]
+    assert [spawned_id for spawned_id, *_ in res.spawned] == [task_id]
+    assert res.admission_blocked is False

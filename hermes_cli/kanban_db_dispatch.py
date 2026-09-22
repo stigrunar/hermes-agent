@@ -3760,7 +3760,13 @@ def _dispatch_adaptive_locked(
 
     default_name = _resolve_default_assignee(default_assignee)
     per_profile_running = dict(by_profile)
-    review_eligible = _any_spawnable_review(review_rows)
+    review_eligible = _any_spawnable_review(
+        conn,
+        review_rows,
+        per_profile_cap=per_profile_cap,
+        per_profile_running=per_profile_running,
+        worker_toolsets=worker_toolsets,
+    )
     ready_budget = max(spawn_budget - 1, 0) if spawn_budget is not None and review_eligible else spawn_budget
     spawned = 0
     lane_kwargs = dict(
