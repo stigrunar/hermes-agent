@@ -322,40 +322,6 @@ class GatewayGoalsMixin:
         # Deferred until the visible final response is delivered, else "✓ Goal achieved" precedes it.
         if msg and source is not None:
             await self._defer_goal_status_notice_after_delivery(source, msg)
-
-    @staticmethod
-    def _dedupe_loop_wakeup_candidates(candidates):
-        """Keep one due-loop candidate per routed conversation."""
-        routed = {}
-        unrouted = []
-        for candidate in candidates:
-            sid, state = candidate
-            route = state.route or {}
-            if not route.get("platform") or not route.get("chat_id"):
-                unrouted.append(candidate)
-                continue
-            route_key = tuple(
-                route.get(field, "")
-                for field in ("platform", "chat_id", "chat_type", "thread_id", "user_id")
-            )
-
-            def _number(value):
-                try:
-                    return float(value or 0.0)
-                except (TypeError, ValueError):
-                    return 0.0
-
-            candidate_key = (
-                _number(getattr(state, "not_before_at", 0.0)),
-                _number(getattr(state, "next_due_at", 0.0)),
-                _number(getattr(state, "ticks_fired", 0)),
-                _number(getattr(state, "created_at", 0.0)),
-                sid,
-            )
-            previous = routed.get(route_key)
-            if previous is None or candidate_key > previous[0]:
-                routed[route_key] = (candidate_key, candidate)
-        return [entry[1] for entry in routed.values()] + unrouted
         prompt = decision.get("continuation_prompt") or ""
         if not decision.get("should_continue") or not prompt or source is None:
             return
