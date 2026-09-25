@@ -53,7 +53,7 @@ out.write_text('receipt:' + prompt, encoding='utf-8')
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
     monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: True)
-    conn = odb.connect()
+    conn = odb.connect(tmp_path / "outcomes.db")
     try:
         oid = odb.create_outcome(conn, project_id="p", outcome_key="O")
         yield conn, oid
@@ -175,5 +175,26 @@ def test_dirty_worktree_is_rejected_before_admission(store, tmp_path):
             output_file=tmp_path / "last.md",
             stderr_file=tmp_path / "stderr.log",
             codex_executable=str(_fake_codex(tmp_path)),
+        )
+    assert odb.get_execution(conn, eid)["state"] == "queued"
+
+
+def test_unknown_sandbox_is_rejected_before_admission(store, tmp_path):
+    conn, oid = store
+    repo = _repo(tmp_path)
+    eid = _execution(conn, oid, repo, eid="ex_unknown_sandbox")
+    prompt = tmp_path / "prompt.txt"
+    prompt.write_text("nope", encoding="utf-8")
+
+    with pytest.raises(DirectCodexExecutionError, match="only allows"):
+        run_direct_codex_execution(
+            conn,
+            execution_id=eid,
+            repo=repo,
+            prompt_file=prompt,
+            output_file=tmp_path / "last.md",
+            stderr_file=tmp_path / "stderr.log",
+            codex_executable=str(_fake_codex(tmp_path)),
+            sandbox="invalid",
         )
     assert odb.get_execution(conn, eid)["state"] == "queued"

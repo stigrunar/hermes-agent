@@ -213,7 +213,8 @@ def build_parser(
     p_direct_codex.add_argument("--codex-exe", default=None)
     p_direct_codex.add_argument("--codex-profile", default="writer")
     p_direct_codex.add_argument(
-        "--sandbox", default="workspace-write", choices=["read-only", "workspace-write"]
+        "--sandbox", default="workspace-write",
+        choices=["read-only", "workspace-write", "danger-full-access"],
     )
     p_direct_codex.add_argument("--heartbeat-seconds", type=float, default=15.0)
     p_direct_codex.add_argument("--timeout-seconds", type=int, default=1800)

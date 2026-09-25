@@ -161,9 +161,9 @@ def run_direct_codex_execution(
     prompt = _read_prompt(prompt_file)
     executable = _resolve_codex_executable(codex_executable)
 
-    if sandbox not in {"read-only", "workspace-write"}:
+    if sandbox not in {"read-only", "workspace-write", "danger-full-access"}:
         raise DirectCodexExecutionError(
-            "direct Codex runner only allows read-only or workspace-write sandbox"
+            "direct Codex runner only allows read-only, workspace-write, or danger-full-access sandbox"
         )
     if not str(codex_profile or "").strip():
         raise DirectCodexExecutionError("codex_profile is required")

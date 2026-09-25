@@ -21,6 +21,11 @@ def _run(argv):
     return projects_cmd.projects_command(args)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_outcomes_db(tmp_path, monkeypatch):
+    monkeypatch.setattr(odb, "outcomes_db_path", lambda: tmp_path / "outcomes.db")
+
+
 def test_create_list_show(capsys, tmp_path):
     assert _run(["create", "My App", str(tmp_path), "--use"]) == 0
     out = capsys.readouterr().out
@@ -271,3 +276,81 @@ out.write_text('cli-receipt:' + prompt, encoding='utf-8')
     assert result["execution"]["state"] == "completed"
     assert result["execution"]["receipt_uri"] == output.resolve().as_uri()
     assert (repo / "artifact.txt").read_text(encoding="utf-8") == "cli-change\n"
+
+
+def test_direct_codex_full_access_reaches_linked_worktree_git_admin(capsys, tmp_path, monkeypatch):
+    import json
+    import subprocess
+
+    monkeypatch.setattr(odb, "cross_project_orchestration_enabled", lambda: True)
+    repo = tmp_path / "repo"
+    linked = tmp_path / "linked"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.email", "test@example.invalid"], check=True)
+    subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+    (repo / "seed.txt").write_text("seed\n", encoding="utf-8")
+    subprocess.run(["git", "-C", str(repo), "add", "seed.txt"], check=True)
+    subprocess.run(["git", "-C", str(repo), "commit", "-qm", "seed"], check=True)
+    subprocess.run(
+        ["git", "-C", str(repo), "worktree", "add", "-q", "-b", "full-access", str(linked)],
+        check=True,
+    )
+    assert (linked / ".git").is_file()
+    base = subprocess.check_output(["git", "-C", str(linked), "rev-parse", "HEAD"], text=True).strip()
+
+    fake = tmp_path / "fake-codex"
+    fake.write_text(
+        """#!/usr/bin/env python3
+import json, pathlib, subprocess, sys
+args = sys.argv[1:]
+out = pathlib.Path(args[args.index('-o') + 1])
+prompt = sys.stdin.read()
+pathlib.Path('artifact.txt').write_text('linked commit\\n', encoding='utf-8')
+subprocess.run(['git', 'add', 'artifact.txt'], check=True)
+subprocess.run(['git', 'commit', '-qm', 'child commit'], check=True)
+out.write_text(json.dumps({'argv': args, 'prompt': prompt}), encoding='utf-8')
+""",
+        encoding="utf-8",
+    )
+    fake.chmod(0o755)
+    prompt = tmp_path / "prompt.txt"
+    output = tmp_path / "last.json"
+    stderr = tmp_path / "stderr.log"
+    prompt.write_text("commit artifact", encoding="utf-8")
+
+    assert _run(["create", "Direct Linked", str(linked)]) == 0
+    capsys.readouterr()
+    assert _run(["outcome-create", "direct-linked", "DIRECT-LINKED-R1"]) == 0
+    capsys.readouterr()
+    command = [
+        "direct-codex-run", "direct-linked", "DIRECT-LINKED-R1",
+        "--repo", str(linked),
+        "--scope", "artifact.txt",
+        "--prompt-file", str(prompt),
+        "--output-file", str(output),
+        "--stderr-file", str(stderr),
+        "--codex-exe", str(fake),
+        "--heartbeat-seconds", "0.1",
+        "--timeout-seconds", "5",
+    ]
+    with pytest.raises(SystemExit) as invalid:
+        _run([*command, "--sandbox", "invalid"])
+    assert invalid.value.code == 2
+    capsys.readouterr()
+
+    assert _run([*command, "--sandbox", "danger-full-access"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ok"] is True
+    assert result["execution"]["state"] == "completed"
+    assert result["execution"]["receipt_uri"] == output.resolve().as_uri()
+    child = json.loads(output.read_text(encoding="utf-8"))
+    assert child["argv"][child["argv"].index("--sandbox") + 1] == "danger-full-access"
+    assert child["prompt"] == "commit artifact"
+    head = subprocess.check_output(["git", "-C", str(linked), "rev-parse", "HEAD"], text=True).strip()
+    assert head != base
+    assert subprocess.check_output(
+        ["git", "-C", str(linked), "show", "HEAD:artifact.txt"], text=True
+    ) == "linked commit\n"
+    assert subprocess.check_output(
+        ["git", "-C", str(linked), "status", "--porcelain"], text=True
+    ) == ""
